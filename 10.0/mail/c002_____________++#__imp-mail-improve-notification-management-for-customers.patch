@@ -1,0 +1,294 @@
+PR: https://github.com/odoo/odoo/pull/
+
+From: 72dfcae2a4b03623e780b857abf37c7aec5b8456
+From: Thibault Delavallée
+Date: 2016-09-01 10:57:56
+
+Structural Changes: 6
+Total Changes: 119
+
+[IMP] mail: improve notification management for customers
+
+Currently it is impossible in Discuss to know whether an email has been sent
+to a customer and whether it failed or bounced. A notified partner has an
+entry in the needaction m2m table. In this commit we decorate this table to
+add fields about the email notification: is an email sent, did it failed, did
+it bounce.
+
+This information is kept only for customers. Internal users does not use this
+information. Moreover their notification is deleted once the message is read
+in the Chatter. This avoids having a notification table that grows quickly.
+
+Chatter now holds a new icon for email details. It allows to know on a thread
+status of emails sent to customers.
+
+================================= pseudo patch: =================================
+
+--- a/addons/mail/models/__init__.py
++++ b/addons/mail/models/__init__.py
+@@ -4,6 +4,7 @@ import mail_message_subtype
+ import mail_tracking_value
+ import mail_alias
+ import mail_followers
++import mail_notification
+ import mail_message
+ import mail_mail
+ import mail_thread
+
+--- a/addons/mail/models/mail_mail.py
++++ b/addons/mail/models/mail_mail.py
+@@ -129,6 +129,19 @@ class MailMail(models.Model):
+         :param browse_record mail: the mail that was just sent
+         :return: True
+         """
++        notif_emails = self.filtered(lambda email: email.notification)
++        if notif_emails:
++            notifications = self.env['mail.notification'].search([
++                ('mail_message_id', 'in', notif_emails.mapped('mail_message_id').ids),
++                ('is_email', '=', True)])
++            if mail_sent:
++                notifications.write({
++                    'email_status': 'sent',
++                })
++            else:
++                notifications.write({
++                    'email_status': 'exception',
++                })
+         if mail_sent:
+             self.sudo().filtered(lambda self: self.auto_delete).unlink()
+         return True
+
+--- a/addons/mail/models/mail_message.py
++++ b/addons/mail/models/mail_message.py
+@@ -82,6 +82,10 @@ class Message(models.Model):
+         help='Need Action')
+     channel_ids = fields.Many2many(
+         'mail.channel', 'mail_message_mail_channel_rel', string='Channels')
++    # notifications
++    notification_ids = fields.One2many(
++        'mail.notification', 'mail_message_id', 'Notifications',
++        auto_join=True, copy=False)
+     # user interface
+     starred_partner_ids = fields.Many2many(
+         'res.partner', 'mail_message_res_partner_starred_rel', string='Favorited By')
+@@ -105,7 +109,10 @@ class Message(models.Model):
+     @api.multi
+     def _get_needaction(self):
+         """ Need action on a mail.message = notified on my channel """
+-        my_messages = self.sudo().filtered(lambda msg: self.env.user.partner_id in msg.needaction_partner_ids)
++        my_messages = self.env['mail.notification'].sudo().search([
++            ('mail_message_id', 'in', self.ids),
++            ('res_partner_id', '=', self.env.user.partner_id.id),
++            ('is_read', '=', False)]).mapped('mail_message_id')
+         for message in self:
+             message.needaction = message in my_messages
+ 
+@@ -117,8 +124,8 @@ class Message(models.Model):
+     @api.model
+     def _search_needaction(self, operator, operand):
+         if operator == '=' and operand:
+-            return [('needaction_partner_ids', 'in', self.env.user.partner_id.id)]
+-        return [('needaction_partner_ids', 'not in', self.env.user.partner_id.id)]
++            return ['&', ('notification_ids.res_partner_id', '=', self.env.user.partner_id.id), ('notification_ids.is_read', '=', False)]
++        return ['&', ('notification_ids.res_partner_id', '=', self.env.user.partner_id.id), ('notification_ids.is_read', '=', True)]
+ 
+     @api.depends('starred_partner_ids')
+     def _get_starred(self):
+@@ -147,7 +154,8 @@ class Message(models.Model):
+         """ Remove all needactions of the current partner. If channel_ids is
+             given, restrict to messages written in one of those channels. """
+         partner_id = self.env.user.partner_id.id
+-        if domain is None:
++        delete_mode = not self.env.user.share  # delete employee notifs, keep customer ones
++        if domain is None and delete_mode:
+             query = "DELETE FROM mail_message_res_partner_needaction_rel WHERE res_partner_id IN %s"
+             args = [(partner_id,)]
+             if channel_ids:
+@@ -170,7 +178,14 @@ class Message(models.Model):
+             if channel_ids:
+                 msg_domain += [('channel_ids', 'in', channel_ids)]
+             unread_messages = self.search(expression.AND([msg_domain, domain]))
+-            unread_messages.sudo().write({'needaction_partner_ids': [(3, partner_id)]})
++            notifications = self.env['mail.notification'].sudo().search([
++                ('mail_message_id', 'in', unread_messages.ids),
++                ('res_partner_id', '=', self.env.user.partner_id.id),
++                ('is_read', '=', False)])
++            if delete_mode:
++                notifications.unlink()
++            else:
++                notifications.write({'is_read': True})
+             ids = unread_messages.mapped('id')
+ 
+         notification = {'type': 'mark_as_read', 'message_ids': ids, 'channel_ids': channel_ids}
+@@ -193,14 +208,20 @@ class Message(models.Model):
+     def set_message_done(self):
+         """ Remove the needaction from messages for the current partner. """
+         partner_id = self.env.user.partner_id
+-        messages = self.filtered(lambda msg: partner_id in msg.needaction_partner_ids)
+-        if not len(messages):
++        delete_mode = not self.env.user.share  # delete employee notifs, keep customer ones
++
++        notifications = self.env['mail.notification'].sudo().search([
++            ('mail_message_id', 'in', self.ids),
++            ('res_partner_id', '=', partner_id.id),
++            ('is_read', '=', False)])
++
++        if not notifications:
+             return
+-        messages.sudo().write({'needaction_partner_ids': [(3, partner_id.id)]})
+ 
+         # notifies changes in messages through the bus.  To minimize the number of
+         # notifications, we need to group the messages depending on their channel_ids
+         groups = []
++        messages = notifications.mapped('mail_message_id')
+         current_channel_ids = messages[0].channel_ids
+         current_group = []
+         for record in messages:
+@@ -215,6 +236,11 @@ class Message(models.Model):
+         current_group = [record.id]
+         current_channel_ids = record.channel_ids
+ 
++        if delete_mode:
++            notifications.unlink()
++        else:
++            notifications.write({'is_read': True})
++
+         for (msg_ids, channel_ids) in groups:
+             notification = {'type': 'mark_as_read', 'message_ids': msg_ids, 'channel_ids': [c.id for c in channel_ids]}
+             self.env['bus.bus'].sendone((self._cr.dbname, 'res.partner', partner_id.id), notification)
+@@ -270,6 +296,8 @@ class Message(models.Model):
+                 partners |= message.partner_ids
+             elif not message.subtype_id and message.partner_ids:  # take specified people of message without a subtype (log)
+                 partners |= message.partner_ids
++            if message.needaction_partner_ids:  # notified
++                partners |= message.needaction_partner_ids
+             if message.attachment_ids:
+                 attachments |= message.attachment_ids
+             if message.tracking_value_ids:
+@@ -311,6 +339,11 @@ class Message(models.Model):
+             else:
+                 partner_ids = [partner_tree[partner.id] for partner in message.partner_ids
+                                 if partner.id in partner_tree]
++
++            customer_email_data = []
++            for notification in message.notification_ids.filtered(lambda notif: notif.res_partner_id.partner_share):
++                customer_email_data.append((partner_tree[notification.res_partner_id.id][0], partner_tree[notification.res_partner_id.id][1], notification.email_status))
++
+             attachment_ids = []
+             for attachment in message.attachment_ids:
+                 if attachment.id in attachments_tree:
+@@ -323,6 +356,10 @@ class Message(models.Model):
+             message_dict.update({
+                 'author_id': author,
+                 'partner_ids': partner_ids,
++                'customer_email_status': (all(d[2] == 'sent' for d in customer_email_data) and 'sent') or
++                                        (any(d[2] == 'exception' for d in customer_email_data) and 'exception') or 
++                                        (any(d[2] == 'bounce' for d in customer_email_data) and 'bounce') or 'ready',
++                'customer_email_data': customer_email_data,
+                 'attachment_ids': attachment_ids,
+                 'tracking_value_ids': tracking_value_ids,
+             })
+
+--- a/None
++++ b/addons/mail/models/mail_notification.py
+@@ -0,0 +1,30 @@
++# -*- coding: utf-8 -*-
++
++from odoo import api, fields, models
++
++
++class Notification(models.Model):
++    _name = 'mail.notification'
++    _table = 'mail_message_res_partner_needaction_rel'
++    _rec_name = 'res_partner_id'
++    _log_access = False
++    _description = 'Message Notifications'
++
++    mail_message_id = fields.Many2one(
++        'mail.message', 'Message', index=True, ondelete='cascade', required=True)
++    res_partner_id = fields.Many2one(
++        'res.partner', 'Needaction Recipient', index=True, ondelete='cascade', required=True)
++    is_read = fields.Boolean('Is Read', index=True)
++    is_email = fields.Boolean('Sent by Email', index=True)
++    email_status = fields.Selection([
++        ('ready', 'Ready to Send'),
++        ('sent', 'Sent'),
++        ('bounce', 'Bounced'),
++        ('exception', 'Exception')], 'Email Status',
++        default='ready', index=True)
++
++    @api.model_cr
++    def init(self):
++        self._cr.execute('SELECT indexname FROM pg_indexes WHERE indexname = %s', ('mail_notification_res_partner_id_is_read_email_status_mail_message_id',))
++        if not self._cr.fetchone():
++            self._cr.execute('CREATE INDEX mail_notification_res_partner_id_is_read_email_status_mail_message_id ON mail_message_res_partner_needaction_rel (res_partner_id, is_read, email_status, mail_message_id)')
+
+--- a/addons/mail/models/mail_thread.py
++++ b/addons/mail/models/mail_thread.py
+@@ -190,7 +190,7 @@ class MailThread(models.AbstractModel):
+         # search for unread messages, directly in SQL to improve performances
+         self._cr.execute(""" SELECT msg.res_id FROM mail_message msg
+                              RIGHT JOIN mail_message_res_partner_needaction_rel rel
+-                             ON rel.mail_message_id = msg.id AND rel.res_partner_id = %s
++                             ON rel.mail_message_id = msg.id AND rel.res_partner_id = %s AND (rel.is_read = false OR rel.is_read IS NULL)
+                              WHERE msg.model = %s AND msg.res_id in %s""",
+                          (self.env.user.partner_id.id, self._name, tuple(self.ids),))
+         for result in self._cr.fetchall():
+
+--- a/addons/mail/models/res_partner.py
++++ b/addons/mail/models/res_partner.py
+@@ -133,6 +133,17 @@ class Partner(models.Model):
+             emails |= self.env['mail.mail'].create(create_values)
+         return emails, recipients_nbr
+ 
++    @api.model
++    def _notify_udpate_notifications(self, emails):
++        for email in emails:
++            notifications = self.env['mail.notification'].sudo().search([
++                ('mail_message_id', '=', email.mail_message_id.id),
++                ('res_partner_id', 'in', email.recipient_ids.ids)])
++            notifications.write({
++                'is_email': True,
++                'email_status': 'ready',
++            })
++
+     @api.multi
+     def _notify(self, message, force_send=False, user_signature=True):
+         # TDE TODO: model-dependant ? (like customer -> always email ?)
+@@ -166,7 +177,6 @@ class Partner(models.Model):
+             base_template_ctx['signature'] = False
+         base_mail_values = self._notify_prepare_email_values(message)
+ 
+-
+         # classify recipients: actions / no action
+         if message.model and message.res_id and hasattr(self.env[message.model], '_message_notification_recipients'):
+             recipients = self.env[message.model].browse(message.res_id)._message_notification_recipients(message, self)
+@@ -185,6 +195,9 @@ class Partner(models.Model):
+                 fol_values = template_fol.generate_email(message.id, fields=['body_html', 'subject'])
+                 # send email
+                 new_emails, new_recipients_nbr = self._notify_send(fol_values['body'], fol_values['subject'], recipient_template_values['followers'], **base_mail_values)
++                # update notifications
++                self._notify_udpate_notifications(new_emails)
++
+                 emails |= new_emails
+                 recipients_nbr += new_recipients_nbr
+             if recipient_template_values['not_followers']:
+@@ -196,6 +209,9 @@ class Partner(models.Model):
+                 not_values = template_not.generate_email(message.id, fields=['body_html', 'subject'])
+                 # send email
+                 new_emails, new_recipients_nbr = self._notify_send(not_values['body'], not_values['subject'], recipient_template_values['not_followers'], **base_mail_values)
++                # update notifications
++                self._notify_udpate_notifications(new_emails)
++
+                 emails |= new_emails
+                 recipients_nbr += new_recipients_nbr
+ 
+@@ -226,7 +242,7 @@ class Partner(models.Model):
+             self.env.cr.execute("""
+                 SELECT count(*) as needaction_count
+                 FROM mail_message_res_partner_needaction_rel R
+-                WHERE R.res_partner_id = %s """, (self.env.user.partner_id.id,))
++                WHERE R.res_partner_id = %s AND (R.is_read = false OR R.is_read IS NULL)""", (self.env.user.partner_id.id,))
+             return self.env.cr.dictfetchall()[0].get('needaction_count')
+         _logger.error('Call to needaction_count without partner_id')
+         return 0

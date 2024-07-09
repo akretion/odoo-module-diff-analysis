@@ -1,0 +1,288 @@
+PR: https://github.com/odoo/odoo/pull/68451
+
+From: 864595901e4d06fc5bb979381281be4122f74fc2
+From: William Braeckman
+Date: 2021-06-03 12:09:32
+
+Structural Changes: 13
+Total Changes: 180
+
+[IMP] hr,hr_payroll: plan automation on triggers
+
+Automate activites linked to plan on certain triggers.
+To automate onboarding and offboarding processes, we can now define
+plans that will activate upon triggers, such as employee creation,
+departure (archive), contract start or contract end.
+Manual plans are still possible.
+
+Upon activation of a plan, a message will be added to the employee's
+chatter with the name of the plan.
+
+More options have been added related to when to schedule the plan's
+activities.
+
+The blocking mechanism has been removed (the plan would not launch if an
+activity could not be started, due to lack of information), failed
+activities will now be logged into the employee's chatter.
+
+The list and kanban employee views have also been updated to include
+info such as first contract date and activity information.
+
+Task ID: 2489095
+
+closes odoo/odoo#68451
+
+Related: odoo/enterprise#17343
+Related: odoo/upgrade#2314
+Signed-off-by: Yannick Tivisse (yti) <yti@odoo.com>
+
+================================= pseudo patch: =================================
+
+--- a/addons/hr/models/hr_employee.py
++++ b/addons/hr/models/hr_employee.py
+@@ -6,10 +6,11 @@ from random import choice
+ from string import digits
+ from werkzeug.urls import url_encode
+ from dateutil.relativedelta import relativedelta
++from collections import defaultdict
+ 
+ from odoo import api, fields, models, _
+ from odoo.osv.query import Query
+-from odoo.exceptions import ValidationError, AccessError
++from odoo.exceptions import ValidationError, AccessError, UserError
+ from odoo.osv import expression
+ from odoo.tools.misc import format_date
+ 
+@@ -281,17 +282,20 @@ class HrEmployeePrivate(models.Model):
+             vals.update(self._sync_user(user, bool(vals.get('image_1920'))))
+             vals['name'] = vals.get('name', user.name)
+         employee = super(HrEmployeePrivate, self).create(vals)
+-        url = '/web#%s' % url_encode({
+-            'action': 'hr.plan_wizard_action',
+-            'active_id': employee.id,
+-            'active_model': 'hr.employee',
+-            'menu_id': self.env.ref('hr.menu_hr_root').id,
+-        })
+-        employee._message_log(body=_('<b>Congratulations!</b> May I recommend you to setup an <a href="%s">onboarding plan?</a>') % (url))
+         if employee.department_id:
+             self.env['mail.channel'].sudo().search([
+                 ('subscription_department_ids', 'in', employee.department_id.id)
+             ])._subscribe_users_automatically()
++        # Launch onboarding plans
++        if not employee._launch_plans_from_trigger(trigger='employee_creation'):
++            # Keep the recommend message if no plans are launched
++            url = '/web#%s' % url_encode({
++                'action': 'hr.plan_wizard_action',
++                'active_id': employee.id,
++                'active_model': 'hr.employee',
++                'menu_id': self.env.ref('hr.menu_hr_root').id,
++            })
++            employee._message_log(body=_('<b>Congratulations!</b> May I recommend you to setup an <a href="%s">onboarding plan?</a>') % (url))
+         return employee
+ 
+     def write(self, vals):
+@@ -336,9 +340,9 @@ class HrEmployeePrivate(models.Model):
+         archived_addresses = unarchived_employees.mapped('address_home_id').filtered(lambda addr: not addr.active)
+         archived_addresses.toggle_active()
+ 
+-        # Empty links to this employees (example: manager, coach, time off responsible, ...)
+         archived_employees = self.filtered(lambda e: not e.active)
+         if archived_employees:
++            # Empty links to this employees (example: manager, coach, time off responsible, ...)
+             employee_fields_to_empty = self._get_employee_m2o_to_empty_on_archived_employees()
+             user_fields_to_empty = self._get_user_m2o_to_empty_on_archived_employees()
+             employee_domain = [[(field, 'in', archived_employees.ids)] for field in employee_fields_to_empty]
+@@ -352,6 +356,9 @@ class HrEmployeePrivate(models.Model):
+                     if employee[field] in archived_employees.user_id:
+                         employee[field] = False
+ 
++            # Launch automatic offboarding plans
++            archived_employees._launch_plans_from_trigger(trigger='employee_archive')
++
+         if len(self) == 1 and not self.active:
+             return {
+                 'type': 'ir.actions.act_window',
+@@ -410,6 +417,71 @@ class HrEmployeePrivate(models.Model):
+             self = self.with_user(real_user)
+         return self
+ 
++    def _launch_plans_from_trigger(self, trigger):
++        '''
++        Launches all plans for given trigger
++
++        Returns False if no plans are launched, True otherwise
++        '''
++        plan_ids = self.env['hr.plan'].search([('trigger', '=', trigger)])
++        if not plan_ids or not self:
++            return False
++        #Group plans and employees by company id
++        plans_per_company = defaultdict(lambda: self.env['hr.plan'])
++        for plan_id in plan_ids:
++            plans_per_company[plan_id.company_id.id] |= plan_id
++        employees_per_company = defaultdict(lambda: self.env['hr.employee'])
++        for employee_id in self:
++            employees_per_company[employee_id.company_id.id] |= employee_id
++        #Launch the plans
++        for company_id in employees_per_company:
++            employees_per_company[company_id]._launch_plan(plans_per_company[company_id])
++        return True
++
++    def _launch_plan(self, plan_ids):
++        '''
++        Launch all given plans
++        '''
++        for employee_id in self:
++            for plan_id in plan_ids:
++                employee_id._message_log(
++                    body=_('Plan %s has been launched.', plan_id.name),
++                )
++                errors = []
++                for activity_type in plan_id.plan_activity_type_ids:
++                    responsible = False
++                    try:
++                        responsible = activity_type.get_responsible_id(employee_id)
++                    except UserError as error:
++                        errors.append(_(
++                            'Warning ! The step "%(name)s: %(summary)s" assigned to %(responsible)s '
++                            'could not be started because: "%(error)s"',
++                            name=activity_type.activity_type_id.name,
++                            summary=activity_type.summary,
++                            responsible=activity_type.responsible,
++                            error=str(error)
++                        ))
++                        continue
++
++                    if self.env['hr.employee'].with_user(responsible).check_access_rights('read', raise_exception=False):
++                        if activity_type.deadline_type == 'default':
++                            date_deadline = self.env['mail.activity']._calculate_date_deadline(activity_type.activity_type_id)
++                        elif activity_type.deadline_type == 'plan_active':
++                            date_deadline = fields.Date.context_today(self)
++                        elif activity_type.deadline_type == 'trigger_offset':
++                            date_deadline = fields.Date.add(fields.Date.context_today(self), days=activity_type.deadline_days)
++
++                        employee_id.activity_schedule(
++                            activity_type_id=activity_type.activity_type_id.id,
++                            summary=activity_type.summary,
++                            note=activity_type.note,
++                            user_id=responsible.id,
++                            date_deadline=date_deadline,
++                        )
++                employee_id._message_log(
++                    body='<br/>'.join(errors),
++                )
++
+     # ---------------------------------------------------------
+     # Messaging
+     # ---------------------------------------------------------
+
+--- a/addons/hr/models/hr_plan.py
++++ b/addons/hr/models/hr_plan.py
+@@ -10,6 +10,13 @@ class HrPlanActivityType(models.Model):
+     _description = 'Plan activity type'
+     _rec_name = 'summary'
+ 
++    _sql_constraints = [
++        (
++            'check_deadline_days', 'CHECK (COALESCE(deadline_days) >= 0)',
++            'Days deadline must be positive.'
++        ),
++    ]
++
+     activity_type_id = fields.Many2one(
+         'mail.activity.type', 'Activity Type',
+         default=lambda self: self.env.ref('mail.mail_activity_data_todo'),
+@@ -22,8 +29,24 @@ class HrPlanActivityType(models.Model):
+         ('manager', 'Manager'),
+         ('employee', 'Employee'),
+         ('other', 'Other')], default='employee', string='Responsible', required=True)
+-    responsible_id = fields.Many2one('res.users', 'Responsible Person', help='Specific responsible of activity if not linked to the employee.')
++    responsible_id = fields.Many2one('res.users', 'Name', help='Specific responsible of activity if not linked to the employee.')
+     note = fields.Html('Note')
++    deadline_type = fields.Selection(
++        [
++            ('default', 'Default value'),
++            ('plan_active', "At plan's activation"),
++            ('trigger_offset', 'Days after activation trigger'),
++        ],
++        string='Activity Deadline',
++        default='default',
++        required=True,
++    )
++    deadline_days = fields.Integer(string='Days Deadline')
++    company_id = fields.Many2one(
++         'res.company',
++         string='Company',
++         default=lambda self: self.env.company,
++     )
+ 
+     @api.depends('activity_type_id')
+     def _compute_default_summary(self):
+@@ -62,3 +85,68 @@ class HrPlan(models.Model):
+     name = fields.Char('Name', required=True)
+     plan_activity_type_ids = fields.Many2many('hr.plan.activity.type', string='Activities')
+     active = fields.Boolean(default=True)
++    plan_type = fields.Selection(
++        [
++            ('onboarding', 'Onboarding'),
++            ('offboarding', 'Offboarding'),
++            ('other', 'Other'),
++        ], string='Type', default='onboarding', required=True,
++    )
++    trigger_onboarding = fields.Selection(
++        [
++            ('manual', 'Manual'),
++            ('employee_creation', 'Employee Creation'),
++        ], compute='_compute_triggers', inverse='_inverse_triggers',
++        required=True, readonly=False,
++    )
++    trigger_offboarding = fields.Selection(
++        [
++            ('manual', 'Manual'),
++            ('employee_archive', 'Archived Employee'),
++        ], compute='_compute_triggers', inverse='_inverse_triggers',
++        required=True, readonly=False,
++    )
++    trigger_other = fields.Selection(
++        [
++            ('manual', 'Manual'),
++        ], compute='_compute_triggers', inverse='_inverse_triggers',
++        required=True, readonly=False,
++    )
++    trigger = fields.Char(default='manual', compute='_compute_trigger', store=True)
++    company_id = fields.Many2one('res.company', string='Company', default=lambda self: self.env.company)
++
++    @api.depends('trigger')
++    def _compute_triggers(self):
++        trigger_types = {'trigger_onboarding', 'trigger_offboarding', 'trigger_other'}
++        type_to_trigger = {
++            'onboarding': 'trigger_onboarding',
++            'offboarding': 'trigger_offboarding',
++            'other': 'trigger_other',
++        }
++        for record in self:
++            #trigger for active
++            record[type_to_trigger[record.plan_type]] = record.trigger or 'manual'
++            #'manual' for all others
++            for disabled_trigger in trigger_types - {type_to_trigger[record.plan_type]}:
++                record[disabled_trigger] = 'manual'
++
++    def _inverse_triggers(self):
++        type_to_trigger = {
++            'onboarding': 'trigger_onboarding',
++            'offboarding': 'trigger_offboarding',
++            'other': 'trigger_other',
++        }
++        for record in self:
++            # or 'manual' required is for trigger_other since it can not be changed it's always False here
++            record.trigger = record[type_to_trigger[record.plan_type]] or 'manual'
++
++    @api.depends('plan_type')
++    def _compute_trigger(self):
++        # In case only plan_type changes
++        type_to_trigger = {
++            'onboarding': 'trigger_onboarding',
++            'offboarding': 'trigger_offboarding',
++            'other': 'trigger_other',
++        }
++        for record in self:
++            record.trigger = record[type_to_trigger[record.plan_type]] or 'manual'

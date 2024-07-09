@@ -1,0 +1,160 @@
+PR: https://github.com/odoo/odoo/pull/
+
+From: 826f927a1ed54f6e2468e8f3b8649c1b7cfdf04b
+From: Haresh Shyara
+Date: 2019-01-17 13:00:21
+
+Structural Changes: 8
+Total Changes: 82
+
+[MOV] purchase_requisition: make requisition services friendly
+
+The purpose of this commit is to make requisition usable with only services. Stock part is extracted in a new module `purchase_requisition_stock` which allows to create requisition based on product availbility or demand, also
+we have moved all security access related stock in this bridge module.
+
+Task ID : 1851286
+
+================================= pseudo patch: =================================
+
+--- a/addons/purchase_requisition/models/__init__.py
++++ b/addons/purchase_requisition/models/__init__.py
+@@ -3,4 +3,3 @@
+ from . import purchase
+ from . import product
+ from . import purchase_requisition
+-from . import stock
+
+--- a/addons/purchase_requisition/models/purchase.py
++++ b/addons/purchase_requisition/models/purchase.py
+@@ -39,7 +39,6 @@ class PurchaseOrder(models.Model):
+                 self.origin = requisition.name
+         self.notes = requisition.description
+         self.date_order = requisition.date_end or fields.Datetime.now()
+-        self.picking_type_id = requisition.picking_type_id.id
+ 
+         if requisition.type_id.line_copy != 'copy':
+             return
+
+--- a/addons/purchase_requisition/models/purchase_requisition.py
++++ b/addons/purchase_requisition/models/purchase_requisition.py
+@@ -43,16 +43,6 @@ class PurchaseRequisition(models.Model):
+     _inherit = ['mail.thread', 'mail.activity.mixin']
+     _order = "id desc"
+ 
+-    def _get_picking_in(self):
+-        pick_in = self.env.ref('stock.picking_type_in', raise_if_not_found=False)
+-        company = self.env['res.company']._company_default_get('purchase.requisition')
+-        if not pick_in or pick_in.sudo().warehouse_id.company_id.id != company.id:
+-            pick_in = self.env['stock.picking.type'].search(
+-                [('warehouse_id.company_id', '=', company.id), ('code', '=', 'incoming')],
+-                limit=1,
+-            )
+-        return pick_in
+-
+     def _get_type_id(self):
+         return self.env['purchase.requisition.type'].search([], limit=1)
+ 
+@@ -69,12 +59,10 @@ class PurchaseRequisition(models.Model):
+     company_id = fields.Many2one('res.company', string='Company', required=True, default=lambda self: self.env['res.company']._company_default_get('purchase.requisition'))
+     purchase_ids = fields.One2many('purchase.order', 'requisition_id', string='Purchase Orders', states={'done': [('readonly', True)]})
+     line_ids = fields.One2many('purchase.requisition.line', 'requisition_id', string='Products to Purchase', states={'done': [('readonly', True)]}, copy=True)
+-    warehouse_id = fields.Many2one('stock.warehouse', string='Warehouse')
+     state = fields.Selection(PURCHASE_REQUISITION_STATES,
+                               'Status', tracking=True, required=True,
+                               copy=False, default='draft')
+     state_blanket_order = fields.Selection(PURCHASE_REQUISITION_STATES, compute='_set_state')
+-    picking_type_id = fields.Many2one('stock.picking.type', 'Operation Type', required=True, default=_get_picking_in)
+     is_quantity_copy = fields.Selection(related='type_id.quantity_copy', readonly=True)
+     currency_id = fields.Many2one('res.currency', 'Currency', required=True,
+         default=lambda self: self.env.user.company_id.currency_id.id)
+@@ -169,7 +157,6 @@ class PurchaseRequisition(models.Model):
+                 'product_id': product_id.id,
+                 'product_uom_id': product_uom.id,
+                 'product_qty': product_qty,
+-                'move_dest_id': values.get('move_dest_ids') and values['move_dest_ids'][0].id or False,
+             })],
+         }
+ 
+@@ -196,7 +183,6 @@ class PurchaseRequisitionLine(models.Model):
+     account_analytic_id = fields.Many2one('account.analytic.account', string='Analytic Account')
+     analytic_tag_ids = fields.Many2many('account.analytic.tag', string='Analytic Tags')
+     schedule_date = fields.Date(string='Scheduled Date')
+-    move_dest_id = fields.Many2one('stock.move', 'Downstream Move')
+     supplier_info_ids = fields.One2many('product.supplierinfo', 'purchase_requisition_line_id')
+ 
+     @api.model
+@@ -281,5 +267,4 @@ class PurchaseRequisitionLine(models.Model):
+             'date_planned': date_planned,
+             'account_analytic_id': self.account_analytic_id.id,
+             'analytic_tag_ids': self.analytic_tag_ids.ids,
+-            'move_dest_ids': self.move_dest_id and [(4, self.move_dest_id.id)] or []
+         }
+
+--- a/addons/purchase_requisition/models/stock.py
++++ b/None
+@@ -1,65 +0,0 @@
+-# -*- encoding: utf-8 -*-
+-# Part of Odoo. See LICENSE file for full copyright and licensing details.
+-
+-from odoo import api, fields, models
+-
+-
+-class ProcurementGroup(models.Model):
+-    _inherit = 'procurement.group'
+-
+-    @api.model
+-    def _get_exceptions_domain(self):
+-        return super(ProcurementGroup, self)._get_exceptions_domain() + [('requistion_line_ids', '=', False)]
+-
+-
+-class StockRule(models.Model):
+-    _inherit = 'stock.rule'
+-
+-    @api.multi
+-    def _run_buy(self, product_id, product_qty, product_uom, location_id, name, origin, values):
+-        if product_id.purchase_requisition != 'tenders':
+-            return super(StockRule, self)._run_buy(product_id, product_qty, product_uom, location_id, name, origin, values)
+-        values = self.env['purchase.requisition']._prepare_tender_values(product_id, product_qty, product_uom, location_id, name, origin, values)
+-        values['picking_type_id'] = self.picking_type_id.id
+-        self.env['purchase.requisition'].create(values)
+-        return True
+-
+-    def _prepare_purchase_order(self, product_id, product_qty, product_uom, origin, values, partner):
+-        res = super(StockRule, self)._prepare_purchase_order(product_id, product_qty, product_uom, origin, values, partner)
+-        res['partner_ref'] = values['supplier'].purchase_requisition_id.name
+-        res['requisition_id'] = values['supplier'].purchase_requisition_id.id
+-        if values['supplier'].purchase_requisition_id.currency_id:
+-            res['currency_id'] = values['supplier'].purchase_requisition_id.currency_id.id
+-        return res
+-
+-    def _make_po_get_domain(self, values, partner):
+-        domain = super(StockRule, self)._make_po_get_domain(values, partner)
+-        if 'supplier' in values and values['supplier'].purchase_requisition_id:
+-            domain += (
+-                ('requisition_id', '=', values['supplier'].purchase_requisition_id.id),
+-            )
+-        return domain
+-
+-
+-class StockMove(models.Model):
+-    _inherit = 'stock.move'
+-
+-    requisition_line_ids = fields.One2many('purchase.requisition.line', 'move_dest_id')
+-
+-    def _get_upstream_documents_and_responsibles(self, visited):
+-        if self.requisition_line_ids:
+-            return [(requisition_line.requisition_id, requisition_line.requisition_id.user_id, visited) for requisition_line in self.requisition_line_ids if requisition_line.requisition_id.state not in ('done', 'cancel')]
+-        else:
+-            return super(StockMove, self)._get_upstream_documents_and_responsibles(visited)
+-
+-
+-class Orderpoint(models.Model):
+-    _inherit = "stock.warehouse.orderpoint"
+-
+-    def _quantity_in_progress(self):
+-        res = super(Orderpoint, self)._quantity_in_progress()
+-        for op in self:
+-            for pr in self.env['purchase.requisition'].search([('state','=','draft'),('origin','=',op.name)]):
+-                for prline in pr.line_ids.filtered(lambda l: l.product_id.id == op.product_id.id):
+-                    res[op.id] += prline.product_uom_id._compute_quantity(prline.product_qty, op.product_uom, round=False)
+-        return res

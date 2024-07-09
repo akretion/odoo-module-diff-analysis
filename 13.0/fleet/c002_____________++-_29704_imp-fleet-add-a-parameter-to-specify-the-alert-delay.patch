@@ -1,0 +1,150 @@
+PR: https://github.com/odoo/odoo/pull/29704
+
+From: de7c94a3357aff311f7866a73bf3f6434edf097e
+From: jbm-odoo
+Date: 2019-01-22 09:44:34
+
+Structural Changes: 6
+Total Changes: 35
+
+[IMP] fleet: Add a parameter to specify the alert delay
+
+Purpose
+=======
+
+An alert is sent when the vehicle contract will be outdated in less than a month.
+
+This could be a parameter than could be set on the res.config.
+
+Specification
+=============
+
+Use ir.config.parameter in all the cases
+
+Default value is 30 days
+
+Consider 'diesoon' contract as an 'in progress' contract
+
+closes odoo/odoo#29704
+
+================================= pseudo patch: =================================
+
+--- a/addons/fleet/models/__init__.py
++++ b/addons/fleet/models/__init__.py
+@@ -4,3 +4,4 @@
+ from . import fleet_vehicle
+ from . import fleet_vehicle_cost
+ from . import fleet_vehicle_model
++from . import res_config_settings
+
+--- a/addons/fleet/models/fleet_vehicle.py
++++ b/addons/fleet/models/fleet_vehicle.py
+@@ -115,13 +115,15 @@ class FleetVehicle(models.Model):
+ 
+     @api.depends('log_contracts')
+     def _compute_contract_reminder(self):
++        params = self.env['ir.config_parameter'].sudo()
++        delay_alert_contract = int(params.get_param('hr_fleet.delay_alert_contract', default=30))
+         for record in self:
+             overdue = False
+             due_soon = False
+             total = 0
+             name = ''
+             for element in record.log_contracts:
+-                if element.state in ('open', 'expired') and element.expiration_date:
++                if element.state in ('open', 'diesoon', 'expired') and element.expiration_date:
+                     current_date_str = fields.Date.context_today(record)
+                     due_time_str = element.expiration_date
+                     current_date = fields.Date.from_string(current_date_str)
+@@ -130,13 +132,13 @@ class FleetVehicle(models.Model):
+                     if diff_time < 0:
+                         overdue = True
+                         total += 1
+-                    if 0 >= diff_time < 30:
++                    if diff_time < delay_alert_contract:
+                         due_soon = True
+                         total += 1
+                     if overdue or due_soon:
+                         log_contract = self.env['fleet.vehicle.log.contract'].search([
+                             ('vehicle_id', '=', record.id),
+-                            ('state', 'in', ('open', 'expired'))
++                            ('state', 'in', ('open', 'diesoon', 'expired'))
+                             ], limit=1, order='expiration_date asc')
+                         if log_contract:
+                             # we display only the name of the oldest overdue/due soon contract
+@@ -148,6 +150,8 @@ class FleetVehicle(models.Model):
+             record.contract_renewal_name = name
+ 
+     def _search_contract_renewal_due_soon(self, operator, value):
++        params = self.env['ir.config_parameter'].sudo()
++        delay_alert_contract = int(params.get_param('hr_fleet.delay_alert_contract', default=30))
+         res = []
+         assert operator in ('=', '!=', '<>') and value in (True, False), 'Operation not supported'
+         if (operator == '=' and value is True) or (operator in ('<>', '!=') and value is False):
+@@ -156,7 +160,7 @@ class FleetVehicle(models.Model):
+             search_operator = 'not in'
+         today = fields.Date.context_today(self)
+         datetime_today = fields.Datetime.from_string(today)
+-        limit_date = fields.Datetime.to_string(datetime_today + relativedelta(days=+15))
++        limit_date = fields.Datetime.to_string(datetime_today + relativedelta(days=+delay_alert_contract))
+         self.env.cr.execute("""SELECT cost.vehicle_id,
+                         count(contract.id) AS contract_number
+                         FROM fleet_vehicle_cost cost
+@@ -164,7 +168,7 @@ class FleetVehicle(models.Model):
+                         WHERE contract.expiration_date IS NOT NULL
+                           AND contract.expiration_date > %s
+                           AND contract.expiration_date < %s
+-                          AND contract.state IN ('open', 'expired')
++                          AND contract.state IN ('open', 'diesoon', 'expired')
+                         GROUP BY cost.vehicle_id""", (today, limit_date))
+         res_ids = [x[0] for x in self.env.cr.fetchall()]
+         res.append(('id', search_operator, res_ids))
+@@ -184,7 +188,7 @@ class FleetVehicle(models.Model):
+                         LEFT JOIN fleet_vehicle_log_contract contract ON contract.cost_id = cost.id
+                         WHERE contract.expiration_date IS NOT NULL
+                           AND contract.expiration_date < %s
+-                          AND contract.state IN ('open', 'expired')
++                          AND contract.state IN ('open', 'diesoon', 'expired')
+                         GROUP BY cost.vehicle_id ''', (today,))
+         res_ids = [x[0] for x in self.env.cr.fetchall()]
+         res.append(('id', search_operator, res_ids))
+
+--- a/addons/fleet/models/fleet_vehicle_cost.py
++++ b/addons/fleet/models/fleet_vehicle_cost.py
+@@ -156,7 +156,7 @@ class FleetVehicleLogContract(models.Model):
+         otherwise return the number of days before the contract expires
+         """
+         for record in self:
+-            if (record.expiration_date and (record.state == 'open' or record.state == 'expired')):
++            if record.expiration_date and record.state in ['open', 'diesoon', 'expired']:
+                 today = fields.Date.from_string(fields.Date.today())
+                 renew_date = fields.Date.from_string(record.expiration_date)
+                 diff_time = (renew_date - today).days
+@@ -267,9 +267,11 @@ class FleetVehicleLogContract(models.Model):
+     def scheduler_manage_contract_expiration(self):
+         # This method is called by a cron task
+         # It manages the state of a contract, possibly by posting a message on the vehicle concerned and updating its status
++        params = self.env['ir.config_parameter'].sudo()
++        delay_alert_contract = int(params.get_param('hr_fleet.delay_alert_contract', default=30))
+         date_today = fields.Date.from_string(fields.Date.today())
+-        in_fifteen_days = fields.Date.to_string(date_today + relativedelta(days=+15))
+-        nearly_expired_contracts = self.search([('state', '=', 'open'), ('expiration_date', '<', in_fifteen_days)])
++        outdated_days = fields.Date.to_string(date_today + relativedelta(days=+delay_alert_contract))
++        nearly_expired_contracts = self.search([('state', '=', 'open'), ('expiration_date', '<', outdated_days)])
+ 
+         nearly_expired_contracts.write({'state': 'diesoon'})
+         for contract in nearly_expired_contracts.filtered(lambda contract: contract.user_id):
+
+--- a/None
++++ b/addons/fleet/models/res_config_settings.py
+@@ -0,0 +1,10 @@
++# -*- coding: utf-8 -*-
++# Part of Odoo. See LICENSE file for full copyright and licensing details.
++
++from odoo import fields, models
++
++
++class ResConfigSettings(models.TransientModel):
++    _inherit = ['res.config.settings']
++
++    delay_alert_contract = fields.Integer(string='Delay alert contract outdated', default=30, config_parameter='hr_fleet.delay_alert_contract')

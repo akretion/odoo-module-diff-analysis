@@ -1,0 +1,318 @@
+PR: https://github.com/odoo/odoo/pull/
+
+From: 7d678cc7f4c9e00d78d4120f703e90bd282c1a51
+From: oco-odoo
+Date: 2021-04-01 12:09:20
+
+Structural Changes: 19
+Total Changes: 106
+
+[IMP] account: introduce foreign VAT fiscal positions
+
+Such fiscal positions define an alternate VAT for a specific region. When foreign_vat is set, a country must be set on the fiscal position; it'll be used to know for which tax report the fiscal position must be available as an alternate VAT (in the tax report; see enterprise branch). Note that it is possible to defined several foreign VATs for the same country, as long as they belong to different states within that country.
+
+Note that this new feature is only for FOREIGN stuff; so, when you have to submit a tax report in different regions than yours. For example if you have a Belgian accounting, have French customers, and have a French VAT in addition to your Belgian VAT, to submit a tax report in France. For domestic operations, simply use your the vat field of your company, just like before.
+
+[IMP] account: add country_id on taxes and filter them on invoices
+
+The invoices now compute the country from which they should accept the taxes: it's either the one defined by fiscal_position_id.country_id (if fiscal_position_id is a foreign VAT fiscal position, i.e. it defines a foreign_vat value), or the company's account_fiscal_country_id.
+
+Taxes from other countries are filtered from the view; we don't want them to be available there. There is also a constraint ensuring that. Same goes for tax repartition lines and tags from other countries.
+
+We don't want to mix taxes, tags and foreign VAT fiscal positions from different countries, as it would break the tax report in enterprise. Doing this ensures the tax report can efficiently discriminate the move lines between the different regions whose report they have to appear in.
+
+[IMP] account: add country_id to account.chart.template
+
+This is done so that the taxes are created in the right country, and the fiscal country is initialized in a consistent way when instantiating the CoA on the company.
+
+[IMP] account: print foreign VAT on invoice instead of company VAT if one is defined
+
+[IMP] web: allow forcing company vat on document templates
+
+This is done to allow the use of foreign vat fiscal position on invoices: in that case, we don't want to use the company VAT, but the value of fiscal_position_id.foreign_vat. So, when such a value exists, the invoice simply set the force_vat variable to the right value.
+
+[IMP] base_vat: also validate VAT of foreign VAT fiscal positions
+
+We generalize the code formerly only done for res.partner so that the foreign_vat field of account.fiscal.position can be checked in the same way.
+
+================================= pseudo patch: =================================
+
+--- a/addons/account/models/account_move.py
++++ b/addons/account/models/account_move.py
+@@ -327,6 +327,7 @@ class AccountMove(models.Model):
+     display_inactive_currency_warning = fields.Boolean(
+         compute="_compute_display_inactive_currency_warning",
+         help="Technical field used for tracking the status of the currency")
++    tax_country_id = fields.Many2one(comodel_name='res.country', compute='_compute_tax_country_id', help="Technical field to filter the available taxes depending on the fiscal country and fiscal position.")
+     # Technical field to hide Reconciled Entries stat button
+     has_reconciled_entries = fields.Boolean(compute="_compute_has_reconciled_entries")
+     show_reset_to_draft_button = fields.Boolean(compute='_compute_show_reset_to_draft_button')
+@@ -1572,6 +1573,14 @@ class AccountMove(models.Model):
+         for move in self:
+             move.show_reset_to_draft_button = not move.restrict_mode_hash_table and move.state in ('posted', 'cancel')
+ 
++    @api.depends('company_id.account_fiscal_country_id', 'fiscal_position_id.country_id', 'fiscal_position_id.foreign_vat')
++    def _compute_tax_country_id(self):
++        for record in self:
++            if record.fiscal_position_id.foreign_vat:
++                record.tax_country_id = record.fiscal_position_id.country_id
++            else:
++                record.tax_country_id = record.company_id.account_fiscal_country_id
++
+     # -------------------------------------------------------------------------
+     # BUSINESS MODELS SYNCHRONIZATION
+     # -------------------------------------------------------------------------
+@@ -1706,6 +1715,17 @@ class AccountMove(models.Model):
+             if record.is_sale_document() and journal_type != 'sale' or record.is_purchase_document() and journal_type != 'purchase':
+                 raise ValidationError(_("The chosen journal has a type that is not compatible with your invoice type. Sales operations should go to 'sale' journals, and purchase operations to 'purchase' ones."))
+ 
++    @api.constrains('line_ids', 'fiscal_position_id', 'company_id')
++    def _validate_taxes_country(self):
++        """ By playing with the fiscal position in the form view, it is possible to keep taxes on the invoices from
++        a different country than the one allowed by the fiscal country or the fiscal position.
++        This contrains ensure such account.move cannot be kept, as they could generate inconsistencies in the reports.
++        """
++        self._compute_tax_country_id() # We need to ensure this field has been computed, as we use it in our check
++        for record in self:
++            if record.line_ids.tax_ids and record.line_ids.tax_ids.country_id != record.tax_country_id:
++                raise ValidationError(_("This entry contains some tax from an unallowed country. Please check its fiscal position and your tax configuration."))
++
+     # -------------------------------------------------------------------------
+     # LOW-LEVEL METHODS
+     # -------------------------------------------------------------------------
+@@ -1900,7 +1920,7 @@ class AccountMove(models.Model):
+         return res
+ 
+     @api.ondelete(at_uninstall=False)
+-    def _unlink_except_parts_of_chain(self):
++    def _unlink_forbid_parts_of_chain(self):
+         """ Moves with a sequence number can only be deleted if they are the last element of a chain of sequence.
+         If they are not, deleting them would create a gap. If the user really wants to do this, he still can
+         explicitly empty the 'name' field of the move; but we discourage that practice.
+@@ -2986,6 +3006,7 @@ class AccountMove(models.Model):
+         """
+         return []
+ 
++
+ class AccountMoveLine(models.Model):
+     _name = "account.move.line"
+     _description = "Journal Item"
+@@ -3006,7 +3027,6 @@ class AccountMoveLine(models.Model):
+     company_currency_id = fields.Many2one(related='company_id.currency_id', string='Company Currency',
+         readonly=True, store=True,
+         help='Utility field to express amount currency')
+-    tax_fiscal_country_id = fields.Many2one(comodel_name='res.country', related='move_id.company_id.account_tax_fiscal_country_id')
+     account_id = fields.Many2one('account.account', string='Account',
+         index=True, ondelete="cascade",
+         domain="[('deprecated', '=', False), ('company_id', '=', 'company_id'),('is_off_balance', '=', False)]",
+
+--- a/addons/account/models/account_partial_reconcile.py
++++ b/addons/account/models/account_partial_reconcile.py
+@@ -486,6 +486,7 @@ class AccountPartialReconcile(models.Model):
+                     'line_ids': [],
+                     'tax_cash_basis_rec_id': partial.id,
+                     'tax_cash_basis_move_id': move.id,
++                    'fiscal_position_id': move.fiscal_position_id,
+                 }
+ 
+                 # Tracking of lines grouped all together.
+
+--- a/addons/account/models/account_tax.py
++++ b/addons/account/models/account_tax.py
+@@ -95,8 +95,8 @@ class AccountTax(models.Model):
+         help="Account used to transition the tax amount for cash basis taxes. It will contain the tax amount as long as the original invoice has not been reconciled ; at reconciliation, this amount cancelled on this account and put on the regular tax account.")
+     invoice_repartition_line_ids = fields.One2many(string="Distribution for Invoices", comodel_name="account.tax.repartition.line", inverse_name="invoice_tax_id", copy=True, help="Distribution when the tax is used on an invoice")
+     refund_repartition_line_ids = fields.One2many(string="Distribution for Refund Invoices", comodel_name="account.tax.repartition.line", inverse_name="refund_tax_id", copy=True, help="Distribution when the tax is used on a refund")
+-    tax_fiscal_country_id = fields.Many2one(string='Fiscal Country', comodel_name='res.country', related='company_id.account_tax_fiscal_country_id', help="Technical field used to restrict the domain of account tags for tax repartition lines created for this tax.")
+-    country_code = fields.Char(related='company_id.country_id.code', readonly=True)
++    country_id = fields.Many2one(string="Country", comodel_name='res.country', required=True, help="The country for which this tax is applicable.")
++    country_code = fields.Char(related='country_id.code', readonly=True)
+ 
+     _sql_constraints = [
+         ('name_company_uniq', 'unique(name, company_id, type_tax_use, tax_scope)', 'Tax names must be unique !'),
+@@ -110,18 +110,19 @@ class AccountTax(models.Model):
+         company_id = rslt.get('company_id')
+         company = self.env['res.company'].browse(company_id)
+ 
++        if 'country_id' in fields_list:
++            rslt['country_id'] = company.account_fiscal_country_id.id
++
+         if 'refund_repartition_line_ids' in fields_list:
+-            # We write on the related country_id field so that the field is recomputed. Without that, it will stay empty until we save the record.
+             rslt['refund_repartition_line_ids'] = [
+-                (0, 0, {'repartition_type': 'base', 'factor_percent': 100.0, 'tag_ids': [], 'company_id': company_id, 'tax_fiscal_country_id': company.country_id.id}),
+-                (0, 0, {'repartition_type': 'tax', 'factor_percent': 100.0, 'tag_ids': [], 'company_id': company_id, 'tax_fiscal_country_id': company.country_id.id}),
++                (0, 0, {'repartition_type': 'base', 'factor_percent': 100.0, 'tag_ids': [], 'company_id': company_id}),
++                (0, 0, {'repartition_type': 'tax', 'factor_percent': 100.0, 'tag_ids': [], 'company_id': company_id}),
+             ]
+ 
+         if 'invoice_repartition_line_ids' in fields_list:
+-            # We write on the related country_id field so that the field is recomputed. Without that, it will stay empty until we save the record.
+             rslt['invoice_repartition_line_ids'] = [
+-                (0, 0, {'repartition_type': 'base', 'factor_percent': 100.0, 'tag_ids': [], 'company_id': company_id, 'tax_fiscal_country_id': company.country_id.id}),
+-                (0, 0, {'repartition_type': 'tax', 'factor_percent': 100.0, 'tag_ids': [], 'company_id': company_id, 'tax_fiscal_country_id': company.country_id.id}),
++                (0, 0, {'repartition_type': 'base', 'factor_percent': 100.0, 'tag_ids': [], 'company_id': company_id}),
++                (0, 0, {'repartition_type': 'tax', 'factor_percent': 100.0, 'tag_ids': [], 'company_id': company_id}),
+             ]
+ 
+         return rslt
+@@ -645,11 +646,10 @@ class AccountTaxRepartitionLine(models.Model):
+         check_company=True,
+         help="The tax set to apply this distribution on refund invoices. Mutually exclusive with invoice_tax_id")
+     tax_id = fields.Many2one(comodel_name='account.tax', compute='_compute_tax_id')
+-    tax_fiscal_country_id = fields.Many2one(string="Fiscal Country", comodel_name='res.country', related='company_id.account_tax_fiscal_country_id', help="Technical field used to restrict tags domain in form view.")
+     company_id = fields.Many2one(string="Company", comodel_name='res.company', compute="_compute_company", store=True, help="The company this distribution line belongs to.")
+     sequence = fields.Integer(string="Sequence", default=1,
+         help="The order in which distribution lines are displayed and matched. For refunds to work properly, invoice distribution lines should be arranged in the same order as the credit note distribution lines they correspond to.")
+-    use_in_tax_closing = fields.Boolean(string="Tax Closing Entry")
++    use_in_tax_closing = fields.Boolean(string="Tax Closing Entry", default=True)
+ 
+     @api.onchange('account_id', 'repartition_type')
+     def _on_change_account_id(self):
+@@ -664,6 +664,12 @@ class AccountTaxRepartitionLine(models.Model):
+             if record.invoice_tax_id and record.refund_tax_id:
+                 raise ValidationError(_("Tax distribution lines should apply to either invoices or refunds, not both at the same time. invoice_tax_id and refund_tax_id should not be set together."))
+ 
++    @api.constrains('invoice_tax_id', 'refund_tax_id', 'tag_ids')
++    def validate_tags_country(self):
++        for record in self:
++            if record.tag_ids.country_id and record.tax_id.country_id != record.tag_ids.country_id:
++                raise ValidationError(_("A tax should only use tags from its country. You should use another tax and a fiscal position if you wish to uses the tags from foreign tax reports."))
++
+     @api.depends('factor_percent')
+     def _compute_factor(self):
+         for record in self:
+
+--- a/addons/account/models/chart_template.py
++++ b/addons/account/models/chart_template.py
+@@ -105,12 +105,16 @@ class AccountChartTemplate(models.Model):
+         string="Gain Exchange Rate Account", domain=[('internal_type', '=', 'other'), ('deprecated', '=', False)])
+     expense_currency_exchange_account_id = fields.Many2one('account.account.template',
+         string="Loss Exchange Rate Account", domain=[('internal_type', '=', 'other'), ('deprecated', '=', False)])
++    country_id = fields.Many2one(string="Country", comodel_name='res.country', help="The country this chart of accounts belongs to. None if it's generic.")
++
+     account_journal_suspense_account_id = fields.Many2one('account.account.template', string='Journal Suspense Account')
+     account_journal_payment_debit_account_id = fields.Many2one('account.account.template', string='Journal Outstanding Receipts Account')
+     account_journal_payment_credit_account_id = fields.Many2one('account.account.template', string='Journal Outstanding Payments Account')
++
+     default_cash_difference_income_account_id = fields.Many2one('account.account.template', string="Cash Difference Income Account")
+     default_cash_difference_expense_account_id = fields.Many2one('account.account.template', string="Cash Difference Expense Account")
+     default_pos_receivable_account_id = fields.Many2one('account.account.template', string="PoS receivable account")
++
+     property_account_receivable_id = fields.Many2one('account.account.template', string='Receivable Account')
+     property_account_payable_id = fields.Many2one('account.account.template', string='Payable Account')
+     property_account_expense_categ_id = fields.Many2one('account.account.template', string='Category of Expense Account')
+@@ -331,6 +335,10 @@ class AccountChartTemplate(models.Model):
+         company.account_sale_tax_id = self.env['account.tax'].search([('type_tax_use', 'in', ('sale', 'all')), ('company_id', '=', company.id)], limit=1).id
+         company.account_purchase_tax_id = self.env['account.tax'].search([('type_tax_use', 'in', ('purchase', 'all')), ('company_id', '=', company.id)], limit=1).id
+ 
++        if self.country_id:
++            # If this CoA is made for only one country, set it as the fiscal country of the company.
++            company.account_fiscal_country_id = self.country_id
++
+         return {}
+ 
+     @api.model
+@@ -1010,6 +1018,10 @@ class AccountTaxTemplate(models.Model):
+             for template in templates:
+                 if all(child.id in tax_template_to_tax for child in template.children_tax_ids):
+                     vals = template._get_tax_vals(company, tax_template_to_tax)
++
++                    if self.chart_template_id.country_id:
++                        vals['country_id'] = self.chart_template_id.country_id.id
++
+                     tax_template_vals.append((template, vals))
+                 else:
+                     # defer the creation of this tax to the next batch
+
+--- a/addons/account/models/company.py
++++ b/addons/account/models/company.py
+@@ -78,9 +78,6 @@ class ResCompany(models.Model):
+     property_stock_account_output_categ_id = fields.Many2one('account.account', string="Output Account for Stock Valuation")
+     property_stock_valuation_account_id = fields.Many2one('account.account', string="Account Template for Stock Valuation")
+     bank_journal_ids = fields.One2many('account.journal', 'company_id', domain=[('type', '=', 'bank')], string='Bank Journals')
+-    tax_exigibility = fields.Boolean(string='Use Cash Basis')
+-    account_tax_fiscal_country_id = fields.Many2one('res.country', string="Fiscal Country", compute='compute_account_tax_fiscal_country', store=True, readonly=False, help="The country to use the tax reports from for this company")
+-
+     incoterm_id = fields.Many2one('account.incoterms', string='Default incoterm',
+         help='International Commercial Terms are a series of predefined commercial terms used in international transactions.')
+ 
+@@ -129,7 +126,24 @@ class ResCompany(models.Model):
+     # Technical field to hide country specific fields in company form view
+     country_code = fields.Char(related='country_id.code')
+ 
++    # Taxes
++    account_fiscal_country_id = fields.Many2one(
++        string="Fiscal Country",
++        comodel_name='res.country',
++        compute='compute_account_tax_fiscal_country',
++        store=True,
++        readonly=False,
++        help="The country to use the tax reports from for this company")
++
++    account_enabled_tax_country_ids = fields.Many2many(
++        string="l10n-used countries",
++        comodel_name='res.country',
++        compute='_compute_account_enabled_tax_country_ids',
++        help="Technical field containing the countries for which this company is using tax-related features"
++             "(hence the ones for which l10n modules need to show tax-related fields).")
++
+     # Cash basis taxes
++    tax_exigibility = fields.Boolean(string='Use Cash Basis')
+     tax_cash_basis_journal_id = fields.Many2one(
+         comodel_name='account.journal',
+         string="Cash Basis Journal")
+@@ -160,7 +174,13 @@ class ResCompany(models.Model):
+     @api.depends('country_id')
+     def compute_account_tax_fiscal_country(self):
+         for record in self:
+-            record.account_tax_fiscal_country_id = record.country_id
++            record.account_fiscal_country_id = record.country_id
++
++    @api.depends('account_fiscal_country_id')
++    def _compute_account_enabled_tax_country_ids(self):
++        for record in self:
++            foreign_vat_fpos = self.env['account.fiscal.position'].search([('company_id', '=', record.id), ('foreign_vat', '!=', False)])
++            record.account_enabled_tax_country_ids = foreign_vat_fpos.country_id + record.account_fiscal_country_id
+ 
+     def get_and_update_account_invoice_onboarding_state(self):
+         """ This method is called on the controller rendering method and ensures that the animations
+
+--- a/addons/account/models/partner.py
++++ b/addons/account/models/partner.py
+@@ -31,6 +31,7 @@ class AccountFiscalPosition(models.Model):
+     note = fields.Text('Notes', translate=True, help="Legal mentions that have to be printed on the invoices.")
+     auto_apply = fields.Boolean(string='Detect Automatically', help="Apply automatically this fiscal position.")
+     vat_required = fields.Boolean(string='VAT required', help="Apply only if partner has a VAT number.")
++    company_country_id = fields.Many2one(string="Company Country", related='company_id.country_id')
+     country_id = fields.Many2one('res.country', string='Country',
+         help="Apply only if delivery country matches.")
+     country_group_id = fields.Many2one('res.country.group', string='Country Group',
+@@ -40,6 +41,7 @@ class AccountFiscalPosition(models.Model):
+     zip_to = fields.Char(string='Zip Range To')
+     # To be used in hiding the 'Federal States' field('attrs' in view side) when selected 'Country' has 0 states.
+     states_count = fields.Integer(compute='_compute_states_count')
++    foreign_vat = fields.Char(string="Foreign Tax ID", help="The tax ID of your company in the region mapped by this fiscal position.")
+ 
+     def _compute_states_count(self):
+         for position in self:
+@@ -51,6 +53,19 @@ class AccountFiscalPosition(models.Model):
+             if position.zip_from and position.zip_to and position.zip_from > position.zip_to:
+                 raise ValidationError(_('Invalid "Zip Range", please configure it properly.'))
+ 
++    @api.constrains('country_id', 'state_ids', 'foreign_vat')
++    def _validate_foreign_vat_country(self):
++        for record in self:
++            if record.foreign_vat and record.country_id == record.company_id.account_fiscal_country_id:
++                if record.foreign_vat == record.company_id.vat:
++                    raise ValidationError(_("You cannot create a fiscal position within your fiscal country with the same VAT number as the main one set on your company."))
++
++                if not record.state_ids:
++                    if record.company_id.country_id.state_ids:
++                        raise ValidationError(_("You cannot create a fiscal position with a foreign VAT within your fiscal country without assigning it a state."))
++                    else:
++                        raise ValidationError(_("You cannot create a fiscal position with a foreign VAT within your fiscal country."))
++
+     def map_tax(self, taxes, product=None, partner=None):
+         if not self:
+             return taxes

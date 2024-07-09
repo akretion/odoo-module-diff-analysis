@@ -1,0 +1,226 @@
+PR: https://github.com/odoo/odoo/pull/
+
+From: 7daa85dd12ff522be510bc2f8db1d968cae7d891
+From: Dharmraj Jhala
+Date: 2019-02-14 16:37:25
+
+Structural Changes: 11
+Total Changes: 97
+
+[IMP] base,product,website_sale,*: improve product images
+
+* = account, purchase, website_sale_comparison, website_sale_wishlist
+
+Raw Image & Mixin
+=================
+
+Previously, the main image from a product was stored resized. This caused
+inconsistencies with the size of the images on ecommerce: the main image was
+resized, but the extra images were not.
+
+Now, we always store all raw images, thanks to the new mixin. This way, product
+images that were created before the installation of ecommerce will be ready to
+be used in ecommerce without any other change.
+
+We also store the resized versions instead of computing them on the fly: this
+will take more disk space, but significantly increase the speed of the
+pages when displaying images, as well as reduce server CPU load.
+
+Images on variants
+==================
+
+Previously, it was only possible to set the extra product images on a template,
+and not on a variant.
+
+Now, we allow extra images also on the variants, this gives more flexibility to
+the user.
+
+Both extra images on template and variant have been given a sequence field to be
+able to sort them easily.
+
+On /shop we always display the image of the template for performance reasons.
+On /product we never display the image of the template, unless the variant has
+no image, then the template image is the fallback.
+
+Carousel
+========
+
+The carousel view has been cleaned and improved:
+
+- remove the duplicate XML that was created with the product configurator fix
+- use a single loop from a single source to get all the images, instead of
+	merging the different sources in the view with complex conditions
+- improve the HTML structure, reduce the CSS with appropriate classes
+
+Preview Image
+=============
+
+Both in website and backend: make better use of `preview_image` to display
+a small image whenever possible, to reduce download size for the end user.
+
+task-34045
+PR: #30656
+
+Co-authored-by: Parth Gajjar <pga@odoo.com>
+Co-authored-by: Sébastien Theys <seb@odoo.com>
+
+================================= pseudo patch: =================================
+
+--- a/addons/product/models/product.py
++++ b/addons/product/models/product.py
+@@ -83,7 +83,7 @@ class ProductProduct(models.Model):
+     _name = "product.product"
+     _description = "Product"
+     _inherits = {'product.template': 'product_tmpl_id'}
+-    _inherit = ['mail.thread', 'mail.activity.mixin']
++    _inherit = ['mail.thread', 'mail.activity.mixin', 'image.mixin']
+     _order = 'default_code, name, id'
+ 
+     # price: total price, context dependent (partner, pricelist, quantity)
+@@ -118,20 +118,6 @@ class ProductProduct(models.Model):
+         'product.attribute.value', string='Attribute Values', ondelete='restrict')
+     product_template_attribute_value_ids = fields.Many2many(
+         'product.template.attribute.value', string='Template Attribute Values', compute="_compute_product_template_attribute_value_ids")
+-    # image: all image fields are base64 encoded and PIL-supported
+-    image_variant = fields.Binary(
+-        "Variant Image",
+-        help="This field holds the image used as image for the product variant, limited to 1024x1024px.")
+-    image = fields.Binary(
+-        "Big-sized image", compute='_compute_images', inverse='_set_image',
+-        help="Image of the product variant (Big-sized image of product template if false). It is automatically "
+-             "resized as a 1024x1024px image, with aspect ratio preserved.")
+-    image_small = fields.Binary(
+-        "Small-sized image", compute='_compute_images', inverse='_set_image_small',
+-        help="Image of the product variant (Small-sized image of product template if false).")
+-    image_medium = fields.Binary(
+-        "Medium-sized image", compute='_compute_images', inverse='_set_image_medium',
+-        help="Image of the product variant (Medium-sized image of product template if false).")
+     is_product_variant = fields.Boolean(compute='_compute_is_product_variant')
+ 
+     standard_price = fields.Float(
+@@ -241,47 +227,6 @@ class ProductProduct(models.Model):
+         else:
+             self.partner_ref = self.display_name
+ 
+-    @api.one
+-    @api.depends('image_variant', 'product_tmpl_id.image')
+-    def _compute_images(self):
+-        if self._context.get('bin_size'):
+-            self.image_medium = self.image_variant
+-            self.image_small = self.image_variant
+-            self.image = self.image_variant
+-        else:
+-            resized_images = tools.image_get_resized_images(self.image_variant, return_big=True, avoid_resize_medium=True)
+-            self.image_medium = resized_images['image_medium']
+-            self.image_small = resized_images['image_small']
+-            self.image = resized_images['image']
+-        if not self.image_medium:
+-            self.image_medium = self.product_tmpl_id.image_medium
+-        if not self.image_small:
+-            self.image_small = self.product_tmpl_id.image_small
+-        if not self.image:
+-            self.image = self.product_tmpl_id.image
+-
+-    @api.one
+-    def _set_image(self):
+-        self._set_image_value(self.image)
+-
+-    @api.one
+-    def _set_image_medium(self):
+-        self._set_image_value(self.image_medium)
+-
+-    @api.one
+-    def _set_image_small(self):
+-        self._set_image_value(self.image_small)
+-
+-    @api.one
+-    def _set_image_value(self, value):
+-        if isinstance(value, str):
+-            value = value.encode('ascii')
+-        image = tools.image_resize_image_big(value)
+-        if self.product_tmpl_id.image:
+-            self.image_variant = image
+-        else:
+-            self.product_tmpl_id.image = image
+-
+     @api.depends('product_tmpl_id', 'attribute_value_ids')
+     def _compute_product_template_attribute_value_ids(self):
+         # Fetch and pre-map the values first for performance. It assumes there
+@@ -306,6 +251,26 @@ class ProductProduct(models.Model):
+                 else:
+                     product.product_template_attribute_value_ids += values_per_template[product.product_tmpl_id.id][pav.id]
+ 
++    @api.multi
++    def _get_image_fallback_record(self):
++        """Override to get the image from the template if no image is set on the
++        variant."""
++        return self.product_tmpl_id
++
++    @api.multi
++    def _force_write_image_on_fallback(self):
++        """Override to always write on the template if there is only one
++        variant.
++
++        This is needed because when there is only one variant, the user doesn't
++        know there is a difference between template and variant, he expects both
++        images to be the same.
++        """
++        return self.env['product.product'].search_count([
++            ('product_tmpl_id', '=', self.product_tmpl_id.id),
++            ('active', '=', True),
++        ]) <= 1
++
+     @api.one
+     def _get_pricelist_items(self):
+         self.pricelist_item_ids = self.env['product.pricelist.item'].search([
+
+--- a/addons/product/models/product_template.py
++++ b/addons/product/models/product_template.py
+@@ -12,7 +12,7 @@ from odoo.osv import expression
+ 
+ class ProductTemplate(models.Model):
+     _name = "product.template"
+-    _inherit = ['mail.thread', 'mail.activity.mixin']
++    _inherit = ['mail.thread', 'mail.activity.mixin', 'image.mixin']
+     _description = "Product Template"
+     _order = "name"
+ 
+@@ -134,20 +134,6 @@ class ProductTemplate(models.Model):
+ 
+     item_ids = fields.One2many('product.pricelist.item', 'product_tmpl_id', 'Pricelist Items')
+ 
+-    # image: all image fields are base64 encoded and PIL-supported
+-    image = fields.Binary(
+-        "Image", help="This field holds the image used as image for the product, limited to 1024x1024px.")
+-    image_medium = fields.Binary(
+-        "Medium-sized image",
+-        help="Medium-sized image of the product. It is automatically "
+-             "resized as a 128x128px image, with aspect ratio preserved, "
+-             "only when the image exceeds one of those sizes. Use this field in form views or some kanban views.")
+-    image_small = fields.Binary(
+-        "Small-sized image",
+-        help="Small-sized image of the product. It is automatically "
+-             "resized as a 64x64px image, with aspect ratio preserved. "
+-             "Use this field anywhere a small image is required.")
+-
+     @api.depends('product_variant_ids')
+     def _compute_product_variant_id(self):
+         for p in self:
+@@ -328,9 +314,6 @@ class ProductTemplate(models.Model):
+     @api.model_create_multi
+     def create(self, vals_list):
+         ''' Store the initial standard price in order to be able to retrieve the cost of a product template for a given date'''
+-        # TDE FIXME: context brol
+-        for vals in vals_list:
+-            tools.image_resize_images(vals)
+         templates = super(ProductTemplate, self).create(vals_list)
+         if "create_product_product" not in self._context:
+             templates.with_context(create_from_tmpl=True).create_variant_ids()
+@@ -355,7 +338,6 @@ class ProductTemplate(models.Model):
+ 
+     @api.multi
+     def write(self, vals):
+-        tools.image_resize_images(vals)
+         res = super(ProductTemplate, self).write(vals)
+         if 'attribute_line_ids' in vals or vals.get('active'):
+             self.create_variant_ids()

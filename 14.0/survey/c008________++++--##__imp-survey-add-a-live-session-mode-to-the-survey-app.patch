@@ -1,0 +1,612 @@
+PR: https://github.com/odoo/odoo/pull/
+
+From: e973bd5519295ca737b57de6d50b021ffb5ec6c4
+From: Aurélien Warnon
+Date: 2020-01-31 14:35:48
+
+Structural Changes: 22
+Total Changes: 311
+
+[IMP] survey: add a 'live session' mode to the survey app
+
+PURPOSE
+
+Add a "live session" mode for survey that allows the host to interact with its
+audience.
+He controls the pace of the survey and the audience answers questions one at a
+time.
+
+Results for each question can be displayed by the host to adapt his speech in
+real time.
+
+A gamification component even allows to give points to the attendees, based on
+the quickness of their answer, and create ranking to keep everyone's attention.
+
+SPECIFICATIONS
+
+This whole feature is deeply integrated with survey.
+It adds a layer of "survey session" on top if it that gathers attendees and
+answers during the lifespan of the session.
+
+The attendee identity is filled in by a special question that is marked as
+"Save as user nickname".
+If the host has not configured that question or if the user doesn't answer,
+they are marked as "Anonymous" in the rankings.
+
+The answer score computation is also altered during the session to take the
+speed of the answer into account.
+
+To ease the access to the survey to attendees, we have introduced two new
+routes in the survey main controller:
+- '/s/123456'
+  That uses the 6 first characters of the token to give quick access to the
+  survey and allow typing the URL manually somewhat conveniently.
+- '/s' that renders a view that asks the attendee to enter the survey 'code',
+  which then redirects to the previous route.
+
+This commit also fixes a few bugs:
+- A bugged use case with the "enter key" listener.
+  When the survey is done, we display a "result template" that shows the user
+  his score and allows him to retry if possible.
+  When this template is displayed, we don't want to listen to the "enter" key
+  that allows to submit the survey form.
+- We now correctly remove the timer and initialize the result
+  widget when the user presses 'enter' on the last page / question.
+
+SURVEY SESSION FLOW
+
+HOST point of view:
+
+- On the Survey Form, the host configures:
+    - "Reward quick answers" that gives more points to attendees if they answer
+      quickly
+    - Question Time Limit, on each question, that defines the time limit for
+      that specific question, allowing to have different (or no) timer for each
+      question.
+- From the Survey Form, the host can start a "live session"
+  Only one session per survey can be running at a time.
+- When he starts the session, the session_state is marked as 'ready', meaning
+  all attendees landing on the survey page will be part of the session.
+- The host will land on a page showing the current number of attendees as well
+  as the link for the attendees to join that session.
+- The host starts the session, activating the first question of this session.
+  We keep an active reference to the "current_question_id" and use the bus to
+  trigger an event that will refresh the survey page for all attendees, showing
+  them the question and allowing them to answer.
+- The host gets a "question management screen", from which he can:
+    - See the current question text & suggested answers
+    - See the current question timer
+    - See the number of answers received for the question
+    - Display the answers of the question (same view as the survey "results"
+      page, but only for the question)
+    - Display the ranking of attendees (if "competitive mode" is enabled)
+- The host controls the pace of the survey by moving to the next question until
+  it's the last one of the survey, then ends the current session.
+  When the session is closed, we mark the answers of the attendees as "done".
+- The host lands on a screen where he sees the survey results and the ranking
+  of all attendees.
+
+ATTENDEE point of view:
+
+- He reaches the survey when a session and open, and gets a screen asking him
+  to wait until the host decides to start the session.
+- When the sessions starts, he's automatically redirected to the first question
+  (see above).
+- If the session is already started when he reaches the link, he lands on the
+  current question (and NOT on the first one)
+- If the host has configured a time limit, the attendee sees the countdown
+  while he's answering.
+- When the attendee answers the question, the screen tells him the answer is
+  registered and he has to wait for the host to go to the next question, which
+  will happen automatically.
+- If the timer reaches 0 and he has not submitted his answer, it's too late and
+  he waits for the next one.
+- It continues like that until the end of the session.
+- At the end of the session, the attendee gets a screen with his global results
+  (same as a regular scored survey).
+
+PR #43568
+Task 1972640
+
+Co-authored-by: David Beguin <dbe@odoo.com>
+
+================================= pseudo patch: =================================
+
+--- a/addons/survey/models/survey_question.py
++++ b/addons/survey/models/survey_question.py
+@@ -82,8 +82,11 @@ class SurveyQuestion(models.Model):
+         ('matrix', 'Matrix')], string='Question Type')
+     # -- char_box
+     save_as_email = fields.Boolean(
+-        "Save as user email", compute='_compute_save_as_email', readonly=False, store=True,
++        "Save as user email", compute='_compute_save_as_email', readonly=False, store=True, copy=True,
+         help="If checked, this option will save the user's answer as its email address.")
++    save_as_nickname = fields.Boolean(
++        "Save as user nickname", compute='_compute_save_as_nickname', readonly=False, store=True, copy=True,
++        help="If checked, this option will save the user's answer as its nickname.")
+     # -- simple choice / multiple choice / matrix
+     suggested_answer_ids = fields.One2many(
+         'survey.question.answer', 'question_id', string='Types of answers', copy=True,
+@@ -96,11 +99,14 @@ class SurveyQuestion(models.Model):
+     matrix_row_ids = fields.One2many(
+         'survey.question.answer', 'matrix_question_id', string='Matrix Rows', copy=True,
+         help='Labels used for proposed choices: rows of matrix')
+-    # -- display options
++    # -- display & timing options
+     column_nb = fields.Selection([
+         ('12', '1'), ('6', '2'), ('4', '3'), ('3', '4'), ('2', '6')],
+         string='Number of columns', default='12',
+         help='These options refer to col-xx-[12|6|4|3|2] classes in Bootstrap for dropdown-based simple and multiple choice questions.')
++    is_time_limited = fields.Boolean("The question is limited in time",
++        help="Currently only supported for live sessions.")
++    time_limit = fields.Integer("Time limit (seconds)")
+     # -- comments (simple choice, multiple choice, matrix (without count as an answer))
+     comments_allowed = fields.Boolean('Show Comments Field')
+     comments_message = fields.Char('Comment Message', translate=True, default=lambda self: _("If other, please specify:"))
+@@ -181,6 +187,12 @@ class SurveyQuestion(models.Model):
+             if question.question_type != 'char_box' or not question.validation_email:
+                 question.save_as_email = False
+ 
++    @api.depends('question_type')
++    def _compute_save_as_nickname(self):
++        for question in self:
++            if question.question_type != 'char_box':
++                question.save_as_nickname = False
++
+     # Validation methods
+     def validate_question(self, answer, comment=None):
+         """ Validate question, depending on question type and parameters
+
+--- a/addons/survey/models/survey_survey.py
++++ b/addons/survey/models/survey_survey.py
+@@ -1,12 +1,16 @@
+ # -*- coding: utf-8 -*-
+ # Part of Odoo. See LICENSE file for full copyright and licensing details.
+ 
++import datetime
+ import json
+ import random
+ import uuid
+ import werkzeug
+ 
++from dateutil.relativedelta import relativedelta
++
+ from odoo import api, exceptions, fields, models, _
++from odoo.exceptions import AccessError
+ from odoo.osv import expression
+ 
+ 
+@@ -105,6 +109,21 @@ class Survey(models.Model):
+     certification_give_badge = fields.Boolean('Give Badge')
+     certification_badge_id = fields.Many2one('gamification.badge', 'Certification Badge')
+     certification_badge_id_dummy = fields.Many2one(related='certification_badge_id', string='Certification Badge ')
++    # live sessions
++    session_state = fields.Selection([
++        ('ready', 'Ready'),
++        ('in_progress', 'In Progress'),
++        ], string="Session State", copy=False)
++    # live sessions - current question fields
++    session_question_id = fields.Many2one('survey.question', string="Current Question", copy=False,
++        help="The current question of the survey session.")
++    session_question_start_time = fields.Datetime("Current Question Start Time", copy=False,
++        help="The time at which the current question has started, used to handle the timer for attendees.")
++    session_question_answer_count = fields.Integer("Answers Count", compute='_compute_session_question_answer_count')
++    # live sessions - settings
++    session_show_ranking = fields.Boolean("Show Session Ranking", compute='_compute_session_show_ranking',
++        help="This mode will display a ranking chart of all attendees.")
++    session_speed_rating = fields.Boolean("Reward quick answers", help="Attendees get more points if they answer quickly")
+ 
+     _sql_constraints = [
+         ('access_token_unique', 'unique(access_token)', 'Access token should be unique'),
+@@ -157,6 +176,28 @@ class Survey(models.Model):
+             survey.page_ids = survey.question_and_page_ids.filtered(lambda question: question.is_page)
+             survey.question_ids = survey.question_and_page_ids - survey.page_ids
+ 
++    @api.depends('session_question_id', 'user_input_ids.user_input_line_ids')
++    def _compute_session_question_answer_count(self):
++        """ We have to loop since our result is dependent of the survey.session_question_id.
++        This field is currently used to display the count about a single survey, in the
++        context of sessions, so it should not matter too much. """
++        for survey in self:
++            answer_count = 0
++            input_line_count = self.env['survey.user_input.line'].read_group(
++                [('question_id', '=', survey.session_question_id.id), ('survey_id', '=', survey.id)],
++                ['user_input_id:count_distinct'],
++                ['question_id'],
++            )
++            if input_line_count:
++                answer_count = input_line_count[0].get('user_input_id')
++
++            survey.session_question_answer_count = answer_count
++
++    @api.depends('scoring_type')
++    def _compute_session_show_ranking(self):
++        for survey in self:
++            survey.session_show_ranking = survey.scoring_type != 'no_scoring'
++
+     @api.onchange('scoring_success_min')
+     def _onchange_scoring_success_min(self):
+         if self.scoring_success_min < 0 or self.scoring_success_min > 100:
+@@ -240,15 +281,25 @@ class Survey(models.Model):
+             answer_vals = {
+                 'survey_id': survey.id,
+                 'test_entry': test_entry,
++                'is_session_answer': survey.session_state in ['ready', 'in_progress']
+             }
++            if survey.session_state == 'in_progress':
++                # if the session is already in progress, the answer skips the 'new' state
++                answer_vals.update({
++                    'state': 'in_progress',
++                    'start_datetime': fields.Datetime.now(),
++                })
+             if user and not user._is_public():
+                 answer_vals['partner_id'] = user.partner_id.id
+                 answer_vals['email'] = user.email
++                answer_vals['nickname'] = user.name
+             elif partner:
+                 answer_vals['partner_id'] = partner.id
+                 answer_vals['email'] = partner.email
++                answer_vals['nickname'] = partner.name
+             else:
+                 answer_vals['email'] = email
++                answer_vals['nickname'] = email
+ 
+             if invite_token:
+                 answer_vals['invite_token'] = invite_token
+@@ -261,10 +312,13 @@ class Survey(models.Model):
+             answer_vals.update(additional_vals)
+             user_inputs += user_inputs.create(answer_vals)
+ 
+-        for question in self.mapped('question_ids').filtered(lambda q: q.question_type == 'char_box' and q.save_as_email):
++        for question in self.mapped('question_ids').filtered(
++                lambda q: q.question_type == 'char_box' and (q.save_as_email or q.save_as_nickname)):
+             for user_input in user_inputs:
+-                if user_input.email:
++                if question.save_as_email and user_input.email:
+                     user_input.save_lines(question, user_input.email)
++                if question.save_as_nickname and user_input.nickname:
++                    user_input.save_lines(question, user_input.nickname)
+ 
+         return user_inputs
+ 
+@@ -391,6 +445,7 @@ class Survey(models.Model):
+                 to True if she knows that the page to display is the first one!
+                 (doing this will probably cause a giant worm to eat her house)
+         """
++
+         survey = user_input.survey_id
+ 
+         pages_or_questions = survey._get_pages_or_questions(user_input)
+@@ -411,8 +466,26 @@ class Survey(models.Model):
+             return (pages_or_questions[current_page_index + 1][1], show_last)
+ 
+     def _get_survey_questions(self, answer=None, page_id=None, question_id=None):
++        """ Returns a tuple containing: the survey question and the passed question_id / page_id
++        based on the question_layout and the fact that it's a session or not.
++
++        Breakdown of use cases:
++        - We are currently running a session
++          We return the current session question and it's id
++        - The layout is page_per_section
++          We return the questions for that page and the passed page_id
++        - The layout is page_per_question
++          We return the question for the passed question_id and the question_id
++        - The layout is one_page
++          We return all the questions of the survey and None
++
++        In addition, we cross the returned questions with the answer.predefined_question_ids,
++        that allows to handle the randomization of questions. """
++
+         questions, page_or_question_id = None, None
+ 
++        if answer and answer.is_session_answer:
++            return self.session_question_id, self.session_question_id.id
+         if self.questions_layout == 'page_per_section':
+             if not page_id:
+                 raise ValueError("Page id is needed for question layout 'page_per_section'")
+@@ -434,6 +507,68 @@ class Survey(models.Model):
+             questions = questions & answer.predefined_question_ids
+         return questions, page_or_question_id
+ 
++    # ------------------------------------------------------------
++    # SESSIONS MANAGEMENT
++    # ------------------------------------------------------------
++
++    def _session_open(self):
++        """ The session start is sudo'ed to allow survey user to manage sessions of surveys
++        they do not own.
++
++        We flush after writing to make sure it's updated before bus takes over. """
++
++        if self.env.user.has_group('survey.group_survey_user'):
++            self.sudo().write({'session_state': 'in_progress'})
++            self.sudo().flush(['session_state'])
++
++    def _session_trigger_next_question(self):
++        """ Triggers the next question of the session.
++
++        We artificially add 2 seconds to the 'current_question_start_time' to account for server delay.
++        As the timing can influence the attendees score, we try to be fair with everyone by giving them
++        an extra few seconds before we start counting down.
++
++        Frontend should take the delay into account by displaying the appropriate animations.
++
++        Writing the next question on the survey is sudo'ed to avoid potential access right issues.
++        e.g: a survey user can create a live session from any survey but he can only write
++        on its own survey. """
++
++        self.ensure_one()
++
++        if not self.question_ids or not self.env.user.has_group('survey.group_survey_user'):
++            return
++
++        if not self.session_question_id:
++            question = self.question_ids[0]
++        else:
++            questions = list(enumerate(self.question_ids))
++            current_question_index = questions.index(
++                next(question for question in questions if question[1] == self.session_question_id)
++            )
++            if current_question_index < len(self.question_ids) - 1:
++                question = self.question_ids[current_question_index + 1]
++            else:
++                question = self.session_question_id
++
++        # using datetime.datetime because we want the millis portion
++        now = datetime.datetime.now()
++        self.sudo().write({
++            'session_question_id': question.id,
++            'session_question_start_time': fields.Datetime.now() + relativedelta(seconds=2)
++        })
++        self.env['bus.bus'].sendone(self.access_token, {
++            'question_start': now.timestamp(),
++            'type': 'next_question'
++        })
++
++    def _prepare_ranking_values(self):
++        """" The ranking is descending and takes the total of the attendee points up to the current question. """
++        self.ensure_one()
++
++        return self.env['survey.user_input'].search([('survey_id', '=', self.id)],
++            limit=25, order="scoring_total desc")
++
+     # ------------------------------------------------------------
+     # ACTIONS
+     # ------------------------------------------------------------
+@@ -552,9 +687,50 @@ class Survey(models.Model):
+             'url': '/survey/%s/get_certification_preview' % (self.id)
+         }
+ 
++    def action_start_session(self):
++        """ Sets the necessary fields for the session to take place and starts it.
++        The write is sudo'ed because a survey user can start a session even if it's
++        not his own survey. """
++
++        if not self.env.user.has_group('survey.group_survey_user'):
++            raise AccessError(_('Only survey users can manage sessions.'))
++
++        self.ensure_one()
++        self.sudo().write({
++            'questions_layout': 'page_per_question',
++            'session_question_id': None,
++            'session_state': 'ready'
++        })
++        return self.action_open_session_manager()
++
++    def action_open_session_manager(self):
++        self.ensure_one()
++
++        return {
++            'type': 'ir.actions.act_url',
++            'name': "Open Session Manager",
++            'target': 'self',
++            'url': '/survey/session/manage/%s' % self.access_token
++        }
++
++    def action_end_session(self):
++        """ The write is sudo'ed because a survey user can end a session even if it's
++        not his own survey. """
++
++        if not self.env.user.has_group('survey.group_survey_user'):
++            raise AccessError(_('Only survey users can manage sessions.'))
++
++        self.sudo().write({'session_state': False})
++        self.user_input_ids.sudo().write({'state': 'done'})
++        self.env['bus.bus'].sendone(self.access_token, {'type': 'end_session'})
++
+     def get_start_url(self):
+         return 'survey/start/%s' % self.access_token
+ 
++    def get_start_short_url(self):
++        """ See controller method docstring for more details. """
++        return '/s/%s' % self.access_token[:6]
++
+     def get_print_url(self):
+         return 'survey/print/%s' % self.access_token
+ 
+
+--- a/addons/survey/models/survey_user.py
++++ b/addons/survey/models/survey_user.py
+@@ -34,24 +34,29 @@ class SurveyUserInput(models.Model):
+     is_attempts_limited = fields.Boolean("Limited number of attempts", related='survey_id.is_attempts_limited')
+     attempts_limit = fields.Integer("Number of attempts", related='survey_id.attempts_limit')
+     attempts_number = fields.Integer("Attempt n°", compute='_compute_attempts_number')
+-    is_time_limit_reached = fields.Boolean("Is time limit reached?", compute='_compute_is_time_limit_reached')
++    survey_time_limit_reached = fields.Boolean("Survey Time Limit Reached", compute='_compute_survey_time_limit_reached')
+     # identification / access
+     access_token = fields.Char('Identification token', default=lambda self: str(uuid.uuid4()), readonly=True, required=True, copy=False)
+     invite_token = fields.Char('Invite token', readonly=True, copy=False)  # no unique constraint, as it identifies a pool of attempts
+     partner_id = fields.Many2one('res.partner', string='Partner', readonly=True)
+     email = fields.Char('Email', readonly=True)
++    nickname = fields.Char('Nickname', help="Attendee nickname, mainly used to identify him in survey sessions rankings.")
+     # questions / answers
+     user_input_line_ids = fields.One2many('survey.user_input.line', 'user_input_id', string='Answers', copy=True)
+     predefined_question_ids = fields.Many2many('survey.question', string='Predefined Questions', readonly=True)
+-    scoring_percentage = fields.Float("Score (%)", compute="_compute_scoring_percentage", store=True, compute_sudo=True)  # stored for perf reasons
++    scoring_percentage = fields.Float("Score (%)", compute="_compute_scoring_values", store=True, compute_sudo=True)  # stored for perf reasons
++    scoring_total = fields.Float("Total Score", compute="_compute_scoring_values", store=True, compute_sudo=True)  # stored for perf reasons
+     scoring_success = fields.Boolean('Quizz Passed', compute='_compute_scoring_success', store=True, compute_sudo=True)  # stored for perf reasons
++    # live sessions
++    is_session_answer = fields.Boolean('Is in a Session', help="Is that user input part of a survey session or not.")
++    question_time_limit_reached = fields.Boolean("Question Time Limit Reached", compute='_compute_question_time_limit_reached')
+ 
+     _sql_constraints = [
+         ('unique_token', 'UNIQUE (access_token)', 'An access token must be unique!'),
+     ]
+ 
+     @api.depends('user_input_line_ids.answer_score', 'user_input_line_ids.question_id')
+-    def _compute_scoring_percentage(self):
++    def _compute_scoring_values(self):
+         for user_input in self:
+             total_possible_score = sum([
+                 answer_score if answer_score > 0 else 0
+@@ -60,24 +65,48 @@ class SurveyUserInput(models.Model):
+ 
+             if total_possible_score == 0:
+                 user_input.scoring_percentage = 0
++                user_input.scoring_total = 0
+             else:
+-                score = (sum(user_input.user_input_line_ids.mapped('answer_score')) / total_possible_score) * 100
+-                user_input.scoring_percentage = round(score, 2) if score > 0 else 0
++                score_total = sum(user_input.user_input_line_ids.mapped('answer_score'))
++                user_input.scoring_total = score_total
++                score_percentage = (score_total / total_possible_score) * 100
++                user_input.scoring_percentage = round(score_percentage, 2) if score_percentage > 0 else 0
+ 
+     @api.depends('scoring_percentage', 'survey_id.scoring_success_min')
+     def _compute_scoring_success(self):
+         for user_input in self:
+             user_input.scoring_success = user_input.scoring_percentage >= user_input.survey_id.scoring_success_min
+ 
+-    @api.depends('start_datetime', 'survey_id.is_time_limited', 'survey_id.time_limit')
+-    def _compute_is_time_limit_reached(self):
++    @api.depends(
++        'start_datetime',
++        'survey_id.is_time_limited',
++        'survey_id.time_limit')
++    def _compute_survey_time_limit_reached(self):
+         """ Checks that the user_input is not exceeding the survey's time limit. """
+         for user_input in self:
+-            if user_input.start_datetime and user_input.survey_id.is_time_limited:
+-                datetime_limit = user_input.start_datetime + relativedelta(minutes=user_input.survey_id.time_limit)
+-                user_input.is_time_limit_reached = fields.Datetime.now() > datetime_limit
++            if not user_input.is_session_answer and user_input.start_datetime:
++                start_time = user_input.start_datetime
++                time_limit = user_input.survey_id.time_limit
++                user_input.survey_time_limit_reached = user_input.survey_id.is_time_limited and \
++                    fields.Datetime.now() > start_time + relativedelta(minutes=time_limit)
+             else:
+-                user_input.is_time_limit_reached = False
++                user_input.survey_time_limit_reached = False
++
++    @api.depends(
++        'survey_id.session_question_id.time_limit',
++        'survey_id.session_question_id.is_time_limited',
++        'survey_id.session_question_start_time')
++    def _compute_question_time_limit_reached(self):
++        """ Checks that the user_input is not exceeding the question's time limit.
++        Only used in the context of survey sessions. """
++        for user_input in self:
++            if user_input.is_session_answer and user_input.survey_id.session_question_start_time:
++                start_time = user_input.survey_id.session_question_start_time
++                time_limit = user_input.survey_id.session_question_id.time_limit
++                user_input.question_time_limit_reached = user_input.survey_id.session_question_id.is_time_limited and \
++                    fields.Datetime.now() > start_time + relativedelta(seconds=time_limit)
++            else:
++                user_input.question_time_limit_reached = False
+ 
+     @api.depends('state', 'test_entry', 'survey_id.is_attempts_limited', 'partner_id', 'email', 'invite_token')
+     def _compute_attempts_number(self):
+@@ -155,6 +184,13 @@ class SurveyUserInput(models.Model):
+     def _generate_invite_token(self):
+         return str(uuid.uuid4())
+ 
++    def _mark_in_progress(self):
++        """ marks the state as 'in_progress' and updates the start_datetime accordingly. """
++        self.write({
++            'start_datetime': fields.Datetime.now(),
++            'state': 'in_progress'
++        })
++
+     def _mark_done(self):
+         """ This method will:
+         1. mark the state as 'done'
+@@ -205,6 +241,9 @@ class SurveyUserInput(models.Model):
+             self._save_line_simple_answer(question, old_answers, answer)
+             if question.save_as_email and answer:
+                 self.write({'email': answer})
++            if question.save_as_nickname and answer:
++                self.write({'nickname': answer})
++
+         elif question.question_type in ['simple_choice', 'multiple_choice']:
+             self._save_line_choice(question, old_answers, answer, comment)
+         elif question.question_type == 'matrix':
+@@ -244,7 +283,7 @@ class SurveyUserInput(models.Model):
+             for row_key, row_answer in answers.items():
+                 for answer in row_answer:
+                     vals = self._get_line_answer_values(question, answer, 'suggestion')
+-                    vals['matrix_row_id'] = row_key
++                    vals['matrix_row_id'] = int(row_key)
+                     vals_list.append(vals.copy())
+ 
+         if comment:
+@@ -383,13 +422,53 @@ class SurveyUserInputLine(models.Model):
+     @api.model_create_multi
+     def create(self, vals_list):
+         for vals in vals_list:
+-            suggested_answer_id = vals.get('suggested_answer_id')
+-            if suggested_answer_id:
+-                vals.update({'answer_score': self.env['survey.question.answer'].browse(int(suggested_answer_id)).answer_score})
++            score = self._get_answer_score(vals.get('user_input_id'), vals.get('suggested_answer_id'))
++            if score and not vals.get('answer_score'):
++                vals.update({'answer_score': score})
+         return super(SurveyUserInputLine, self).create(vals_list)
+ 
+     def write(self, vals):
+-        suggested_answer_id = vals.get('suggested_answer_id')
+-        if suggested_answer_id:
+-            vals.update({'answer_score': self.env['survey.question.answer'].browse(int(suggested_answer_id)).answer_score})
++        score = self._get_answer_score(
++            vals.get('user_input_id'),
++            vals.get('suggested_answer_id'),
++            compute_speed_score=False)
++        if score and not vals.get('answer_score'):
++            vals.update({'answer_score': score})
+         return super(SurveyUserInputLine, self).write(vals)
++
++    @api.model
++    def _get_answer_score(self, user_input_id, suggested_answer_id, compute_speed_score=True):
++        """ If score depends on the speed of the answer, we need to compute it.
++        If the user answers in less than 2 seconds, he gets 100% of the points.
++        If he answers after that, he gets minimum 50% of the points.
++        The 50 other % are ponderated between the time limit and the time it took him to answer.
++
++        If the score does not depend on the speed, we just return the answer_score field of the
++        suggested survey.question.answer. """
++
++        if not suggested_answer_id:
++            return None
++
++        answer = self.env['survey.question.answer'].search([('id', '=', suggested_answer_id)], limit=1)
++        answer_score = answer.answer_score
++
++        if compute_speed_score:
++            user_input = self.env['survey.user_input'].browse(user_input_id)
++            session_speed_rating = user_input.exists() and user_input.is_session_answer and user_input.survey_id.session_speed_rating
++            if session_speed_rating and answer.answer_score and answer.answer_score > 0:
++                max_score_delay = 2
++                time_limit = answer.question_id.time_limit
++                now = fields.Datetime.now()
++                seconds_to_answer = (now - user_input.survey_id.session_question_start_time).total_seconds()
++                question_remaining_time = time_limit - seconds_to_answer
++                if seconds_to_answer < max_score_delay:  # if answered within the max_score_delay
++                    answer_score = answer.answer_score
++                elif question_remaining_time < 0:  # if no time left
++                    answer_score = answer.answer_score / 2
++                else:
++                    time_limit -= max_score_delay  # we remove the max_score_delay to have all possible values
++                    question_remaining_time -= max_score_delay
++                    score_proportion = (time_limit - seconds_to_answer) / time_limit
++                    answer_score = (answer.answer_score / 2) * (1 + score_proportion)
++
++        return answer_score

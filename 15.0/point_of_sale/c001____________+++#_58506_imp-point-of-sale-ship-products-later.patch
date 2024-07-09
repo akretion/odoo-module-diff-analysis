@@ -1,0 +1,230 @@
+PR: https://github.com/odoo/odoo/pull/58506
+
+From: dd2aaf0b1dc4ff3997ca753ee1feb67920f5cbfa
+From: Pierre Masereel
+Date: 2021-01-27 10:46:13
+
+Structural Changes: 9
+Total Changes: 123
+
+[IMP] point_of_sale: Ship products later
+
+For now, when you are selling products in the point of sales, the stock
+is affected once the order is validated or the session closed. But in
+some case, you don't have the product in your store, and you have to
+plan a delivery for the order.
+
+To be able to plan a delivery, you can now choose the warehouse in POS
+Config and the routes of your warehouse will be applied. You can also
+set a specific rule on your POS Config if you've enabled the
+multi-step-routes in the inventory module
+
+closes odoo/odoo#58506
+
+Task-id: 2082104
+Signed-off-by: pimodoo <pimodoo@users.noreply.github.com>
+
+================================= pseudo patch: =================================
+
+--- a/addons/point_of_sale/models/pos_config.py
++++ b/addons/point_of_sale/models/pos_config.py
+@@ -76,6 +76,9 @@ class PosConfig(models.Model):
+     _name = 'pos.config'
+     _description = 'Point of Sale Configuration'
+ 
++    def _default_warehouse_id(self):
++        return self.env['stock.warehouse'].search([('company_id', '=', self.env.company.id)], limit=1).id
++
+     def _default_picking_type_id(self):
+         return self.env['stock.warehouse'].search([('company_id', '=', self.env.company.id)], limit=1).pos_type_id.id
+ 
+@@ -217,6 +220,15 @@ class PosConfig(models.Model):
+     has_active_session = fields.Boolean(compute='_compute_current_session')
+     show_allow_invoicing_alert = fields.Boolean(compute="_compute_show_allow_invoicing_alert")
+     manual_discount = fields.Boolean(string="Manual Discounts", default=True)
++    ship_later = fields.Boolean(string="Ship Later")
++    warehouse_id = fields.Many2one('stock.warehouse', default=_default_warehouse_id, ondelete='restrict')
++    route_id = fields.Many2one('stock.location.route', string="Spefic route for products delivered later.")
++    picking_policy = fields.Selection([
++        ('direct', 'As soon as possible'),
++        ('one', 'When all products are ready')],
++        string='Shipping Policy', required=True, default='direct',
++        help="If you deliver all products at once, the delivery order will be scheduled based on the greatest "
++        "product lead time. Otherwise, it will be based on the shortest.")
+ 
+     @api.depends('use_pricelist', 'available_pricelist_ids')
+     def _compute_allowed_pricelist_ids(self):
+
+--- a/addons/point_of_sale/models/pos_order.py
++++ b/addons/point_of_sale/models/pos_order.py
+@@ -49,6 +49,7 @@ class PosOrder(models.Model):
+             'amount_return':  ui_order['amount_return'],
+             'company_id': self.env['pos.session'].browse(ui_order['pos_session_id']).company_id.id,
+             'to_invoice': ui_order['to_invoice'] if "to_invoice" in ui_order else False,
++            'to_ship': ui_order['to_ship'] if "to_ship" in ui_order else False,
+             'is_tipped': ui_order.get('is_tipped', False),
+             'tip_amount': ui_order.get('tip_amount', 0),
+         }
+@@ -242,6 +243,7 @@ class PosOrder(models.Model):
+     picking_count = fields.Integer(compute='_compute_picking_count')
+     failed_pickings = fields.Boolean(compute='_compute_picking_count')
+     picking_type_id = fields.Many2one('stock.picking.type', related='session_id.config_id.picking_type_id', string="Operation Type", readonly=False)
++    procurement_group_id = fields.Many2one('procurement.group', 'Procurement Group', copy=False)
+ 
+     note = fields.Text(string='Internal Notes')
+     nb_print = fields.Integer(string='Number of Print', readonly=True, copy=False, default=0)
+@@ -255,6 +257,7 @@ class PosOrder(models.Model):
+     payment_ids = fields.One2many('pos.payment', 'pos_order_id', string='Payments', readonly=True)
+     session_move_id = fields.Many2one('account.move', string='Session Journal Entry', related='session_id.move_id', readonly=True, copy=False)
+     to_invoice = fields.Boolean('To invoice')
++    to_ship = fields.Boolean('To ship')
+     is_invoiced = fields.Boolean('Is Invoiced', compute='_compute_is_invoiced')
+     is_tipped = fields.Boolean('Is this already tipped?', readonly=True)
+     tip_amount = fields.Float(string='Tip Amount', digits=0, readonly=True)
+@@ -474,17 +477,20 @@ class PosOrder(models.Model):
+ 
+     def _create_order_picking(self):
+         self.ensure_one()
+-        if not self.session_id.update_stock_at_closing or (self.company_id.anglo_saxon_accounting and self.to_invoice):
+-            picking_type = self.config_id.picking_type_id
+-            if self.partner_id.property_stock_customer:
+-                destination_id = self.partner_id.property_stock_customer.id
+-            elif not picking_type or not picking_type.default_location_dest_id:
+-                destination_id = self.env['stock.warehouse']._get_partner_locations()[0].id
+-            else:
+-                destination_id = picking_type.default_location_dest_id.id
++        if self.to_ship:
++            self.lines._launch_stock_rule_from_pos_order_lines()
++        else:
++            if not self.session_id.update_stock_at_closing or (self.company_id.anglo_saxon_accounting and self.to_invoice):
++                picking_type = self.config_id.picking_type_id
++                if self.partner_id.property_stock_customer:
++                    destination_id = self.partner_id.property_stock_customer.id
++                elif not picking_type or not picking_type.default_location_dest_id:
++                    destination_id = self.env['stock.warehouse']._get_partner_locations()[0].id
++                else:
++                    destination_id = picking_type.default_location_dest_id.id
+ 
+-            pickings = self.env['stock.picking']._create_picking_from_pos_order_lines(destination_id, self.lines, picking_type, self.partner_id)
+-            pickings.write({'pos_session_id': self.session_id.id, 'pos_order_id': self.id, 'origin': self.name})
++                pickings = self.env['stock.picking']._create_picking_from_pos_order_lines(destination_id, self.lines, picking_type, self.partner_id)
++                pickings.write({'pos_session_id': self.session_id.id, 'pos_order_id': self.id, 'origin': self.name})
+ 
+     def add_payment(self, data):
+         """Create a new payment for the order"""
+@@ -623,6 +629,7 @@ class PosOrder(models.Model):
+             'creation_date': order.date_order.astimezone(timezone),
+             'fiscal_position_id': order.fiscal_position_id.id,
+             'to_invoice': order.to_invoice,
++            'to_ship': order.to_ship,
+             'state': order.state,
+             'account_move': order.account_move.id,
+             'id': order.id,
+@@ -788,6 +795,70 @@ class PosOrderLine(models.Model):
+     def export_for_ui(self):
+         return self.mapped(self._export_for_ui) if self else []
+ 
++    def _get_procurement_group(self):
++        return self.order_id.procurement_group_id
++
++    def _prepare_procurement_group_vals(self):
++        return {
++            'name': self.order_id.name,
++            'move_type': self.order_id.config_id.picking_policy,
++            'pos_order_id': self.order_id.id,
++            'partner_id': self.order_id.partner_id.id,
++        }
++
++    def _prepare_procurement_values(self, group_id=False):
++        """ Prepare specific key for moves or other components that will be created from a stock rule
++        comming from a sale order line. This method could be override in order to add other custom key that could
++        be used in move/po creation.
++        """
++        self.ensure_one()
++        # Use the delivery date if there is else use date_order and lead time
++        date_deadline = self.order_id.date_order
++        values = {
++            'group_id': group_id,
++            'date_planned': date_deadline,
++            'date_deadline': date_deadline,
++            'route_ids': self.order_id.config_id.route_id,
++            'warehouse_id': self.order_id.config_id.warehouse_id or False,
++            'partner_id': self.order_id.partner_id.id,
++            'product_description_variants': self.full_product_name,
++            'company_id': self.order_id.company_id,
++        }
++        return values
++
++    def _launch_stock_rule_from_pos_order_lines(self):
++
++        procurements = []
++        for line in self:
++            line = line.with_company(line.company_id)
++            if not line.product_id.type in ('consu','product'):
++                continue
++
++            group_id = line._get_procurement_group()
++            if not group_id:
++                group_id = self.env['procurement.group'].create(line._prepare_procurement_group_vals())
++                line.order_id.procurement_group_id = group_id
++
++            values = line._prepare_procurement_values(group_id=group_id)
++            product_qty = line.qty
++
++            procurement_uom = line.product_id.uom_id
++            procurements.append(self.env['procurement.group'].Procurement(
++                line.product_id, product_qty, procurement_uom,
++                line.order_id.partner_id.property_stock_customer,
++                line.name, line.order_id.name, line.order_id.company_id, values))
++        if procurements:
++            self.env['procurement.group'].run(procurements)
++
++        # This next block is currently needed only because the scheduler trigger is done by picking confirmation rather than stock.move confirmation
++        orders = self.mapped('order_id')
++        for order in orders:
++            pickings_to_confirm = order.picking_ids
++            if pickings_to_confirm:
++                # Trigger the Scheduler for Pickings
++                pickings_to_confirm.action_confirm()
++        return True
++
+ 
+ class PosOrderLineLot(models.Model):
+     _name = "pos.pack.operation.lot"
+
+--- a/addons/point_of_sale/models/pos_session.py
++++ b/addons/point_of_sale/models/pos_session.py
+@@ -340,7 +340,7 @@ class PosSession(models.Model):
+             session_destination_id = picking_type.default_location_dest_id.id
+ 
+         for order in self.order_ids:
+-            if order.company_id.anglo_saxon_accounting and order.to_invoice:
++            if (order.company_id.anglo_saxon_accounting and order.to_invoice) or order.to_ship:
+                 continue
+             destination_id = order.partner_id.property_stock_customer.id or session_destination_id
+             if destination_id in lines_grouped_by_dest_location:
+
+--- a/addons/point_of_sale/models/stock_picking.py
++++ b/addons/point_of_sale/models/stock_picking.py
+@@ -155,3 +155,21 @@ class StockPicking(models.Model):
+         # Avoid sending Mail/SMS for POS deliveries
+         pickings = self.filtered(lambda p: p.picking_type_id != p.picking_type_id.warehouse_id.pos_type_id)
+         return super(StockPicking, pickings)._send_confirmation_email()
++
++class ProcurementGroup(models.Model):
++    _inherit = 'procurement.group'
++
++    pos_order_id = fields.Many2one('pos.order', 'POS Order')
++
++class StockMove(models.Model):
++    _inherit = 'stock.move'
++
++    def _get_new_picking_values(self):
++        vals = super(StockMove, self)._get_new_picking_values()
++        vals['pos_session_id'] = self.mapped('group_id.pos_order_id.session_id').id
++        vals['pos_order_id'] = self.mapped('group_id.pos_order_id').id
++        return vals
++
++    def _key_assign_picking(self):
++        keys = super(StockMove, self)._key_assign_picking()
++        return keys + (self.group_id.pos_order_id,)

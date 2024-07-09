@@ -1,0 +1,143 @@
+PR: https://github.com/odoo/odoo/pull/106411
+
+From: 706f9286f4bbca97ef9159b2ce009de829275e86
+From: clesgow
+Date: 2023-01-13 15:27:26
+
+Structural Changes: 4
+Total Changes: 35
+
+[IMP] *purchase*: Allow multiple created_purchase_line on a single move
+
+Problem case :
+- Create a product with MTO and Buy route activated.
+- Create a Sale Order containing this product.
+- Confirm the Sale Order, this will generate a Purchase Order for this
+product.
+- Go to Alternatives -> Create Alternative -> Select another vendor &
+select "Copy products".
+
+The alternative PO won't be linked to the Sale Order, as this link is
+done through the relation `created_purchase_line_id` <-> `move_dest_ids`
+respectively on the `stock.move` and the `purchase.order.line`.
+The only way to enable multiple Purchase Order to be linked to a single
+move is to extend the number of `created_purchase_line_id` linked to a
+move, hence changing it to a Many2Many relation.
+
+Then, when an alternative PO is created, we link the original PO lines
+`move_dest_ids` to the newly created PO lines, which correctly links the
+SO and the alternative PO.
+
+closes odoo/odoo#106411
+
+Related: odoo/upgrade#4116
+Signed-off-by: Arnold Moyaux (arm) <arm@odoo.com>
+
+================================= pseudo patch: =================================
+
+--- a/addons/purchase_stock/models/purchase.py
++++ b/addons/purchase_stock/models/purchase.py
+@@ -3,7 +3,7 @@
+ from markupsafe import Markup
+ from dateutil.relativedelta import relativedelta
+ 
+-from odoo import api, fields, models, SUPERUSER_ID, _
++from odoo import api, Command, fields, models, SUPERUSER_ID, _
+ from odoo.tools.float_utils import float_compare, float_is_zero, float_round
+ from odoo.exceptions import UserError
+ 
+@@ -122,6 +122,9 @@ class PurchaseOrder(models.Model):
+                 for order_line in order.order_line:
+                     order_line.move_ids._action_cancel()
+                     if order_line.move_dest_ids:
++                        moves_to_unlink = order_line.move_dest_ids.filtered(lambda m: len(m.created_purchase_line_ids.ids) > 1)
++                        if moves_to_unlink:
++                            moves_to_unlink.created_purchase_line_ids = [Command.unlink(order_line.id)]
+                         move_dest_ids = order_line.move_dest_ids
+                         if order_line.propagate_cancel:
+                             move_dest_ids._action_cancel()
+@@ -292,7 +295,7 @@ class PurchaseOrderLine(models.Model):
+ 
+     move_ids = fields.One2many('stock.move', 'purchase_line_id', string='Reservation', readonly=True, copy=False)
+     orderpoint_id = fields.Many2one('stock.warehouse.orderpoint', 'Orderpoint', copy=False, index='btree_not_null')
+-    move_dest_ids = fields.One2many('stock.move', 'created_purchase_line_id', 'Downstream Moves')
++    move_dest_ids = fields.Many2many('stock.move', 'stock_move_created_purchase_line_rel', 'created_purchase_line_id', 'move_id', 'Downstream moves alt')
+     product_description_variants = fields.Char('Custom Description')
+     propagate_cancel = fields.Boolean('Propagate cancellation', default=True)
+     forecasted_issue = fields.Boolean(compute='_compute_forecasted_issue')
+@@ -386,6 +389,12 @@ class PurchaseOrderLine(models.Model):
+     def unlink(self):
+         self.move_ids._action_cancel()
+ 
++        # Unlink move_dests that have other created_purchase_line_ids instead of cancelling them
++        for line in self:
++            moves_to_unlink = line.move_dest_ids.filtered(lambda m: len(m.created_purchase_line_ids.ids) > 1)
++            if moves_to_unlink:
++                moves_to_unlink.created_purchase_line_ids = [Command.unlink(line.id)]
++
+         ppg_cancel_lines = self.filtered(lambda line: line.propagate_cancel)
+         ppg_cancel_lines.move_dest_ids._action_cancel()
+ 
+@@ -560,7 +569,7 @@ class PurchaseOrderLine(models.Model):
+         for line in self.filtered(lambda l: not l.display_type):
+             for val in line._prepare_stock_moves(picking):
+                 values.append(val)
+-            line.move_dest_ids.created_purchase_line_id = False
++            line.move_dest_ids.created_purchase_line_ids = [Command.clear()]
+ 
+         return self.env['stock.move'].create(values)
+ 
+
+--- a/addons/purchase_stock/models/stock_move.py
++++ b/addons/purchase_stock/models/stock_move.py
+@@ -1,7 +1,7 @@
+ # -*- coding: utf-8 -*-
+ # Part of Odoo. See LICENSE file for full copyright and licensing details.
+ 
+-from odoo import api, fields, models, _
++from odoo import api, Command, fields, models, _
+ from odoo.tools.float_utils import float_round, float_is_zero
+ from odoo.exceptions import UserError
+ 
+@@ -12,19 +12,19 @@ class StockMove(models.Model):
+     purchase_line_id = fields.Many2one(
+         'purchase.order.line', 'Purchase Order Line',
+         ondelete='set null', index='btree_not_null', readonly=True)
+-    created_purchase_line_id = fields.Many2one(
+-        'purchase.order.line', 'Created Purchase Order Line',
+-        ondelete='set null', index='btree_not_null', readonly=True, copy=False)
++    created_purchase_line_ids = fields.Many2many(
++        'purchase.order.line', 'stock_move_created_purchase_line_rel',
++        'move_id', 'created_purchase_line_id', 'Created Purchase Order Lines', copy=False)
+ 
+     @api.model
+     def _prepare_merge_moves_distinct_fields(self):
+         distinct_fields = super(StockMove, self)._prepare_merge_moves_distinct_fields()
+-        distinct_fields += ['purchase_line_id', 'created_purchase_line_id']
++        distinct_fields += ['purchase_line_id', 'created_purchase_line_ids']
+         return distinct_fields
+ 
+     @api.model
+     def _prepare_merge_negative_moves_excluded_distinct_fields(self):
+-        return super()._prepare_merge_negative_moves_excluded_distinct_fields() + ['created_purchase_line_id']
++        return super()._prepare_merge_negative_moves_excluded_distinct_fields() + ['created_purchase_line_ids']
+ 
+     def _compute_partner_id(self):
+         # dropshipped moves should have their partner_ids directly set
+@@ -151,12 +151,12 @@ class StockMove(models.Model):
+ 
+     def _clean_merged(self):
+         super(StockMove, self)._clean_merged()
+-        self.write({'created_purchase_line_id': False})
++        self.write({'created_purchase_line_ids': [Command.clear()]})
+ 
+     def _get_upstream_documents_and_responsibles(self, visited):
+-        if self.created_purchase_line_id and self.created_purchase_line_id.state not in ('done', 'cancel') \
+-                and (self.created_purchase_line_id.state != 'draft' or self._context.get('include_draft_documents')):
+-            return [(self.created_purchase_line_id.order_id, self.created_purchase_line_id.order_id.user_id, visited)]
++        created_pl = self.created_purchase_line_ids.filtered(lambda cpl: cpl.state not in ('done', 'cancel') and (cpl.state != 'draft' or self._context.get('include_draft_documents')))
++        if created_pl:
++            return [(pl.order_id, pl.order_id.user_id, visited) for pl in created_pl]
+         elif self.purchase_line_id and self.purchase_line_id.state not in ('done', 'cancel'):
+             return[(self.purchase_line_id.order_id, self.purchase_line_id.order_id.user_id, visited)]
+         else:

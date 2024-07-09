@@ -1,0 +1,95 @@
+PR: https://github.com/odoo/odoo/pull/151597
+
+From: b51b9cd474d8cb898d1f257e8e5df4eaf9144e2a
+From: Gorash
+Date: 2024-03-15 14:29:08
+
+Structural Changes: 1
+Total Changes: 31
+
+[REF] mail: introduce _filter_tracked_field_access()
+
+This method simplifies the selection of tracking values for fields that
+are accessible to a given environment, and replaces the computed field
+that was used for that purpose.
+
+Part-of: odoo/odoo#151597
+
+================================= pseudo patch: =================================
+
+--- a/addons/mail/models/mail_message.py
++++ b/addons/mail/models/mail_message.py
+@@ -919,7 +919,7 @@ class Message(models.Model):
+                 'personas': [{'id': guest.id, 'name': guest.name, 'type': "guest"} for guest in reactions.guest_id] + [{'id': partner.id, 'name': partner.name, 'type': "partner"} for partner in reactions.partner_id],
+                 'message': {'id': message_sudo.id},
+             } for content, reactions in reactions_per_content.items()]
+-            allowed_tracking_ids = message_sudo.tracking_value_ids.filtered(lambda tracking: not tracking.field_groups or self.env.is_superuser() or self.user_has_groups(tracking.field_groups))
++            allowed_tracking_ids = message_sudo.tracking_value_ids._filter_tracked_field_access(self.env)
+             displayed_tracking_ids = allowed_tracking_ids
+             if record_sudo and hasattr(record_sudo, '_track_filter_for_display'):
+                 displayed_tracking_ids = record_sudo._track_filter_for_display(displayed_tracking_ids)
+
+--- a/addons/mail/models/mail_thread.py
++++ b/addons/mail/models/mail_thread.py
+@@ -3439,9 +3439,7 @@ class MailThread(models.AbstractModel):
+         if check_tracking:
+             tracking_values = self.env['mail.tracking.value'].sudo().search(
+                 [('mail_message_id', '=', message.id)]
+-            ).filtered(
+-                lambda track: not track.field_groups or self.env.is_superuser() or self.user_has_groups(track.field_groups)
+-            )
++            )._filter_tracked_field_access(self.env)
+             if tracking_values and hasattr(record_wlang, '_track_filter_for_display'):
+                 tracking_values = record_wlang._track_filter_for_display(tracking_values)
+             tracking = [
+@@ -4064,7 +4062,12 @@ class MailThread(models.AbstractModel):
+         if message.subtype_id and message.subtype_id.description:
+             tracking_message = return_line + message.subtype_id.description + return_line
+ 
+-        for value in message.sudo().tracking_value_ids.filtered(lambda tracking: not tracking.field_groups):
++        def _free_access(tracking):
++            model = self.env[tracking.mail_message_id.model]
++            field = model._fields.get(tracking.field_id.name)
++            return field and not field.groups
++
++        for value in message.sudo().tracking_value_ids.filtered(_free_access):
+             if value.field_id.ttype == 'boolean':
+                 old_value = str(bool(value.old_value_integer))
+                 new_value = str(bool(value.new_value_integer))
+
+--- a/addons/mail/models/mail_tracking_value.py
++++ b/addons/mail/models/mail_tracking_value.py
+@@ -16,7 +16,6 @@ class MailTracking(models.Model):
+         'ir.model.fields', required=False, readonly=True,
+         index=True, ondelete='set null')
+     field_info = fields.Json('Removed field information')
+-    field_groups = fields.Char(compute='_compute_field_groups')
+ 
+     old_value_integer = fields.Integer('Old Value Integer', readonly=True)
+     old_value_float = fields.Float('Old Value Float', readonly=True)
+@@ -35,14 +34,19 @@ class MailTracking(models.Model):
+ 
+     mail_message_id = fields.Many2one('mail.message', 'Message ID', required=True, index=True, ondelete='cascade')
+ 
+-    @api.depends('mail_message_id', 'field_id')
+-    def _compute_field_groups(self):
+-        for tracking in self:
++    def _filter_tracked_field_access(self, env):
++        """ Return the subset of ``self`` for which the user in ``env`` has
++        access to the corresponding field.
++        """
++        def has_field_access(tracking):
+             field = None
+             if tracking.field_id:
+-                model = self.env[tracking.field_id.model]
+-                field = model._fields.get(tracking.field_id.name)
+-            tracking.field_groups = field.groups if field else 'base.group_system'
++                field = env[tracking.field_id.model]._fields.get(tracking.field_id.name)
++            if not field:
++                return env.is_system()
++            return not field.groups or env.is_superuser() or self.with_env(env).user_has_groups(field.groups)
++
++        return self.filtered(has_field_access)
+ 
+     @api.model
+     def _create_tracking_values(self, initial_value, new_value, col_name, col_info, record):

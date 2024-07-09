@@ -1,0 +1,136 @@
+PR: https://github.com/odoo/odoo/pull/122144
+
+From: 16a07ed1bfd33a193b363f3e87aab3f9bd6f8bd0
+From: damr
+Date: 2023-07-19 21:17:53
+
+Structural Changes: 6
+Total Changes: 44
+
+[IMP] project: make the field company_id of projects non required
+
+This commit's purpose is to allow the user to set the company_id of a project to False, meaning the project is no longer restricted for the user who does not have access to the company of the project. This change induces a lot of other small behavior changes/approximation. Since some fields (currency_id, resource_calendar_id, etc) were company dependent, we had to updates some use cases.
+
+task-3084819
+
+closes odoo/odoo#122144
+
+Related: odoo/enterprise#41363
+Related: odoo/upgrade#4947
+Signed-off-by: Xavier Bol (xbo) <xbo@odoo.com>
+
+================================= pseudo patch: =================================
+
+--- a/addons/sale_timesheet/models/__init__.py
++++ b/addons/sale_timesheet/models/__init__.py
+@@ -9,3 +9,4 @@ from . import project_update
+ from . import sale_order
+ from . import res_config_settings
+ from . import project_sale_line_employee_map
++from . import hr_employee
+
+--- a/None
++++ b/addons/sale_timesheet/models/hr_employee.py
+@@ -0,0 +1,15 @@
++# Part of Odoo. See LICENSE file for full copyright and licensing details.
++
++from odoo import api, models
++
++
++class HrEmployee(models.Model):
++    _inherit = 'hr.employee'
++
++    @api.model
++    def default_get(self, fields):
++        result = super(HrEmployee, self).default_get(fields)
++        project_company_id = self.env.context.get('create_project_employee_mapping', False)
++        if project_company_id:
++            result['company_id'] = project_company_id
++        return result
+
+--- a/addons/sale_timesheet/models/product.py
++++ b/addons/sale_timesheet/models/product.py
+@@ -19,8 +19,8 @@ class ProductTemplate(models.Model):
+         ('timesheet', 'Timesheets on project (one fare per SO/Project)'),
+     ], ondelete={'timesheet': 'set manual'})
+     # override domain
+-    project_id = fields.Many2one(domain="[('company_id', '=', current_company_id), ('allow_billable', '=', True), ('pricing_type', '=', 'task_rate'), ('allow_timesheets', 'in', [service_policy == 'delivered_timesheet', True])]")
+-    project_template_id = fields.Many2one(domain="[('company_id', '=', current_company_id), ('allow_billable', '=', True), ('allow_timesheets', 'in', [service_policy == 'delivered_timesheet', True])]")
++    project_id = fields.Many2one(domain="['|', ('company_id', '=', False), '&', ('company_id', '=?', company_id), ('company_id', '=', current_company_id), ('allow_billable', '=', True), ('pricing_type', '=', 'task_rate'), ('allow_timesheets', 'in', [service_policy == 'delivered_timesheet', True])]")
++    project_template_id = fields.Many2one(domain="['|', ('company_id', '=', False), '&', ('company_id', '=?', company_id), ('company_id', '=', current_company_id), ('allow_billable', '=', True), ('allow_timesheets', 'in', [service_policy == 'delivered_timesheet', True])]")
+     service_upsell_threshold = fields.Float('Threshold', default=1, help="Percentage of time delivered compared to the prepaid amount that must be reached for the upselling opportunity activity to be triggered.")
+     service_upsell_threshold_ratio = fields.Char(compute='_compute_service_upsell_threshold_ratio')
+ 
+
+--- a/addons/sale_timesheet/models/project.py
++++ b/addons/sale_timesheet/models/project.py
+@@ -405,14 +405,25 @@ class Project(models.Model):
+             return profitability_items
+         aa_line_read_group = self.env['account.analytic.line'].sudo()._read_group(
+             self.sudo()._get_profitability_aal_domain(),
+-            ['timesheet_invoice_type'],
+-            ['amount:sum', 'id:array_agg'])
++            ['timesheet_invoice_type', 'timesheet_invoice_id', 'currency_id'],
++            ['amount:sum', 'id:array_agg'],
++        )
+         can_see_timesheets = with_action and len(self) == 1 and self.user_has_groups('hr_timesheet.group_hr_timesheet_approver')
+         revenues_dict = {}
+         costs_dict = {}
+         total_revenues = {'invoiced': 0.0, 'to_invoice': 0.0}
+         total_costs = {'billed': 0.0, 'to_bill': 0.0}
+-        for invoice_type, amount, ids in aa_line_read_group:
++        dict_rate_per_currency = {}
++        today = fields.Date.context_today(self)
++        convert_company = self.company_id or self.env.company
++        for timesheet_invoice_type, dummy, currency, amount, ids in aa_line_read_group:
++            if currency != self.currency_id:
++                rate = dict_rate_per_currency.get(currency.id, False)
++                if not rate:
++                    rate = currency._get_conversion_rate(currency, self.currency_id, convert_company, today)
++                    dict_rate_per_currency[currency.id] = rate
++                amount = self.currency_id.round(amount * rate)
++            invoice_type = timesheet_invoice_type
+             cost = costs_dict.setdefault(invoice_type, {'billed': 0.0, 'to_bill': 0.0})
+             revenue = revenues_dict.setdefault(invoice_type, {'invoiced': 0.0, 'to_invoice': 0.0})
+             if amount < 0:  # cost
+@@ -424,7 +435,6 @@ class Project(models.Model):
+             if can_see_timesheets and invoice_type not in ['other_costs', 'other_revenues']:
+                 cost.setdefault('record_ids', []).extend(ids)
+                 revenue.setdefault('record_ids', []).extend(ids)
+-
+         action_name = None
+         if can_see_timesheets:
+             action_name = 'action_profitability_items'
+@@ -591,7 +601,7 @@ class ProjectTask(models.Model):
+         if not self.partner_id.commercial_partner_id or not self.allow_billable:
+             return False
+         domain = [
+-            ('company_id', '=', self.company_id.id),
++            ('company_id', '=?', self.company_id.id),
+             ('is_service', '=', True),
+             ('order_partner_id', 'child_of', self.partner_id.commercial_partner_id.id),
+             ('is_expense', '=', False),
+
+--- a/addons/sale_timesheet/models/project_sale_line_employee_map.py
++++ b/addons/sale_timesheet/models/project_sale_line_employee_map.py
+@@ -18,8 +18,7 @@ class ProjectProductEmployeeMap(models.Model):
+             ('is_service', '=', True),
+             ('is_expense', '=', False),
+             ('state', '=', 'sale'),
+-            ('order_partner_id', '=?', partner_id),
+-            '|', ('company_id', '=', False), ('company_id', '=', company_id)]""")
++            ('order_partner_id', '=?', partner_id)]""")
+     sale_order_id = fields.Many2one(related="project_id.sale_order_id")
+     company_id = fields.Many2one('res.company', string='Company', related='project_id.company_id')
+     partner_id = fields.Many2one(related='project_id.partner_id')
+
+--- a/addons/sale_timesheet/models/sale_order.py
++++ b/addons/sale_timesheet/models/sale_order.py
+@@ -231,7 +231,6 @@ class SaleOrderLine(models.Model):
+     @api.depends('analytic_line_ids.project_id', 'project_id.pricing_type')
+     def _compute_qty_delivered(self):
+         super(SaleOrderLine, self)._compute_qty_delivered()
+-
+         lines_by_timesheet = self.filtered(lambda sol: sol.qty_delivered_method == 'timesheet')
+         domain = lines_by_timesheet._timesheet_compute_delivered_quantity_domain()
+         mapping = lines_by_timesheet.sudo()._get_delivered_quantity_by_analytic(domain)

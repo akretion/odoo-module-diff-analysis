@@ -1,0 +1,672 @@
+PR: https://github.com/odoo/odoo/pull/
+
+From: a30aa2aeed18babe4720fb59fd74186907ed7dd4
+From: Antoine Vandevenne (anv)
+Date: 2021-03-30 07:25:51
+
+Structural Changes: 17
+Total Changes: 631
+
+[REF] payment_adyen: migrate Adyen to the new payment API
+
+This commits also switches the Adyen implementation from the Hosted
+Payment Pages API to the new Checkout API, hence replacing the payment
+with redirection flow by a direct payment flow.
+
+See the merge commit for more details.
+
+task-2479832
+
+================================= pseudo patch: =================================
+
+--- a/addons/payment_adyen/models/__init__.py
++++ b/addons/payment_adyen/models/__init__.py
+@@ -1,3 +1,5 @@
+-# -*- coding: utf-8 -*-
++# Part of Odoo. See LICENSE file for full copyright and licensing details.
+ 
+-from . import payment
++from . import payment_acquirer
++from . import payment_token
++from . import payment_transaction
+
+--- a/addons/payment_adyen/models/payment.py
++++ b/None
+@@ -1,269 +0,0 @@
+-# coding: utf-8
+-
+-import base64
+-import json
+-import binascii
+-from collections import OrderedDict
+-import hashlib
+-import hmac
+-import logging
+-from itertools import chain
+-
+-from werkzeug import urls
+-
+-from odoo import api, fields, models, tools, _
+-from odoo.addons.payment.models.payment_acquirer import ValidationError
+-from odoo.addons.payment_adyen.controllers.main import AdyenController
+-from odoo.tools.pycompat import to_text
+-
+-_logger = logging.getLogger(__name__)
+-
+-# https://docs.adyen.com/developers/development-resources/currency-codes
+-CURRENCY_CODE_MAPS = {
+-    "BHD": 3,
+-    "CVE": 0,
+-    "DJF": 0,
+-    "GNF": 0,
+-    "IDR": 0,
+-    "JOD": 3,
+-    "JPY": 0,
+-    "KMF": 0,
+-    "KRW": 0,
+-    "KWD": 3,
+-    "LYD": 3,
+-    "OMR": 3,
+-    "PYG": 0,
+-    "RWF": 0,
+-    "TND": 3,
+-    "UGX": 0,
+-    "VND": 0,
+-    "VUV": 0,
+-    "XAF": 0,
+-    "XOF": 0,
+-    "XPF": 0,
+-}
+-
+-
+-class AcquirerAdyen(models.Model):
+-    _inherit = 'payment.acquirer'
+-
+-    provider = fields.Selection(selection_add=[
+-        ('adyen', 'Adyen')
+-    ], ondelete={'adyen': 'set default'})
+-    adyen_merchant_account = fields.Char('Merchant Account', required_if_provider='adyen', groups='base.group_user')
+-    adyen_skin_code = fields.Char('Skin Code', required_if_provider='adyen', groups='base.group_user')
+-    adyen_skin_hmac_key = fields.Char('Skin HMAC Key', required_if_provider='adyen', groups='base.group_user')
+-
+-    @api.model
+-    def _adyen_convert_amount(self, amount, currency):
+-        """
+-        Adyen requires the amount to be multiplied by 10^k,
+-        where k depends on the currency code.
+-        """
+-        k = CURRENCY_CODE_MAPS.get(currency.name, 2)
+-        paymentAmount = int(tools.float_round(amount, k) * (10**k))
+-        return paymentAmount
+-
+-    @api.model
+-    def _get_adyen_urls(self, environment):
+-        """ Adyen URLs: yhpp: hosted payment page: pay.shtml for single, select.shtml for multiple """
+-        return {
+-            'adyen_form_url': 'https://%s.adyen.com/hpp/pay.shtml' % ('live' if environment == 'prod' else environment),
+-        }
+-
+-    def _adyen_generate_merchant_sig_sha256(self, inout, values):
+-        """ Generate the shasign for incoming or outgoing communications., when using the SHA-256
+-        signature.
+-
+-        :param string inout: 'in' (odoo contacting adyen) or 'out' (adyen
+-                             contacting odoo). In this last case only some
+-                             fields should be contained (see e-Commerce basic)
+-        :param dict values: transaction values
+-        :return string: shasign
+-        """
+-        def escapeVal(val):
+-            return val.replace('\\', '\\\\').replace(':', '\\:')
+-
+-        def signParams(parms):
+-            signing_string = ':'.join(
+-                escapeVal(v)
+-                for v in chain(parms.keys(), parms.values())
+-            )
+-            hm = hmac.new(hmac_key, signing_string.encode('utf-8'), hashlib.sha256)
+-            return base64.b64encode(hm.digest())
+-
+-        assert inout in ('in', 'out')
+-        assert self.provider == 'adyen'
+-
+-        if inout == 'in':
+-            # All the fields sent to Adyen must be included in the signature. ALL the fucking
+-            # fields, despite what is claimed in the documentation. For example, in
+-            # https://docs.adyen.com/developers/hpp-manual, it is stated: "The resURL parameter does
+-            # not need to be included in the signature." It's a trap, it must be included as well!
+-            keys = [
+-                'merchantReference', 'paymentAmount', 'currencyCode', 'shipBeforeDate', 'skinCode',
+-                'merchantAccount', 'sessionValidity', 'merchantReturnData', 'shopperEmail',
+-                'shopperReference', 'allowedMethods', 'blockedMethods', 'offset',
+-                'shopperStatement', 'recurringContract', 'billingAddressType',
+-                'deliveryAddressType', 'brandCode', 'countryCode', 'shopperLocale', 'orderData',
+-                'offerEmail', 'resURL',
+-            ]
+-        else:
+-            keys = [
+-                'authResult', 'merchantReference', 'merchantReturnData', 'paymentMethod',
+-                'pspReference', 'shopperLocale', 'skinCode',
+-            ]
+-
+-        hmac_key = binascii.a2b_hex(self.adyen_skin_hmac_key.encode('ascii'))
+-        raw_values = {k: values.get(k, '') for k in keys if k in values}
+-        raw_values_ordered = OrderedDict(sorted(raw_values.items(), key=lambda t: t[0]))
+-
+-        return signParams(raw_values_ordered)
+-
+-    def _adyen_generate_merchant_sig(self, inout, values):
+-        """ Generate the shasign for incoming or outgoing communications, when using the SHA-1
+-        signature (deprecated by Adyen).
+-
+-        :param string inout: 'in' (odoo contacting adyen) or 'out' (adyen
+-                             contacting odoo). In this last case only some
+-                             fields should be contained (see e-Commerce basic)
+-        :param dict values: transaction values
+-
+-        :return string: shasign
+-        """
+-        assert inout in ('in', 'out')
+-        assert self.provider == 'adyen'
+-
+-        if inout == 'in':
+-            keys = "paymentAmount currencyCode shipBeforeDate merchantReference skinCode merchantAccount sessionValidity shopperEmail shopperReference recurringContract allowedMethods blockedMethods shopperStatement merchantReturnData billingAddressType deliveryAddressType offset".split()
+-        else:
+-            keys = "authResult pspReference merchantReference skinCode merchantReturnData".split()
+-
+-        def get_value(key):
+-            if values.get(key):
+-                return values[key]
+-            return ''
+-
+-        sign = ''.join('%s' % get_value(k) for k in keys).encode('ascii')
+-        key = self.adyen_skin_hmac_key.encode('ascii')
+-        return base64.b64encode(hmac.new(key, sign, hashlib.sha1).digest())
+-
+-    def adyen_form_generate_values(self, values):
+-        base_url = self.get_base_url()
+-        # tmp
+-        import datetime
+-        from dateutil import relativedelta
+-
+-        paymentAmount = self._adyen_convert_amount(values['amount'], values['currency'])
+-        if self.provider == 'adyen' and len(self.adyen_skin_hmac_key) == 64:
+-            tmp_date = datetime.datetime.today() + relativedelta.relativedelta(days=1)
+-
+-            values.update({
+-                'merchantReference': values['reference'],
+-                'paymentAmount': '%d' % paymentAmount,
+-                'currencyCode': values['currency'] and values['currency'].name or '',
+-                'shipBeforeDate': tmp_date.strftime('%Y-%m-%d'),
+-                'skinCode': self.adyen_skin_code,
+-                'merchantAccount': self.adyen_merchant_account,
+-                'shopperLocale': values.get('partner_lang', ''),
+-                'sessionValidity': tmp_date.isoformat('T')[:19] + "Z",
+-                'resURL': urls.url_join(base_url, AdyenController._return_url),
+-                'merchantReturnData': json.dumps({'return_url': '%s' % values.pop('return_url')}) if values.get('return_url', '') else False,
+-                'shopperEmail': values.get('partner_email') or values.get('billing_partner_email') or '',
+-            })
+-            values['merchantSig'] = self._adyen_generate_merchant_sig_sha256('in', values)
+-
+-        else:
+-            tmp_date = datetime.date.today() + relativedelta.relativedelta(days=1)
+-
+-            values.update({
+-                'merchantReference': values['reference'],
+-                'paymentAmount': '%d' % paymentAmount,
+-                'currencyCode': values['currency'] and values['currency'].name or '',
+-                'shipBeforeDate': tmp_date,
+-                'skinCode': self.adyen_skin_code,
+-                'merchantAccount': self.adyen_merchant_account,
+-                'shopperLocale': values.get('partner_lang'),
+-                'sessionValidity': tmp_date,
+-                'resURL': urls.url_join(base_url, AdyenController._return_url),
+-                'merchantReturnData': json.dumps({'return_url': '%s' % values.pop('return_url')}) if values.get('return_url') else False,
+-            })
+-            values['merchantSig'] = self._adyen_generate_merchant_sig('in', values)
+-
+-        return values
+-
+-    def adyen_get_form_action_url(self):
+-        self.ensure_one()
+-        environment = 'prod' if self.state == 'enabled' else 'test'
+-        return self._get_adyen_urls(environment)['adyen_form_url']
+-
+-
+-class TxAdyen(models.Model):
+-    _inherit = 'payment.transaction'
+-
+-    # --------------------------------------------------
+-    # FORM RELATED METHODS
+-    # --------------------------------------------------
+-
+-    @api.model
+-    def _adyen_form_get_tx_from_data(self, data):
+-        reference, pspReference = data.get('merchantReference'), data.get('pspReference')
+-        if not reference or not pspReference:
+-            error_msg = _('Adyen: received data with missing reference (%s) or missing pspReference (%s)') % (reference, pspReference)
+-            _logger.info(error_msg)
+-            raise ValidationError(error_msg)
+-
+-        # find tx -> @TDENOTE use pspReference ?
+-        tx = self.env['payment.transaction'].search([('reference', '=', reference)])
+-        if not tx or len(tx) > 1:
+-            error_msg = _('Adyen: received data for reference %s') % (reference)
+-            if not tx:
+-                error_msg += _('; no order found')
+-            else:
+-                error_msg += _('; multiple order found')
+-            _logger.info(error_msg)
+-            raise ValidationError(error_msg)
+-
+-        # verify shasign
+-        if len(tx.acquirer_id.adyen_skin_hmac_key) == 64:
+-            shasign_check = tx.acquirer_id._adyen_generate_merchant_sig_sha256('out', data)
+-        else:
+-            shasign_check = tx.acquirer_id._adyen_generate_merchant_sig('out', data)
+-        if to_text(shasign_check) != to_text(data.get('merchantSig')):
+-            error_msg = _('Adyen: invalid merchantSig, received %s, computed %s') % (data.get('merchantSig'), shasign_check)
+-            _logger.warning(error_msg)
+-            raise ValidationError(error_msg)
+-
+-        return tx
+-
+-    def _adyen_form_get_invalid_parameters(self, data):
+-        invalid_parameters = []
+-
+-        # reference at acquirer: pspReference
+-        if self.acquirer_reference and data.get('pspReference') != self.acquirer_reference:
+-            invalid_parameters.append(('pspReference', data.get('pspReference'), self.acquirer_reference))
+-        # seller
+-        if data.get('skinCode') != self.acquirer_id.adyen_skin_code:
+-            invalid_parameters.append(('skinCode', data.get('skinCode'), self.acquirer_id.adyen_skin_code))
+-        # result
+-        if not data.get('authResult'):
+-            invalid_parameters.append(('authResult', data.get('authResult'), 'something'))
+-
+-        return invalid_parameters
+-
+-    def _adyen_form_validate(self, data):
+-        status = data.get('authResult', 'PENDING')
+-        if status == 'AUTHORISED':
+-            self.write({'acquirer_reference': data.get('pspReference')})
+-            self._set_transaction_done()
+-            return True
+-        elif status == 'PENDING':
+-            self.write({'acquirer_reference': data.get('pspReference')})
+-            self._set_transaction_pending()
+-            return True
+-        else:
+-            error = _('Adyen: feedback error')
+-            _logger.info(error)
+-            self.write({'state_message': error})
+-            self._set_transaction_cancel()
+-            return False
+
+--- a/None
++++ b/addons/payment_adyen/models/payment_acquirer.py
+@@ -0,0 +1,119 @@
++# Part of Odoo. See LICENSE file for full copyright and licensing details.
++
++import logging
++import re
++
++import requests
++
++from odoo import _, api, fields, models
++from odoo.exceptions import ValidationError
++
++from odoo.addons.payment_adyen.const import API_ENDPOINT_VERSIONS
++
++_logger = logging.getLogger(__name__)
++
++
++class PaymentAcquirer(models.Model):
++    _inherit = 'payment.acquirer'
++
++    provider = fields.Selection(
++        selection_add=[('adyen', "Adyen")], ondelete={'adyen': 'set default'})
++    adyen_merchant_account = fields.Char(
++        string="Merchant Account",
++        help="The code of the merchant account to use with this acquirer",
++        required_if_provider='adyen', groups='base.group_system')
++    adyen_api_key = fields.Char(
++        string="API Key", help="The API key of the user account", required_if_provider='adyen',
++        groups='base.group_system')
++    adyen_hmac_key = fields.Char(
++        string="HMAC Key", help="The HMAC key of the webhook", required_if_provider='adyen',
++        groups='base.group_system')
++    adyen_checkout_api_url = fields.Char(
++        string="Checkout API URL", help="The base URL for the Checkout API endpoints",
++        required_if_provider='adyen')
++    adyen_recurring_api_url = fields.Char(
++        string="Recurring API URL", help="The base URL for the Recurring API endpoints",
++        required_if_provider='adyen')
++
++    #=== CRUD METHODS ===#
++
++    @api.model_create_multi
++    def create(self, values_list):
++        for values in values_list:
++            self._adyen_trim_api_urls(values)
++        return super().create(values_list)
++
++    def write(self, values):
++        self._adyen_trim_api_urls(values)
++        return super().write(values)
++
++    @api.model
++    def _adyen_trim_api_urls(self, values):
++        """ Remove the version and the endpoint from the url of Adyen API fields.
++
++        :param dict values: The create or write values
++        :return: None
++        """
++        for field_name in ('adyen_checkout_api_url', 'adyen_recurring_api_url'):
++            if values.get(field_name):  # Test the value in case we're duplicating an acquirer
++                values[field_name] = re.sub(r'[vV]\d+(/.*)?', '', values[field_name])
++
++    #=== BUSINESS METHODS ===#
++
++    def _adyen_make_request(self, url_field_name, endpoint, payload=None, method='POST'):
++        """ Make a request to Adyen API at the specified endpoint.
++
++        Note: self.ensure_one()
++
++        :param str url_field_name: The name of the field holding the base URL for the request
++        :param str endpoint: The endpoint to be reached by the request
++        :param dict payload: The payload of the request
++        :param str method: The HTTP method of the request
++        :return The JSON-formatted content of the response
++        :rtype: dict
++        :raise: ValidationError if an HTTP error occurs
++        """
++
++        def _build_url(_base_url, _version, _endpoint):
++            """ Build an API URL by appending the version and endpoint to a base URL.
++
++            The final URL follows this pattern : `<_base>/V<_version>/<_endpoint>`.
++
++            :param str _base_url: The base of the url prefixed with `https://`
++            :param int _version: The version of the endpoint
++            :param str _endpoint: The endpoint of the URL.
++            :return: The final URL
++            :rtype: str
++            """
++            _base = _base_url.rstrip('/')  # Remove potential trailing slash
++            _endpoint = _endpoint.lstrip('/')  # Remove potential leading slash
++            return f'{_base}/V{_version}/{_endpoint}'
++
++        self.ensure_one()
++
++        version = API_ENDPOINT_VERSIONS[endpoint]
++        base_url = self[url_field_name]  # Restrict request URL to the stored API URL fields
++        url = _build_url(base_url, version, endpoint)
++        headers = {'X-API-Key': self.adyen_api_key}
++        try:
++            response = requests.request(method, url, json=payload, headers=headers, timeout=60)
++            response.raise_for_status()
++        except requests.exceptions.ConnectionError:
++            _logger.exception("unable to reach endpoint at %s", url)
++            raise ValidationError("Adyen: " + _("Could not establish the connection to the API."))
++        except requests.exceptions.HTTPError:
++            _logger.exception("invalid API request at %s with data %s", url, payload)
++            raise ValidationError("Adyen: " + _("The communication with the API failed."))
++        return response.json()
++
++    def _adyen_compute_shopper_reference(self, partner_id):
++        """ Compute a unique reference of the partner for Adyen.
++
++        This is used for the `shopperReference` field in communications with Adyen and stored in the
++        `adyen_shopper_reference` field on `payment.token` if the payment method is tokenized.
++
++        :param recordset partner_id: The partner making the transaction, as a `res.partner` id
++        :return: The unique reference for the partner
++        :rtype: str
++        """
++        return f'ODOO_PARTNER_{partner_id}'
+
+--- a/None
++++ b/addons/payment_adyen/models/payment_token.py
+@@ -0,0 +1,54 @@
++# Part of Odoo. See LICENSE file for full copyright and licensing details.
++
++from odoo import _, fields, models
++from odoo.exceptions import UserError, ValidationError
++
++
++class PaymentToken(models.Model):
++    _inherit = 'payment.token'
++
++    adyen_shopper_reference = fields.Char(
++        string="Shopper Reference", help="The unique reference of the partner owning this token",
++        readonly=True)
++
++    #=== BUSINESS METHODS ===#
++
++    def _handle_deactivation_request(self):
++        """ Override of payment to request request Adyen to delete the token.
++
++        Note: self.ensure_one()
++
++        :return: None
++        """
++        super()._handle_deactivation_request()
++        if self.provider != 'adyen':
++            return
++
++        data = {
++            'merchantAccount': self.acquirer_id.adyen_merchant_account,
++            'shopperReference': self.adyen_shopper_reference,
++            'recurringDetailReference': self.acquirer_ref,
++        }
++        try:
++            self.acquirer_id._adyen_make_request(
++                url_field_name='adyen_recurring_api_url',
++                endpoint='/disable',
++                payload=data,
++                method='POST'
++            )
++        except ValidationError:
++            pass  # Deactivating the token in Odoo is more important than in Adyen
++
++    def _handle_reactivation_request(self):
++        """ Override of payment to raise an error informing that Adyen tokens cannot be restored.
++
++        Note: self.ensure_one()
++
++        :return: None
++        :raise: UserError if the token is managed by Adyen
++        """
++        super()._handle_reactivation_request()
++        if self.provider != 'adyen':
++            return
++
++        raise UserError(_("Saved payment methods cannot be restored once they have been deleted."))
+
+--- a/None
++++ b/addons/payment_adyen/models/payment_transaction.py
+@@ -0,0 +1,183 @@
++# Part of Odoo. See LICENSE file for full copyright and licensing details.
++
++import logging
++import pprint
++
++from odoo import _, api, fields, models
++from odoo.exceptions import UserError, ValidationError
++
++from odoo.addons.payment import utils as payment_utils
++from odoo.addons.payment_adyen.const import CURRENCY_DECIMALS, RESULT_CODES_MAPPING
++
++_logger = logging.getLogger(__name__)
++
++
++class PaymentTransaction(models.Model):
++    _inherit = 'payment.transaction'
++
++    adyen_payment_data = fields.Char(
++        string="Saved Payment Data",
++        help="Data that must be passed back to Adyen when returning from redirect", readonly=True,
++        groups='base.group_system')
++
++    #=== BUSINESS METHODS ===#
++
++    def _get_specific_processing_values(self, processing_values):
++        """ Override of payment to return Adyen-specific processing values.
++
++        Note: self.ensure_one() from `_get_processing_values`
++
++        :param dict processing_values: The generic processing values of the transaction
++        :return: The dict of acquirer-specific processing values
++        :rtype: dict
++        """
++        res = super()._get_specific_processing_values(processing_values)
++        if self.provider != 'adyen':
++            return res
++
++        converted_amount = payment_utils.to_minor_currency_units(
++            self.amount, self.currency_id, CURRENCY_DECIMALS.get(self.currency_id.name)
++        )
++        return {
++            'converted_amount': converted_amount,
++            'access_token': payment_utils.generate_access_token(
++                processing_values['reference'],
++                converted_amount,
++                processing_values['partner_id']
++            )
++        }
++
++    def _send_payment_request(self):
++        """ Override of payment to send a payment request to Adyen.
++
++        Note: self.ensure_one()
++
++        :return: None
++        :raise: UserError if the transaction is not linked to a token
++        """
++        super()._send_payment_request()
++        if self.provider != 'adyen':
++            return
++
++        # Make the payment request to Adyen
++        if not self.token_id:
++            raise UserError("Adyen: " + _("The transaction is not linked to a token."))
++
++        converted_amount = payment_utils.to_minor_currency_units(
++            self.amount, self.currency_id, CURRENCY_DECIMALS.get(self.currency_id.name)
++        )
++        data = {
++            'merchantAccount': self.acquirer_id.adyen_merchant_account,
++            'amount': {
++                'value': converted_amount,
++                'currency': self.currency_id.name,
++            },
++            'reference': self.reference,
++            'paymentMethod': {
++                'recurringDetailReference': self.token_id.acquirer_ref
++            },  # Required by Adyen although it is also provided with 'storedPaymentMethodId'
++            'storedPaymentMethodId': self.token_id.acquirer_ref,
++            'shopperReference': self.token_id.adyen_shopper_reference,
++            'recurringProcessingModel': 'Subscription',
++            'shopperIP': payment_utils.get_customer_ip_address(),
++            'shopperInteraction': 'ContAuth',
++        }
++        response_content = self.acquirer_id._adyen_make_request(
++            url_field_name='adyen_checkout_api_url',
++            endpoint='/payments',
++            payload=data,
++            method='POST'
++        )
++
++        # Handle the payment request response
++        _logger.info("payment request response:\n%s", pprint.pformat(response_content))
++        self._handle_feedback_data('adyen', response_content)
++
++    @api.model
++    def _get_tx_from_feedback_data(self, provider, data):
++        """ Override of payment to find the transaction based on Adyen data.
++
++        :param str provider: The provider of the acquirer that handled the transaction
++        :param dict data: The feedback data sent by the provider
++        :return: The transaction if found
++        :rtype: recordset of `payment.transaction`
++        :raise: ValidationError if inconsistent data were received
++        :raise: ValidationError if the data match no transaction
++        """
++        tx = super()._get_tx_from_feedback_data(provider, data)
++        if provider != 'adyen':
++            return tx
++
++        reference = data.get('merchantReference')
++        if not reference:
++            raise ValidationError("Adyen: " + _("Received data with missing merchant reference"))
++
++        tx = self.search([('reference', '=', reference), ('provider', '=', 'adyen')])
++        if not tx:
++            raise ValidationError(
++                "Adyen: " + _("No transaction found matching reference %s.", reference)
++            )
++        return tx
++
++    def _process_feedback_data(self, data):
++        """ Override of payment to process the transaction based on Adyen data.
++
++        Note: self.ensure_one()
++
++        :param dict data: The feedback data sent by the provider
++        :return: None
++        :raise: ValidationError if inconsistent data were received
++        """
++        super()._process_feedback_data(data)
++        if self.provider != 'adyen':
++            return
++
++        # Handle the acquirer reference
++        if 'pspReference' in data:
++            self.acquirer_reference = data.get('pspReference')
++
++        # Handle the payment state
++        payment_state = data.get('resultCode')
++        if not payment_state:
++            raise ValidationError("Adyen: " + _("Received data with missing payment state."))
++
++        if payment_state in RESULT_CODES_MAPPING['pending']:
++            self._set_pending()
++        elif payment_state in RESULT_CODES_MAPPING['done']:
++            has_token_data = 'recurring.recurringDetailReference' in data.get('additionalData', {})
++            if self.tokenize and has_token_data:
++                self._adyen_tokenize_from_feedback_data(data)
++            self._set_done()
++        elif payment_state in RESULT_CODES_MAPPING['cancel']:
++            self._set_canceled()
++        else:  # Classify unsupported payment state as `error` tx state
++            _logger.warning("received data with invalid payment state: %s", payment_state)
++            self._set_error(
++                "Adyen: " + _("Received data with invalid payment state: %s", payment_state)
++            )
++
++    def _adyen_tokenize_from_feedback_data(self, data):
++        """ Create a new token based on the feedback data.
++
++        Note: self.ensure_one()
++
++        :param dict data: The feedback data sent by the provider
++        :return: None
++        """
++        self.ensure_one()
++
++        token = self.env['payment.token'].create({
++            'acquirer_id': self.acquirer_id.id,
++            'name': payment_utils.build_token_name(data['additionalData'].get('cardSummary')),
++            'partner_id': self.partner_id.id,
++            'acquirer_ref': data['additionalData']['recurring.recurringDetailReference'],
++            'adyen_shopper_reference': data['additionalData']['recurring.shopperReference'],
++            'verified': True,  # The payment is authorized, so the payment method is valid
++        })
++        self.write({
++            'token_id': token,
++            'tokenize': False,
++        })
++        _logger.info(
++            "created token with id %s for partner with id %s", token.id, self.partner_id.id
++        )

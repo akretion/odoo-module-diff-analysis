@@ -1,0 +1,154 @@
+PR: https://github.com/odoo/odoo/pull/141264
+
+From: ece4c1adea120282d41f7da25a7a09efa613c933
+From: yhu-odoo
+Date: 2023-11-14 15:51:13
+
+Structural Changes: 2
+Total Changes: 41
+
+[IMP] mrp{,_subcontracting_purchase}, {purchase_,}stock: add DTPMO to lead days
+
+For subcontracting, we need to consider both vendor lead time and
+manufacturing lead time, and DTPMO (Days To Prepare MO) on the BOM.
+Subcontracting delay =
+    max(Vendor lead time, Manufacturing lead time + DTPMO) + Days to Purchase + Purchase security lead time
+
+Same thing applied to Bom overview, except:
+1. Availability state will be computed based on the delay time of it's
+   components. DTPMO on the bom won't be take into account.
+2. Lead time will use the DTPMO on the BOM. DTPMO will be added to
+   the lead time when it's a manufacturing bom or when it's a
+   subcontracting bom with Manufacturing Lead Time + DTPMO > Vendor Lead Time
+
+Task-3081481
+
+Part-of: odoo/odoo#141264
+
+================================= pseudo patch: =================================
+
+--- a/addons/stock/models/product.py
++++ b/addons/stock/models/product.py
+@@ -595,12 +595,13 @@ class Product(models.Model):
+         else:
+             return self._get_rules_from_location(rule.location_src_id, seen_rules=seen_rules | rule)
+ 
+-    def _get_date_with_security_lead_days(self, date, location, route_ids=False):
++    def _get_dates_info(self, date, location, route_ids=False):
+         rules = self._get_rules_from_location(location, route_ids=route_ids)
+-        for action, days in location.company_id._get_security_by_rule_action().items():
+-            if action in rules.mapped('action'):
+-                date -= relativedelta(days=days)
+-        return date
++        delays, _ = rules.with_context(bypass_delay_description=True)._get_lead_days(self)
++        return {
++            'date_planned': date - relativedelta(days=delays['security_lead_days']),
++            'date_order': date - relativedelta(days=delays['security_lead_days'] + delays['purchase_delay']),
++        }
+ 
+     def _get_only_qty_available(self):
+         """ Get only quantities available, it is equivalent to read qty_available
+
+--- a/addons/stock/models/res_company.py
++++ b/addons/stock/models/res_company.py
+@@ -206,6 +206,3 @@ class Company(models.Model):
+             'partner_id': company.partner_id.id
+         } for company in companies])
+         return companies
+-
+-    def _get_security_by_rule_action(self):
+-        return {}
+
+--- a/addons/stock/models/stock_move.py
++++ b/addons/stock/models/stock_move.py
+@@ -1401,12 +1401,13 @@ Please change the quantity done or the rounding precision of your unit of measur
+             elif self.rule_id.group_propagation_option == 'none':
+                 group_id = False
+         product_id = self.product_id.with_context(lang=self._get_lang())
+-        date = self._get_mto_procurement_date()
++        dates_info = {'date_planned': self._get_mto_procurement_date()}
+         if self.location_id.warehouse_id and self.location_id.warehouse_id.lot_stock_id.parent_path in self.location_id.parent_path:
+-            date = self.product_id._get_date_with_security_lead_days(self.date, self.location_id, route_ids=self.route_ids)
++            dates_info = self.product_id._get_dates_info(self.date, self.location_id, route_ids=self.route_ids)
+         return {
+             'product_description_variants': self.description_picking and self.description_picking.replace(product_id._get_description(self.picking_type_id), ''),
+-            'date_planned': date,
++            'date_planned': dates_info.get('date_planned'),
++            'date_order': dates_info.get('date_order'),
+             'date_deadline': self.date_deadline,
+             'move_dest_ids': self,
+             'group_id': group_id,
+
+--- a/addons/stock/models/stock_orderpoint.py
++++ b/addons/stock/models/stock_orderpoint.py
+@@ -79,6 +79,7 @@ class StockWarehouseOrderpoint(models.Model):
+     qty_forecast = fields.Float('Forecast', readonly=True, compute='_compute_qty', digits='Product Unit of Measure')
+     qty_to_order = fields.Float('To Order', compute='_compute_qty_to_order', store=True, readonly=False, digits='Product Unit of Measure')
+ 
++    #TODO: remove this field in master
+     days_to_order = fields.Float(compute='_compute_days_to_order', help="Numbers of days  in advance that replenishments demands are created.")
+     visibility_days = fields.Float(
+         compute='_compute_visibility_days', inverse='_set_visibility_days', readonly=False,
+@@ -113,7 +114,7 @@ class StockWarehouseOrderpoint(models.Model):
+                 continue
+             values = orderpoint._get_lead_days_values()
+             lead_days, dummy = orderpoint.rule_ids._get_lead_days(orderpoint.product_id, **values)
+-            lead_days_date = fields.Date.today() + relativedelta.relativedelta(days=lead_days)
++            lead_days_date = fields.Date.today() + relativedelta.relativedelta(days=lead_days['total_delay'])
+             orderpoint.lead_days_date = lead_days_date
+ 
+     @api.depends('route_id', 'product_id', 'location_id', 'company_id', 'warehouse_id', 'product_id.route_ids')
+@@ -352,7 +353,7 @@ class StockWarehouseOrderpoint(models.Model):
+                 # group product by lead_days and location in order to read virtual_available
+                 # in batch
+                 rules = product._get_rules_from_location(loc)
+-                lead_days = rules.with_context(bypass_delay_description=True)._get_lead_days(product)[0]
++                lead_days = rules.with_context(bypass_delay_description=True)._get_lead_days(product)[0]['total_delay']
+                 ploc_per_day[(lead_days, loc)].add(product.id)
+ 
+         # recompute virtual_available with lead days
+@@ -481,11 +482,12 @@ class StockWarehouseOrderpoint(models.Model):
+         comming from an orderpoint. This method could be override in order to add other custom key that could
+         be used in move/po creation.
+         """
+-        date_planned = date or fields.Date.today()
+-        date_planned = self.product_id._get_date_with_security_lead_days(date_planned, self.location_id, route_ids=self.route_id)
++        date_deadline = date or fields.Date.today()
++        dates_info = self.product_id._get_dates_info(date_deadline, self.location_id, route_ids=self.route_id)
+         return {
+             'route_ids': self.route_id,
+-            'date_planned': date_planned,
++            'date_planned': dates_info['date_planned'],
++            'date_order': dates_info['date_order'],
+             'date_deadline': date or False,
+             'warehouse_id': self.warehouse_id,
+             'orderpoint_id': self,
+
+--- a/addons/stock/models/stock_rule.py
++++ b/addons/stock/models/stock_rule.py
+@@ -359,12 +359,14 @@ class StockRule(models.Model):
+         :param product: the product of the procurement
+         :type product: :class:`~odoo.addons.product.models.product.ProductProduct`
+         :return: the cumulative delay and cumulative delay's description
+-        :rtype: tuple[int, list[str, str]]
++        :rtype: tuple[defaultdict(float), list[str, str]]
+         """
++        delays = defaultdict(float)
+         delay = sum(self.filtered(lambda r: r.action in ['pull', 'pull_push']).mapped('delay'))
++        delays['total_delay'] += delay
+         global_visibility_days = self.env['ir.config_parameter'].sudo().get_param('stock.visibility_days')
+         if global_visibility_days:
+-            delay += int(global_visibility_days)
++            delays['total_delay'] += int(global_visibility_days)
+         if self.env.context.get('bypass_delay_description'):
+             delay_description = []
+         else:
+@@ -375,7 +377,7 @@ class StockRule(models.Model):
+             ]
+         if global_visibility_days:
+             delay_description.append((_('Global Visibility Days'), _('+ %d day(s)', int(global_visibility_days))))
+-        return delay, delay_description
++        return delays, delay_description
+ 
+ 
+ class ProcurementGroup(models.Model):

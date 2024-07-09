@@ -1,0 +1,179 @@
+PR: https://github.com/odoo/odoo/pull/
+
+From: bc1b452159acc1b233c1277edbc1d9adb2970f2f
+From: Hareshkumar Shyara
+Date: 2017-08-25 09:21:31
+
+Structural Changes: 11
+Total Changes: 60
+
+[IMP] account: improve usability of Cash Basis Taxes
+
+- Replace 'Use Cash Basis' checkbox by 'Tax Due' having two radio buttons,
+    - Based on Invoice (default)
+    - Based on Payment
+- "Tax received account" display only when we select "Based on Payment"
+- Changed the field name 'use_cash_basis' into 'tax_exigibility'.
+
+Was PR #17326
+
+================================= pseudo patch: =================================
+
+--- a/addons/account/models/account.py
++++ b/addons/account/models/account.py
+@@ -662,17 +662,20 @@ class AccountTax(models.Model):
+     analytic = fields.Boolean(string="Include in Analytic Cost", help="If set, the amount computed by this tax will be assigned to the same analytic account as the invoice line (if any)")
+     tag_ids = fields.Many2many('account.account.tag', 'account_tax_account_tag', string='Tags', help="Optional tags you may want to assign for custom reporting")
+     tax_group_id = fields.Many2one('account.tax.group', string="Tax Group", default=_default_tax_group, required=True)
+-    # Technical field to make the 'use_cash_basis' field invisible if the same named field is set to false in 'res.company' model
+-    hide_use_cash_basis = fields.Boolean(string='Hide Use Cash Basis Option', related='company_id.use_cash_basis')
+-    use_cash_basis = fields.Boolean(
+-        'Use Cash Basis',
+-        help="Select this if the tax should use cash basis,"
+-        "which will create an entry for this tax on a given account during reconciliation")
++    # Technical field to make the 'tax_exigibility' field invisible if the same named field is set to false in 'res.company' model
++    hide_tax_exigibility = fields.Boolean(string='Hide Use Cash Basis Option', related='company_id.tax_exigibility')
++    tax_exigibility = fields.Selection(
++        [('on_invoice', 'Based on Invoice'),
++         ('on_payment', 'Based on Payment'),
++        ], string='Tax Due', default='on_invoice',
++        oldname='use_cash_basis',
++        help="Based on Invoice: the tax is due as soon as the invoice is validated.\n"
++        "Based on Payment: the tax is due as soon as the payment of the invoice is received.")
+     cash_basis_account = fields.Many2one(
+         'account.account',
+         string='Tax Received Account',
+         domain=[('deprecated', '=', False)],
+-        help='Account use when creating entry for tax cash basis')
++        help='Account used as counterpart for the journal entry, for taxes exigible based on payments.')
+ 
+     _sql_constraints = [
+         ('name_company_uniq', 'unique(name, company_id, type_tax_use)', 'Tax names must be unique !'),
+
+--- a/addons/account/models/account_config_settings.py
++++ b/addons/account/models/account_config_settings.py
+@@ -60,7 +60,7 @@ class AccountConfigSettings(models.TransientModel):
+     module_product_margin = fields.Boolean(string="Allow Product Margin")
+     module_l10n_eu_service = fields.Boolean(string="EU Digital Goods VAT")
+     module_account_taxcloud = fields.Boolean(string="Account TaxCloud")
+-    use_cash_basis = fields.Boolean(string='Cash Basis', related='company_id.use_cash_basis')
++    tax_exigibility = fields.Boolean(string='Cash Basis', related='company_id.tax_exigibility')
+     tax_cash_basis_journal_id = fields.Many2one('account.journal', related='company_id.tax_cash_basis_journal_id', string="Tax Cash Basis Journal")
+ 
+     @api.model
+@@ -123,14 +123,14 @@ class AccountConfigSettings(models.TransientModel):
+         if self.module_account_yodlee:
+             self.module_account_plaid = True
+ 
+-    @api.onchange('use_cash_basis')
+-    def _onchange_use_cash_basis(self):
++    @api.onchange('tax_exigibility')
++    def _onchange_tax_exigibility(self):
+         res = {}
+         tax = self.env['account.tax'].search([
+-            ('company_id', '=', self.env.user.company_id.id), ('use_cash_basis', '=', True)
++            ('company_id', '=', self.env.user.company_id.id), ('tax_exigibility', '=', 'on_payment')
+         ], limit=1)
+-        if not self.use_cash_basis and tax:
+-            self.use_cash_basis = True
++        if not self.tax_exigibility and tax:
++            self.tax_exigibility = True
+             res['warning'] = {
+                 'title': _('Error!'),
+                 'message': _('You cannot disable this setting because some of your taxes are cash basis. '
+
+--- a/addons/account/models/account_move.py
++++ b/addons/account/models/account_move.py
+@@ -1204,10 +1204,10 @@ class AccountMoveLine(models.Model):
+         #the 'tax_ids' is a cash based tax.
+         taxes = False
+         if vals.get('tax_line_id'):
+-            taxes = [{'use_cash_basis': self.env['account.tax'].browse(vals['tax_line_id']).use_cash_basis}]
++            taxes = [{'tax_exigibility': self.env['account.tax'].browse(vals['tax_line_id']).tax_exigibility}]
+         if vals.get('tax_ids'):
+             taxes = self.env['account.move.line'].resolve_2many_commands('tax_ids', vals['tax_ids'])
+-        if taxes and any([tax['use_cash_basis'] for tax in taxes]) and not vals.get('tax_exigible'):
++        if taxes and any([tax['tax_exigibility'] == 'on_payment' for tax in taxes]) and not vals.get('tax_exigible'):
+             vals['tax_exigible'] = False
+ 
+         new_line = super(AccountMoveLine, self).create(vals)
+@@ -1563,7 +1563,7 @@ class AccountPartialReconcile(models.Model):
+                     rounded_amt = line.company_id.currency_id.round(amount)
+                     if float_is_zero(rounded_amt, precision_rounding=line.company_id.currency_id.rounding):
+                         continue
+-                    if line.tax_line_id and line.tax_line_id.use_cash_basis:
++                    if line.tax_line_id and line.tax_line_id.tax_exigibility == 'on_payment':
+                         if not newly_created_move:
+                             newly_created_move = self._create_tax_basis_move()
+                         #create cash basis entry for the tax line
+@@ -1596,7 +1596,7 @@ class AccountPartialReconcile(models.Model):
+                             to_clear_aml |= line
+                             to_clear_aml.reconcile()
+ 
+-                    if any([tax.use_cash_basis for tax in line.tax_ids]):
++                    if any([tax.tax_exigibility == 'on_payment' for tax in line.tax_ids]):
+                         if not newly_created_move:
+                             newly_created_move = self._create_tax_basis_move()
+                         #create cash basis entry for the base
+
+--- a/addons/account/models/chart_template.py
++++ b/addons/account/models/chart_template.py
+@@ -519,15 +519,18 @@ class AccountTaxTemplate(models.Model):
+     analytic = fields.Boolean(string="Analytic Cost", help="If set, the amount computed by this tax will be assigned to the same analytic account as the invoice line (if any)")
+     tag_ids = fields.Many2many('account.account.tag', string='Account tag', help="Optional tags you may want to assign for custom reporting")
+     tax_group_id = fields.Many2one('account.tax.group', string="Tax Group")
+-    use_cash_basis = fields.Boolean(
+-        'Use Cash Basis',
+-        help="Select this if the tax should use cash basis,"
+-        "which will create an entry for this tax on a given account during reconciliation")
++    tax_exigibility = fields.Selection(
++        [('on_invoice', 'Based on Invoice'),
++         ('on_payment', 'Based on Payment'),
++        ], string='Tax Due', default='on_invoice',
++        oldname='use_cash_basis',
++        help="Based on Invoice: the tax is due as soon as the invoice is validated.\n"
++        "Based on Payment: the tax is due as soon as the payment of the invoice is received.")
+     cash_basis_account = fields.Many2one(
+         'account.account.template',
+         string='Tax Received Account',
+         domain=[('deprecated', '=', False)],
+-        help='Account use when creating entry for tax cash basis')
++        help='Account used as counterpart for the journal entry, for taxes exigible based on payments.')
+ 
+     _sql_constraints = [
+         ('name_company_uniq', 'unique(name, company_id, type_tax_use)', 'Tax names must be unique !'),
+@@ -566,7 +569,7 @@ class AccountTaxTemplate(models.Model):
+             'tag_ids': [(6, 0, [t.id for t in self.tag_ids])],
+             'children_tax_ids': [(6, 0, children_ids)],
+             'tax_adjustment': self.tax_adjustment,
+-            'use_cash_basis': self.use_cash_basis,
++            'tax_exigibility': self.tax_exigibility,
+         }
+ 
+         if self.tax_group_id:
+@@ -596,10 +599,10 @@ class AccountTaxTemplate(models.Model):
+                 'cash_basis_account': tax.cash_basis_account.id,
+             }
+ 
+-        if any([tax.use_cash_basis for tax in self]):
+-            # When a CoA is being installed automatically and if it is creating account tax(es) whose field `Use Cash Basis`(use_cash_basis) is set to True by default
++        if any([tax.tax_exigibility == 'on_payment' for tax in self]):
++            # When a CoA is being installed automatically and if it is creating account tax(es) whose field `Use Cash Basis`(tax_exigibility) is set to True by default
+             # (exapmple of such CoA's are l10n_fr and l10n_mx) then in the `Accounting Settings` the option `Cash Basis` should be checked by default.
+-            company.use_cash_basis = True
++            company.tax_exigibility = True
+ 
+         return {
+             'tax_template_to_tax': tax_template_to_tax,
+
+--- a/addons/account/models/company.py
++++ b/addons/account/models/company.py
+@@ -44,7 +44,7 @@ If you have any queries regarding your account, Please contact us.
+ 
+ Thank you in advance for your cooperation.
+ Best Regards,''')
+-    use_cash_basis = fields.Boolean(string='Use Cash Basis')
++    tax_exigibility = fields.Boolean(string='Use Cash Basis')
+ 
+     @api.multi
+     def compute_fiscalyear_dates(self, date):

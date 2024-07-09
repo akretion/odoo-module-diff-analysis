@@ -1,0 +1,142 @@
+PR: https://github.com/odoo/odoo/pull/80118
+
+From: 8d0b08752535e82a17af9166c9469b1bae8d5afa
+From: yhu-odoo
+Date: 2022-03-31 15:24:44
+
+Structural Changes: 3
+Total Changes: 37
+
+[IMP] mrp: enable manual consumption on components
+
+Currently, when changing qty_producing on a MO, consumed number of each
+component will always be updated. In this commit, we add a new boolean
+field manual_consumption to bom.line. If checked, that line won't be
+updated when changing qty_producing.
+The same but invisible field manual_consumption is also added to each
+line on MO. It will use the value on BOM as defualt value. When user
+manually set the consued qty, it will be checked automatically. Also,
+when user manually update the SML, the field on SM will also be set to
+true.
+
+Task-2687494
+
+closes odoo/odoo#80118
+
+Related: odoo/enterprise#25607
+Signed-off-by: William Henrotin (whe) <whe@odoo.com>
+
+================================= pseudo patch: =================================
+
+--- a/addons/mrp/models/mrp_bom.py
++++ b/addons/mrp/models/mrp_bom.py
+@@ -70,6 +70,7 @@ class MrpBom(models.Model):
+         help="Defines if you can consume more or less components than the quantity defined on the BoM:\n"
+              "  * Allowed: allowed for all manufacturing users.\n"
+              "  * Allowed with warning: allowed for all manufacturing users with summary of consumption differences when closing the manufacturing order.\n"
++             "  Note that in the case of component Manual Consumption, where consumption is registered manually exclusively, consumption warnings will still be issued when appropriate also.\n"
+              "  * Blocked: only a manager can close a manufacturing order when the BoM consumption is not respected.",
+         default='warning',
+         string='Flexible Consumption',
+@@ -392,6 +393,11 @@ class MrpBomLine(models.Model):
+         'mrp.bom.line', string="BOM lines of the referred bom",
+         compute='_compute_child_line_ids')
+     attachments_count = fields.Integer('Attachments Count', compute='_compute_attachments_count')
++    tracking = fields.Selection(related='product_id.tracking')
++    manual_consumption = fields.Boolean(
++        'Manual Consumption', default=False, compute='_compute_manual_consumption', store=True, copy=True,
++        help="When activated, then the registration of consumption for that component is recorded manually exclusively.\n"
++             "If not activated, and any of the components consumption is edited manually on the manufacturing order, Odoo assumes manual consumption also.")
+ 
+     _sql_constraints = [
+         ('bom_qty_zero', 'CHECK (product_qty>=0)', 'All product quantities must be greater or equal to 0.\n'
+@@ -399,6 +405,10 @@ class MrpBomLine(models.Model):
+             'You should install the mrp_byproduct module if you want to manage extra products on BoMs !'),
+     ]
+ 
++    @api.depends('product_id', 'tracking')
++    def _compute_manual_consumption(self):
++        self.filtered(lambda m: m.tracking != 'none').manual_consumption = True
++
+     @api.depends('product_id', 'bom_id')
+     def _compute_child_bom_id(self):
+         for line in self:
+
+--- a/addons/mrp/models/stock_move.py
++++ b/addons/mrp/models/stock_move.py
+@@ -140,6 +140,17 @@ class StockMove(models.Model):
+     product_qty_available = fields.Float('Product On Hand Quantity', related='product_id.qty_available')
+     product_virtual_available = fields.Float('Product Forecasted Quantity', related='product_id.virtual_available')
+     description_bom_line = fields.Char('Kit', compute='_compute_description_bom_line')
++    manual_consumption = fields.Boolean(
++        'Manual Consumption', compute='_compute_manual_consumption', store=True,
++        help="When activated, then the registration of consumption for that component is recorded manually exclusively.\n"
++             "If not activated, and any of the components consumption is edited manually on the manufacturing order, Odoo assumes manual consumption also.")
++
++    @api.depends('state', 'product_id', 'operation_id')
++    def _compute_manual_consumption(self):
++        for move in self:
++            if move.state != 'draft':
++                continue
++            move.manual_consumption = move.bom_line_id.manual_consumption or move.product_id.tracking != 'none'
+ 
+     @api.depends('bom_line_id')
+     def _compute_description_bom_line(self):
+@@ -226,6 +237,12 @@ class StockMove(models.Model):
+             mo = self.raw_material_production_id
+             self._update_quantity_done(mo)
+ 
++    @api.onchange('quantity_done')
++    def _onchange_quantity_done(self):
++        if self.raw_material_production_id and not self.manual_consumption and \
++           self.should_consume_qty != self.quantity_done:
++            self.manual_consumption = True
++
+     @api.model
+     def default_get(self, fields_list):
+         defaults = super(StockMove, self).default_get(fields_list)
+@@ -250,6 +267,9 @@ class StockMove(models.Model):
+         - Moves from a copied MO
+         - Backorders
+         """
++        if self.env.context.get('force_manual_consumption'):
++            for vals in vals_list:
++                vals['manual_consumption'] = True
+         mo_id_to_mo = defaultdict(lambda: self.env['mrp.production'])
+         product_id_to_product = defaultdict(lambda: self.env['product.product'])
+         for values in vals_list:
+@@ -278,6 +298,8 @@ class StockMove(models.Model):
+         return super().create(vals_list)
+ 
+     def write(self, vals):
++        if self.env.context.get('force_manual_consumption'):
++            vals['manual_consumption'] = True
+         if 'product_uom_qty' in vals and 'move_line_ids' in vals:
+             # first update lines then product_uom_qty as the later will unreserve
+             # so possibly unlink lines
+@@ -340,6 +362,7 @@ class StockMove(models.Model):
+         if self.raw_material_production_id:
+             action['views'] = [(self.env.ref('mrp.view_stock_move_operations_raw').id, 'form')]
+             action['context']['show_destination_location'] = False
++            action['context']['force_manual_consumption'] = True
+         elif self.production_id:
+             action['views'] = [(self.env.ref('mrp.view_stock_move_operations_finished').id, 'form')]
+             action['context']['show_source_location'] = False
+@@ -395,6 +418,7 @@ class StockMove(models.Model):
+         return {
+             'state': 'confirmed',
+             'reservation_date': self.reservation_date,
++            'manual_consumption': self.bom_line_id.manual_consumption or self.product_id.tracking != 'none',
+             'move_orig_ids': [Command.link(m.id) for m in self.mapped('move_orig_ids')],
+             'move_dest_ids': [Command.link(m.id) for m in self.mapped('move_dest_ids')]
+         }
+@@ -424,7 +448,8 @@ class StockMove(models.Model):
+         # Do not update extra product quantities
+         if float_is_zero(self.product_uom_qty, precision_rounding=self.product_uom.rounding):
+             return True
+-        if self.has_tracking != 'none' or self.state == 'done':
++        if self.has_tracking != 'none' or self.state == 'done' or \
++           self.manual_consumption or self._origin.manual_consumption:
+             return True
+         return False
+ 

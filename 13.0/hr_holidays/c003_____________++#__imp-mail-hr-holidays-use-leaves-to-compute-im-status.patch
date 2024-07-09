@@ -1,0 +1,171 @@
+PR: https://github.com/odoo/odoo/pull/
+
+From: 086405344e7302d9f7b243ba0c30d55131aeb3fe
+From: XavierDo
+Date: 2019-02-07 12:53:03
+
+Structural Changes: 6
+Total Changes: 102
+
+[IMP] mail, hr_holidays: use leaves to compute im_status
+
+When on leave, the im_status can be either leave_online or leave_offline.
+This will allow to display a specific icon and a default message when the user
+is not at the office.
+The leave can have an out of office message. This message will be displayed
+in the chat window instead of the user ooo message, and the end date of the leave will be displayed too.
+
+Technical details.
+Right now the im_status access leaves directly to know if a user is on leave or not.
+An index has been added to optimise this request (thanks to rco).
+A solution to optimise this would be to compute part of the information in a cron.
+
+Task: 1856205
+
+================================= pseudo patch: =================================
+
+--- a/addons/hr_holidays/models/__init__.py
++++ b/addons/hr_holidays/models/__init__.py
+@@ -6,4 +6,7 @@ from . import hr
+ from . import hr_leave
+ from . import hr_leave_allocation
+ from . import hr_leave_type
+-from . import mail_message_subtype
+\ No newline at end of file
++from . import mail_channel
++from . import mail_message_subtype
++from . import res_partner
++from . import res_users
+
+--- a/addons/hr_holidays/models/hr_leave.py
++++ b/addons/hr_holidays/models/hr_leave.py
+@@ -9,7 +9,7 @@ import math
+ from datetime import datetime
+ from pytz import timezone, UTC
+ 
+-from odoo import api, fields, models
++from odoo import api, fields, models, tools
+ from odoo.addons.resource.models.resource import float_to_time, HOURS_PER_DAY
+ from odoo.exceptions import AccessError, UserError, ValidationError
+ from odoo.tools import float_compare
+@@ -128,6 +128,7 @@ class HolidaysRequest(models.Model):
+         'hr.department', string='Department', readonly=True,
+         states={'draft': [('readonly', False)], 'confirm': [('readonly', False)]})
+     notes = fields.Text('Reasons', readonly=True, states={'draft': [('readonly', False)], 'confirm': [('readonly', False)]})
++    out_of_office_message = fields.Char(string='Out of Office Message')
+     # duration
+     date_from = fields.Datetime(
+         'Start Date', readonly=True, index=True, copy=False, required=True,
+@@ -250,6 +251,13 @@ class HolidaysRequest(models.Model):
+         ('duration_check', "CHECK ( number_of_days >= 0 )", "If you want to change the number of days you should use the 'period' mode"),
+     ]
+ 
++    @api.model_cr_context
++    def _auto_init(self):
++        res = super(HolidaysRequest, self)._auto_init()
++        tools.create_index(self._cr, 'hr_leave_date_to_date_from_index',
++                           self._table, ['date_to', 'date_from'])
++        return res
++
+     @api.onchange('holiday_status_id')
+     def _onchange_holiday_status_id(self):
+         self.request_unit_half = False
+
+--- a/None
++++ b/addons/hr_holidays/models/mail_channel.py
+@@ -0,0 +1,36 @@
++# -*- coding: utf-8 -*-
++# Part of Odoo. See LICENSE file for full copyright and licensing details.
++
++from odoo import api, fields, models
++
++
++class Channel(models.Model):
++    _inherit = 'mail.channel'
++
++    @api.multi
++    def channel_info(self, extra_info=False):
++        channel_infos = super(Channel, self).channel_info(extra_info)
++        partners_on_leave = []
++        for channel_info in channel_infos:
++            if 'direct_partner' in channel_info:
++                for direct_partner in channel_info['direct_partner']:
++                    if 'leave' in direct_partner['im_status']:
++                        partners_on_leave.append(direct_partner['id'])
++        if partners_on_leave:
++            now = fields.Datetime.now()
++            self.env.cr.execute('''SELECT res_users.partner_id as partner_id, hr_leave.out_of_office_message as out_of_office_message, hr_leave.date_to as date_to
++                                FROM res_users
++                                JOIN hr_leave ON hr_leave.user_id = res_users.id
++                                AND hr_leave.state not in ('cancel', 'refuse')
++                                AND res_users.active = 't'
++                                AND hr_leave.date_from <= %s
++                                AND hr_leave.date_to >= %s
++                                AND res_users.partner_id in %s''', (now, now, tuple(partners_on_leave)))
++            out_of_office_info = dict(((res['partner_id'], res) for res in self.env.cr.dictfetchall()))
++            for channel_info in channel_infos:
++                if 'direct_partner' in channel_info:
++                    for direct_partner in channel_info['direct_partner']:
++                        if 'leave' in direct_partner['im_status']:
++                            direct_partner['out_of_office_date_end'] = out_of_office_info.get(direct_partner['id'], {}).get('date_to')
++                            direct_partner['out_of_office_message'] = out_of_office_info.get(direct_partner['id'], {}).get('out_of_office_message')
++        return channel_infos
+
+--- a/None
++++ b/addons/hr_holidays/models/res_partner.py
+@@ -0,0 +1,22 @@
++# -*- coding: utf-8 -*-
++# Part of Odoo. See LICENSE file for full copyright and licensing details.
++
++from odoo import api, models
++
++
++class ResPartner(models.Model):
++    _inherit = 'res.partner'
++
++    def _compute_im_status(self):
++        super(ResPartner, self)._compute_im_status()
++        absent_now = self._get_on_leave_ids()
++        for partner in self:
++            if partner.id in absent_now:
++                if partner.im_status == 'online':
++                    partner.im_status = 'leave_online'
++                else:
++                    partner.im_status = 'leave_offline'
++
++    @api.model
++    def _get_on_leave_ids(self):
++        return self.env['res.users']._get_on_leave_ids(partner=True)
+
+--- a/None
++++ b/addons/hr_holidays/models/res_users.py
+@@ -0,0 +1,29 @@
++# -*- coding: utf-8 -*-
++# Part of Odoo. See LICENSE file for full copyright and licensing details.
++
++from odoo import api, fields, models
++
++
++class ResUsers(models.Model):
++    _inherit = "res.users"
++
++    def _compute_im_status(self):
++        super(ResUsers, self)._compute_im_status()
++        on_leave_user_ids = self._get_on_leave_ids()
++        for user in self:
++            if user.id in on_leave_user_ids:
++                if user.im_status == 'online':
++                    user.im_status = 'leave_online'
++                else:
++                    user.im_status = 'leave_offline'
++
++    @api.model
++    def _get_on_leave_ids(self, partner=False):
++        now = fields.Datetime.now()
++        field = 'partner_id' if partner else 'id'
++        self.env.cr.execute('''SELECT res_users.%s FROM res_users
++                            JOIN hr_leave ON hr_leave.user_id = res_users.id
++                            AND state not in ('cancel', 'refuse')
++                            AND res_users.active = 't'
++                            AND date_from <= %%s AND date_to >= %%s''' % field, (now, now))
++        return [r[0] for r in self.env.cr.fetchall()]

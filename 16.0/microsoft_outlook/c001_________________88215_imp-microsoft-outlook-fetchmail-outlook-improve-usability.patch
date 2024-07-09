@@ -1,0 +1,185 @@
+PR: https://github.com/odoo/odoo/pull/88215
+
+From: e9f712278d5c6ab68d86be2ed7727aefd4625fff
+From: std-odoo
+Date: 2022-07-12 13:36:50
+
+Structural Changes: 2
+Total Changes: 61
+
+[IMP] microsoft_outlook, fetchmail_outlook *: improve usability
+
+* fetchmail, google_gmail, fetchmail_gmail
+
+Purpose
+=======
+Improve the usability of the outlook modules.
+
+Specifications
+==============
+Remove the checkbox "Use Outlook" and instead use the
+smtp_authentication and the server_type, to be consistent with Gmail.
+
+Hide the password field for Outlook / Gmail mail servers.
+
+Add constraints on the outgoing mail server to force the user to use
+the right configuration (e.g. the from_filter, so the sending does not
+fail).
+
+Add an option in the mail module to install Outlook.
+
+Show a message for the outgoing mail servers to explain each
+authentication methods.
+
+Task-2811567
+
+Part-of: odoo/odoo#88215
+
+================================= pseudo patch: =================================
+
+--- a/addons/microsoft_outlook/models/ir_mail_server.py
++++ b/addons/microsoft_outlook/models/ir_mail_server.py
+@@ -3,7 +3,7 @@
+ 
+ import base64
+ 
+-from odoo import _, api, models
++from odoo import _, api, fields, models
+ from odoo.exceptions import UserError
+ 
+ 
+@@ -15,12 +15,28 @@ class IrMailServer(models.Model):
+ 
+     _OUTLOOK_SCOPE = 'https://outlook.office.com/SMTP.Send'
+ 
+-    @api.constrains('use_microsoft_outlook_service', 'smtp_pass', 'smtp_encryption')
+-    def _check_use_microsoft_outlook_service(self):
+-        for server in self:
+-            if not server.use_microsoft_outlook_service:
+-                continue
++    smtp_authentication = fields.Selection(
++        selection_add=[('outlook', 'Outlook OAuth Authentication')],
++        ondelete={'outlook': 'set default'})
++
++    @api.depends('smtp_authentication')
++    def _compute_is_microsoft_outlook_configured(self):
++        outlook_servers = self.filtered(lambda server: server.smtp_authentication == 'outlook')
++        (self - outlook_servers).is_microsoft_outlook_configured = False
++        super(IrMailServer, outlook_servers)._compute_is_microsoft_outlook_configured()
+ 
++    def _compute_smtp_authentication_info(self):
++        outlook_servers = self.filtered(lambda server: server.smtp_authentication == 'outlook')
++        outlook_servers.smtp_authentication_info = _(
++            'Connect your Outlook account with the OAuth Authentication process.  \n'
++            'By default, only a user with a matching email address will be able to use this server. '
++            'To extend its use, you should set a "mail.default.from" system parameter.')
++        super(IrMailServer, self - outlook_servers)._compute_smtp_authentication_info()
++
++    @api.constrains('smtp_authentication', 'smtp_pass', 'smtp_encryption', 'from_filter', 'smtp_user')
++    def _check_use_microsoft_outlook_service(self):
++        outlook_servers = self.filtered(lambda server: server.smtp_authentication == 'outlook')
++        for server in outlook_servers:
+             if server.smtp_pass:
+                 raise UserError(_(
+                     'Please leave the password field empty for Outlook mail server %r. '
+@@ -31,17 +47,22 @@ class IrMailServer(models.Model):
+                     'Incorrect Connection Security for Outlook mail server %r. '
+                     'Please set it to "TLS (STARTTLS)".', server.name))
+ 
++            if server.from_filter != server.smtp_user:
++                raise UserError(_(
++                    'This server %r can only be used for your personal email address. '
++                    'Please fill the "from_filter" field with %r.', server.name, server.smtp_user))
++
+     @api.onchange('smtp_encryption')
+     def _onchange_encryption(self):
+         """Do not change the SMTP configuration if it's a Outlook server
+ 
+         (e.g. the port which is already set)"""
+-        if not self.use_microsoft_outlook_service:
++        if self.smtp_authentication != 'outlook':
+             super()._onchange_encryption()
+ 
+-    @api.onchange('use_microsoft_outlook_service')
+-    def _onchange_use_microsoft_outlook_service(self):
+-        if self.use_microsoft_outlook_service:
++    @api.onchange('smtp_authentication')
++    def _onchange_smtp_authentication_outlook(self):
++        if self.smtp_authentication == 'outlook':
+             self.smtp_host = 'smtp.outlook.com'
+             self.smtp_encryption = 'starttls'
+             self.smtp_port = 587
+@@ -50,11 +71,17 @@ class IrMailServer(models.Model):
+             self.microsoft_outlook_access_token = False
+             self.microsoft_outlook_access_token_expiration = False
+ 
++    @api.onchange('smtp_user', 'smtp_authentication')
++    def _on_change_smtp_user_outlook(self):
++        """The Outlook mail servers can only be used for the user personal email address."""
++        if self.smtp_authentication == 'outlook':
++            self.from_filter = self.smtp_user
++
+     def _smtp_login(self, connection, smtp_user, smtp_password):
+-        if len(self) == 1 and self.use_microsoft_outlook_service:
++        if len(self) == 1 and self.smtp_authentication == 'outlook':
+             auth_string = self._generate_outlook_oauth2_string(smtp_user)
+             oauth_param = base64.b64encode(auth_string.encode()).decode()
+             connection.ehlo()
+-            connection.docmd('AUTH', 'XOAUTH2 %s' % oauth_param)
++            connection.docmd('AUTH', f'XOAUTH2 {oauth_param}')
+         else:
+             super()._smtp_login(connection, smtp_user, smtp_password)
+
+--- a/addons/microsoft_outlook/models/microsoft_outlook_mixin.py
++++ b/addons/microsoft_outlook/models/microsoft_outlook_mixin.py
+@@ -23,7 +23,6 @@ class MicrosoftOutlookMixin(models.AbstractModel):
+     _OUTLOOK_SCOPE = None
+     _OUTLOOK_ENDPOINT = 'https://login.microsoftonline.com/common/oauth2/v2.0/'
+ 
+-    use_microsoft_outlook_service = fields.Boolean('Outlook Authentication')
+     is_microsoft_outlook_configured = fields.Boolean('Is Outlook Credential Configured',
+         compute='_compute_is_microsoft_outlook_configured')
+     microsoft_outlook_refresh_token = fields.Char(string='Outlook Refresh Token',
+@@ -35,14 +34,13 @@ class MicrosoftOutlookMixin(models.AbstractModel):
+     microsoft_outlook_uri = fields.Char(compute='_compute_outlook_uri', string='Authentication URI',
+         help='The URL to generate the authorization code from Outlook', groups='base.group_system')
+ 
+-    @api.depends('use_microsoft_outlook_service')
+     def _compute_is_microsoft_outlook_configured(self):
+         Config = self.env['ir.config_parameter'].sudo()
+         microsoft_outlook_client_id = Config.get_param('microsoft_outlook_client_id')
+         microsoft_outlook_client_secret = Config.get_param('microsoft_outlook_client_secret')
+         self.is_microsoft_outlook_configured = microsoft_outlook_client_id and microsoft_outlook_client_secret
+ 
+-    @api.depends('use_microsoft_outlook_service')
++    @api.depends('is_microsoft_outlook_configured')
+     def _compute_outlook_uri(self):
+         Config = self.env['ir.config_parameter'].sudo()
+         base_url = self.get_base_url()
+@@ -50,7 +48,7 @@ class MicrosoftOutlookMixin(models.AbstractModel):
+         OUTLOOK_ENDPOINT = Config.get_param('microsoft.outlook.endpoint', self._OUTLOOK_ENDPOINT)
+ 
+         for record in self:
+-            if not record.id or not record.use_microsoft_outlook_service or not record.is_microsoft_outlook_configured:
++            if not record.id or not record.is_microsoft_outlook_configured:
+                 record.microsoft_outlook_uri = False
+                 continue
+ 
+@@ -80,7 +78,7 @@ class MicrosoftOutlookMixin(models.AbstractModel):
+         if not self.env.user.has_group('base.group_system'):
+             raise AccessError(_('Only the administrator can link an Outlook mail server.'))
+ 
+-        if not self.use_microsoft_outlook_service or not self.is_microsoft_outlook_configured:
++        if not self.is_microsoft_outlook_configured:
+             raise UserError(_('Please configure your Outlook credentials.'))
+ 
+         return {
+@@ -161,7 +159,7 @@ class MicrosoftOutlookMixin(models.AbstractModel):
+            or not self.microsoft_outlook_access_token_expiration \
+            or self.microsoft_outlook_access_token_expiration < now_timestamp:
+             if not self.microsoft_outlook_refresh_token:
+-                raise UserError(_('Please login your Outlook mail server before using it.'))
++                raise UserError(_('Please connect with your Outlook account before using it.'))
+             (
+                 self.microsoft_outlook_access_token,
+                 self.microsoft_outlook_access_token_expiration,

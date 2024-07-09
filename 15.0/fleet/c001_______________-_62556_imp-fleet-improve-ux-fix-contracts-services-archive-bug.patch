@@ -1,0 +1,131 @@
+PR: https://github.com/odoo/odoo/pull/62556
+
+From: fc396a4d17714cb781866de03c8a596b37776899
+From: Aurélien (avd)
+Date: 2021-02-24 12:32:11
+
+Structural Changes: 4
+Total Changes: 38
+
+[IMP] fleet: improve ux + fix contracts/services archive bug
+
+Revamp the kanban view of fleet.vehicle.log.services.
+
+Add some ux improvements (new filters, better naming,..).
+
+Fix bug where contracts/services of archived fleet.vehicle were
+not counted in statinfo.
+
+When a fleet.vehicle is archived, archive its related contracts/services.
+
+closes odoo/odoo#62556
+
+Taskid: 2389823
+Related: odoo/upgrade#2063
+Related: odoo/enterprise#15036
+Signed-off-by: Yannick Tivisse (yti) <yti@odoo.com>
+
+================================= pseudo patch: =================================
+
+--- a/addons/fleet/models/fleet_vehicle.py
++++ b/addons/fleet/models/fleet_vehicle.py
+@@ -29,15 +29,7 @@ class FleetVehicle(models.Model):
+     future_driver_id = fields.Many2one('res.partner', 'Future Driver', tracking=True, help='Next Driver of the vehicle', copy=False, domain="['|', ('company_id', '=', False), ('company_id', '=', company_id)]")
+     model_id = fields.Many2one('fleet.vehicle.model', 'Model',
+         tracking=True, required=True, help='Model of the vehicle')
+-    manager_id = fields.Many2one('res.users', compute='_compute_manager_id', domain=lambda self: [('groups_id', 'in', self.env.ref('fleet.fleet_group_manager').id)], store=True, readonly=False)
+-
+-    @api.depends('model_id')
+-    def _compute_manager_id(self):
+-        for vehicle in self:
+-            if vehicle.model_id:
+-                vehicle.manager_id = vehicle.model_id.manager_id
+-            else:
+-                vehicle.manager_id = None
++    manager_id = fields.Many2one('res.users', 'Fleet Manager', domain=lambda self: [('groups_id', 'in', self.env.ref('fleet.fleet_group_manager').id)])
+ 
+     brand_id = fields.Many2one('fleet.vehicle.model.brand', 'Brand', related="model_id.brand_id", store=True, readonly=False)
+     log_drivers = fields.One2many('fleet.vehicle.assignation.log', 'vehicle_id', string='Assignment Logs')
+@@ -133,8 +125,8 @@ class FleetVehicle(models.Model):
+         LogContract = self.env['fleet.vehicle.log.contract']
+         for record in self:
+             record.odometer_count = Odometer.search_count([('vehicle_id', '=', record.id)])
+-            record.service_count = LogService.search_count([('vehicle_id', '=', record.id)])
+-            record.contract_count = LogContract.search_count([('vehicle_id', '=', record.id), ('state', '!=', 'closed')])
++            record.service_count = LogService.search_count([('vehicle_id', '=', record.id), ('active', '=', record.active)])
++            record.contract_count = LogContract.search_count([('vehicle_id', '=', record.id), ('state', '!=', 'closed'), ('active', '=', record.active)])
+             record.history_count = self.env['fleet.vehicle.assignation.log'].search_count([('vehicle_id', '=', record.id)])
+ 
+     @api.depends('log_contracts')
+@@ -256,8 +248,6 @@ class FleetVehicle(models.Model):
+                     future_driver.sudo().write({'plan_to_change_car': True})
+ 
+         res = super(FleetVehicle, self).write(vals)
+-        if 'active' in vals and not vals['active']:
+-            self.mapped('log_contracts').write({'active': False})
+         return res
+ 
+     def create_driver_history(self, driver_id):
+@@ -282,6 +272,11 @@ class FleetVehicle(models.Model):
+             vehicle.driver_id = vehicle.future_driver_id
+             vehicle.future_driver_id = False
+ 
++    def toggle_active(self):
++        self.env['fleet.vehicle.log.contract'].with_context(active_test=False).search([('vehicle_id', 'in', self.ids)]).toggle_active()
++        self.env['fleet.vehicle.log.services'].with_context(active_test=False).search([('vehicle_id', 'in', self.ids)]).toggle_active()
++        super(FleetVehicle, self).toggle_active()
++
+     @api.model
+     def _read_group_stage_ids(self, stages, domain, order):
+         return self.env['fleet.vehicle.state'].search([], order=order)
+
+--- a/addons/fleet/models/fleet_vehicle_cost.py
++++ b/addons/fleet/models/fleet_vehicle_cost.py
+@@ -150,11 +150,11 @@ class FleetVehicleLogServices(models.Model):
+         default=lambda self: self.env.ref('fleet.type_service_service_8', raise_if_not_found=False),
+     )
+     state = fields.Selection([
+-        ('todo', 'To Do'),
++        ('new', 'New'),
+         ('running', 'Running'),
+         ('done', 'Done'),
+         ('cancelled', 'Cancelled'),
+-    ], default='todo', string='Stage')
++    ], default='new', string='Stage', group_expand='_expand_states')
+ 
+     def _get_odometer(self):
+         self.odometer = 0
+@@ -187,3 +187,6 @@ class FleetVehicleLogServices(models.Model):
+     def _compute_purchaser_id(self):
+         for service in self:
+             service.purchaser_id = service.vehicle_id.driver_id
++
++    def _expand_states(self, states, domain, order):
++        return [key for key, dummy in type(self).state.selection]
+
+--- a/addons/fleet/models/fleet_vehicle_model.py
++++ b/addons/fleet/models/fleet_vehicle_model.py
+@@ -12,8 +12,6 @@ class FleetVehicleModel(models.Model):
+     name = fields.Char('Model name', required=True)
+     brand_id = fields.Many2one('fleet.vehicle.model.brand', 'Manufacturer', required=True, help='Manufacturer of the vehicle')
+     vendors = fields.Many2many('res.partner', 'fleet_vehicle_model_vendors', 'model_id', 'partner_id', string='Vendors')
+-    manager_id = fields.Many2one('res.users', 'Fleet Manager', default=lambda self: self.env.uid,
+-                                 domain=lambda self: [('groups_id', 'in', self.env.ref('fleet.fleet_group_manager').id)])
+     image_128 = fields.Image(related='brand_id.image_128', readonly=True)
+     active = fields.Boolean(default=True)
+     vehicle_type = fields.Selection([('car', 'Car'), ('bike', 'Bike')], default='car', required=True)
+@@ -28,14 +26,6 @@ class FleetVehicleModel(models.Model):
+             res.append((record.id, name))
+         return res
+ 
+-    def write(self, vals):
+-        if 'manager_id' in vals:
+-            old_manager = self.manager_id.id if self.manager_id else None
+-
+-            self.env['fleet.vehicle'].search([('model_id', '=', self.id), ('manager_id', '=', old_manager)]).write({'manager_id': vals['manager_id']})
+-
+-        return super(FleetVehicleModel, self).write(vals)
+-
+ 
+ class FleetVehicleModelBrand(models.Model):
+     _name = 'fleet.vehicle.model.brand'

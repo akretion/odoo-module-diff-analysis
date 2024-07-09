@@ -1,0 +1,201 @@
+PR: https://github.com/odoo/odoo/pull/47186
+
+From: 840c18d23095e7e73910aede7853f4d55db602ea
+From: Rémy Baranx (bar)
+Date: 2020-03-31 13:47:27
+
+Structural Changes: 4
+Total Changes: 70
+
+[IMP] sale_management: remove price_unit from quotation template
+
+Purpose
+=======
+
+Having price and discount on quotation template is quite confusing
+as it is more the job of pricelists.
+In order to make it more simple for the user, we should remove the
+fields price_unit and discount from quotation template.
+
+Implementation
+========
+
+Now, the public price of a product is used instead of the price from
+the quotation template. If a pricelist exists, it is taken into
+account as before.
+
++ Add new tests to check the sale order template behavior.
+
+closes odoo/odoo#47186
+
+Taskid: 47186
+Related: odoo/upgrade#972
+Signed-off-by: Yannick Tivisse (yti) <yti@odoo.com>
+
+================================= pseudo patch: =================================
+
+--- a/addons/sale_management/models/sale_order.py
++++ b/addons/sale_management/models/sale_order.py
+@@ -58,17 +58,24 @@ class SaleOrder(models.Model):
+         }
+ 
+     def _compute_option_data_for_template_change(self, option):
++        price = option.product_id.lst_price
++        discount = 0
++
+         if self.pricelist_id:
+-            price = self.pricelist_id.with_context(uom=option.uom_id.id).get_product_price(option.product_id, 1, False)
+-        else:
+-            price = option.price_unit
++            pricelist_price = self.pricelist_id.with_context(uom=option.uom_id.id).get_product_price(option.product_id, 1, False)
++
++            if self.pricelist_id.discount_policy == 'without_discount' and price:
++                discount = max(0, (price - pricelist_price) * 100 / price)
++            else:
++                price = pricelist_price
++
+         return {
+             'product_id': option.product_id.id,
+             'name': option.name,
+             'quantity': option.quantity,
+             'uom_id': option.uom_id.id,
+             'price_unit': price,
+-            'discount': option.discount,
++            'discount': discount
+         }
+ 
+     def update_prices(self):
+@@ -80,49 +87,51 @@ class SaleOrder(models.Model):
+ 
+     @api.onchange('sale_order_template_id')
+     def onchange_sale_order_template_id(self):
++
+         if not self.sale_order_template_id:
+             self.require_signature = self._get_default_require_signature()
+             self.require_payment = self._get_default_require_payment()
+             return
++
+         template = self.sale_order_template_id.with_context(lang=self.partner_id.lang)
+ 
++        # --- first, process the list of products from the template
+         order_lines = [(5, 0, 0)]
+         for line in template.sale_order_template_line_ids:
+             data = self._compute_line_data_for_template_change(line)
++
+             if line.product_id:
++                price = line.product_id.lst_price
+                 discount = 0
++
+                 if self.pricelist_id:
+-                    price = self.pricelist_id.with_context(uom=line.product_uom_id.id).get_product_price(line.product_id, 1, False)
+-                    if self.pricelist_id.discount_policy == 'without_discount' and line.price_unit:
+-                        discount = (line.price_unit - price) / line.price_unit * 100
+-                        # negative discounts (= surcharge) are included in the display price
+-                        if discount < 0:
+-                            discount = 0
+-                        else:
+-                            price = line.price_unit
+-                    elif line.price_unit:
+-                        price = line.price_unit
+-
+-                else:
+-                    price = line.price_unit
++                    pricelist_price = self.pricelist_id.with_context(uom=line.product_uom_id.id).get_product_price(line.product_id, 1, False)
++
++                    if self.pricelist_id.discount_policy == 'without_discount' and price:
++                        discount = max(0, (price - pricelist_price) * 100 / price)
++                    else:
++                        price = pricelist_price
+ 
+                 data.update({
+                     'price_unit': price,
+-                    'discount': 100 - ((100 - discount) * (100 - line.discount) / 100),
++                    'discount': discount,
+                     'product_uom_qty': line.product_uom_qty,
+                     'product_id': line.product_id.id,
+                     'product_uom': line.product_uom_id.id,
+                     'customer_lead': self._get_customer_lead(line.product_id.product_tmpl_id),
+                 })
++
+             order_lines.append((0, 0, data))
+ 
+         self.order_line = order_lines
+         self.order_line._compute_tax_id()
+ 
++        # then, process the list of optional products from the template
+         option_lines = [(5, 0, 0)]
+         for option in template.sale_order_template_option_ids:
+             data = self._compute_option_data_for_template_change(option)
+             option_lines.append((0, 0, data))
++
+         self.sale_order_option_ids = option_lines
+ 
+         if template.number_of_days > 0:
+
+--- a/addons/sale_management/models/sale_order_template.py
++++ b/addons/sale_management/models/sale_order_template.py
+@@ -108,8 +108,6 @@ class SaleOrderTemplateLine(models.Model):
+     product_id = fields.Many2one(
+         'product.product', 'Product', check_company=True,
+         domain=[('sale_ok', '=', True)])
+-    price_unit = fields.Float('Unit Price', required=True, digits='Product Price')
+-    discount = fields.Float('Discount (%)', digits='Discount', default=0.0)
+     product_uom_qty = fields.Float('Quantity', required=True, digits='Product UoS', default=1)
+     product_uom_id = fields.Many2one('uom.uom', 'Unit of Measure', domain="[('category_id', '=', product_uom_category_id)]")
+     product_uom_category_id = fields.Many2one(related='product_id.uom_id.category_id', readonly=True)
+@@ -122,19 +120,13 @@ class SaleOrderTemplateLine(models.Model):
+     def _onchange_product_id(self):
+         self.ensure_one()
+         if self.product_id:
+-            self.price_unit = self.product_id.lst_price
+             self.product_uom_id = self.product_id.uom_id.id
+             self.name = self.product_id.get_product_multiline_description_sale()
+ 
+-    @api.onchange('product_uom_id')
+-    def _onchange_product_uom(self):
+-        if self.product_id and self.product_uom_id:
+-            self.price_unit = self.product_id.uom_id._compute_price(self.product_id.lst_price, self.product_uom_id)
+-
+     @api.model
+     def create(self, values):
+         if values.get('display_type', self.default_get(['display_type'])['display_type']):
+-            values.update(product_id=False, price_unit=0, product_uom_qty=0, product_uom_id=False)
++            values.update(product_id=False, product_uom_qty=0, product_uom_id=False)
+         return super(SaleOrderTemplateLine, self).create(values)
+ 
+     def write(self, values):
+@@ -148,7 +140,7 @@ class SaleOrderTemplateLine(models.Model):
+             "Missing required product and UoM on accountable sale quote line."),
+ 
+         ('non_accountable_fields_null',
+-            "CHECK(display_type IS NULL OR (product_id IS NULL AND price_unit = 0 AND product_uom_qty = 0 AND product_uom_id IS NULL))",
++            "CHECK(display_type IS NULL OR (product_id IS NULL AND product_uom_qty = 0 AND product_uom_id IS NULL))",
+             "Forbidden product, unit price, quantity, and UoM on non-accountable sale quote line"),
+     ]
+ 
+@@ -165,8 +157,6 @@ class SaleOrderTemplateOption(models.Model):
+     product_id = fields.Many2one(
+         'product.product', 'Product', domain=[('sale_ok', '=', True)],
+         required=True, check_company=True)
+-    price_unit = fields.Float('Unit Price', required=True, digits='Product Price')
+-    discount = fields.Float('Discount (%)', digits='Discount')
+     uom_id = fields.Many2one('uom.uom', 'Unit of Measure ', required=True, domain="[('category_id', '=', product_uom_category_id)]")
+     product_uom_category_id = fields.Many2one(related='product_id.uom_id.category_id', readonly=True)
+     quantity = fields.Float('Quantity', required=True, digits='Product UoS', default=1)
+@@ -175,16 +165,5 @@ class SaleOrderTemplateOption(models.Model):
+     def _onchange_product_id(self):
+         if not self.product_id:
+             return
+-        self.price_unit = self.product_id.list_price
+         self.uom_id = self.product_id.uom_id
+         self.name = self.product_id.get_product_multiline_description_sale()
+-
+-    @api.onchange('uom_id')
+-    def _onchange_product_uom(self):
+-        if not self.product_id:
+-            return
+-        if not self.uom_id:
+-            self.price_unit = 0.0
+-            return
+-        if self.uom_id.id != self.product_id.uom_id.id:
+-            self.price_unit = self.product_id.uom_id._compute_price(self.price_unit, self.uom_id)

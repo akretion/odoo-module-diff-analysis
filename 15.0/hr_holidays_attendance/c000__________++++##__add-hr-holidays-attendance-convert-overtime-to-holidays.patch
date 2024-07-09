@@ -1,0 +1,314 @@
+PR: https://github.com/odoo/odoo/pull/
+
+From: 2961513141685f4eae095f04e961996d7d956fc5
+From: Kevin Baptiste
+Date: 2021-07-06 09:35:01
+
+Structural Changes: 16
+Total Changes: 260
+
+[ADD] hr_holidays_attendance: convert overtime to holidays
+
+This module allows an employee to create leave requests or allocation
+requests from their overtime.
+
+Depending on the configuration of the leave type, the request can be
+made from:
+
+    - "My Profile" for allocation which allows employee requests;
+    - Time Off dashboard for leave type with no allocations;
+    - The employee profile for the time off manager.
+
+TaskID: 1904850
+
+[IMP] hr_holidays{,_attendance}: leave allocation multi create
+
+Change leave allocation create function to a multi create one.
+
+Task ID: 1904850
+
+================================= pseudo patch: =================================
+
+--- a/None
++++ b/addons/hr_holidays_attendance/models/__init__.py
+@@ -0,0 +1,8 @@
++# -*- coding: utf-8 -*-
++# Part of Odoo. See LICENSE file for full copyright and licensing details.
++
++from . import hr_leave_allocation
++from . import hr_leave_type
++from . import hr_leave
++from . import res_company
++from . import res_users
+
+--- a/None
++++ b/addons/hr_holidays_attendance/models/hr_leave.py
+@@ -0,0 +1,81 @@
++# -*- coding: utf-8 -*-
++# Part of Odoo. See LICENSE file for full copyright and licensing details.
++
++from odoo import api, fields, models, _
++from odoo.exceptions import ValidationError
++from odoo.tools import float_round
++
++
++class HRLeave(models.Model):
++    _inherit = 'hr.leave'
++
++    overtime_id = fields.Many2one('hr.attendance.overtime', string='Extra Hours', groups='hr_holidays.group_hr_holidays_user')
++    employee_overtime = fields.Float(related='employee_id.total_overtime')
++    overtime_deductible = fields.Boolean(compute='_compute_overtime_deductible')
++
++    @api.depends('holiday_status_id')
++    def _compute_overtime_deductible(self):
++        for leave in self:
++            leave.overtime_deductible = leave.holiday_status_id.overtime_deductible and leave.holiday_status_id.allocation_type == 'no'
++
++    @api.model_create_multi
++    def create(self, vals_list):
++        res = super().create(vals_list)
++        today = fields.Date.today()
++        for leave in res:
++            if not leave.overtime_deductible:
++                continue
++            employee = leave.employee_id.sudo()
++            duration = leave.number_of_hours_display
++            if duration > employee.total_overtime:
++                if employee.user_id == self.env.user:
++                    raise ValidationError(_('You do not have enough extra hours to request this leave'))
++                raise ValidationError(_('The employee does not have enough extra hours to request this leave.'))
++            if not leave.overtime_id:
++                leave.sudo().overtime_id = self.env['hr.attendance.overtime'].sudo().create({
++                    'employee_id': employee.id,
++                    'date': today,
++                    'adjustment': True,
++                    'duration': -1 * duration,
++                })
++        return res
++
++    def write(self, vals):
++        res = super().write(vals)
++        fields_to_check = {'number_of_days', 'date_from', 'date_to', 'state', 'employee_id'}
++        if not any(field for field in fields_to_check if field in vals):
++            return res
++        #User may not have access to overtime_id field
++        for leave in self.sudo().filtered('overtime_id'):
++            employee = leave.employee_id
++            duration = leave.number_of_hours_display
++            overtime_duration = leave.overtime_id.sudo().duration
++            if overtime_duration != duration:
++                if duration > employee.total_overtime - overtime_duration:
++                    raise ValidationError(_('The employee does not have enough extra hours to extend this leave.'))
++                leave.overtime_id.sudo().duration = -1 * duration
++        return res
++
++    def action_draft(self):
++        overtime_leaves = self.filtered('overtime_deductible')
++        if any([l.employee_overtime < float_round(l.number_of_hours_display, 2) for l in overtime_leaves]):
++            if self.employee_id.user_id.id == self.env.user.id:
++                raise ValidationError(_('You do not have enough extra hours to request this leave'))
++            raise ValidationError(_('The employee does not have enough extra hours to request this leave.'))
++
++        res = super().action_draft()
++        overtime_leaves.overtime_id.sudo().unlink()
++        for leave in overtime_leaves:
++            overtime = self.env['hr.attendance.overtime'].sudo().create({
++                'employee_id': leave.employee_id.id,
++                'date': fields.Date.today(),
++                'adjustment': True,
++                'duration': -1 * leave.number_of_hours_display
++            })
++            leave.sudo().overtime_id = overtime.id
++        return res
++
++    def action_refuse(self):
++        res = super().action_refuse()
++        self.overtime_id.sudo().unlink()
++        return res
+
+--- a/None
++++ b/addons/hr_holidays_attendance/models/hr_leave_allocation.py
+@@ -0,0 +1,83 @@
++# -*- coding: utf-8 -*-
++# Part of Odoo. See LICENSE file for full copyright and licensing details.
++
++from odoo import api, fields, models, _
++from odoo.exceptions import ValidationError
++from odoo.tools import float_round
++
++
++class HolidaysAllocation(models.Model):
++    _inherit = 'hr.leave.allocation'
++
++    def default_get(self, fields):
++        res = super().default_get(fields)
++        if 'holiday_status_id' in fields and self.env.context.get('deduct_extra_hours'):
++            leave_type = self.env['hr.leave.type'].search([
++                ('valid', '=', True),
++                ('overtime_deductible', '=', True),
++                ('allocation_type', '!=', 'no')], limit=1)
++            res['holiday_status_id'] = leave_type.id
++        return res
++
++    overtime_deductible = fields.Boolean(compute='_compute_overtime_deductible')
++    overtime_id = fields.Many2one('hr.attendance.overtime', string='Extra Hours', groups='hr_holidays.group_hr_holidays_user')
++    employee_overtime = fields.Float(related='employee_id.total_overtime')
++    hr_attendance_overtime = fields.Boolean(related='employee_company_id.hr_attendance_overtime')
++
++    @api.depends('holiday_status_id')
++    def _compute_overtime_deductible(self):
++        for allocation in self:
++            allocation.overtime_deductible = allocation.holiday_status_id.company_id.hr_attendance_overtime and allocation.holiday_status_id.overtime_deductible
++
++    @api.model_create_multi
++    def create(self, vals_list):
++        res = super().create(vals_list)
++        for allocation in res:
++            if allocation.overtime_deductible and allocation.holiday_type == 'employee':
++                duration = allocation.number_of_hours_display
++                if duration > allocation.employee_id.total_overtime:
++                    raise ValidationError(_('The employee does not have enough overtime hours to request this leave.'))
++                if not allocation.overtime_id:
++                    allocation.sudo().overtime_id = self.env['hr.attendance.overtime'].sudo().create({
++                        'employee_id': allocation.employee_id.id,
++                        'date': fields.Date.today(),
++                        'adjustment': True,
++                        'duration': -1 * duration,
++                    })
++        return res
++
++    def write(self, vals):
++        res = super().write(vals)
++        if 'number_of_days' not in vals:
++            return res
++        for allocation in self.filtered('overtime_id'):
++            employee = allocation.employee_id
++            duration = allocation.number_of_hours_display
++            overtime_duration = allocation.overtime_id.sudo().duration
++            if overtime_duration != duration:
++                if duration > employee.total_overtime - overtime_duration:
++                    raise ValidationError(_('The employee does not have enough extra hours to extend this allocation.'))
++                allocation.overtime_id.sudo().duration = -1 * duration
++        return res
++
++    def action_draft(self):
++        overtime_allocations = self.filtered('overtime_deductible')
++        if any([a.employee_overtime < float_round(a.number_of_hours_display, 2) for a in overtime_allocations]):
++            raise ValidationError(_('The employee does not have enough extra hours to request this allocation.'))
++        res = super().action_draft()
++
++        overtime_allocations.overtime_id.sudo().unlink()
++        for allocation in overtime_allocations:
++            overtime = self.env['hr.attendance.overtime'].sudo().create({
++                'employee_id': allocation.employee_id.id,
++                'date': fields.Date.today(),
++                'adjustment': True,
++                'duration': -1 * allocation.number_of_hours_display
++            })
++            allocation.sudo().overtime_id = overtime.id
++        return res
++
++    def action_refuse(self):
++        res = super().action_refuse()
++        self.overtime_id.sudo().unlink()
++        return res
+
+--- a/None
++++ b/addons/hr_holidays_attendance/models/hr_leave_type.py
+@@ -0,0 +1,32 @@
++# -*- coding: utf-8 -*-
++# Part of Odoo. See LICENSE file for full copyright and licensing details.
++
++from odoo import fields, models
++
++
++class HRLeaveType(models.Model):
++    _inherit = 'hr.leave.type'
++
++    hr_attendance_overtime = fields.Boolean(related='company_id.hr_attendance_overtime')
++    overtime_deductible = fields.Boolean(
++        "Deduct Extra Hours", default=False,
++        help="Once a time off of this type is approved, extra hours in attendances will be deducted.")
++
++    def get_employees_days(self, employee_ids):
++        res = super().get_employees_days(employee_ids)
++        deductible_time_off_type_ids = self.env['hr.leave.type'].search([
++            ('overtime_deductible', '=', True),
++            ('allocation_type', '=', 'no')]).ids
++        for employee_id, allocations in res.items():
++            for allocation_id in allocations:
++                if allocation_id in deductible_time_off_type_ids:
++                    res[employee_id][allocation_id]['virtual_remaining_leaves'] = self.env['hr.employee'].sudo().browse(employee_id).total_overtime
++                    res[employee_id][allocation_id]['overtime_deductible'] = True
++                else:
++                    res[employee_id][allocation_id]['overtime_deductible'] = False
++        return res
++
++    def _get_days_request(self):
++        res = super()._get_days_request()
++        res[1]['overtime_deductible'] = self.overtime_deductible
++        return res
+
+--- a/None
++++ b/addons/hr_holidays_attendance/models/res_company.py
+@@ -0,0 +1,24 @@
++# -*- coding: utf-8 -*-
++# Part of Odoo. See LICENSE file for full copyright and licensing details.
++
++from odoo import models
++
++
++class ResCompany(models.Model):
++    _inherit = 'res.company'
++
++    def write(self, vals):
++        res = super().write(vals)
++        if 'hr_attendance_overtime' not in vals:
++            return res
++        extra_hours_time_off_type = self.env.ref('hr_holidays_attendance.holiday_status_extra_hours', raise_if_not_found=False)
++        if not extra_hours_time_off_type:
++            return res
++        all_companies = self.env['res.company'].sudo().search([])
++        # Unarchive time of type if the feature is enabled
++        if any(company.hr_attendance_overtime and not extra_hours_time_off_type.active for company in all_companies):
++            extra_hours_time_off_type.toggle_active()
++        # Archive time of type if the feature is disabled for all the company
++        if all(not company.hr_attendance_overtime and extra_hours_time_off_type.active for company in all_companies):
++            extra_hours_time_off_type.toggle_active()
++        return res
+
+--- a/None
++++ b/addons/hr_holidays_attendance/models/res_users.py
+@@ -0,0 +1,32 @@
++# -*- coding: utf-8 -*-
++# Part of Odoo. See LICENSE file for full copyright and licensing details.
++
++from odoo import api, fields, models
++
++
++class ResUsers(models.Model):
++    _inherit = 'res.users'
++
++    request_overtime = fields.Boolean(compute='_compute_request_overtime')
++
++    @property
++    def SELF_READABLE_FIELDS(self):
++        return super().SELF_READABLE_FIELDS + ['request_overtime']
++
++    @api.depends_context('uid')
++    @api.depends('total_overtime')
++    def _compute_request_overtime(self):
++        is_holiday_user = self.env.user.has_group('hr_holidays.group_hr_holidays_user')
++        time_off_types = self.env['hr.leave.type'].search_count([
++            ('valid', '=', True),
++            ('allocation_type', '=', 'fixed_allocation'),
++            ('overtime_deductible', '=', True)
++        ])
++        for user in self:
++            if user.total_overtime >= 1:
++                if is_holiday_user:
++                    user.request_overtime = True
++                else:
++                    user.request_overtime = time_off_types
++            else:
++                user.request_overtime = False

@@ -1,0 +1,573 @@
+PR: https://github.com/odoo/odoo/pull/87131
+
+From: dbd09f16a2c5e453224ee82810c5ecd6da05c02c
+From: JF Aubert
+Date: 2022-06-03 14:40:08
+
+Structural Changes: 11
+Total Changes: 331
+
+[IMP] mrp,mrp_workorder: workorder scheduling revamp
+
+Currently MRP only allows sequential scheduling of work orders.
+
+This commit allows to specify the dependencies for work orders to be
+scheduled in parallel or in a complex diagram.
+
+By enabling the feature in the settings and at the bom level,
+you can specify dependencies between operations:
+on the operation form, select the operations on which the
+current one depends.
+
+The dependencies will be reflected in work orders during planning.
+
+The workorders Gantt view has been adapted for you to visualize
+and manipulate the dependencies.
+
+Please note:
+- work orders without predecessors will be started first
+- they can all be done in parallel
+- when all work orders of this step are finished, their successors
+  will start
+- and so on, step by step
+
+Also, with the feature activated at the bom level and no dependency,
+the parallel scheme will be applied (all operations at first step).
+
+Finally, without activation at the bom level, the dependencies will
+be created in order to satisfy the current sequential model.
+
+Task: 2691328
+Part-of: odoo/odoo#87131
+
+================================= pseudo patch: =================================
+
+--- a/addons/mrp/models/mrp_bom.py
++++ b/addons/mrp/models/mrp_bom.py
+@@ -1,7 +1,7 @@
+ # -*- coding: utf-8 -*-
+ # Part of Odoo. See LICENSE file for full copyright and licensing details.
+ 
+-from odoo import api, fields, models, _
++from odoo import api, fields, models, _, Command
+ from odoo.exceptions import UserError, ValidationError
+ from odoo.osv.expression import AND, NEGATIVE_TERM_OPERATORS
+ from odoo.tools import float_round
+@@ -80,6 +80,9 @@ class MrpBom(models.Model):
+     possible_product_template_attribute_value_ids = fields.Many2many(
+         'product.template.attribute.value',
+         compute='_compute_possible_product_template_attribute_value_ids')
++    allow_operation_dependencies = fields.Boolean('Operation Dependencies',
++        help="Create operation level dependencies that will influence both planning and the status of work orders upon MO confirmation. If this feature is ticked, and nothing is specified, Odoo will assume that all operations can be started simultaneously."
++    )
+ 
+     _sql_constraints = [
+         ('qty_positive', 'check (product_qty > 0)', 'The quantity to produce must be positive!'),
+@@ -177,11 +180,21 @@ class MrpBom(models.Model):
+ 
+     def copy(self, default=None):
+         res = super().copy(default)
+-        for bom_line in res.bom_line_ids:
+-            if bom_line.operation_id:
+-                operation = res.operation_ids.filtered(lambda op: op._get_comparison_values() == bom_line.operation_id._get_comparison_values())
+-                # Two operations could have the same values so we take the first one
+-                bom_line.operation_id = operation[:1]
++        if self.operation_ids:
++            operations_mapping = {}
++            for original, copied in zip(self.operation_ids, res.operation_ids.sorted()):
++                operations_mapping[original] = copied
++            for bom_line in res.bom_line_ids:
++                if bom_line.operation_id:
++                    bom_line.operation_id = operations_mapping[bom_line.operation_id]
++            for operation in self.operation_ids:
++                if operation.blocked_by_operation_ids:
++                    copied_operation = operations_mapping[operation]
++                    dependencies = []
++                    for dependency in operation.blocked_by_operation_ids:
++                        dependencies.append(Command.link(operations_mapping[dependency].id))
++                    copied_operation.blocked_by_operation_ids = dependencies
++
+         return res
+ 
+     @api.model
+
+--- a/addons/mrp/models/mrp_production.py
++++ b/addons/mrp/models/mrp_production.py
+@@ -240,6 +240,7 @@ class MrpProduction(models.Model):
+     show_allocation = fields.Boolean(
+         compute='_compute_show_allocation',
+         help='Technical Field used to decide whether the button "Allocation" should be displayed.')
++    allow_workorder_dependencies = fields.Boolean('Allow Work Order Dependencies')
+ 
+     _sql_constraints = [
+         ('name_uniq', 'unique(name, company_id)', 'Reference must be unique per Company!'),
+@@ -775,7 +776,7 @@ class MrpProduction(models.Model):
+             if any(field in ['move_raw_ids', 'move_finished_ids', 'workorder_ids'] for field in vals) and production.state != 'draft':
+                 production._autoconfirm_production()
+                 if production in production_to_replan:
+-                    production._plan_workorders(replan=True)
++                    production._plan_workorders()
+             if production.state == 'done' and ('lot_producing_id' in vals or 'qty_producing' in vals):
+                 finished_move_lines = production.move_finished_ids.filtered(
+                     lambda move: move.product_id == production.product_id and move.state == 'done').mapped('move_line_ids')
+@@ -836,6 +837,21 @@ class MrpProduction(models.Model):
+             default['move_raw_ids'] = [(0, 0, move.copy_data()[0]) for move in self.move_raw_ids.filtered(lambda m: m.product_qty != 0.0)]
+         return super(MrpProduction, self).copy_data(default=default)
+ 
++    def copy(self, default=None):
++        res = super().copy(default)
++        if self.workorder_ids.blocked_by_workorder_ids:
++            workorders_mapping = {}
++            for original, copied in zip(self.workorder_ids, res.workorder_ids.sorted()):
++                workorders_mapping[original] = copied
++            for workorder in self.workorder_ids:
++                if workorder.blocked_by_workorder_ids:
++                    copied_workorder = workorders_mapping[workorder]
++                    dependencies = []
++                    for dependency in workorder.blocked_by_workorder_ids:
++                        dependencies.append(Command.link(workorders_mapping[dependency].id))
++                    copied_workorder.blocked_by_workorder_ids = dependencies
++        return res
++
+     def action_view_mo_delivery(self):
+         """ Returns an action that display picking related to manufacturing order.
+         It can either be a list view or in a form view (if there is only one picking to show).
+@@ -1212,6 +1228,37 @@ class MrpProduction(models.Model):
+         self.filtered(lambda mo: mo.state == 'draft').state = 'confirmed'
+         return True
+ 
++    def _link_workorders_and_moves(self):
++        self.ensure_one()
++        if not self.workorder_ids:
++            return
++        workorder_per_operation = {workorder.operation_id: workorder for workorder in self.workorder_ids}
++        workorder_boms = self.workorder_ids.operation_id.bom_id
++        last_workorder_per_bom = defaultdict(lambda: self.env['mrp.workorder'])
++        self.allow_workorder_dependencies = self.bom_id.allow_operation_dependencies
++        if self.allow_workorder_dependencies:
++            for workorder in self.workorder_ids:
++                workorder.blocked_by_workorder_ids = [Command.link(workorder_per_operation[operation_id].id) for operation_id in workorder.operation_id.blocked_by_operation_ids]
++                if not workorder.needed_by_workorder_ids:
++                    last_workorder_per_bom[workorder.operation_id.bom_id] = workorder
++        else:
++            previous_workorder = False
++            for workorder in self.workorder_ids:
++                if previous_workorder and previous_workorder.operation_id.bom_id == workorder.operation_id.bom_id:
++                    workorder.blocked_by_workorder_ids = [Command.link(previous_workorder.id)]
++                previous_workorder = workorder
++                last_workorder_per_bom[workorder.operation_id.bom_id] = workorder
++        for move in (self.move_raw_ids | self.move_finished_ids):
++            if move.operation_id:
++                move.write({
++                    'workorder_id': workorder_per_operation[move.operation_id].id
++                })
++            else:
++                bom = move.bom_line_id.bom_id if (move.bom_line_id and move.bom_line_id.bom_id in workorder_boms) else self.bom_id
++                move.write({
++                    'workorder_id': last_workorder_per_bom[bom].id
++                })
++
+     def action_assign(self):
+         for production in self:
+             production.move_raw_ids._action_assign()
+@@ -1237,65 +1284,17 @@ class MrpProduction(models.Model):
+ 
+         if not self.workorder_ids:
+             return
+-        # Schedule all work orders (new ones and those already created)
+-        qty_to_produce = max(self.product_qty - self.qty_produced, 0)
+-        qty_to_produce = self.product_uom_id._compute_quantity(qty_to_produce, self.product_id.uom_id)
+-        start_date = max(self.date_planned_start, datetime.datetime.now())
+-        if replan:
+-            workorder_ids = self.workorder_ids.filtered(lambda wo: wo.state in ('pending', 'waiting', 'ready'))
+-            # We plan the manufacturing order according to its `date_planned_start`, but if
+-            # `date_planned_start` is in the past, we plan it as soon as possible.
+-            workorder_ids.leave_id.unlink()
+-        else:
+-            workorder_ids = self.workorder_ids.filtered(lambda wo: not wo.date_planned_start)
+-        for workorder in workorder_ids:
+-            workcenters = workorder.workcenter_id | workorder.workcenter_id.alternative_workcenter_ids
+-
+-            best_finished_date = datetime.datetime.max
+-            vals = {}
+-            for workcenter in workcenters:
+-                # compute theoretical duration
+-                if workorder.workcenter_id == workcenter:
+-                    duration_expected = workorder.duration_expected
+-                else:
+-                    duration_expected = workorder._get_duration_expected(alternative_workcenter=workcenter)
+ 
+-                from_date, to_date = workcenter._get_first_available_slot(start_date, duration_expected)
+-                # If the workcenter is unavailable, try planning on the next one
+-                if not from_date:
+-                    continue
+-                # Check if this workcenter is better than the previous ones
+-                if to_date and to_date < best_finished_date:
+-                    best_start_date = from_date
+-                    best_finished_date = to_date
+-                    best_workcenter = workcenter
+-                    vals = {
+-                        'workcenter_id': workcenter.id,
+-                        'duration_expected': duration_expected,
+-                    }
+-
+-            # If none of the workcenter are available, raise
+-            if best_finished_date == datetime.datetime.max:
+-                raise UserError(_('Impossible to plan the workorder. Please check the workcenter availabilities.'))
+-
+-            # Instantiate start_date for the next workorder planning
+-            if workorder.next_work_order_id:
+-                start_date = best_finished_date
+-
+-            # Create leave on chosen workcenter calendar
+-            leave = self.env['resource.calendar.leaves'].create({
+-                'name': workorder.display_name,
+-                'calendar_id': best_workcenter.resource_calendar_id.id,
+-                'date_from': best_start_date,
+-                'date_to': best_finished_date,
+-                'resource_id': best_workcenter.resource_id.id,
+-                'time_type': 'other'
+-            })
+-            vals['leave_id'] = leave.id
+-            workorder.write(vals)
++        self._link_workorders_and_moves()
++
++        # Plan workorders starting from final ones (those with no dependent workorders)
++        final_workorders = self.workorder_ids.filtered(lambda wo: not wo.needed_by_workorder_ids)
++        for workorder in final_workorders:
++            workorder._plan_workorder(replan)
++
+         self.with_context(force_date=True).write({
+-            'date_planned_start': self.workorder_ids[0].date_planned_start,
+-            'date_planned_finished': self.workorder_ids[-1].date_planned_finished
++            'date_planned_start': min([workorder.leave_id.date_from for workorder in self.workorder_ids]),
++            'date_planned_finished': max([workorder.leave_id.date_to for workorder in self.workorder_ids])
+         })
+ 
+     def button_unplan(self):
+@@ -1697,7 +1696,6 @@ class MrpProduction(models.Model):
+         # backordered workorders. To do that, we use the original `duration_expected` and the
+         # ratio of the quantity produced and the quantity to produce.
+         workorders_to_cancel = self.env['mrp.workorder']
+-        workorders_to_update = self.env['mrp.workorder']
+         for production in self:
+             initial_qty = initial_qty_by_production[production]
+             initial_workorder_remaining_qty = []
+@@ -1717,13 +1715,9 @@ class MrpProduction(models.Model):
+                 workorder.qty_reported_from_previous_wo = max(workorder.qty_production - remaining_qty, 0)
+                 if remaining_qty:
+                     initial_workorder_remaining_qty[index % workorders_len] = max(remaining_qty - workorder.qty_produced, 0)
+-                    if workorders_to_update[-1:].production_id != workorder.production_id:
+-                        workorders_to_update += workorder
+                 else:
+                     workorders_to_cancel += workorder
+         workorders_to_cancel.action_cancel()
+-        for workorder in workorders_to_update:
+-            workorder.state = 'ready' if workorder.next_work_order_id.production_availability == 'assigned' else 'waiting'
+         backorders.workorder_ids._action_confirm()
+ 
+         return self.env['mrp.production'].browse(production_ids)
+
+--- a/addons/mrp/models/mrp_routing.py
++++ b/addons/mrp/models/mrp_routing.py
+@@ -2,6 +2,7 @@
+ # Part of Odoo. See LICENSE file for full copyright and licensing details.
+ 
+ from odoo import api, fields, models, _, tools
++from odoo.exceptions import ValidationError
+ 
+ 
+ class MrpRoutingWorkcenter(models.Model):
+@@ -48,6 +49,17 @@ class MrpRoutingWorkcenter(models.Model):
+         'product.template.attribute.value', string="Apply on Variants", ondelete='restrict',
+         domain="[('id', 'in', possible_bom_product_template_attribute_value_ids)]",
+         help="BOM Product Variants needed to apply this line.")
++    allow_operation_dependencies = fields.Boolean(related='bom_id.allow_operation_dependencies')
++    blocked_by_operation_ids = fields.Many2many('mrp.routing.workcenter', relation="mrp_routing_workcenter_dependencies_rel",
++                                     column1="operation_id", column2="blocked_by_id",
++                                     string="Blocked By", help="Operations that need to be completed before this operation can start.",
++                                     domain="[('allow_operation_dependencies', '=', True), ('id', '!=', id), ('bom_id', '=', bom_id)]",
++                                     copy=False)
++    needed_by_operation_ids = fields.Many2many('mrp.routing.workcenter', relation="mrp_routing_workcenter_dependencies_rel",
++                                     column1="blocked_by_id", column2="operation_id",
++                                     string="Blocks", help="Operations that cannot start before this operation is completed.",
++                                     domain="[('allow_operation_dependencies', '=', True), ('id', '!=', id), ('bom_id', '=', bom_id)]",
++                                     copy=False)
+ 
+     @api.depends('time_mode', 'time_mode_batch')
+     def _compute_time_computed_on(self):
+@@ -89,6 +101,11 @@ class MrpRoutingWorkcenter(models.Model):
+         for operation in self:
+             operation.workorder_count = count_data.get(operation.id, 0)
+ 
++    @api.constrains('blocked_by_operation_ids')
++    def _check_no_cyclic_dependencies(self):
++        if not self._check_m2m_recursion('blocked_by_operation_ids'):
++            raise ValidationError(_("You cannot create cyclic dependency."))
++
+     def copy_to_bom(self):
+         if 'bom_id' in self.env.context:
+             bom_id = self.env.context.get('bom_id')
+
+--- a/addons/mrp/models/mrp_workorder.py
++++ b/addons/mrp/models/mrp_workorder.py
+@@ -7,7 +7,7 @@ from collections import defaultdict
+ import json
+ 
+ from odoo import api, fields, models, _, SUPERUSER_ID
+-from odoo.exceptions import UserError
++from odoo.exceptions import UserError, ValidationError
+ from odoo.tools import float_compare, float_round, format_datetime
+ 
+ 
+@@ -66,7 +66,7 @@ class MrpWorkorder(models.Model):
+         ('done', 'Finished'),
+         ('cancel', 'Cancelled')], string='Status',
+         compute='_compute_state', store=True,
+-        default='pending', copy=False, readonly=True)
++        default='pending', copy=False, readonly=True, recursive=True)
+     leave_id = fields.Many2one(
+         'resource.calendar.leaves',
+         help='Slot into workcenter calendar once planned',
+@@ -140,7 +140,6 @@ class MrpWorkorder(models.Model):
+         help='Technical field to store the hourly cost of workcenter at time of work order completion (i.e. to keep a consistent cost).',
+         default=0.0, group_operator="avg")
+ 
+-    next_work_order_id = fields.Many2one('mrp.workorder', "Next Work Order", check_company=True)
+     scrap_ids = fields.One2many('stock.scrap', 'workorder_id')
+     scrap_count = fields.Integer(compute='_compute_scrap_move_count', string='Scrap Move')
+     production_date = fields.Datetime('Production Date', related='production_id.date_planned_start', store=True)
+@@ -149,15 +148,32 @@ class MrpWorkorder(models.Model):
+     consumption = fields.Selection(related='production_id.consumption')
+     qty_reported_from_previous_wo = fields.Float('Carried Quantity', digits='Product Unit of Measure', copy=False,
+         help="The quantity already produced awaiting allocation in the backorders chain.")
+-
+-    @api.depends('production_availability')
++    is_planned = fields.Boolean(related='production_id.is_planned')
++    allow_workorder_dependencies = fields.Boolean(related='production_id.allow_workorder_dependencies')
++    blocked_by_workorder_ids = fields.Many2many('mrp.workorder', relation="mrp_workorder_dependencies_rel",
++                                     column1="workorder_id", column2="blocked_by_id", string="Blocked By",
++                                     domain="[('allow_workorder_dependencies', '=', True), ('id', '!=', id), ('production_id', '=', production_id)]",
++                                     copy=False)
++    needed_by_workorder_ids = fields.Many2many('mrp.workorder', relation="mrp_workorder_dependencies_rel",
++                                     column1="blocked_by_id", column2="workorder_id", string="Blocks",
++                                     domain="[('allow_workorder_dependencies', '=', True), ('id', '!=', id), ('production_id', '=', production_id)]",
++                                     copy=False)
++
++    @api.depends('production_availability', 'blocked_by_workorder_ids', 'blocked_by_workorder_ids.state')
+     def _compute_state(self):
+         # Force the flush of the production_availability, the wo state is modify in the _compute_reservation_state
+         # It is a trick to force that the state of workorder is computed as the end of the
+         # cyclic depends with the mo.state, mo.reservation_state and wo.state
+         for workorder in self:
++            if workorder.state == 'pending':
++                if all([wo.state in ('done', 'cancel') for wo in workorder.blocked_by_workorder_ids]):
++                    workorder.state = 'ready' if workorder.production_id.reservation_state == 'assigned' else 'waiting'
++                    continue
+             if workorder.state not in ('waiting', 'ready'):
+                 continue
++            if not all([wo.state in ('done', 'cancel') for wo in workorder.blocked_by_workorder_ids]):
++                workorder.state = 'pending'
++                continue
+             if workorder.production_id.reservation_state not in ('waiting', 'confirmed', 'assigned'):
+                 continue
+             if workorder.production_id.reservation_state == 'assigned' and workorder.state == 'waiting':
+@@ -167,15 +183,6 @@ class MrpWorkorder(models.Model):
+ 
+     @api.depends('production_state', 'date_planned_start', 'date_planned_finished')
+     def _compute_json_popover(self):
+-        previous_wo_data = self.env['mrp.workorder'].read_group(
+-            [('next_work_order_id', 'in', self.ids)],
+-            ['ids:array_agg(id)', 'date_planned_start:max', 'date_planned_finished:max'],
+-            ['next_work_order_id'])
+-        previous_wo_dict = dict([(x['next_work_order_id'][0], {
+-            'id': x['ids'][0],
+-            'date_planned_start': x['date_planned_start'],
+-            'date_planned_finished': x['date_planned_finished']})
+-            for x in previous_wo_data])
+         if self.ids:
+             conflicted_dict = self._get_conflicted_workorder_ids()
+         for wo in self:
+@@ -185,9 +192,9 @@ class MrpWorkorder(models.Model):
+                 wo.json_popover = False
+                 continue
+             if wo.state in ('pending', 'waiting', 'ready'):
+-                previous_wo = previous_wo_dict.get(wo.id)
+-                prev_start = previous_wo and previous_wo['date_planned_start'] or False
+-                prev_finished = previous_wo and previous_wo['date_planned_finished'] or False
++                previous_wos = wo.blocked_by_workorder_ids
++                prev_start = min([workorder.date_planned_start for workorder in previous_wos]) if previous_wos else False
++                prev_finished = max([workorder.date_planned_finished for workorder in previous_wos]) if previous_wos else False
+                 if wo.state == 'pending' and prev_start and not (prev_start > wo.date_planned_start):
+                     infos.append({
+                         'color': 'text-primary',
+@@ -264,6 +271,11 @@ class MrpWorkorder(models.Model):
+             'date_to': date_to,
+         })
+ 
++    @api.constrains('blocked_by_workorder_ids')
++    def _check_no_cyclic_dependencies(self):
++        if not self._check_m2m_recursion('blocked_by_workorder_ids'):
++            raise ValidationError(_("You cannot create cyclic dependency."))
++
+     def name_get(self):
+         res = []
+         for wo in self:
+@@ -279,13 +291,8 @@ class MrpWorkorder(models.Model):
+         self.mapped('leave_id').unlink()
+         mo_dirty = self.production_id.filtered(lambda mo: mo.state in ("confirmed", "progress", "to_close"))
+ 
+-        previous_wos = self.env['mrp.workorder'].search([
+-            ('next_work_order_id', 'in', self.ids),
+-            ('id', 'not in', self.ids)
+-        ])
+-        for pw in previous_wos:
+-            while pw.next_work_order_id and pw.next_work_order_id in self:
+-                pw.next_work_order_id = pw.next_work_order_id.next_work_order_id
++        for workorder in self:
++            workorder.blocked_by_workorder_ids.needed_by_workorder_ids = workorder.needed_by_workorder_ids
+         res = super().unlink()
+         # We need to go through `_action_confirm` for all workorders of the current productions to
+         # make sure the links between them are correct (`next_work_order_id` could be obsolete now).
+@@ -456,61 +463,64 @@ class MrpWorkorder(models.Model):
+         return res
+ 
+     def _action_confirm(self):
+-        workorders_by_production = defaultdict(lambda: self.env['mrp.workorder'])
+-        for workorder in self:
+-            workorders_by_production[workorder.production_id] |= workorder
+-
+-        for production, workorders in workorders_by_production.items():
+-            workorders_by_bom = defaultdict(lambda: self.env['mrp.workorder'])
+-            bom = self.env['mrp.bom']
+-            moves = production.move_raw_ids | production.move_finished_ids
+-
+-            for workorder in workorders:
+-                bom = workorder.operation_id.bom_id or workorder.production_id.bom_id
+-                previous_workorder = workorders_by_bom[bom][-1:]
+-                previous_workorder.next_work_order_id = workorder.id
+-                workorders_by_bom[bom] |= workorder
+-
+-                moves.filtered(lambda m: m.operation_id == workorder.operation_id).write({
+-                    'workorder_id': workorder.id
+-                })
+-
+-            exploded_boms, dummy = production.bom_id.explode(production.product_id, 1, picking_type=production.bom_id.picking_type_id)
+-            exploded_boms = {b[0]: b[1] for b in exploded_boms}
+-            for move in moves:
+-                if move.workorder_id:
+-                    continue
+-                bom = move.bom_line_id.bom_id
+-                while bom and bom not in workorders_by_bom:
+-                    bom_data = exploded_boms.get(bom, {})
+-                    bom = bom_data.get('parent_line') and bom_data['parent_line'].bom_id or False
+-                if bom in workorders_by_bom:
+-                    move.write({
+-                        'workorder_id': workorders_by_bom[bom][-1:].id
+-                    })
+-                else:
+-                    move.write({
+-                        'workorder_id': workorders_by_bom[production.bom_id][-1:].id
+-                    })
+-
+-            for workorders in workorders_by_bom.values():
+-                if not workorders:
+-                    continue
+-                if workorders[0].state == 'pending':
+-                    workorders[0].state = 'ready' if workorders[0].production_availability == 'assigned' else 'waiting'
+-                for workorder in workorders:
+-                    workorder._start_nextworkorder()
++        for production in self.mapped("production_id"):
++            production._link_workorders_and_moves()
+ 
+     def _get_byproduct_move_to_update(self):
+         return self.production_id.move_finished_ids.filtered(lambda x: (x.product_id.id != self.production_id.product_id.id) and (x.state not in ('done', 'cancel')))
+ 
+-    def _start_nextworkorder(self):
+-        if self.state == 'done':
+-            next_order = self.next_work_order_id
+-            while next_order and next_order.state == 'cancel':
+-                next_order = next_order.next_work_order_id
+-            if next_order.state == 'pending':
+-                next_order.state = 'ready' if next_order.production_availability == 'assigned' else 'waiting'
++    def _plan_workorder(self, replan=False):
++        self.ensure_one()
++        # Plan workorder after its predecessors
++        start_date = max(self.production_id.date_planned_start, datetime.now())
++        for workorder in self.blocked_by_workorder_ids:
++            workorder._plan_workorder(replan)
++            start_date = max(start_date, workorder.date_planned_finished)
++        # Plan only suitable workorders
++        if self.state not in ['pending', 'waiting', 'ready']:
++            return
++        if self.date_planned_start:
++            if replan:
++                self.leave_id.unlink()
++            else:
++                return
++        # Consider workcenter and alternatives
++        workcenters = self.workcenter_id | self.workcenter_id.alternative_workcenter_ids
++        best_finished_date = datetime.max
++        vals = {}
++        for workcenter in workcenters:
++            # Compute theoretical duration
++            if self.workcenter_id == workcenter:
++                duration_expected = self.duration_expected
++            else:
++                duration_expected = self._get_duration_expected(alternative_workcenter=workcenter)
++            from_date, to_date = workcenter._get_first_available_slot(start_date, duration_expected)
++            # If the workcenter is unavailable, try planning on the next one
++            if not from_date:
++                continue
++            # Check if this workcenter is better than the previous ones
++            if to_date and to_date < best_finished_date:
++                best_start_date = from_date
++                best_finished_date = to_date
++                best_workcenter = workcenter
++                vals = {
++                    'workcenter_id': workcenter.id,
++                    'duration_expected': duration_expected,
++                }
++        # If none of the workcenter are available, raise
++        if best_finished_date == datetime.max:
++            raise UserError(_('Impossible to plan the workorder. Please check the workcenter availabilities.'))
++        # Create leave on chosen workcenter calendar
++        leave = self.env['resource.calendar.leaves'].create({
++            'name': self.display_name,
++            'calendar_id': best_workcenter.resource_calendar_id.id,
++            'date_from': best_start_date,
++            'date_to': best_finished_date,
++            'resource_id': best_workcenter.resource_id.id,
++            'time_type': 'other'
++        })
++        vals['leave_id'] = leave.id
++        self.write(vals)
+ 
+     @api.model
+     def gantt_unavailability(self, start_date, end_date, scale, group_bys=None, rows=None):
+@@ -611,8 +621,6 @@ class MrpWorkorder(models.Model):
+             if not workorder.date_planned_start or end_date < workorder.date_planned_start:
+                 vals['date_planned_start'] = end_date
+             workorder.write(vals)
+-
+-            workorder._start_nextworkorder()
+         return True
+ 
+     def end_previous(self, doall=False):
+
+--- a/addons/mrp/models/res_config_settings.py
++++ b/addons/mrp/models/res_config_settings.py
+@@ -21,6 +21,13 @@ class ResConfigSettings(models.TransientModel):
+         implied_group='mrp.group_mrp_routings')
+     group_unlocked_by_default = fields.Boolean("Unlock Manufacturing Orders", implied_group='mrp.group_unlocked_by_default')
+     group_mrp_reception_report = fields.Boolean("Allocation Report for Manufacturing Orders", implied_group='mrp.group_mrp_reception_report')
++    group_mrp_workorder_dependencies = fields.Boolean("Work Order Dependencies", implied_group="mrp.group_mrp_workorder_dependencies")
++
++    def set_values(self):
++        super().set_values()
++        if not self.group_mrp_workorder_dependencies:
++            # Disabling this option should not interfere with currently planned productions
++            self.env['mrp.bom'].search([('allow_operation_dependencies', '=', True)]).allow_operation_dependencies = False
+ 
+     @api.onchange('use_manufacturing_lead')
+     def _onchange_use_manufacturing_lead(self):

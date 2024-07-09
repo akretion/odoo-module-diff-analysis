@@ -1,0 +1,116 @@
+PR: https://github.com/odoo/odoo/pull/44662
+
+From: b415533dca2af9b84725b0c48ee5d26359760300
+From: Victor Feyens
+Date: 2020-04-21 12:28:52
+
+Structural Changes: 2
+Total Changes: 48
+
+[REF] crm(_iap_lead): use read_group instead of computing len of one2many fields
+
+PURPOSE
+
+Several counter fields are performed inefficiently. They use compute methods
+using length of 2many fields instead of making use of more efficient ORM
+methods like read_group.
+
+SPECIFICATIONS
+
+No functional change, only technical performance improvements.
+
+Purpose is to improve lead_count performance. Some people claim to gain a lot
+of queries: from 90 to 30 SQL queries to read 39 partners. Hard to reproduce.
+
+LINKS
+
+Task ID 2196182
+PR odoo/odoo#44662
+
+Co-Authored-By: Fabien Pinckaers <fp@odoo.com>
+Co-Authored-By: Victor Feyens <vfe@odoo.com>
+Co-Authored-By: Thibault Delavallee <tde@odoo.com>
+
+================================= pseudo patch: =================================
+
+--- a/addons/crm/models/calendar.py
++++ b/addons/crm/models/calendar.py
+@@ -23,7 +23,9 @@ class CalendarEvent(models.Model):
+ 
+         return defaults
+ 
+-    opportunity_id = fields.Many2one('crm.lead', 'Opportunity', domain="[('type', '=', 'opportunity')]")
++    opportunity_id = fields.Many2one(
++        'crm.lead', 'Opportunity', domain="[('type', '=', 'opportunity')]",
++        index=True, ondelete='set null')
+ 
+     def _compute_is_highlighted(self):
+         super(CalendarEvent, self)._compute_is_highlighted()
+
+--- a/addons/crm/models/crm_lead.py
++++ b/addons/crm/models/crm_lead.py
+@@ -293,8 +293,13 @@ class Lead(models.Model):
+             lead.expected_revenue = round((lead.planned_revenue or 0.0) * (lead.probability or 0) / 100.0, 2)
+ 
+     def _compute_meeting_count(self):
+-        meeting_data = self.env['calendar.event'].sudo().read_group([('opportunity_id', 'in', self.ids)], ['opportunity_id'], ['opportunity_id'])
+-        mapped_data = {m['opportunity_id'][0]: m['opportunity_id_count'] for m in meeting_data}
++        if self.ids:
++            meeting_data = self.env['calendar.event'].sudo().read_group([
++                ('opportunity_id', 'in', self.ids)
++            ], ['opportunity_id'], ['opportunity_id'])
++            mapped_data = {m['opportunity_id'][0]: m['opportunity_id_count'] for m in meeting_data}
++        else:
++            mapped_data = dict()
+         for lead in self:
+             lead.meeting_count = mapped_data.get(lead.id, 0)
+ 
+
+--- a/addons/crm/models/res_partner.py
++++ b/addons/crm/models/res_partner.py
+@@ -37,13 +37,42 @@ class Partner(models.Model):
+         return rec
+ 
+     def _compute_opportunity_count(self):
++        if self.ids:
++            lead_group_data = self.env['crm.lead'].read_group(
++                [('partner_id.commercial_partner_id', 'in', self.ids)],
++                ['partner_id'], ['partner_id']
++            )
++        else:
++            lead_group_data = []
++        partners = dict(
++            (m['partner_id'][0], m['partner_id_count'])
++            for m in lead_group_data)
++        commercial_partners = {}
++        for partner in self.browse(partners.keys()):
++            commercial_partners.setdefault(partner.commercial_partner_id.id, 0)
++            commercial_partners[partner.commercial_partner_id.id] += partners[partner.id]
+         for partner in self:
+-            operator = 'child_of' if partner.is_company else '='  # the opportunity count should counts the opportunities of this company and all its contacts
+-            partner.opportunity_count = self.env['crm.lead'].search_count([('partner_id', operator, partner.id), ('type', '=', 'opportunity')])
++            if partner.is_company:
++                partner.opportunity_count = commercial_partners.get(partner.id, 0)
++            else:
++                partner.opportunity_count = partners.get(partner.id, 0)
+ 
+     def _compute_meeting_count(self):
++        if self.ids:
++            self.env.cr.execute("""
++                SELECT res_partner_id, calendar_event_id, count(1)
++                  FROM calendar_event_res_partner_rel
++                 WHERE res_partner_id IN %s
++              GROUP BY res_partner_id, calendar_event_id
++            """, [tuple(self.ids)])
++            meeting_data = self.env.cr.fetchall()
++            events = [row[1] for row in meeting_data]
++            valid_events = self.env['calendar.event'].search([('id', 'in', events)])  # filter for ACLs
++            meetings = dict((m[0], m[2]) for m in meeting_data if m[1] in valid_events.ids)
++        else:
++            meetings = dict()
+         for partner in self:
+-            partner.meeting_count = len(partner.meeting_ids)
++            partner.meeting_count = meetings.get(partner.id, 0)
+ 
+     def schedule_meeting(self):
+         partner_ids = self.ids

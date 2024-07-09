@@ -1,0 +1,130 @@
+PR: https://github.com/odoo/odoo/pull/138007
+
+From: a772936bad4908d485ef205f48bb0d45e9b4e506
+From: Victor Piryns (pivi)
+Date: 2023-10-10 01:59:41
+
+Structural Changes: 2
+Total Changes: 46
+
+[PERF] sale_project: speed up reads on `tasks_ids`
+
+Issue:
+Reading on the field `tasks_ids` of the `sale.order` model in some
+context can be slow, leading to really slow creation and duplication
+of tasks on a medium sized database.
+
+Analysis:
+After creation of a task, when the ORM flushes the model, it
+recomputes all the inverse dependencies that needs to be recomputed.
+Currently `task_ids` doesn't implement a `search` routine on the
+field, so `task_ids` needs to be recomputed for *all* sales orders,
+since we don't know which sales order needs computation. So for
+*all* sales orders, we trigger the compute `_compute_tasks_ids`,
+which is badly implemented using the general performance anti-pattern
+```py
+for record in records:
+    field = self.env['model'].search(domain)
+```
+which makes 1 query per record that we are computing.
+
+Solution:
+Correct the implementation of `_compute_tasks_ids`, which now uses a
+`_read_group` instead so we do 1 query for the whole recordset.
+And implement the `search` on the non-stored `tasks_ids` field,
+which speeds up the context of re-computations. This allows the ORM
+to know for which sales order the field `task_ids` needs re-computation.
+
+Results:
+In the context a mid-size database (less than 10k records for the
+concerned models)
+
+Task creation/duplication:
+
+|             | Before | After |
+|-------------|--------|-------|
+| Time        | 1 min  | 1 sec |
+| Query count | 40k    | 300   |
+
+Reference:
+opw-3445565
+
+closes odoo/odoo#138007
+
+X-original-commit: 81ae499ce975a96c12b6e379581ba40167d025db
+Related: odoo/enterprise#48610
+Signed-off-by: Xavier Bol (xbo) <xbo@odoo.com>
+
+================================= pseudo patch: =================================
+
+--- a/addons/sale_project/models/sale_order.py
++++ b/addons/sale_project/models/sale_order.py
+@@ -4,7 +4,7 @@
+ import ast
+ from collections import defaultdict
+ 
+-from odoo import api, fields, models, _
++from odoo import api, fields, models, _, Command
+ from odoo.exceptions import UserError
+ from odoo.tools.safe_eval import safe_eval
+ from odoo.osv.expression import AND
+@@ -13,7 +13,7 @@ from odoo.osv.expression import AND
+ class SaleOrder(models.Model):
+     _inherit = 'sale.order'
+ 
+-    tasks_ids = fields.Many2many('project.task', compute='_compute_tasks_ids', string='Tasks associated to this sale')
++    tasks_ids = fields.Many2many('project.task', compute='_compute_tasks_ids', search='_search_tasks_ids', string='Tasks associated to this sale')
+     tasks_count = fields.Integer(string='Tasks', compute='_compute_tasks_ids', groups="project.group_project_user")
+ 
+     visible_project = fields.Boolean('Display project', compute='_compute_visible_project', readonly=True)
+@@ -53,11 +53,47 @@ class SaleOrder(models.Model):
+             order.show_task_button = order.show_project_button or order.tasks_count
+             order.show_create_project_button = is_project_manager and order.id in show_button_ids and not order.project_count and order.order_line.product_template_id.filtered(lambda x: x.service_policy in ['delivered_timesheet', 'delivered_milestones'])
+ 
++    def _search_tasks_ids(self, operator, value):
++        is_name_search = operator in ['=', '!=', 'like', '=like', 'ilike', '=ilike'] and isinstance(value, str)
++        is_id_eq_search = operator in ['=', '!='] and isinstance(value, int)
++        is_id_in_search = operator in ['in', 'not in'] and isinstance(value, list) and all(isinstance(item, int) for item in value)
++        if not (is_name_search or is_id_eq_search or is_id_in_search):
++            raise NotImplementedError(_('Operation not supported'))
++
++        if is_name_search:
++            tasks_ids = self.env['project.task']._name_search(value, operator=operator, limit=None)
++        elif is_id_eq_search:
++            tasks_ids = value if operator == '=' else self.env['project.task']._search([('id', '!=', value)], order='id')
++        else:  # is_id_in_search
++            tasks_ids = self.env['project.task']._search([('id', operator, value)], order='id')
++
++        tasks = self.env['project.task'].browse(tasks_ids)
++        return [('id', 'in', tasks.sale_order_id.ids)]
++
+     @api.depends('order_line.product_id.project_id')
+     def _compute_tasks_ids(self):
+-        for order in self:
+-            order.tasks_ids = self.env['project.task'].search(['&', ('project_id', '!=', False), '|', ('sale_line_id', 'in', order.order_line.ids), ('sale_order_id', '=', order.id)])
+-            order.tasks_count = len(order.tasks_ids)
++        tasks_per_so = self.env['project.task']._read_group(
++            domain=['&', ('project_id', '!=', False), '|', ('sale_line_id', 'in', self.order_line.ids), ('sale_order_id', 'in', self.ids)],
++            groupby=['sale_order_id'],
++            aggregates=['id:recordset', '__count']
++        )
++        so_with_tasks = self.env['sale.order']
++        for order, tasks_ids, tasks_count in tasks_per_so:
++            if order:
++                order.tasks_ids = tasks_ids
++                order.tasks_count = tasks_count
++                so_with_tasks += order
++            else:
++                # tasks that have no sale_order_id need to be associated with the SO from their sale_line_id
++                for task in tasks_ids:
++                    task_so = task.sale_line_id.order_id
++                    task_so.tasks_ids = [Command.link(task.id)]
++                    task_so.tasks_count += 1
++                    so_with_tasks += task_so
++        remaining_orders = self - so_with_tasks
++        if remaining_orders:
++            remaining_orders.tasks_ids = [Command.clear()]
++            remaining_orders.tasks_count = 0
+ 
+     @api.depends('order_line.product_id.service_tracking')
+     def _compute_visible_project(self):

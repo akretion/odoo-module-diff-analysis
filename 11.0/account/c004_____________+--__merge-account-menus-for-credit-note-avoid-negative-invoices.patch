@@ -1,0 +1,313 @@
+PR: https://github.com/odoo/odoo/pull/
+
+From: 4585b14cd1740ed0f44d32f7bc32468c10dd82ad
+From: Fabien Pinckaers
+Date: 2017-04-08 17:06:21
+
+Structural Changes: 8
+Total Changes: 10
+
+[MERGE] account: menus for credit note + avoid negative invoices
+
+================================= pseudo patch: =================================
+
+--- a/addons/account/models/account.py
++++ b/addons/account/models/account.py
+@@ -242,7 +242,7 @@ class AccountJournal(models.Model):
+ 
+     # Bank journals fields
+     bank_account_id = fields.Many2one('res.partner.bank', string="Bank Account", ondelete='restrict', copy=False)
+-    bank_statements_source = fields.Selection([('no_feeds', 'No Feeds'),('manual', 'Record Manually')], string='Bank Feeds', default='no_feeds')
++    bank_statements_source = fields.Selection([('undefined', 'Undefined Yet'),('manual', 'Record Manually')], string='Bank Feeds', default='undefined')
+     bank_acc_number = fields.Char(related='bank_account_id.acc_number')
+     bank_id = fields.Many2one('res.bank', related='bank_account_id.bank_id')
+ 
+@@ -327,6 +327,15 @@ class AccountJournal(models.Model):
+         if 'bank_acc_number' in vals:
+             for journal in self.filtered(lambda r: r.type == 'bank' and not r.bank_account_id):
+                 journal.set_bank_account(vals.get('bank_acc_number'), vals.get('bank_id'))
++        # create the relevant refund sequence
++        if vals.get('refund_sequence'):
++            for journal in self.filtered(lambda j: j.type in ('sale', 'purchase') and not j.refund_sequence_id):
++                journal_vals = {
++                    'name': journal.name,
++                    'company_id': journal.company_id.id,
++                    'code': journal.code
++                }
++                journal.refund_sequence_id = self.sudo()._create_sequence(journal_vals, refund=True).id
+ 
+         return result
+ 
+@@ -342,7 +351,7 @@ class AccountJournal(models.Model):
+         """ Create new no_gap entry sequence for every new Journal"""
+         prefix = self._get_sequence_prefix(vals['code'], refund)
+         seq = {
+-            'name': vals['name'],
++            'name': refund and vals['name'] + _(': Refund') or vals['name'],
+             'implementation': 'no_gap',
+             'prefix': prefix,
+             'padding': 4,
+
+--- a/addons/account/models/account_bank_statement.py
++++ b/addons/account/models/account_bank_statement.py
+@@ -560,7 +560,7 @@ class AccountBankStatementLine(models.Model):
+         domain_reconciliation = ['&', '&', ('statement_line_id', '=', False), ('account_id', 'in', reconciliation_aml_accounts), ('payment_id','<>', False)]
+ 
+         # Black lines = unreconciled & (not linked to a payment or open balance created by statement
+-        domain_matching = ['&', ('reconciled', '=', False), '|', ('payment_id','=',False), ('statement_id', '<>', False)]
++        domain_matching = [('reconciled', '=', False)]
+         if self.partner_id.id or overlook_partner:
+             domain_matching = expression.AND([domain_matching, [('account_id.internal_type', 'in', ['payable', 'receivable'])]])
+         else:
+
+--- a/addons/account/models/account_invoice.py
++++ b/addons/account/models/account_invoice.py
+@@ -318,7 +318,7 @@ class AccountInvoice(models.Model):
+         default=lambda self: self.env.user)
+     fiscal_position_id = fields.Many2one('account.fiscal.position', string='Fiscal Position', oldname='fiscal_position',
+         readonly=True, states={'draft': [('readonly', False)]})
+-    commercial_partner_id = fields.Many2one('res.partner', string='Commercial Entity',
++    commercial_partner_id = fields.Many2one('res.partner', string='Commercial Entity', compute_sudo=True,
+         related='partner_id.commercial_partner_id', store=True, readonly=True,
+         help="The commercial entity that will be used on Journal Entries for this invoice")
+ 
+
+--- a/addons/account/models/account_journal_dashboard.py
++++ b/addons/account/models/account_journal_dashboard.py
+@@ -219,7 +219,7 @@ class account_journal(models.Model):
+                 ctx.update({'default_type': 'in_refund', 'type': 'in_refund'})
+             view_id = self.env.ref('account.invoice_supplier_form').id
+         else:
+-            ctx.update({'default_journal_id': self.id})
++            ctx.update({'default_journal_id': self.id, 'view_no_maturity': True})
+             view_id = self.env.ref('account.view_move_form').id
+             model = 'account.move'
+         return {
+@@ -307,6 +307,8 @@ class account_journal(models.Model):
+         [action] = self.env.ref('account.%s' % action_name).read()
+         action['context'] = ctx
+         action['domain'] = self._context.get('use_domain', [])
++        action['views'] = False
++        action['view_id'] = False
+         return action
+ 
+     @api.multi
+
+--- a/addons/account/models/account_move.py
++++ b/addons/account/models/account_move.py
+@@ -1133,7 +1133,7 @@ class AccountMoveLine(models.Model):
+         # Create tax lines
+         tax_lines_vals = []
+         if context.get('apply_taxes') and vals.get('tax_ids'):
+-            # Get ids from triplets : https://www.odoo.com/documentation/master/reference/orm.html#openerp.models.Model.write
++            # Get ids from triplets : https://www.odoo.com/documentation/10.0/reference/orm.html#odoo.models.Model.write
+             tax_ids = [tax['id'] for tax in self.resolve_2many_commands('tax_ids', vals['tax_ids']) if tax.get('id')]
+             # Since create() receives ids instead of recordset, let's just use the old-api bridge
+             taxes = self.env['account.tax'].browse(tax_ids)
+@@ -1430,10 +1430,69 @@ class AccountPartialReconcile(models.Model):
+     company_id = fields.Many2one('res.company', related='debit_move_id.company_id', store=True, string='Currency')
+     full_reconcile_id = fields.Many2one('account.full.reconcile', string="Full Reconcile", copy=False)
+ 
++    @api.multi
++    def _prepare_exchange_diff_line_to_reconcile(self, amount_diff, currency, diff_in_currency, move):
++        self.ensure_one()
++        return {
++            'name': _('Currency exchange rate difference'),
++            'debit': amount_diff < 0 and -amount_diff or 0.0,
++            'credit': amount_diff > 0 and amount_diff or 0.0,
++            'account_id': self.debit_move_id.account_id.id,
++            'move_id': move.id,
++            'currency_id': currency.id,
++            'amount_currency': -diff_in_currency,
++            'partner_id': self.debit_move_id.partner_id.id,
++        }
++
++    @api.multi
++    def _prepare_exchange_diff_move_line(self, amount_diff, currency, diff_in_currency, move):
++        self.ensure_one()
++        exchange_journal = self.company_id.currency_exchange_journal_id
++        return {
++            'name': _('Currency exchange rate difference'),
++            'debit': amount_diff > 0 and amount_diff or 0.0,
++            'credit': amount_diff < 0 and -amount_diff or 0.0,
++            'account_id':  amount_diff > 0 and exchange_journal.default_debit_account_id.id or exchange_journal.default_credit_account_id.id,
++            'move_id': move.id,
++            'currency_id': currency.id,
++            'amount_currency': diff_in_currency,
++            'partner_id': self.debit_move_id.partner_id.id,
++        }
++
++    @api.multi
++    def _prepare_exchange_diff_move(self, move_date):
++        self.ensure_one()
++        res = {'journal_id': self.company_id.currency_exchange_journal_id.id}
++        # The move date should be the maximum date between payment and invoice
++        # (in case of payment in advance). However, we should make sure the
++        # move date is not recorded after the end of year closing.
++        if move_date > self.company_id.fiscalyear_lock_date:
++            res['date'] = move_date
++        return res
++
++    @api.multi
++    def _prepare_exchange_diff_partial_reconcile(self, aml, line_to_reconcile, currency):
++        self.ensure_one()
++        return {
++            'debit_move_id': aml.credit and line_to_reconcile.id or aml.id,
++            'credit_move_id': aml.debit and line_to_reconcile.id or aml.id,
++            'amount': abs(aml.amount_residual),
++            'amount_currency': abs(aml.amount_residual_currency),
++            'currency_id': currency.id,
++        }
++
+     def create_exchange_rate_entry(self, aml_to_fix, amount_diff, diff_in_currency, currency, move_date):
+-        """ Automatically create a journal entry to book the exchange rate difference.
+-            That new journal entry is made in the company `currency_exchange_journal_id` and one of its journal
+-            items is matched with the other lines to balance the full reconciliation.
++        """
++        Automatically create a journal entry to book the exchange rate
++        difference. That new journal entry is made in the company
++        `currency_exchange_journal_id` and one of its journal items is
++        matched with the other lines to balance the full reconciliation.
++        :param aml_to_fix: account.move.line
++        :param amount_diff: float
++        :param diff_in_currency: float
++        :param currency: res.currency
++        :param move_date: date
++        :return: account.move.line to reconcile and account.partial.reconcile
+         """
+         for rec in self:
+             if not rec.company_id.currency_exchange_journal_id:
+@@ -1442,44 +1501,34 @@ class AccountPartialReconcile(models.Model):
+                 raise UserError(_("You should configure the 'Gain Exchange Rate Account' in the accounting settings, to manage automatically the booking of accounting entries related to differences between exchange rates."))
+             if not self.company_id.expense_currency_exchange_account_id.id:
+                 raise UserError(_("You should configure the 'Loss Exchange Rate Account' in the accounting settings, to manage automatically the booking of accounting entries related to differences between exchange rates."))
+-            move_vals = {'journal_id': rec.company_id.currency_exchange_journal_id.id}
+-
+-            # The move date should be the maximum date between payment and invoice (in case
+-            # of payment in advance). However, we should make sure the move date is not
+-            # recorded after the end of year closing.
+-            if move_date > rec.company_id.fiscalyear_lock_date:
+-                move_vals['date'] = move_date
+-            move = rec.env['account.move'].create(move_vals)
++
++            move = rec.env['account.move'].create(
++                rec._prepare_exchange_diff_move(move_date=move_date))
++
+             amount_diff = rec.company_id.currency_id.round(amount_diff)
+             diff_in_currency = currency.round(diff_in_currency)
+-            line_to_reconcile = rec.env['account.move.line'].with_context(check_move_validity=False).create({
+-                'name': _('Currency exchange rate difference'),
+-                'debit': amount_diff < 0 and -amount_diff or 0.0,
+-                'credit': amount_diff > 0 and amount_diff or 0.0,
+-                'account_id': rec.debit_move_id.account_id.id,
+-                'move_id': move.id,
+-                'currency_id': currency.id,
+-                'amount_currency': -diff_in_currency,
+-                'partner_id': rec.debit_move_id.partner_id.id,
+-            })
+-            rec.env['account.move.line'].create({
+-                'name': _('Currency exchange rate difference'),
+-                'debit': amount_diff > 0 and amount_diff or 0.0,
+-                'credit': amount_diff < 0 and -amount_diff or 0.0,
+-                'account_id': amount_diff > 0 and rec.company_id.currency_exchange_journal_id.default_debit_account_id.id or rec.company_id.currency_exchange_journal_id.default_credit_account_id.id,
+-                'move_id': move.id,
+-                'currency_id': currency.id,
+-                'amount_currency': diff_in_currency,
+-                'partner_id': rec.debit_move_id.partner_id.id,
+-            })
++            aml_model = rec.env['account.move.line']
++            aml_model.with_context(check_move_validity=False).create(
++                rec._prepare_exchange_diff_move_line(
++                    amount_diff=amount_diff,
++                    currency=currency,
++                    diff_in_currency=diff_in_currency,
++                    move=move))
++
++            line_to_reconcile = aml_model.create(
++                rec._prepare_exchange_diff_line_to_reconcile(
++                    amount_diff=amount_diff,
++                    currency=currency,
++                    diff_in_currency=diff_in_currency,
++                    move=move))
++
+             for aml in aml_to_fix:
+-                partial_rec = rec.env['account.partial.reconcile'].create({
+-                    'debit_move_id': aml.credit and line_to_reconcile.id or aml.id,
+-                    'credit_move_id': aml.debit and line_to_reconcile.id or aml.id,
+-                    'amount': abs(aml.amount_residual),
+-                    'amount_currency': abs(aml.amount_residual_currency),
+-                    'currency_id': currency.id,
+-                })
++                partial_rec = rec.env['account.partial.reconcile'].create(
++                    rec._prepare_exchange_diff_partial_reconcile(
++                        aml=aml,
++                        line_to_reconcile=line_to_reconcile,
++                        currency=currency)
++                )
+             move.post()
+         return line_to_reconcile, partial_rec
+ 
+
+--- a/addons/account/models/company.py
++++ b/addons/account/models/company.py
+@@ -1,6 +1,7 @@
+ # -*- coding: utf-8 -*-
+ 
+ from odoo import fields, models, api, _
++from odoo.exceptions import ValidationError
+ from datetime import timedelta
+ 
+ 
+@@ -19,7 +20,7 @@ class ResCompany(models.Model):
+     bank_account_code_prefix = fields.Char(string='Prefix of the bank accounts', oldname="bank_account_code_char")
+     cash_account_code_prefix = fields.Char(string='Prefix of the cash accounts')
+     accounts_code_digits = fields.Integer(string='Number of digits in an account code')
+-    tax_cash_basis_journal_id = fields.Many2one('account.journal', string="Tax Cash Basis Journal")
++    tax_cash_basis_journal_id = fields.Many2one('account.journal', string="Cash Basis Journal")
+     tax_calculation_rounding_method = fields.Selection([
+         ('round_per_line', 'Round per Line'),
+         ('round_globally', 'Round Globally'),
+@@ -79,6 +80,14 @@ Best Regards,''')
+ 
+     @api.multi
+     def write(self, values):
++        #restrict the closing of FY if there are still unposted entries
++        if values.get('fiscalyear_lock_date'):
++            nb_draft_entries = self.env['account.move'].search([
++                ('company_id', 'in', [c.id for c in self]),
++                ('state', '=', 'draft'),
++                ('date', '<=', values['fiscalyear_lock_date'])])
++            if nb_draft_entries:
++                raise ValidationError(_('There are still unposted entries in the period you want to lock. You should either post or delete them.'))
+         # Reflect the change on accounts
+         for company in self:
+             digits = values.get('accounts_code_digits') or company.accounts_code_digits
+
+--- a/addons/account/models/partner.py
++++ b/addons/account/models/partner.py
+@@ -316,17 +316,6 @@ class ResPartner(models.Model):
+             domain += overdue_domain
+         return domain
+ 
+-    @api.multi
+-    def _compute_issued_total(self):
+-        """ Returns the issued total as will be displayed on partner view """
+-        today = fields.Date.context_today(self)
+-        for partner in self:
+-            domain = partner.get_followup_lines_domain(today, overdue_only=True)
+-            issued_total = 0
+-            for aml in self.env['account.move.line'].search(domain):
+-                issued_total += aml.amount_residual
+-            partner.issued_total = issued_total
+-
+     @api.one
+     def _compute_has_unreconciled_entries(self):
+         # Avoid useless work if has_unreconciled_entries is not relevant for this partner
+@@ -387,7 +376,6 @@ class ResPartner(models.Model):
+ 
+     contracts_count = fields.Integer(compute='_journal_item_count', string="Contracts", type='integer')
+     journal_item_count = fields.Integer(compute='_journal_item_count', string="Journal Items", type="integer")
+-    issued_total = fields.Monetary(compute='_compute_issued_total', string="Journal Items")
+     property_account_payable_id = fields.Many2one('account.account', company_dependent=True,
+         string="Account Payable", oldname="property_account_payable",
+         domain="[('internal_type', '=', 'payable'), ('deprecated', '=', False)]",

@@ -1,0 +1,118 @@
+PR: https://github.com/odoo/odoo/pull/95480
+
+From: 0f71c64237b313fad0a261f4dd652bdc9459d995
+From: william
+Date: 2022-07-07 12:44:25
+
+Structural Changes: 1
+Total Changes: 32
+
+[FIX] account: reduce locking on moves
+
+By trying to avoid concurrency issues while assigning the sequence [1],
+we are locking too many operations even when not in the process of
+assigning a new number.
+* when computing `highest_name`, we don't need to lock as this is mostly
+  an information on the form that can possibly change anyway while the
+  form view is open (without any lock anymore)
+* when computing the accounting date, we don't need to lock, the only
+  information we want is the format of the sequence (yearly, monthly, no
+  reset), which is not likely to change on a same journal.
+* when changing the `journal_id`, it is only a helper for encoding, if
+  there is a concurrency error it will be shown during the post anyways.
+  Also same argument as for `highest_name`
+
+[1] https://github.com/odoo/odoo/commit/ba6ee0b75d66d6f22a592b1b6a7c5158461bec41
+
+closes odoo/odoo#95480
+
+X-original-commit: 809557cdd02fe6581ed573b58158a927aabe0694
+Related: odoo/enterprise#29212
+Signed-off-by: Olivier Colson (oco) <oco@odoo.com>
+Signed-off-by: William André (wan) <wan@odoo.com>
+
+================================= pseudo patch: =================================
+
+--- a/addons/account/models/account_move.py
++++ b/addons/account/models/account_move.py
+@@ -470,7 +470,7 @@ class AccountMove(models.Model):
+         """
+         lock_dates = self._get_violated_lock_dates(invoice_date, has_tax)
+         today = fields.Date.today()
+-        highest_name = self.highest_name or self._get_last_sequence(relaxed=True)
++        highest_name = self.highest_name or self._get_last_sequence(relaxed=True, lock=False)
+         number_reset = self._deduce_sequence_number_reset(highest_name)
+         if lock_dates:
+             invoice_date = lock_dates[-1][0] + timedelta(days=1)
+@@ -546,7 +546,7 @@ class AccountMove(models.Model):
+             if new_currency != self.currency_id:
+                 self.currency_id = new_currency
+                 self._onchange_currency()
+-        if self.state == 'draft' and self.name and self.name != '/' and not self.quick_edit_mode and self._get_last_sequence():
++        if self.state == 'draft' and self.name and self.name != '/' and not self.quick_edit_mode and self._get_last_sequence(lock=False):
+             self.name = '/'
+ 
+     @api.onchange('partner_id')
+@@ -1318,7 +1318,7 @@ class AccountMove(models.Model):
+             )
+         )
+         self = self.sorted(lambda m: (m.date, m.ref or '', m.id))
+-        highest_name = self[0]._get_last_sequence() if self else False
++        highest_name = self[0]._get_last_sequence(lock=False) if self else False
+ 
+         # Group the moves by journal and month
+         for move in self:
+@@ -1381,7 +1381,7 @@ class AccountMove(models.Model):
+     @api.depends('journal_id', 'date')
+     def _compute_highest_name(self):
+         for record in self:
+-            record.highest_name = record._get_last_sequence()
++            record.highest_name = record._get_last_sequence(lock=False)
+ 
+     @api.depends('journal_id.type', 'company_id.quick_edit_mode', 'quick_edit_total_amount')
+     def _compute_quick_edit_mode(self):
+
+--- a/addons/account/models/sequence_mixin.py
++++ b/addons/account/models/sequence_mixin.py
+@@ -133,7 +133,7 @@ class SequenceMixin(models.AbstractModel):
+         self.ensure_one()
+         return "00000000"
+ 
+-    def _get_last_sequence(self, relaxed=False, with_prefix=None):
++    def _get_last_sequence(self, relaxed=False, with_prefix=None, lock=True):
+         """Retrieve the previous sequence.
+ 
+         This is done by taking the number with the greatest alphabetical value within
+@@ -165,20 +165,22 @@ class SequenceMixin(models.AbstractModel):
+             where_string += " AND sequence_prefix = %(with_prefix)s "
+             param['with_prefix'] = with_prefix
+ 
+-        query = """
+-            UPDATE {table} SET write_date = write_date WHERE id = (
+-                SELECT id FROM {table}
++        query = f"""
++                SELECT {{field}} FROM {self._table}
+                 {where_string}
+-                AND sequence_prefix = (SELECT sequence_prefix FROM {table} {where_string} ORDER BY id DESC LIMIT 1)
++                AND sequence_prefix = (SELECT sequence_prefix FROM {self._table} {where_string} ORDER BY id DESC LIMIT 1)
+                 ORDER BY sequence_number DESC
+                 LIMIT 1
++        """
++        if lock:
++            query = f"""
++            UPDATE {self._table} SET write_date = write_date WHERE id = (
++                {query.format(field='id')}
+             )
+-            RETURNING {field};
+-        """.format(
+-            table=self._table,
+-            where_string=where_string,
+-            field=self._sequence_field,
+-        )
++            RETURNING {self._sequence_field};
++            """
++        else:
++            query = query.format(field=self._sequence_field)
+ 
+         self.flush_model([self._sequence_field, 'sequence_number', 'sequence_prefix'])
+         self.env.cr.execute(query, param)

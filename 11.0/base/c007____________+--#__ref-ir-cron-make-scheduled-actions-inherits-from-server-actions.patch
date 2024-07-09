@@ -1,0 +1,313 @@
+PR: https://github.com/odoo/odoo/pull/
+
+From: 1c79c5ee3050ad8ba907aeda70c0d1f3dbe837a0
+From: Thibault Delavallée
+Date: 2017-01-03 18:11:07
+
+Structural Changes: 7
+Total Changes: 172
+
+[REF] ir_cron: make scheduled actions inherits from server actions
+
+The purpose of this commit is to handle code execution only in server
+action and delegate schedule management to ir_cron model.
+
+ir.cron model now inherits from ir.actions.server. Fields model, function
+and args are removed as well as the logic to handle them. There is no
+more code manipulation and evaluation in ir_cron, only a call to the run
+method of ir.actions.server.
+
+Cron form view use server action form view as primary view. This way
+automated actions use the same base form as server actions with
+cron details added.
+
+Thanks to @fpodoo for the original idea and preliminary work. Thanks to
+@jpr-odoo for first developments. Thanks to @jem-odoo for reviewing.
+
+================================= pseudo patch: =================================
+
+--- a/odoo/addons/base/ir/ir_actions.py
++++ b/odoo/addons/base/ir/ir_actions.py
+@@ -458,7 +458,8 @@ class IrActionsServer(models.Model):
+     name = fields.Char(string='Action Name', translate=True)
+     type = fields.Char(default='ir.actions.server')
+     usage = fields.Selection([
+-        ('ir_actions_server', 'Server Action')], string='Usage',
++        ('ir_actions_server', 'Server Action'),
++        ('ir_cron', 'Scheduled Action')], string='Usage',
+         default='ir_actions_server', required=True)
+     state = fields.Selection([
+         ('code', 'Execute Python Code'),
+
+--- a/odoo/addons/base/ir/ir_autovacuum.xml
++++ b/odoo/addons/base/ir/ir_autovacuum.xml
+@@ -1,13 +1,12 @@
+ <?xml version="1.0" encoding="utf-8"?>
+ <odoo>
+-        <record model="ir.cron" id="autovacuum_job">
+-            <field name='name'>Auto-vacuum internal data</field>
+-            <field name='interval_number'>1</field>
+-            <field name='interval_type'>days</field>
+-            <field name="numbercall">-1</field>
+-            <field name="active">True</field>
+-            <field name="model">ir.autovacuum</field>
+-            <field name="function">power_on</field>
+-            <field name="args">()</field>
+-        </record>
++    <record id="autovacuum_job" model="ir.cron">
++        <field name="name">Base: Auto-vacuum internal data</field>
++        <field name="model_id" ref="model_ir_autovacuum"/>
++        <field name="state">code</field>
++        <field name="code">model.power_on()</field>
++        <field name='interval_number'>1</field>
++        <field name='interval_type'>days</field>
++        <field name="numbercall">-1</field>
++    </record>
+ </odoo>
+
+--- a/odoo/addons/base/ir/ir_cron.py
++++ b/odoo/addons/base/ir/ir_cron.py
+@@ -10,17 +10,13 @@ from dateutil.relativedelta import relativedelta
+ 
+ import odoo
+ from odoo import api, fields, models, _
+-from odoo.exceptions import UserError, ValidationError
+-from odoo.tools.safe_eval import safe_eval
++from odoo.exceptions import UserError
+ 
+ _logger = logging.getLogger(__name__)
+ 
+ BASE_VERSION = odoo.modules.load_information_from_description_file('base')['version']
+ 
+ 
+-def str2tuple(s):
+-    return safe_eval('tuple(%s)' % (s or ''))
+-
+ _intervalTypes = {
+     'days': lambda interval: relativedelta(days=interval),
+     'hours': lambda interval: relativedelta(hours=interval),
+@@ -40,9 +36,12 @@ class ir_cron(models.Model):
+     # See also odoo.cron
+ 
+     _name = "ir.cron"
+-    _order = 'name'
++    _order = 'cron_name'
+ 
+-    name = fields.Char(required=True)
++    ir_actions_server_id = fields.Many2one(
++        'ir.actions.server', 'Server action',
++        delegate=True, ondelete='restrict', required=True)
++    cron_name = fields.Char('Name', related='ir_actions_server_id.name', store=True)
+     user_id = fields.Many2one('res.users', string='User', default=lambda self: self.env.user, required=True)
+     active = fields.Boolean(default=True)
+     interval_number = fields.Integer(default=1, help="Repeat every x.")
+@@ -54,77 +53,50 @@ class ir_cron(models.Model):
+     numbercall = fields.Integer(string='Number of Calls', default=1, help='How many times the method is called,\na negative number indicates no limit.')
+     doall = fields.Boolean(string='Repeat Missed', help="Specify if missed occurrences should be executed when the server restarts.")
+     nextcall = fields.Datetime(string='Next Execution Date', required=True, default=fields.Datetime.now, help="Next planned execution date for this job.")
+-    model = fields.Char(string='Object', help="Model name on which the method to be called is located, e.g. 'res.partner'.")
+-    function = fields.Char(string='Method', help="Name of the method to be called when this job is processed.")
+-    args = fields.Text(string='Arguments', help="Arguments to be passed to the method, e.g. (uid,).")
+     priority = fields.Integer(default=5, help='The priority of the job, as an integer: 0 means higher priority, 10 means lower priority.')
+ 
+-    @api.constrains('args')
+-    def _check_args(self):
+-        try:
+-            for this in self:
+-                str2tuple(this.args)
+-        except Exception:
+-            raise ValidationError(_('Invalid arguments'))
++    @api.model
++    def create(self, values):
++        values['usage'] = 'ir_cron'
++        return super(ir_cron, self).create(values)
+ 
+     @api.multi
+     def method_direct_trigger(self):
+         for cron in self:
+-            self.sudo(user=cron.user_id.id)._callback(cron.model, cron.function, cron.args, cron.id)
++            self.sudo(user=cron.user_id.id).ir_actions_server_id.run()
+         return True
+ 
+     @api.model
+-    def _handle_callback_exception(self, model_name, method_name, args, job_id, job_exception):
++    def _handle_callback_exception(self, cron_name, server_action_id, job_id, job_exception):
+         """ Method called when an exception is raised by a job.
+ 
+-        Simply logs the exception and rollback the transaction.
+-
+-        :param model_name: model name on which the job method is located.
+-        :param method_name: name of the method to call when this job is processed.
+-        :param args: arguments of the method (without the usual self, cr, uid).
+-        :param job_id: job id.
+-        :param job_exception: exception raised by the job.
+-
+-        """
++        Simply logs the exception and rollback the transaction. """
+         self._cr.rollback()
+-        _logger.exception("Call of self.env[%r].%s(*%r) failed in Job %s",
+-                          model_name, method_name, args, job_id)
++        _logger.exception("Call from cron %s for server action %d failed in Job %s",
++                          cron_name, server_action_id, job_id)
+ 
+     @api.model
+-    def _callback(self, model_name, method_name, args, job_id):
+-        """ Run the method associated to a given job
+-
+-        It takes care of logging and exception handling.
+-
+-        :param model_name: model name on which the job method is located.
+-        :param method_name: name of the method to call when this job is processed.
+-        :param args: arguments of the method (without the usual self, cr, uid).
+-        :param job_id: job id.
+-        """
++    def _callback(self, cron_name, server_action_id, job_id):
++        """ Run the method associated to a given job. It takes care of logging
++        and exception handling. Note that the user running the server action
++        is the user calling this method. """
+         try:
+-            args = str2tuple(args)
+             if self.pool != self.pool.check_signaling():
+                 # the registry has changed, reload self in the new registry
+                 self.env.reset()
+                 self = self.env()[self._name]
+-            if model_name in self.env:
+-                model = self.env[model_name]
+-                if hasattr(model, method_name):
+-                    log_depth = (None if _logger.isEnabledFor(logging.DEBUG) else 1)
+-                    odoo.netsvc.log(_logger, logging.DEBUG, 'cron.object.execute', (self._cr.dbname, self._uid, '*', model_name, method_name)+tuple(args), depth=log_depth)
+-                    if _logger.isEnabledFor(logging.DEBUG):
+-                        start_time = time.time()
+-                    getattr(model, method_name)(*args)
+-                    if _logger.isEnabledFor(logging.DEBUG):
+-                        end_time = time.time()
+-                        _logger.debug('%.3fs (%s, %s)', end_time - start_time, model_name, method_name)
+-                    self.pool.signal_caches_change()
+-                else:
+-                    _logger.warning("Method '%s.%s' does not exist.", model_name, method_name)
+-            else:
+-                _logger.warning("Model %r does not exist.", model_name)
++
++            log_depth = (None if _logger.isEnabledFor(logging.DEBUG) else 1)
++            odoo.netsvc.log(_logger, logging.DEBUG, 'cron.object.execute', (self._cr.dbname, self._uid, '*', cron_name, server_action_id), depth=log_depth)
++            if _logger.isEnabledFor(logging.DEBUG):
++                start_time = time.time()
++            self.env['ir.actions.server'].browse(server_action_id).run()
++            if _logger.isEnabledFor(logging.DEBUG):
++                end_time = time.time()
++                _logger.debug('%.3fs (cron %s, server action %d with uid %d)', end_time - start_time, cron_name, server_action_id, self.env.uid)
++            self.pool.signal_caches_change()
+         except Exception, e:
+-            self._handle_callback_exception(model_name, method_name, args, job_id, e)
++            self._handle_callback_exception(cron_name, server_action_id, job_id, e)
+ 
+     @classmethod
+     def _process_job(cls, job_cr, job, cron_cr):
+@@ -151,7 +123,7 @@ class ir_cron(models.Model):
+                     if numbercall > 0:
+                         numbercall -= 1
+                     if not ok or job['doall']:
+-                        cron._callback(job['model'], job['function'], job['args'], job['id'])
++                        cron._callback(job['cron_name'], job['ir_actions_server_id'], job['id'])
+                     if numbercall:
+                         nextcall += _intervalTypes[job['interval_type']](job['interval_number'])
+                     ok = True
+@@ -223,10 +195,10 @@ class ir_cron(models.Model):
+ 
+                 locked_job = lock_cr.fetchone()
+                 if not locked_job:
+-                    _logger.debug("Job `%s` already executed by another process/thread. skipping it", job['name'])
++                    _logger.debug("Job `%s` already executed by another process/thread. skipping it", job['cron_name'])
+                     continue
+                 # Got the lock on the job row, run its code
+-                _logger.debug('Starting job `%s`.', job['name'])
++                _logger.debug('Starting job `%s`.', job['cron_name'])
+                 job_cr = db.cursor()
+                 try:
+                     registry = odoo.registry(db_name)
+@@ -239,7 +211,7 @@ class ir_cron(models.Model):
+             except psycopg2.OperationalError, e:
+                 if e.pgcode == '55P03':
+                     # Class 55: Object not in prerequisite state; 55P03: lock_not_available
+-                    _logger.debug('Another process/thread is already busy executing job `%s`, skipping it.', job['name'])
++                    _logger.debug('Another process/thread is already busy executing job `%s`, skipping it.', job['cron_name'])
+                     continue
+                 else:
+                     # Unexpected OperationalError
+
+--- a/odoo/addons/base/ir/ir_cron_view.xml
++++ b/odoo/addons/base/ir/ir_cron_view.xml
+@@ -1,42 +1,28 @@
+ <?xml version="1.0" encoding="utf-8"?>
+ <odoo>
+         <!-- ir.cron -->
+-        <record id="ir_cron_view" model="ir.ui.view">
++        <record id="ir_cron_view_form" model="ir.ui.view">
++            <field name="name">ir.cron.view.form</field>
+             <field name="model">ir.cron</field>
++            <field name="mode">primary</field>
++            <field name="inherit_id" ref="base.view_server_action_form"/>
+             <field name="arch" type="xml">
+-                <form string="Scheduled Actions">
+-                    <header>
+-                        <button name="method_direct_trigger" type="object" string="Run Manually" class="oe_highlight"/> 
+-                    </header>
+-                   <sheet>
+-                    <group col="4">
+-                        <field name="name"/>
+-                        <field name="active"/>
+-                        <field name="user_id" />
+-                        <field name="priority" />
++                <xpath expr="//button[@name='create_action']" position="replace">
++                    <button name="method_direct_trigger" type="object" string="Run Manually" class="oe_highlight"/>
++                </xpath>
++                <xpath expr="//button[@name='unlink_action']" position="replace">
++                </xpath>
++                <xpath expr="//group[@name='action_wrapper']" position="inside">
++                    <group>
++                        <field name="user_id"/>
++                        <field name="priority"/>
++                        <field name="interval_number"/>
++                        <field name="interval_type"/>
++                        <field name="nextcall"/>
++                        <field name="numbercall"/>
++                        <field name="doall"/>
+                     </group>
+-                    <notebook>
+-                    <page string="Information">
+-                        <group col="4">
+-                            <field name="interval_number"/>
+-                            <field name="interval_type"/>
+-                            <newline/>
+-                            <field name="nextcall"/>
+-                            <field name="numbercall"/>
+-                            <field name="doall"/>
+-                        </group>
+-                    </page>
+-                    <page string="Technical Data" groups="base.group_no_one">
+-                        <group string="Action to Trigger">
+-                            <field name="model"/>
+-                            <field name="function"/>
+-                        </group>
+-                        <label for="args"/>
+-                        <field name="args"/>
+-                    </page>
+-                    </notebook>
+-                   </sheet> 
+-                </form>
++                </xpath>
+             </field>
+         </record>
+         <record id="ir_cron_view_tree" model="ir.ui.view">
+
+--- a/odoo/addons/base/tests/test_search.py
++++ b/odoo/addons/base/tests/test_search.py
+@@ -105,7 +105,7 @@ class test_search(TransactionCase):
+         cron_ids = {}
+         for u in 'BAC':
+             user_ids[u] = Users.create({'name': u, 'login': u}).id
+-            cron_ids[u] = Cron.create({'name': u, 'user_id': user_ids[u]}).id
++            cron_ids[u] = Cron.create({'name': u, 'model_id': self.env.ref('base.model_res_partner').id, 'user_id': user_ids[u]}).id
+ 
+         ids = Cron.search([('id', 'in', cron_ids.values())], order='user_id').ids
+         expected_ids = [cron_ids[l] for l in 'ABC']

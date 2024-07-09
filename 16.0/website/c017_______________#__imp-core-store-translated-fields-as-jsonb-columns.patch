@@ -1,0 +1,248 @@
+PR: https://github.com/odoo/odoo/pull/
+
+From: ef00294e7189359c47638c4a71626f1937395edb
+From: Chong Wang (cwg)
+Date: 2022-09-15 20:37:50
+
+Structural Changes: 1
+Total Changes: 132
+
+[IMP] core: store translated fields as JSONB columns
+
+Translated fields no longer use the model ir.translation.  Instead they store
+all their values as JSON, and store them into JSONB columns in the model's
+table.  The field's column value is either NULL or a JSON dict mapping language
+codes to text (the field's value in the corresponding language), and must
+contain an entry for key 'en_US' (as it is used as a fallback for all other
+languages).  Empty text is allowed in translation values, but not NULL.
+
+Here are examples for a field with translate=True:
+
+    NULL
+    {"en_US": "Foo"}
+    {"en_US": "Foo", "fr_FR": "Bar", "nl_NL": "Baz"}
+    {"en_US": "Foo", "fr_FR": "", "nl_NL": "Baz"}
+
+Like before, writing False to the field makes it NULL, i.e., False in all
+languages.  However, writing "" to the field makes its value empty in the
+current language, but does not discard the values in the other languages.
+
+Here are examples for a field with translate=xml_translate:
+
+    NULL
+    {"en_US": "<div>Foo<p>Bar</p></div>", "fr_FR": "<div>Fou<p>Barre</p></div>"}
+
+Change for callable(translate) fields: one can now write any value in any
+language on such a field.  The new value will be adapted in all languages, based
+on the mapping of terms between languages in the old values.  Basically the
+structure of the value must remain the same in all languages, like before.
+
+Reading a translated field is now both simpler and faster than the former
+implementation.  We fetch the value of the field in the current language by
+coalescing its value with the 'en_US' value of the field:
+
+    SELECT id, COALESCE(name->>'fr_FR', name->>'en_US') AS name ...
+
+The raw cache of the field contains either None or a dict which is conceptually
+a subset of the JSON value in database (except for missing languages).  For the
+sake of simplicity, most cache operations deal with the dict and return the text
+value in the current language.
+
+Trigram indexes have been adapted to the new storing strategy, and should enable
+to search in any language.  Before this change, only the source value of the
+field ('en_US') could be indexed.
+
+Computed stored translated fields are not supported by the framework, because of
+the complexity of the computation itself: the field would need to be computed in
+all active languages.  We chose to not provide any hook to compute a field in
+all languages at once, and the framework always invokes a compute method once to
+recompute it.
+
+Code translations are no longer stored into the database.  They become static,
+and are extracted from the PO files when needed.  The worker simply uses a cache
+with extracted code translations for performance.  This is reasonable, since
+fr_FR code translations for all modules takes around 2MB of memory, and the
+cache can be shared among all registries in the worker.  Changing code
+translations requires to update the corresponding PO file and reloading the
+worker(s).
+
+Performance summary:
+ (+) reading 'model' translated fields is faster
+ (+) reading 'model_terms' translated fields is much faster (no need to inject
+     translations into the source value)
+ (+) searching translated fields with operator 'ilike' is much faster when the
+     field is indexed with 'trigram'
+ (+) updating translated fields requires less ORM flushing
+ (-) importing translations from PO files is 2x slower
+
+Some extra fixes:
+ - make field 'name' of ir.actions.actions translated; because of the PG
+   inheritance, this is necessary to make the column definition consistent in
+   all models that inherit from ir.actions.actions.
+ - add some backend API for the web/website client for editing translations
+ - move methods get_field_string() to model ir.model.fields
+ - move _load_module_terms to model ir.module.module
+ - adapt tests in test_impex, test_new_api
+ - because env.lang is injected into SQL queries, its returned value is
+   now guaranteed to correspond to a valid active language or None
+ - remove wizard to insert missing translations (no longer makes sense)
+
+task-id: 2081307
+
+Co-authored-by: Fabien Pinckaers <fp@openerp.com>
+Co-authored-by: Raphael Collet <rco@odoo.com>
+
+================================= pseudo patch: =================================
+
+--- a/addons/website/models/__init__.py
++++ b/addons/website/models/__init__.py
+@@ -18,7 +18,6 @@ from . import website_menu
+ from . import website_page
+ from . import website_rewrite
+ from . import ir_rule
+-from . import ir_translation
+ from . import ir_ui_view
+ from . import res_company
+ from . import res_partner
+
+--- a/addons/website/models/ir_module_module.py
++++ b/addons/website/models/ir_module_module.py
+@@ -456,3 +456,70 @@ class IrModuleModule(models.Model):
+                 cow_view = View.browse(view_replay[0])
+                 View._load_records_write_on_cow(cow_view, view_replay[1], view_replay[2])
+             self.pool.website_views_to_adapt.clear()
++
++    @api.model
++    def _load_module_terms(self, modules, langs, overwrite=False):
++        """ Add missing website specific translation """
++        res = super()._load_module_terms(modules, langs, overwrite=overwrite)
++
++        if not langs or langs == ['en_US'] or not modules:
++            return res
++
++        # Add specific view translations
++
++        # use the translation dic of the generic to translate the specific
++        self.env.cr.flush()
++        cache = self.env.cache
++        View = self.env['ir.ui.view']
++        field = self.env['ir.ui.view']._fields['arch_db']
++        # assume there are not too many records
++        self.env.cr.execute(""" SELECT generic.arch_db, specific.arch_db, specific.id
++                          FROM ir_ui_view generic
++                         INNER JOIN ir_ui_view specific
++                            ON generic.key = specific.key
++                         WHERE generic.website_id IS NULL AND generic.type = 'qweb'
++                         AND specific.website_id IS NOT NULL
++            """)
++        for generic_arch_db, specific_arch_db, specific_id in self.env.cr.fetchall():
++            if not generic_arch_db:
++                continue
++            langs_update = (langs & generic_arch_db.keys()) - {'en_US'}
++            generic_arch_db_en = generic_arch_db.pop('en_US')
++            specific_arch_db_en = specific_arch_db.pop('en_US')
++            generic_arch_db = {k: generic_arch_db[k] for k in langs_update}
++            specific_arch_db = {k: specific_arch_db.get(k, specific_arch_db_en) for k in langs_update}
++            generic_translation_dictionary = field.get_translation_dictionary(generic_arch_db_en, generic_arch_db)
++            specific_translation_dictionary = field.get_translation_dictionary(specific_arch_db_en, specific_arch_db)
++            # update specific_translation_dictionary
++            for term_en, specific_term_langs in specific_translation_dictionary.items():
++                if term_en not in generic_translation_dictionary:
++                    continue
++                for lang, generic_term_lang in generic_translation_dictionary[term_en].items():
++                    if overwrite or term_en == specific_term_langs[lang]:
++                        specific_term_langs[lang] = generic_term_lang
++            for lang in langs_update:
++                specific_arch_db[lang] = field.translate(
++                    lambda term: specific_translation_dictionary.get(term, {lang: None})[lang], specific_arch_db_en)
++            specific_arch_db['en_US'] = specific_arch_db_en
++            cache.update_raw(View.browse(specific_id), field, [specific_arch_db], dirty=True)
++
++        default_menu = self.env.ref('website.main_menu', raise_if_not_found=False)
++        if not default_menu:
++            return res
++
++        o_menu_name = [f"'{lang}', o_menu.name->>'{lang}'" for lang in langs if lang != 'en_US']
++        o_menu_name = 'jsonb_build_object(' + ', '.join(o_menu_name) + ')'
++        self.env.cr.execute(f"""
++                        UPDATE website_menu menu
++                           SET name = {'menu.name || ' + o_menu_name if overwrite else o_menu_name + ' || menu.name'}
++                          FROM website_menu o_menu
++                         INNER JOIN website_menu s_menu
++                            ON o_menu.name->>'en_US' = s_menu.name->>'en_US' AND o_menu.url = s_menu.url
++                         INNER JOIN website_menu root_menu
++                            ON s_menu.parent_id = root_menu.id AND root_menu.parent_id IS NULL
++                         WHERE o_menu.website_id IS NULL AND o_menu.parent_id = %s
++                           AND s_menu.website_id IS NOT NULL
++                           AND menu.id = s_menu.id
++            """, (default_menu.id,))
++
++        return res
+
+--- a/addons/website/models/ir_translation.py
++++ b/None
+@@ -1,64 +0,0 @@
+-# -*- coding: utf-8 -*-
+-# Part of Odoo. See LICENSE file for full copyright and licensing details.
+-
+-from odoo import models
+-
+-class IrTranslation(models.Model):
+-    _inherit = "ir.translation"
+-
+-    def _load_module_terms(self, modules, langs, overwrite=False):
+-        """ Add missing website specific translation """
+-        res = super()._load_module_terms(modules, langs, overwrite=overwrite)
+-
+-        if not langs or not modules:
+-            return res
+-
+-        if overwrite:
+-            conflict_clause = """
+-                   ON CONFLICT {}
+-                   DO UPDATE SET (name, lang, res_id, src, type, value, module, state, comments) =
+-                       (EXCLUDED.name, EXCLUDED.lang, EXCLUDED.res_id, EXCLUDED.src, EXCLUDED.type,
+-                        EXCLUDED.value, EXCLUDED.module, EXCLUDED.state, EXCLUDED.comments)
+-                WHERE EXCLUDED.value IS NOT NULL AND EXCLUDED.value != ''
+-            """
+-        else:
+-            conflict_clause = " ON CONFLICT DO NOTHING"
+-
+-        # Add specific view translations
+-        self.env.cr.execute("""
+-            INSERT INTO ir_translation(name, lang, res_id, src, type, value, module, state, comments)
+-            SELECT DISTINCT ON (specific.id, t.lang, md5(src)) t.name, t.lang, specific.id, t.src, t.type, t.value, t.module, t.state, t.comments
+-              FROM ir_translation t
+-             INNER JOIN ir_ui_view generic
+-                ON t.type = 'model_terms' AND t.name = 'ir.ui.view,arch_db' AND t.res_id = generic.id
+-             INNER JOIN ir_ui_view specific
+-                ON generic.key = specific.key
+-             WHERE t.lang IN %s and t.module IN %s
+-               AND generic.website_id IS NULL AND generic.type = 'qweb'
+-               AND specific.website_id IS NOT NULL""" + conflict_clause.format(
+-                   "(type, name, lang, res_id, md5(src))"
+-        ), (tuple(langs), tuple(modules)))
+-
+-        default_menu = self.env.ref('website.main_menu', raise_if_not_found=False)
+-        if not default_menu:
+-            return res
+-
+-        # Add specific menu translations
+-        self.env.cr.execute("""
+-            INSERT INTO ir_translation(name, lang, res_id, src, type, value, module, state, comments)
+-            SELECT DISTINCT ON (s_menu.id, t.lang) t.name, t.lang, s_menu.id, t.src, t.type, t.value, t.module, t.state, t.comments
+-              FROM ir_translation t
+-             INNER JOIN website_menu o_menu
+-                ON t.type = 'model' AND t.name = 'website.menu,name' AND t.res_id = o_menu.id
+-             INNER JOIN website_menu s_menu
+-                ON o_menu.name = s_menu.name AND o_menu.url = s_menu.url
+-             INNER JOIN website_menu root_menu
+-                ON s_menu.parent_id = root_menu.id AND root_menu.parent_id IS NULL
+-             WHERE t.lang IN %s and t.module IN %s
+-               AND o_menu.website_id IS NULL AND o_menu.parent_id = %s
+-               AND s_menu.website_id IS NOT NULL
+-            """ + conflict_clause.format(
+-            "(type, lang, name, res_id) WHERE type = 'model'"
+-        ), (tuple(langs), tuple(modules), default_menu.id))
+-
+-        return res

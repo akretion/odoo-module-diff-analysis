@@ -1,0 +1,153 @@
+PR: https://github.com/odoo/odoo/pull/81914
+
+From: ca5ee8e2ae3d8b55122f9c8b637d95e076579915
+From: Philippe Wauthy
+Date: 2022-02-15 16:51:11
+
+Structural Changes: 1
+Total Changes: 73
+
+[FIX] hr_holidays: clean allocation validation
+
+PURPOSE
+
+When we made the b2b on Time Off, we designed the allocation settings to be like this :
+
+    1. Allow Allocation : NO (stop here)
+    2. If YES
+    Can the Employee requests Allocation himself ?
+2.1. NO (stop here, cause the HR will create the allocation and it will be automatically accepted)
+2.2. If YES
+Who will approve the Allocation made by the Employee ?
+2.2.1. Nobody, it's directly approved
+2.2.2. The time off officer must approve
+2.2.3. It's SET by the time off officer.
+
+In the day to day live, the case 2.2.3. never happen. It's the same settings as 2.1. "the employee will not make an allocaiton request, it will be the HR officer"
+In fact, nobody understand what is behind that settings and the technical code behind it seems obsolete.
+
+SPECIFICATION
+
+1. Remove the "set by time off officer"
+2. If Employee Requests is set on "Not Allowed", don't display Approval : https://tinyurl.com/yxwwql83 if an allocation is created, it will be done by the HR officer and automatically approved.
+
+task-2705150
+
+closes odoo/odoo#81914
+
+Related: odoo/upgrade#3247
+Related: odoo/enterprise#23105
+Signed-off-by: Kevin Baptiste <kba@odoo.com>
+
+================================= pseudo patch: =================================
+
+--- a/addons/hr_holidays/models/hr_leave_allocation.py
++++ b/addons/hr_holidays/models/hr_leave_allocation.py
+@@ -696,10 +696,7 @@ class HolidaysAllocation(models.Model):
+         self.ensure_one()
+         responsible = self.env.user
+ 
+-        if self.validation_type == 'manager' or (self.validation_type == 'both' and self.state == 'confirm'):
+-            if self.employee_id.leave_manager_id:
+-                responsible = self.employee_id.leave_manager_id
+-        elif self.validation_type == 'hr' or (self.validation_type == 'both' and self.state == 'validate1'):
++        if self.validation_type == 'officer':
+             if self.holiday_status_id.responsible_id:
+                 responsible = self.holiday_status_id.responsible_id
+ 
+@@ -708,29 +705,30 @@ class HolidaysAllocation(models.Model):
+     def activity_update(self):
+         to_clean, to_do = self.env['hr.leave.allocation'], self.env['hr.leave.allocation']
+         for allocation in self:
+-            note = _(
+-                'New Allocation Request created by %(user)s: %(count)s Days of %(allocation_type)s',
+-                user=allocation.create_uid.name,
+-                count=allocation.number_of_days,
+-                allocation_type=allocation.holiday_status_id.name
+-            )
+-            if allocation.state == 'draft':
+-                to_clean |= allocation
+-            elif allocation.state == 'confirm':
+-                allocation.activity_schedule(
+-                    'hr_holidays.mail_act_leave_allocation_approval',
+-                    note=note,
+-                    user_id=allocation.sudo()._get_responsible_for_approval().id or self.env.user.id)
+-            elif allocation.state == 'validate1':
+-                allocation.activity_feedback(['hr_holidays.mail_act_leave_allocation_approval'])
+-                allocation.activity_schedule(
+-                    'hr_holidays.mail_act_leave_allocation_second_approval',
+-                    note=note,
+-                    user_id=allocation.sudo()._get_responsible_for_approval().id or self.env.user.id)
+-            elif allocation.state == 'validate':
+-                to_do |= allocation
+-            elif allocation.state == 'refuse':
+-                to_clean |= allocation
++            if allocation.validation_type != 'no':
++                note = _(
++                    'New Allocation Request created by %(user)s: %(count)s Days of %(allocation_type)s',
++                    user=allocation.create_uid.name,
++                    count=allocation.number_of_days,
++                    allocation_type=allocation.holiday_status_id.name
++                )
++                if allocation.state == 'draft':
++                    to_clean |= allocation
++                elif allocation.state == 'confirm':
++                    allocation.activity_schedule(
++                        'hr_holidays.mail_act_leave_allocation_approval',
++                        note=note,
++                        user_id=allocation.sudo()._get_responsible_for_approval().id or self.env.user.id)
++                elif allocation.state == 'validate1':
++                    allocation.activity_feedback(['hr_holidays.mail_act_leave_allocation_approval'])
++                    allocation.activity_schedule(
++                        'hr_holidays.mail_act_leave_allocation_second_approval',
++                        note=note,
++                        user_id=allocation.sudo()._get_responsible_for_approval().id or self.env.user.id)
++                elif allocation.state == 'validate':
++                    to_do |= allocation
++                elif allocation.state == 'refuse':
++                    to_clean |= allocation
+         if to_clean:
+             to_clean.activity_unlink(['hr_holidays.mail_act_leave_allocation_approval', 'hr_holidays.mail_act_leave_allocation_second_approval'])
+         if to_do:
+
+--- a/addons/hr_holidays/models/hr_leave_type.py
++++ b/addons/hr_holidays/models/hr_leave_type.py
+@@ -85,14 +85,22 @@ class HolidaysType(models.Model):
+         ('both', "By Employee's Approver and Time Off Officer")], default='hr', string='Leave Validation')
+     requires_allocation = fields.Selection([
+         ('yes', 'Yes'),
+-        ('no', 'No Limit')], default="yes", required=True, string='Requires allocation')
++        ('no', 'No Limit')], default="yes", required=True, string='Requires allocation',
++        help="""Yes: Time off requests need to have a valid allocation.\n
++              No Limit: Time Off requests can be taken without any prior allocation.""")
+     employee_requests = fields.Selection([
+         ('yes', 'Extra Days Requests Allowed'),
+-        ('no', 'Not Allowed')], default="no", required=True, string="Employee Requests")
++        ('no', 'Not Allowed')], default="no", required=True, string="Employee Requests",
++        help="""Extra Days Requests Allowed: User can request an allocation for himself.\n
++        Not Allowed: User cannot request an allocation.""")
+     allocation_validation_type = fields.Selection([
+-        ('no', 'No validation needed'),
+         ('officer', 'Approved by Time Off Officer'),
+-        ('set', "Set by Time Off Officer")], default='officer', string='Approval')
++        ('no', 'No validation needed')], default='officer', string='Approval',
++        compute='_compute_allocation_validation_type', store=True, readonly=False,
++        help="""Approved by Time Off Officer: The requested allocation must be validated by the time off approver set on the
++        employee's profile or by a member of the time off officer security group.\n
++        No validation needed: The requested allocation is automatically approved.
++        """)
+     has_valid_allocation = fields.Boolean(compute='_compute_valid', search='_search_valid', help='This indicates if it is still possible to use this type of leave')
+     time_type = fields.Selection([('leave', 'Time Off'), ('other', 'Other')], default='leave', string="Kind of Leave",
+                                  help="Whether this should be computed as a holiday or as work time (eg: formation)")
+@@ -387,6 +395,11 @@ class HolidaysType(models.Model):
+         for leave_type in self:
+             leave_type.accrual_count = mapped_data.get(leave_type.id, 0)
+ 
++    @api.depends('employee_requests')
++    def _compute_allocation_validation_type(self):
++        for leave_type in self:
++            leave_type.allocation_validation_type = 'no' if leave_type.employee_requests == 'no' else 'officer'
++
+     def requested_name_get(self):
+         return self._context.get('holiday_status_name_get', True) and self._context.get('employee_id')
+ 

@@ -1,0 +1,182 @@
+PR: https://github.com/odoo/odoo/pull/138140
+
+From: 30a37c10ec8115b8c7b84f908a5fb4871d2f6cfb
+From: william-andre
+Date: 2023-10-25 11:37:23
+
+Structural Changes: 1
+Total Changes: 94
+
+[IMP] account: journal items match improvements
+
+This commit contains some misc improvements based on the 16.0 overall improvements regarding navigation and Journal Items
+
+in account.full.reconcile, 'name' field has been removed, and the replacement for matching_number will be the SQL id instead (no more sequences)
+
+For full reconciliations, the matching number now don't have an 'A' prefix
+For partial reconciliations, the matching number will have a format of 'P{id}'
+
+Community-pr: https://github.com/odoo/odoo/pull/138140
+Enterprise-pr: https://github.com/odoo/enterprise/pull/48980
+Task-id: 3530458
+Part-of: odoo/odoo#138140
+
+================================= pseudo patch: =================================
+
+--- a/addons/account/models/account_full_reconcile.py
++++ b/addons/account/models/account_full_reconcile.py
+@@ -6,7 +6,6 @@ class AccountFullReconcile(models.Model):
+     _name = "account.full.reconcile"
+     _description = "Full Reconcile"
+ 
+-    name = fields.Char(string='Number', required=True, copy=False, default=lambda self: self.env['ir.sequence'].next_by_code('account.reconcile'))
+     partial_reconcile_ids = fields.One2many('account.partial.reconcile', 'full_reconcile_id', string='Reconciliation Parts')
+     reconciled_line_ids = fields.One2many('account.move.line', 'full_reconcile_id', string='Matched Journal Items')
+     exchange_move_id = fields.Many2one('account.move', index="btree_not_null")
+@@ -35,3 +34,10 @@ class AccountFullReconcile(models.Model):
+             moves_to_reverse._reverse_moves(default_values_list, cancel=True)
+ 
+         return res
++
++    @api.model_create_multi
++    def create(self, vals_list):
++        fulls = super().create(vals_list)
++        for full in fulls:
++            full.reconciled_line_ids.matching_number = str(full.id)
++        return fulls
+
+--- a/addons/account/models/account_move_line.py
++++ b/addons/account/models/account_move_line.py
+@@ -256,7 +256,7 @@ class AccountMoveLine(models.Model):
+     )
+     matching_number = fields.Char(
+         string="Matching #",
+-        compute='_compute_matching_number', store=True,
++        readonly=True,
+         help="Matching number for this line, 'P' if it is only partially reconcile, or the name of "
+              "the full reconcile if it exists.",
+     )
+@@ -666,16 +666,6 @@ class AccountMoveLine(models.Model):
+             if line.currency_id == line.company_id.currency_id:
+                 line.amount_currency = line.balance
+ 
+-    @api.depends('full_reconcile_id.name', 'matched_debit_ids', 'matched_credit_ids')
+-    def _compute_matching_number(self):
+-        for record in self:
+-            if record.full_reconcile_id:
+-                record.matching_number = record.full_reconcile_id.name
+-            elif record.matched_debit_ids or record.matched_credit_ids:
+-                record.matching_number = 'P'
+-            else:
+-                record.matching_number = None
+-
+     @api.depends_context('order_cumulated_balance', 'domain_cumulated_balance')
+     def _compute_cumulated_balance(self):
+         if not self.env.context.get('order_cumulated_balance'):
+@@ -2948,13 +2938,22 @@ class AccountMoveLine(models.Model):
+ 
+     def _all_reconciled_lines(self):
+         reconciliation_lines = self.filtered(lambda x: x.account_id.reconcile or x.account_id.account_type in ('asset_cash', 'liability_credit_card'))
+-        current_lines = reconciliation_lines
+-        current_partials = self.env['account.partial.reconcile']
+-        while current_lines:
+-            current_partials = (current_lines.matched_debit_ids + current_lines.matched_credit_ids) - current_partials
+-            current_lines = (current_partials.debit_move_id + current_partials.credit_move_id) - current_lines
+-            reconciliation_lines += current_lines
+-        return reconciliation_lines
++        self.env['account.partial.reconcile'].flush_model()
++        self.env.cr.execute("""
++            WITH RECURSIVE partials (current_id) AS (
++                    SELECT line.id
++                      FROM account_move_line line
++                     WHERE id = ANY(%s)
++
++                                                UNION
++
++                    SELECT CASE WHEN partial.debit_move_id = p.current_id THEN partial.credit_move_id ELSE partial.debit_move_id END
++                      FROM partials p
++                      JOIN account_partial_reconcile partial ON partial.debit_move_id = p.current_id OR partial.credit_move_id = p.current_id
++            )
++            SELECT current_id FROM partials;
++        """, [reconciliation_lines.ids])
++        return self.browse(r[0] for r in self.env.cr.fetchall())
+ 
+     def _get_attachment_domains(self):
+         self.ensure_one()
+
+--- a/addons/account/models/account_partial_reconcile.py
++++ b/addons/account/models/account_partial_reconcile.py
+@@ -8,7 +8,6 @@ from datetime import date
+ class AccountPartialReconcile(models.Model):
+     _name = "account.partial.reconcile"
+     _description = "Partial Reconcile"
+-    _rec_name = "id"
+ 
+     # ==== Reconciliation fields ====
+     debit_move_id = fields.Many2one(
+@@ -106,6 +105,7 @@ class AccountPartialReconcile(models.Model):
+ 
+         # Retrieve the matching number to unlink.
+         full_to_unlink = self.full_reconcile_id
++        all_reconciled = self.debit_move_id + self.credit_move_id
+ 
+         # Retrieve the CABA entries to reverse.
+         moves_to_reverse = self.env['account.move'].search([('tax_cash_basis_rec_id', 'in', self.ids)])
+@@ -126,8 +126,57 @@ class AccountPartialReconcile(models.Model):
+             } for move in moves_to_reverse]
+             moves_to_reverse._reverse_moves(default_values_list, cancel=True)
+ 
++        self._update_matching_number(all_reconciled)
+         return res
+ 
++    @api.model_create_multi
++    def create(self, vals_list):
++        partials = super().create(vals_list)
++        self._update_matching_number(partials.debit_move_id + partials.credit_move_id)
++        return partials
++
++    @api.model
++    def _update_matching_number(self, amls):
++        amls = amls._all_reconciled_lines()
++        self.env['account.partial.reconcile'].flush_model()
++        amls.flush_recordset(['full_reconcile_id'])
++        self.env.cr.execute("""
++            WITH RECURSIVE partials (line_id, current_id) AS (
++                    SELECT id, id 
++                      FROM account_move_line
++                     WHERE id = ANY(%s)
++                       AND full_reconcile_id IS NULL
++
++                                                UNION
++                                                
++                    SELECT p.line_id,
++                           CASE WHEN partial.debit_move_id = p.current_id THEN partial.credit_move_id
++                                ELSE partial.debit_move_id
++                           END
++                      FROM partials p
++                      JOIN account_partial_reconcile partial ON p.current_id = partial.debit_move_id
++                                                             OR p.current_id = partial.credit_move_id
++            )
++              SELECT line_id, 'P' || MIN(partial.id) AS matching_number
++                FROM partials
++                JOIN account_partial_reconcile partial ON current_id = partial.debit_move_id
++                                                       OR current_id = partial.credit_move_id
++            GROUP BY line_id
++        """, [
++            amls.ids,
++        ])
++
++        line_matching_number = dict(self.env.cr.fetchall())
++
++        for line in amls:
++            if line.full_reconcile_id:
++                line.matching_number = str(line.full_reconcile_id.id)
++            elif line.matched_debit_ids or line.matched_credit_ids:
++                line.matching_number = line_matching_number[line.id]
++            else:
++                line.matching_number = False
++
++
+     # -------------------------------------------------------------------------
+     # RECONCILIATION METHODS
+     # -------------------------------------------------------------------------

@@ -1,0 +1,181 @@
+PR: https://github.com/odoo/odoo/pull/
+
+From: c7f53f770c1d22fd9aff1823a04c86464a91bf71
+From: Tiffany Chang (tic)
+Date: 2020-11-30 16:28:47
+
+Structural Changes: 5
+Total Changes: 54
+
+[IMP] mrp, (purchase_)stock: improve move reservation
+
+Currently stock moves are auto-assigned (i.e. reserve free stock) both
+when the scheduler is run and when a corresponding stock move that can
+assign a move is completed. This strictness was causing issues for
+prioritization of moves to assign, for example a picking with a
+scheduled_date far in the future could automatically reserve all stock
+if it was created before another picking that an immediate
+scheduled_date. To ease this, an extra setting has been added to
+stock.picking.type to let users choose how reservations should occur for
+moves assigned to that picking_type (or picking with that picking_type):
+
+1. 'at_confirm' = automatically when:
+   - stock is available when the move's associated picking/MO is
+   confirmed,
+   - when new stock becomes available,
+   - when the scheduler is triggered (+ stock available).
+2. 'manual' = user must always manually click "Check Availability"
+   button (scheduler will no longer reserve).
+3. 'by_date' = automatically when within the move's reservation_date
+   and:
+   - stock is available when the move's associated picking/MO is
+   confirmed,
+   - new stock becomes available when move is already confirmed, or
+   - the scheduler is run (+ stock is available).
+
+'by_date' has an extra option of # days before the move's scheduled
+date that affects the move.reservation_date.
+
+Task: 2359317
+Upgrade PR: odoo/upgrade#1868
+ENT PR: odoo/enterprise#15050
+
+================================= pseudo patch: =================================
+
+--- a/addons/stock/models/stock_move.py
++++ b/addons/stock/models/stock_move.py
+@@ -3,7 +3,7 @@
+ 
+ import json
+ from collections import defaultdict
+-from datetime import datetime
++from datetime import datetime, timedelta
+ from itertools import groupby
+ from operator import itemgetter
+ from re import findall as regex_findall
+@@ -180,6 +180,8 @@ class StockMove(models.Model):
+     forecast_availability = fields.Float('Forecast Availability', compute='_compute_forecast_information', digits='Product Unit of Measure')
+     forecast_expected_date = fields.Datetime('Forecasted Expected date', compute='_compute_forecast_information')
+     lot_ids = fields.Many2many('stock.production.lot', compute='_compute_lot_ids', inverse='_set_lot_ids', string='Serial Numbers', readonly=False)
++    reservation_date = fields.Date('Date to Reserve', compute='_compute_reservation_date', store=True,
++        help="This is a technical field for calculating when a move should be reserved")
+ 
+     @api.onchange('product_id', 'picking_type_id')
+     def onchange_product(self):
+@@ -493,6 +495,18 @@ class StockMove(models.Model):
+                     move_lines_commands.append((0, 0, move_line_vals))
+             move.write({'move_line_ids': move_lines_commands})
+ 
++    @api.depends('picking_id', 'picking_type_id', 'date')
++    def _compute_reservation_date(self):
++        for move in self:
++            if move.state in ['draft', 'confirmed', 'waiting', 'partially_available']:
++                picking_type_id = False
++                if move.picking_type_id:
++                    picking_type_id = move.picking_type_id
++                elif move.picking_id:
++                    picking_type_id = move.picking_id.picking_type_id
++                if picking_type_id and picking_type_id.reservation_method == 'by_date':
++                    move.reservation_date = fields.Date.to_date(move.date) - timedelta(days=move.picking_type_id.reservation_days_before)
++
+     @api.constrains('product_uom')
+     def _check_uom(self):
+         moves_error = self.filtered(lambda move: move.product_id.uom_id.category_id != move.product_uom.category_id)
+@@ -1120,9 +1134,14 @@ class StockMove(models.Model):
+         if merge:
+             moves = self._merge_moves(merge_into=merge_into)
+ 
+-        # call `_action_assign` on every confirmed move which location_id bypasses the reservation
+-        moves.filtered(lambda move: not move.picking_id.immediate_transfer and move._should_bypass_reservation() and move.state == 'confirmed')._action_assign()
+-
++        # call `_action_assign` on every confirmed move which location_id bypasses the reservation + those expected to be auto-assigned
++        moves.filtered(lambda move: not move.picking_id.immediate_transfer
++                       and move.state == 'confirmed'
++                       and (move._should_bypass_reservation()
++                            or move.picking_type_id.reservation_method == 'at_confirm'
++                            or move.picking_id.picking_type_id.reservation_method == 'at_confirm'
++                            or (move.reservation_date and move.reservation_date <= fields.Date.today())))\
++             ._action_assign()
+         if new_push_moves:
+             new_push_moves._action_confirm()
+ 
+@@ -1385,6 +1404,8 @@ class StockMove(models.Model):
+         self.env['stock.move.line'].create(move_line_vals_list)
+         partially_available_moves.write({'state': 'partially_available'})
+         assigned_moves.write({'state': 'assigned'})
++        if self.env.context.get('bypass_entire_pack'):
++            return
+         self.mapped('picking_id')._check_entire_pack()
+ 
+     def _action_cancel(self):
+@@ -1502,7 +1523,9 @@ class StockMove(models.Model):
+                 new_move_vals = move._split(qty_split)
+                 backorder_moves_vals += new_move_vals
+         backorder_moves = self.env['stock.move'].create(backorder_moves_vals)
+-        backorder_moves._action_confirm(merge=False)
++        # The backorder moves are not yet in their own picking. We do not want to check entire packs for those
++        # ones as it could messed up the result_package_id of the moves being currently validated
++        backorder_moves.with_context(bypass_entire_pack=True)._action_confirm(merge=False)
+         if cancel_backorder:
+             backorder_moves.with_context(moves_todo=moves_todo)._action_cancel()
+         moves_todo.mapped('move_line_ids').sorted()._action_done()
+@@ -1528,7 +1551,9 @@ class StockMove(models.Model):
+             return moves_todo
+ 
+         if picking and not cancel_backorder:
+-            picking._create_backorder()
++            backorder = picking._create_backorder()
++            if any([m.state == 'assigned' for m in backorder.move_lines]):
++               backorder._check_entire_pack()
+         return moves_todo
+ 
+     def unlink(self):
+@@ -1770,5 +1795,8 @@ class StockMove(models.Model):
+         for move in self:
+             domains.append([('product_id', '=', move.product_id.id), ('location_id', '=', move.location_dest_id.id)])
+         static_domain = [('state', 'in', ['confirmed', 'partially_available']), ('procure_method', '=', 'make_to_stock')]
+-        moves_to_reserve = self.env['stock.move'].search(expression.AND([static_domain, expression.OR(domains)]))
++        reservation_domain = ['|', '|', ('picking_type_id.reservation_method', '=', 'at_confirm'),
++                              ('picking_id.picking_type_id.reservation_method', '=', 'at_confirm'),
++                              ('reservation_date', '<=', fields.Date.today())]
++        moves_to_reserve = self.env['stock.move'].search(expression.AND([static_domain, expression.OR(domains), reservation_domain]))
+         moves_to_reserve._action_assign()
+
+--- a/addons/stock/models/stock_picking.py
++++ b/addons/stock/models/stock_picking.py
+@@ -5,7 +5,7 @@ import json
+ import time
+ from ast import literal_eval
+ from collections import defaultdict
+-from datetime import date
++from datetime import date, timedelta
+ from itertools import groupby
+ from operator import itemgetter
+ 
+@@ -66,6 +66,12 @@ class PickingType(models.Model):
+         'Pre-fill Detailed Operations', default=True,
+         help="If this checkbox is ticked, Odoo will automatically pre-fill the detailed "
+         "operations with the corresponding products, locations and lot/serial numbers.")
++    reservation_method = fields.Selection(
++        [('by_date', 'before scheduled date'), ('at_confirm', 'At Confirmation'), ('manual', 'Manually')],
++        'Reservation Method', required=True, default='at_confirm',
++        help="How products in transfers of this operation type should be reserved.")
++    reservation_days_before = fields.Integer('Days', help="Maximum number of days before scheduled date that products should be reserved.")
++
+ 
+     count_picking_draft = fields.Integer(compute='_compute_picking_count')
+     count_picking_ready = fields.Integer(compute='_compute_picking_count')
+
+--- a/addons/stock/models/stock_rule.py
++++ b/addons/stock/models/stock_rule.py
+@@ -489,6 +489,10 @@ class ProcurementGroup(models.Model):
+             ('state', 'in', ['confirmed', 'partially_available']),
+             ('product_uom_qty', '!=', 0.0)
+         ]
++        # TODO: make picking_type_id/reservation method one value on stock.move
++        moves_domain = expression.AND([moves_domain, ['|', '|', ('picking_type_id.reservation_method', '=', 'at_confirm'),
++                                                                ('picking_id.picking_type_id.reservation_method', '=', 'at_confirm'),
++                                                                ('reservation_date', '<=', fields.Date.today())]])
+         if company_id:
+             moves_domain = expression.AND([[('company_id', '=', company_id)], moves_domain])
+         return moves_domain

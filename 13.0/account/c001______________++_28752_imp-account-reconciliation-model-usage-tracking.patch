@@ -1,0 +1,127 @@
+PR: https://github.com/odoo/odoo/pull/28752
+
+From: 82294fd7d3359c195e9cb86f072b5d21440d181a
+From: wan
+Date: 2019-01-28 13:56:53
+
+Structural Changes: 5
+Total Changes: 41
+
+[IMP] account: reconciliation model usage tracking
+
+Task 1883977
+
+==== Purpose ====
+Keep track of journal entries generated using the reconciliation model.
+
+There is no easy way to see a summary of what journal items have been reconciled with a bank statement. This makes troubleshooting difficult. There should be a way to see the detailed history of which bank statement items were reconciled with which journal items.
+
+==== Technical Specs ====
+
+Make a many2one in account.move.line to retrieve the account.reconcile.model having generated this line.
+(Make a computed many2many on account.move to the account.reconcile.model)
+
+Add a stat button on the account.reconcile.model form view to retrieve journal entries more easily.
+
+closes odoo/odoo#28752
+
+================================= pseudo patch: =================================
+
+--- a/addons/account/models/account_bank_statement.py
++++ b/addons/account/models/account_bank_statement.py
+@@ -546,6 +546,7 @@ class AccountBankStatementLine(models.Model):
+                 - 'account_id'
+                 - (optional) 'tax_ids'
+                 - (optional) Other account.move.line fields like analytic_account_id or analytics_id
++                - (optional) 'reconcile_model_id'
+ 
+             :returns: The journal entries with which the transaction was matched. If there was at least an entry in counterpart_aml_dicts or new_aml_dicts, this list contains
+                 the move created by the reconciliation, containing entries for the statement.line (1), the counterpart move lines (0..*) and the new move lines (0..*).
+
+--- a/addons/account/models/account_move.py
++++ b/addons/account/models/account_move.py
+@@ -61,6 +61,23 @@ class AccountMove(models.Model):
+                 move.matched_percentage = 1.0
+             else:
+                 move.matched_percentage = total_reconciled / total_amount
++                
++    @api.multi
++    @api.depends('line_ids.reconcile_model_id')
++    def _compute_reconcile_model(self):
++        for move in self:
++            move.reconcile_model_id = move.line_ids.mapped('reconcile_model_id')
++    
++    @api.model
++    @api.depends('reconcile_model_id')
++    def _search_reconcile_model(self, operator, operand):
++        if operand:
++            rmi = self.search([('line_ids.reconcile_model_id', operator, operand)])
++        else:
++            rmi = self.search([('line_ids', operator, operand)])
++        if rmi:
++            return [('id', 'in', rmi.ids)]
++        return [('id', '=', False)]
+ 
+     @api.one
+     @api.depends('company_id')
+@@ -106,6 +123,7 @@ class AccountMove(models.Model):
+     narration = fields.Text(string='Internal Note')
+     company_id = fields.Many2one('res.company', related='journal_id.company_id', string='Company', store=True, readonly=True)
+     matched_percentage = fields.Float('Percentage Matched', compute='_compute_matched_percentage', digits=0, store=True, readonly=True, help="Technical field used in cash basis method")
++    reconcile_model_id = fields.Many2many('account.reconcile.model', compute='_compute_reconcile_model', search='_search_reconcile_model', string="Reconciliation Model", readonly=True)
+     # Dummy Account field to search on account.move by account_id
+     dummy_account_id = fields.Many2one('account.account', related='line_ids.account_id', string='Account', store=False, readonly=True)
+     tax_cash_basis_rec_id = fields.Many2one(
+@@ -609,6 +627,7 @@ class AccountMoveLine(models.Model):
+     statement_id = fields.Many2one('account.bank.statement', related='statement_line_id.statement_id', string='Statement', store=True,
+         help="The bank statement used for bank reconciliation", index=True, copy=False)
+     reconciled = fields.Boolean(compute='_amount_residual', store=True)
++    reconcile_model_id = fields.Many2one('account.reconcile.model', string="Reconciliation Model", copy=False)
+     full_reconcile_id = fields.Many2one('account.full.reconcile', string="Matching Number", copy=False, index=True)
+     matched_debit_ids = fields.One2many('account.partial.reconcile', 'credit_move_id', String='Matched Debits',
+         help='Debit journal items that are matched with this journal item.')
+@@ -1019,6 +1038,7 @@ class AccountMoveLine(models.Model):
+             return True
+         rec_move_ids = self.env['account.partial.reconcile']
+         for account_move_line in self:
++            account_move_line.reconcile_model_id = False
+             for invoice in account_move_line.payment_id.invoice_ids:
+                 if invoice.id == self.env.context.get('invoice_id') and account_move_line in invoice.payment_move_line_ids:
+                     account_move_line.payment_id.write({'invoice_ids': [(3, invoice.id, None)]})
+
+--- a/addons/account/models/account_reconcile_model.py
++++ b/addons/account/models/account_reconcile_model.py
+@@ -107,6 +107,24 @@ class AccountReconcileModel(models.Model):
+     second_analytic_account_id = fields.Many2one('account.analytic.account', string='Second Analytic Account', ondelete='set null')
+     second_analytic_tag_ids = fields.Many2many('account.analytic.tag', string='Second Analytic Tags',
+                                                relation='account_reconcile_model_second_analytic_tag_rel')
++    
++    number_entries = fields.Integer(string='Number of entries related to this model', compute='_compute_number_entries')
++
++    @api.multi
++    def action_reconcile_stat(self):
++        action = self.env.ref('account.action_move_journal_line').read()[0]
++        action.update({
++            'context': {'search_default_reconcile_model_id': self.name},
++            'help': """<p class="o_view_nocontent_empty_folder">{}</p>""".format(_('No move from this reconciliation model')),
++        })
++        return action
++        
++    @api.multi
++    def _compute_number_entries(self):
++        data = self.env['account.move.line'].read_group([('reconcile_model_id', 'in', self.ids)], ['reconcile_model_ids'], 'reconcile_model_id')
++        mapped_data = dict([(d['reconcile_model_id'][0], d['reconcile_model_id_count']) for d in data])
++        for model in self:
++            model.number_entries = mapped_data.get(model.id, 0)
+ 
+     @api.onchange('name')
+     def onchange_name(self):
+
+--- a/addons/account/models/chart_template.py
++++ b/addons/account/models/chart_template.py
+@@ -1054,3 +1054,5 @@ class AccountReconcileModelTemplate(models.Model):
+     force_second_tax_included = fields.Boolean(string='Second Tax Included in Price',
+         help='Force the second tax to be managed as a price included tax.')
+     second_tax_id = fields.Many2one('account.tax.template', string='Second Tax', ondelete='restrict', domain=[('type_tax_use', '=', 'purchase')])
++
++    number_entries = fields.Integer(string='Number of entries related to this model', compute='_compute_number_entries')

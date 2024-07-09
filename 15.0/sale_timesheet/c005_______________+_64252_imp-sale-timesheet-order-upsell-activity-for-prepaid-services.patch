@@ -1,0 +1,124 @@
+PR: https://github.com/odoo/odoo/pull/64252
+
+From: cd885ad2cdf9e4af64d2d0ae1672536bb51df09e
+From: Xavier BOL (xbo)
+Date: 2021-01-21 10:00:07
+
+Structural Changes: 3
+Total Changes: 44
+
+[IMP] sale{_timesheet}: order upsell activity for prepaid services
+
+When offering services, it is critical to make sure that the time being
+delivered is billable. Otherwise, the company is loosing money.
+
+This commit adds two fields in product.template:
+    1. service_upsell_warning
+    2. service_upsell_threshold
+The first one is a boolean, if it is checked than the second one is
+displayed to add a threshold. This threshold is used to create a upsell
+activity want the (qty_delivered / qty_ordered) in a SOL of this product
+is greater than the threshold defined in the product.
+
+Moreover, when the following condition for a SOL:
+(delivered quantity / ordered quantity) >= threshold set in the product
+is True, then we display an upsell warning for the corresponding
+SO. The problem is we don't check if the warning has already displayed
+by a certain SOL. Thus, each time we timesheet for this SOL, we display
+one more time.
+
+This commit avoids to spam the salesman, to do this, we add a new
+boolean field in sale.order.line, this field will be True if the warning
+upsell activity is shown thanks to the SOL.
+
+A method is added in sale module to create the upsell activity for each SO.
+This method is used in sale_timesheet module to avoid duplicated code.
+
+Finally, an unit test has been added to check the feature.
+
+task-2411291
+
+closes odoo/odoo#64252
+
+Related: odoo/upgrade#2066
+Signed-off-by: Yannick Tivisse (yti) <yti@odoo.com>
+
+================================= pseudo patch: =================================
+
+--- a/addons/sale_timesheet/models/product.py
++++ b/addons/sale_timesheet/models/product.py
+@@ -21,6 +21,8 @@ class ProductTemplate(models.Model):
+     # override domain
+     project_id = fields.Many2one(domain="[('allow_billable', '=', True), ('pricing_type', '=', 'task_rate'), ('allow_timesheets', 'in', [service_policy == 'delivered_timesheet' or '', True])]")
+     project_template_id = fields.Many2one(domain="[('allow_billable', '=', True), ('pricing_type', 'in', ('fixed_rate', 'employee_rate')), ('allow_timesheets', 'in', [service_policy == 'delivered_timesheet' or '', True])]")
++    service_upsell_warning = fields.Boolean('Upsell Warning', help="The salesperson in charge will be assigned an activity informing him of an upselling opportunity once the selected threshold is reached.")
++    service_upsell_threshold = fields.Float('Threshold', help="Percentage of time delivered compared to the prepaid amount that must be reached for the upselling opportunity activity to be triggered.")
+ 
+     def _default_visible_expense_policy(self):
+         visibility = self.user_has_groups('project.group_project_user')
+
+--- a/addons/sale_timesheet/models/sale_order.py
++++ b/addons/sale_timesheet/models/sale_order.py
+@@ -5,6 +5,7 @@ import math
+ 
+ from odoo import api, fields, models, _
+ from odoo.osv import expression
++from odoo.tools import float_compare
+ 
+ 
+ class SaleOrder(models.Model):
+@@ -42,6 +43,46 @@ class SaleOrder(models.Model):
+             total_time *= sale_order.timesheet_encode_uom_id.factor
+             sale_order.timesheet_total_duration = round(total_time)
+ 
++    def _compute_field_value(self, field):
++        super()._compute_field_value(field)
++        if field.name != 'invoice_status' or self.env.context.get('mail_activity_automation_skip'):
++            return
++
++        # Get SOs which their state is not equal to upselling or invoied and if at least a SOL has warning prepaid service upsell set to True and the warning has not already been displayed
++        upsellable_orders = self.filtered(lambda so:
++            so.state == 'sale'
++            and so.invoice_status not in ('upselling', 'invoiced')
++            and (so.user_id or so.partner_id.user_id)  # salesperson needed to assign upsell activity
++        )
++        for order in upsellable_orders:
++            upsellable_lines = order._get_prepaid_service_lines_to_upsell()
++            if upsellable_lines:
++                order._create_upsell_activity()
++                # We want to display only one time the warning for each SOL
++                upsellable_lines.write({'has_displayed_warning_upsell': True})
++
++    def _get_prepaid_service_lines_to_upsell(self):
++        """ Retrieve all sols which need to display an upsell activity warning in the SO
++
++            These SOLs should contain a product which has:
++                - type="service",
++                - service_policy="ordered_timesheet",
++                - service_upsell_warning=True.
++        """
++        self.ensure_one()
++        precision = self.env['decimal.precision'].precision_get('Product Unit of Measure')
++        return self.order_line.filtered(lambda sol:
++            sol.is_service
++            and not sol.has_displayed_warning_upsell  # we don't want to display many times the warning each time we timesheet on the SOL
++            and sol.product_id.service_policy == 'ordered_timesheet'
++            and sol.product_id.service_upsell_warning
++            and float_compare(
++                sol.qty_delivered,
++                sol.product_uom_qty * (sol.product_id.service_upsell_threshold or 1.0),
++                precision_digits=precision
++            ) >= 0
++        )
++
+     def action_view_project_ids(self):
+         self.ensure_one()
+         # redirect to form or kanban view
+@@ -81,6 +122,7 @@ class SaleOrderLine(models.Model):
+     analytic_line_ids = fields.One2many(domain=[('project_id', '=', False)])  # only analytic lines, not timesheets (since this field determine if SO line came from expense)
+     remaining_hours_available = fields.Boolean(compute='_compute_remaining_hours_available', compute_sudo=True)
+     remaining_hours = fields.Float('Remaining Hours on SO', compute='_compute_remaining_hours', compute_sudo=True, store=True)
++    has_displayed_warning_upsell = fields.Boolean('Has Displayed Warning Upsell')
+ 
+     def name_get(self):
+         res = super(SaleOrderLine, self).name_get()

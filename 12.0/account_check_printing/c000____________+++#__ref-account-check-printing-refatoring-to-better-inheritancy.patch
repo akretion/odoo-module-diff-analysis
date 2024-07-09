@@ -1,0 +1,209 @@
+PR: https://github.com/odoo/odoo/pull/
+
+From: 32db86e3a0029e5be2258545dc3562dc9e3f54a2
+From: Christophe Monniez
+Date: 2018-02-01 15:48:33
+
+Structural Changes: 15
+Total Changes: 162
+
+[REF] account_check_printing: refatoring to better inheritancy
+
+* localized checks layout of US and CA introduced in enterprise
+* account settings now install account_check_printing instead of the US checks layout
+Wsa PR #18791. Was task 33298
+
+================================= pseudo patch: =================================
+
+--- a/addons/account_check_printing/models/__init__.py
++++ b/addons/account_check_printing/models/__init__.py
+@@ -4,3 +4,5 @@
+ from . import account_journal
+ from . import account_payment
+ from . import chart_template
++from . import res_company
++from . import res_config_settings
+\ No newline at end of file
+
+--- a/addons/account_check_printing/models/account_payment.py
++++ b/addons/account_check_printing/models/account_payment.py
+@@ -3,7 +3,9 @@
+ 
+ from odoo import models, fields, api, _
+ from odoo.exceptions import UserError, ValidationError
++from odoo.tools.misc import formatLang, format_date
+ 
++INV_LINES_PER_STUB = 9
+ 
+ class AccountRegisterPayments(models.TransientModel):
+     _inherit = "account.register.payments"
+@@ -118,5 +120,104 @@ class AccountPayment(models.Model):
+     @api.multi
+     def do_print_checks(self):
+         """ This method is a hook for l10n_xx_check_printing modules to implement actual check printing capabilities """
+-        raise UserError(_("There is no check layout configured.\nMake sure the proper check printing module is installed"
+-                          " and its configuration (in company settings > 'Configuration' tab) is correct."))
++        raise UserError(_("You have to choose a check layout. For this, go in Apps, search for 'Checks layout' and install one."))
++
++    #######################
++    #CHECK PRINTING METHODS
++    #######################
++    def _check_fill_line(self, amount_str):
++        return amount_str and (amount_str + ' ').ljust(200, '*') or ''
++
++    def _check_build_page_info(self, i, p):
++        multi_stub = self.company_id.account_check_printing_multi_stub
++        return {
++            'sequence_number': self.check_number if (self.journal_id.check_manual_sequencing and self.check_number != 0) else False,
++            'payment_date': format_date(self.env, self.payment_date),
++            'partner_id': self.partner_id,
++            'partner_name': self.partner_id.name,
++            'currency': self.currency_id,
++            'state': self.state,
++            'amount': formatLang(self.env, self.amount, currency_obj=self.currency_id) if i == 0 else 'VOID',
++            'amount_in_word': self._check_fill_line(self.check_amount_in_words) if i == 0 else 'VOID',
++            'memo': self.communication,
++            'stub_cropped': not multi_stub and len(self.invoice_ids) > INV_LINES_PER_STUB,
++            # If the payment does not reference an invoice, there is no stub line to display
++            'stub_lines': p,
++        }
++
++    def _check_get_pages(self):
++        """ Returns the data structure used by the template : a list of dicts containing what to print on pages.
++        """
++        stub_pages = self._check_make_stub_pages() or [False]
++        pages = []
++        for i, p in enumerate(stub_pages):
++            pages.append(self._check_build_page_info(i, p))
++        return pages
++
++    def _check_make_stub_pages(self):
++        """ The stub is the summary of paid invoices. It may spill on several pages, in which case only the check on
++            first page is valid. This function returns a list of stub lines per page.
++        """
++        if len(self.invoice_ids) == 0:
++            return None
++
++        multi_stub = self.company_id.account_check_printing_multi_stub
++
++        invoices = self.invoice_ids.sorted(key=lambda r: r.date_due)
++        debits = invoices.filtered(lambda r: r.type == 'in_invoice')
++        credits = invoices.filtered(lambda r: r.type == 'in_refund')
++
++        # Prepare the stub lines
++        if not credits:
++            stub_lines = [self.make_stub_line(inv) for inv in invoices]
++        else:
++            stub_lines = [{'header': True, 'name': "Bills"}]
++            stub_lines += [self.make_stub_line(inv) for inv in debits]
++            stub_lines += [{'header': True, 'name': "Refunds"}]
++            stub_lines += [self.make_stub_line(inv) for inv in credits]
++
++        # Crop the stub lines or split them on multiple pages
++        if not multi_stub:
++            # If we need to crop the stub, leave place for an ellipsis line
++            num_stub_lines = len(stub_lines) > INV_LINES_PER_STUB and INV_LINES_PER_STUB - 1 or INV_LINES_PER_STUB
++            stub_pages = [stub_lines[:num_stub_lines]]
++        else:
++            stub_pages = []
++            i = 0
++            while i < len(stub_lines):
++                # Make sure we don't start the credit section at the end of a page
++                if len(stub_lines) >= i + INV_LINES_PER_STUB and stub_lines[i + INV_LINES_PER_STUB - 1].get('header'):
++                    num_stub_lines = INV_LINES_PER_STUB - 1 or INV_LINES_PER_STUB
++                else:
++                    num_stub_lines = INV_LINES_PER_STUB
++                stub_pages.append(stub_lines[i:i + num_stub_lines])
++                i += num_stub_lines
++
++        return stub_pages
++
++    def _check_make_stub_line(self, invoice):
++        """ Return the dict used to display an invoice/refund in the stub
++        """
++        # Find the account.partial.reconcile which are common to the invoice and the payment
++        if invoice.type in ['in_invoice', 'out_refund']:
++            invoice_sign = 1
++            invoice_payment_reconcile = invoice.move_id.line_ids.mapped('matched_debit_ids').filtered(lambda r: r.debit_move_id in self.move_line_ids)
++        else:
++            invoice_sign = -1
++            invoice_payment_reconcile = invoice.move_id.line_ids.mapped('matched_credit_ids').filtered(lambda r: r.credit_move_id in self.move_line_ids)
++
++        if self.currency_id != self.journal_id.company_id.currency_id:
++            amount_paid = abs(sum(invoice_payment_reconcile.mapped('amount_currency')))
++        else:
++            amount_paid = abs(sum(invoice_payment_reconcile.mapped('amount')))
++
++        amount_residual = invoice_sign * invoice.residual
++
++        return {
++            'due_date': format_date(self.env, invoice.date_due),
++            'number': invoice.reference and invoice.number + ' - ' + invoice.reference or invoice.number,
++            'amount_total': formatLang(self.env, invoice_sign * invoice.amount_total, currency_obj=invoice.currency_id),
++            'amount_residual': formatLang(self.env, amount_residual, currency_obj=invoice.currency_id) if amount_residual * 10**4 != 0 else '-',
++            'amount_paid': formatLang(self.env, invoice_sign * amount_paid, currency_obj=invoice.currency_id),
++            'currency': invoice.currency_id,
++        }
+
+--- a/None
++++ b/addons/account_check_printing/models/res_company.py
+@@ -0,0 +1,32 @@
++# -*- coding: utf-8 -*-
++
++from openerp import models, api, fields
++
++class res_company(models.Model):
++    _inherit = "res.company"
++
++    account_check_printing_layout = fields.Selection(string="Check Layout", required=True,
++        help="Select the format corresponding to the check paper you will be printing your checks on.\n"
++             "In order to disable the printing feature, select 'None'.",
++        selection=[
++            ('disabled', 'None'),
++            ('action_print_check_top', 'check on top'),
++            ('action_print_check_middle', 'check in middle'),
++            ('action_print_check_bottom', 'check on bottom')
++        ],
++        default="action_print_check_top")
++
++    account_check_printing_date_label = fields.Boolean('Print Date Label', default=True,
++        help="This option allows you to print the date label on the check as per CPA. Disable this if your pre-printed check includes the date label.")
++
++    account_check_printing_multi_stub = fields.Boolean('Multi-Pages Check Stub',
++        help="This option allows you to print check details (stub) on multiple pages if they don't fit on a single page.")
++
++    account_check_printing_margin_top = fields.Float('Check Top Margin', default=0.25,
++        help="Adjust the margins of generated checks to make it fit your printer's settings.")
++
++    account_check_printing_margin_left = fields.Float('Check Left Margin', default=0.25,
++        help="Adjust the margins of generated checks to make it fit your printer's settings.")
++
++    account_check_printing_margin_right = fields.Float('Right Margin', default=0.25,
++        help="Adjust the margins of generated checks to make it fit your printer's settings.")
+
+--- a/None
++++ b/addons/account_check_printing/models/res_config_settings.py
+@@ -0,0 +1,23 @@
++# -*- coding: utf-8 -*-
++# Part of Odoo. See LICENSE file for full copyright and licensing details.
++
++from odoo import fields, models
++
++
++class ResConfigSettings(models.TransientModel):
++    _inherit = 'res.config.settings'
++
++    country_code = fields.Char(string="Company Country code", related='company_id.country_id.code', readonly=True)
++    account_check_printing_layout = fields.Selection(related='company_id.account_check_printing_layout', string="Check Layout",
++        help="Select the format corresponding to the check paper you will be printing your checks on.\n"
++             "In order to disable the printing feature, select 'None'.")
++    account_check_printing_date_label = fields.Boolean(related='company_id.account_check_printing_date_label', string="Print Date Label",
++        help="This option allows you to print the date label on the check as per CPA. Disable this if your pre-printed check includes the date label.")
++    account_check_printing_multi_stub = fields.Boolean(related='company_id.account_check_printing_multi_stub', string='Multi-Pages Check Stub',
++        help="This option allows you to print check details (stub) on multiple pages if they don't fit on a single page.")
++    account_check_printing_margin_top = fields.Float(related='company_id.account_check_printing_margin_top', string='Check Top Margin',
++        help="Adjust the margins of generated checks to make it fit your printer's settings.")
++    account_check_printing_margin_left = fields.Float(related='company_id.account_check_printing_margin_left', string='Check Left Margin',
++        help="Adjust the margins of generated checks to make it fit your printer's settings.")
++    account_check_printing_margin_right = fields.Float(related='company_id.account_check_printing_margin_right', string='Check Right Margin',
++        help="Adjust the margins of generated checks to make it fit your printer's settings.")

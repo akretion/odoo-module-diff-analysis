@@ -1,0 +1,675 @@
+PR: https://github.com/odoo/odoo/pull/
+
+From: 4444475ef477d986040dbc435e1b2286b52e51ce
+From: Xavier-Do
+Date: 2021-06-02 07:47:48
+
+Structural Changes: 9
+Total Changes: 479
+
+[ADD] base, core: built-in profiling tool in Odoo
+
+This commit adds tooling to profile performance and save execution by
+saving stack traces and queries to a file/database in specific format.
+
+----------
+Collectors
+----------
+
+For now, three different profiling modes (aka Collectors) are available
+even if a last once should be introduced by @Gorash to profile qweb
+execution.
+
+- SQLCollector (or 'sql'): Saves the current stack trace and the query
+every time Cursor.execute() is called. Any query executed on the thread
+will be collected, no matter the cursor.
+
+- PeriodicCollector (or 'traces_async'): Saves the stack trace every
+'interval' seconds using a parallel thread to profile the caller thread.
+The python implementation was optimized to minimize impact on
+performance while remaining portable and easy to enable/disable
+inside a odoo execution. Higher the frequency (lower the interval),
+more impactful the profiling will become on the execution and increase
+memory usage. From last experiments, 1ms looks to be a good minimum for
+short executions.
+
+- SyncCollector (or 'traces_sync'): Saves the stack trace every function
+call/return. This collector is obviously quite impactful on performance
+and can quickly overload the memory for long executions, but this is
+quite useful to understand the precise path followed by some short
+executions. Any time related information will be almost irrelevant with this
+collector.
+
+A base Collector defining minimal collectors features can easily be
+extended to create custom collectors if needed.
+
+----------------
+Profiler & Usage
+----------------
+
+Collectors are not supposed to be used by themselves, but should be
+given to a Profiler. The Profiler will synchronize collectors starts and
+stop, and manage saving them to a file of in a ir_profile in the
+database.
+
+Exemple of usage:
+```
+    with Profiler():
+        do_stuff()
+```
+
+This simple example will use the default collectors (sql and
+traces_async) and save them to the database. The database is defined
+automatically from current_thread 'dbname' if available.
+
+Example of usage:
+```
+    with Profiler(collectors=['sql'], db=False, path=/home/user/logs/do_stuff_profile/{time}):
+        do_stuff()
+```
+
+This more complex example disable the default behavior consisting
+to save to the database, gives a path where the profile will be saved
+and specify to only use the 'sql' collector. Note that
+collectors=[SQLCollector()] would have the same behavior since
+Collectors can be either a Collector instance or a string describing the
+desired collector. This allows to define custom params for the
+collectors and use custom collectors if needed.
+
+Note that it is always possible to get results after execution without
+saving it since they are available on the profiler.
+
+```
+    with Profiler(collectors=['sql'], db=False) as p:
+        do_stuff()
+    print(len([None for entry in p.collectors[0].entries if ...]))
+```
+
+Profiler will also save the stack below the profiler start point, and
+collectors will only collect the part of the stack over this stack.
+This is a good way to reduce collectors CPU and memory usage.
+
+Collected entries will be saved as follows:
+
+```
+    [{
+        'start': 2.0,
+        'context': {},
+        'stack': [
+            ['path_to_file', lno, 'func_name', 'line_content'],
+            ...
+        ],
+    },
+    ...
+    ]
+```
+SQLCollector will add three additional keys on each entry:
+- query      (query without parameters)
+- full_query (mogrified query with parameters)
+- time       (the 'exact' execution time of the query)
+
+----------------
+ExecutionContext
+----------------
+
+A last tool, ExecutionContext, allows to define some context on some block of code:
+
+Example of usage:
+```
+    def process_modules(modules)
+        for module in modules:
+          with ExecutionContext(module=module): # note the 'not linter frienldy but still convenient' 2 spaces indentation
+            do_stuff(module):
+```
+
+This context will automatically be added in the stack as a virtual frame between
+process_modules and do_stuff in order to split do_stuff from one single frame to
+one frame per module.
+
+----------
+Speedscope
+----------
+The saved data are in a simple json format easy to analyze, but can't be visualized in
+speedscope as they are. A utility class `Speedscope` can be used to generate a format
+readable by speedscope. The used format is actually the format defined by speedscope,
+meaning that all features should be available using it.
+
+The output format is evented, meaning that we need to transform a list of samples
+(a list of stack) to a list of event (going in/out a frame).
+This is the main task of the Speedscope, as well as combining samples from different
+sources, to display SQLCollector and PeriodicCollector results mixed together.
+
+When stored on an ir_profile, the default speedscope generation can easily be generated
+with the speedscope computed field.
+
+This class can be used as it is but will mainly be useful for the next commit.
+
+Special thanks to @rco-odoo for the in depth review and @Gorash for support.
+
+================================= pseudo patch: =================================
+
+--- a/odoo/addons/base/__manifest__.py
++++ b/odoo/addons/base/__manifest__.py
+@@ -63,6 +63,7 @@ The kernel of Odoo, needed for all installation.
+         'wizard/base_partner_merge_views.xml',
+         'data/ir_actions_data.xml',
+         'data/ir_demo_failure_data.xml',
++        'views/ir_profile_views.xml',
+         'views/res_company_views.xml',
+         'views/res_lang_views.xml',
+         'views/res_partner_views.xml',
+
+--- a/odoo/addons/base/models/__init__.py
++++ b/odoo/addons/base/models/__init__.py
+@@ -33,6 +33,7 @@ from . import ir_demo_failure
+ from . import report_layout
+ from . import report_paperformat
+ 
++from . import ir_profile
+ from . import image_mixin
+ from . import avatar_mixin
+ 
+
+--- a/None
++++ b/odoo/addons/base/models/ir_profile.py
+@@ -0,0 +1,52 @@
++# -*- coding: utf-8 -*-
++# Part of Odoo. See LICENSE file for full copyright and licensing details.
++
++import json
++import base64
++import datetime
++
++from odoo import fields, models, api
++from odoo.exceptions import UserError
++from odoo.http import request
++from odoo.tools.profiler import make_session
++from odoo.tools.speedscope import Speedscope
++
++
++class IrProfile(models.Model):
++    _name = 'ir.profile'
++    _description = 'Profiling results'
++    _log_access = False  # avoid useless foreign key on res_user
++    _order = 'session desc, id desc'
++
++    create_date = fields.Datetime('Creation Date')
++
++    session = fields.Char('Session', index=True)
++    name = fields.Char('Description')
++    duration = fields.Float('Duration')
++
++    init_stack_trace = fields.Text('Initial stack trace', prefetch=False)
++
++    sql = fields.Text('Sql', prefetch=False)
++    traces_async = fields.Text('Traces Async', prefetch=False)
++    traces_sync = fields.Text('Traces Sync', prefetch=False)
++
++    speedscope = fields.Binary('Speedscope', compute='_compute_speedscope')
++
++    @api.autovacuum
++    def _gc_profile(self):
++        # remove profiles older than 30 days
++        domain = [('create_date', '<', fields.Datetime.now() - datetime.timedelta(days=30))]
++        return self.sudo().search(domain).unlink()
++
++    def _compute_speedscope(self):
++        for execution in self:
++            sp = Speedscope(init_stack_trace=json.loads(execution.init_stack_trace))
++            if execution.sql:
++                sp.add('sql', json.loads(execution.sql))
++            if execution.traces_async:
++                sp.add('frames', json.loads(execution.traces_async))
++            if execution.traces_sync:
++                sp.add('settrace', json.loads(execution.traces_sync))
++
++            result = json.dumps(sp.add_default().make())
++            execution.speedscope = base64.b64encode(result.encode('utf-8'))
+
+--- a/odoo/addons/base/security/ir.model.access.csv
++++ b/odoo/addons/base/security/ir.model.access.csv
+@@ -121,3 +121,4 @@
+ "access_base_update_translations","access.base.update.translations","model_base_update_translations","base.group_system",1,1,1,0
+ "access_base_partner_merge_line","access.base.partner.merge.line","model_base_partner_merge_line","base.group_partner_manager",1,1,1,0
+ "access_base_partner_merge_automatic_wizard","access.base.partner.merge.automatic.wizard","model_base_partner_merge_automatic_wizard","base.group_partner_manager",1,1,1,0
++"access_ir_profile","ir_profile","model_ir_profile","group_system",1,1,1,1
+
+--- a/odoo/addons/base/tests/__init__.py
++++ b/odoo/addons/base/tests/__init__.py
+@@ -45,4 +45,5 @@ from . import test_reports
+ from . import test_tests_tags
+ from . import test_form_create
+ from . import test_cloc
++from . import test_profiler
+ from . import test_pdf
+
+--- a/None
++++ b/odoo/addons/base/tests/test_profiler.py
+@@ -0,0 +1,367 @@
++# -*- coding: utf-8 -*-
++# Part of Odoo. See LICENSE file for full copyright and licensing details.
++import time
++
++from odoo.exceptions import AccessError
++from odoo.tests.common import BaseCase, TransactionCase, tagged, new_test_user
++from odoo.tools import profiler
++from odoo.tools.profiler import Profiler, ExecutionContext
++from odoo.tools.speedscope import Speedscope
++
++
++@tagged('post_install', '-at_install', 'profiling')
++# post_install to ensure mail is already loaded if installed (new_test_user would fail otherwise because of notification_type)
++class TestProfileAccess(TransactionCase):
++
++    @classmethod
++    def setUpClass(cls):
++        super().setUpClass()
++        cls.test_profile = cls.env['ir.profile'].create({})
++
++    def test_admin_has_access(self):
++        self.assertEqual(self.env['ir.profile'].search([('id', '=', self.test_profile.id)]), self.test_profile)
++        self.test_profile.read(['name'])
++
++    def test_user_no_access(self):
++        user = new_test_user(self.env, login='noProfile', groups='base.group_user')
++        with self.with_user('noProfile'), self.assertRaises(AccessError):
++            self.env['ir.profile'].search([])
++        with self.assertRaises(AccessError):
++            self.test_profile.with_user(user).read(['name'])
++
++
++@tagged('post_install', '-at_install', 'profiling')
++class TestSpeedscope(BaseCase):
++    def example_profile(self):
++        return {
++            'init_stack_trace': [['/path/tp/file_1.py', 135, '__main__', 'main()']],
++            'result': [{  # init frame
++                'start': 2.0,
++                'context': {},
++                'stack': [
++                    ['/path/tp/file_1.py', 10, 'main', 'do_stuff1(test=do_tests)'],
++                    ['/path/to/file_1.py', 101, 'do_stuff1', 'cr.execute(query, params)'],
++                ],
++            }, {
++                'start': 3.0,
++                'context': {},
++                'stack': [
++                    ['/path/tp/file_1.py', 10, 'main', 'do_stuff1(test=do_tests)'],
++                    ['/path/to/file_1.py', 101, 'do_stuff1', 'cr.execute(query, params)'],
++                    ['/path/to/sql_db.py', 650, 'execute', 'res = self._obj.execute(query, params)'],
++                ],
++            }, {  # duplicate frame
++                'start': 4.0,
++                'context': {},
++                'stack': [
++                    ['/path/tp/file_1.py', 10, 'main', 'do_stuff1(test=do_tests)'],
++                    ['/path/to/file_1.py', 101, 'do_stuff1', 'cr.execute(query, params)'],
++                    ['/path/to/sql_db.py', 650, 'execute', 'res = self._obj.execute(query, params)'],
++                ],
++            }, {  # other frame
++                'start': 6.0,
++                'context': {},
++                'stack': [
++                    ['/path/tp/file_1.py', 10, 'main', 'do_stuff1(test=do_tests)'],
++                    ['/path/to/file_1.py', 101, 'do_stuff1', 'check'],
++                    ['/path/to/sql_db.py', 650, 'check', 'assert x = y'],
++                ],
++            }, {  # out of frame
++                'start': 10.0,
++                'context': {},
++                'stack': [
++                    ['/path/tp/file_1.py', 10, 'main', 'do_stuff1(test=do_tests)'],
++                    ['/path/to/file_1.py', 101, 'do_stuff1', 'for i in range(10):'],
++                ],
++            }, {  # final frame
++                'start': 10.35,
++                'context': {},
++                'stack': None,
++            }],
++        }
++
++    def test_convert_empty(self):
++        Speedscope().make()
++
++    def test_converts_profile_simple(self):
++        profile = self.example_profile()
++
++        sp = Speedscope(init_stack_trace=profile['init_stack_trace'])
++        sp.add('profile', profile['result'])
++        sp.add_output(['profile'], complete=False)
++        res = sp.make()
++
++        frames = res['shared']['frames']
++        self.assertEqual(len(frames), 4)
++
++        profile_combined = res['profiles'][0]
++        events = [(e['type'], e['frame']) for e in profile_combined['events']]
++        self.assertEqual(events, [
++            ('O', 0),  # /main
++            ('O', 1),  # /main/do_stuff1
++            ('O', 2),  # /main/do_stuff1/execute
++            ('C', 2),  # /main/do_stuff1
++            ('O', 3),  # /main/do_stuff1/check
++            ('C', 3),  # /main/do_stuff1
++            ('C', 1),  # /main
++            ('C', 0),  # /
++        ])
++        self.assertEqual(profile_combined['events'][0]['at'], 0.0)
++        self.assertEqual(profile_combined['events'][-1]['at'], 8.35)
++
++    def test_converts_profile_no_end(self):
++        profile = self.example_profile()
++        profile['result'].pop()
++
++        sp = Speedscope(init_stack_trace=profile['init_stack_trace'])
++        sp.add('profile', profile['result'])
++        sp.add_output(['profile'], complete=False)
++        res = sp.make()
++        profile_combined = res['profiles'][0]
++        events = [(e['type'], e['frame']) for e in profile_combined['events']]
++
++        self.assertEqual(events, [
++            ('O', 0),  # /main
++            ('O', 1),  # /main/do_stuff1
++            ('O', 2),  # /main/do_stuff1/execute
++            ('C', 2),  # /main/do_stuff1
++            ('O', 3),  # /main/do_stuff1/check
++            ('C', 3),  # /main/do_stuff1
++            ('C', 1),  # /main
++            ('C', 0),  # /
++        ])
++        self.assertEqual(profile_combined['events'][-1]['at'], 8)
++
++    def test_converts_init_stack_trace(self):
++        profile = self.example_profile()
++
++        sp = Speedscope(init_stack_trace=profile['init_stack_trace'])
++        sp.add('profile', profile['result'])
++        sp.add_output(['profile'], complete=True)
++        res = sp.make()
++
++        profile_combined = res['profiles'][0]
++        events = [(e['type'], e['frame']) for e in profile_combined['events']]
++
++        self.assertEqual(events, [
++            ('O', 4),  # /__main__/
++            ('O', 0),  # /__main__/main
++            ('O', 1),  # /__main__/main/do_stuff1
++            ('O', 2),  # /__main__/main/do_stuff1/execute
++            ('C', 2),  # /__main__/main/do_stuff1
++            ('O', 3),  # /__main__/main/do_stuff1/check
++            ('C', 3),  # /__main__/main/do_stuff1
++            ('C', 1),  # /__main__/main
++            ('C', 0),  # /__main__/
++            ('C', 4),  # /
++        ])
++        self.assertEqual(profile_combined['events'][-1]['at'], 8.35)
++
++    def test_end_priority(self):
++        """
++        If a sample as a time (usually a query) we expect to keep the complete frame
++        even if another concurent frame tics before the end of the current one:
++        frame duration should always be more reliable.
++        """
++
++        async_profile = self.example_profile()['result']
++        sql_profile = self.example_profile()['result']
++        # make sql_profile a single frame from 2.5 to 5.5
++        sql_profile = [sql_profile[1]]
++        sql_profile[0]['start'] = 2.5
++        sql_profile[0]['time'] = 3
++        sql_profile[0]['query'] = 'SELECT 1'
++        sql_profile[0]['full_query'] = 'SELECT 1'
++        # some check to ensure the take makes sence
++        self.assertEqual(async_profile[1]['start'], 3)
++        self.assertEqual(async_profile[2]['start'], 4)
++
++        self.assertNotIn('query', async_profile[1]['stack'])
++        self.assertNotIn('time', async_profile[1]['stack'])
++        self.assertEqual(async_profile[1]['stack'], async_profile[2]['stack'])
++        # this last assertion is not really usefull but ensure that the samples are consistent with the sql one, just missing que query
++
++        sp = Speedscope(init_stack_trace=[])
++        sp.add('sql', async_profile)
++        sp.add('traces', sql_profile)
++        sp.add_output(['sql', 'traces'], complete=False)
++        res = sp.make()
++        profile_combined = res['profiles'][0]
++        events = [(e['at']+2, e['type'], res['shared']['frames'][e['frame']]['name']) for e in profile_combined['events']]
++        self.assertEqual(events, [
++            (2.0, 'O', 'main'),
++            (2.0, 'O', 'do_stuff1'),
++            (2.5, 'O', 'execute'),
++            (2.5, 'O', "sql('SELECT 1')"),
++            (5.5, 'C', "sql('SELECT 1')"), # select ends at 5.5 as expected despite another concurent frame at 3 and 4
++            (5.5, 'C', 'execute'),
++            (6.0, 'O', 'check'),
++            (10.0, 'C', 'check'),
++            (10.35, 'C', 'do_stuff1'),
++            (10.35, 'C', 'main'),
++        ])
++
++
++@tagged('post_install', '-at_install', 'profiling')
++class TestProfiling(TransactionCase):
++
++    def test_default_values(self):
++        p = Profiler()
++        self.assertEqual(p.db, self.env.cr.dbname)
++
++    def test_env_profiler_database(self):
++        p = Profiler(collectors=[])
++        self.assertEqual(p.db, self.env.cr.dbname)
++
++    def test_env_profiler_description(self):
++        with Profiler(collectors=[], db=None) as p:
++            self.assertIn('test_env_profiler_description', p.description)
++
++    def test_execution_context_save(self):
++        with Profiler(db=None, collectors=['sql']) as p:
++            for letter in ('a', 'b'):
++                stack_level = profiler.stack_size()
++                with ExecutionContext(letter=letter):
++                    self.env.cr.execute('SELECT 1')
++        stack_level = profiler.stack_size()
++        entries = p.collectors[0].entries
++        self.assertEqual(entries[0]['exec_context'][stack_level], {'letter': 'a'})
++        self.assertEqual(entries[1]['exec_context'][stack_level], {'letter': 'b'})
++
++    def test_sync_recorder(self):
++        def a():
++            b()
++            c()
++
++        def b():
++            pass
++
++        def c():
++            d()
++            d()
++
++        def d():
++            pass
++
++        with Profiler(description='test', collectors=['traces_sync'], db=None) as p:
++            a()
++
++        stacks = [r['stack'] for r in p.collectors[0].entries]
++
++        # map stack frames to their function name, and check
++        stacks_methods = [[frame[2] for frame in stack] for stack in stacks]
++        self.assertEqual(stacks_methods, [
++            ['a'],
++            ['a', 'b'],
++            ['a'],
++            ['a', 'c'],
++            ['a', 'c', 'd'],
++            ['a', 'c'],
++            ['a', 'c', 'd'],
++            ['a', 'c'],
++            ['a'],
++            [],
++            ['__exit__'],
++            ['__exit__', 'stop']  # could be removed by cleaning two last frames, or removing last frames only contained in profiler.py
++        ])
++
++        # map stack frames to their line number, and check
++        stacks_lines = [[frame[1] for frame in stack] for stack in stacks]
++        self.assertEqual(stacks_lines[1][0] + 1, stacks_lines[3][0],
++                         "Call of b() in a() should be one line before call of c()")
++
++    def test_default_recorders(self):
++        with Profiler(db=None) as p:
++            queries_start = self.env.cr.sql_log_count
++            for i in range(10):
++                self.env['res.partner'].create({'name': 'snail%s' % i})
++            self.env['res.partner'].flush()
++            total_queries = self.env.cr.sql_log_count - queries_start
++
++        rq = next(r for r in p.collectors if r.name == "sql").entries
++        self.assertEqual(p.init_stack_trace[-1][2], 'test_default_recorders')
++        self.assertEqual(p.init_stack_trace[-1][0].split('/')[-1], 'test_profiler.py')
++
++        self.assertEqual(len(rq), total_queries)
++        first_query = rq[0]
++        self.assertEqual(first_query['stack'][0][2], 'create')
++        #self.assertIn("self.env['res.partner'].create({", first_query['stack'][0][3])
++
++        self.assertGreater(first_query['time'], 0)
++        self.assertEqual(first_query['stack'][-1][2], 'execute')
++        self.assertEqual(first_query['stack'][-1][0].split('/')[-1], 'sql_db.py')
++
++
++def deep_call(func, depth):
++    """ Call the given function at the given call depth. """
++    if depth > 0:
++        deep_call(func, depth - 1)
++    else:
++        func()
++
++
++@tagged('-standard', 'profiling_performance')
++class TestPerformance(BaseCase):
++
++    def test_collector_max_frequency(self):
++        """
++        Check the creation time of an entry
++        """
++        collector = profiler.Collector()
++        p = Profiler(collectors=[collector], db=None)
++
++        def collect():
++            collector.add()
++
++        # collect on changing stack
++        with p:
++            start = time.time()
++            while start + 1 > time.time():
++                deep_call(collect, 20)
++
++        self.assertGreater(len(collector.entries), 20000)  # ~40000
++
++        # collect on identical stack
++        collector = profiler.Collector()
++        p = Profiler(collectors=[collector], db=None)
++
++        def collect_1_s():
++            start = time.time()
++            while start + 1 > time.time():
++                collector.add()
++
++        with p:
++            deep_call(collect_1_s, 20)
++
++        self.assertGreater(len(collector.entries), 50000)  # ~70000
++
++    def test_frequencies_1ms_sleep(self):
++        """
++        Check the number of entries generated in 1s at 1kHz
++        we need to artificially change the frame as often as possible to avoid
++        triggering the memory optimisation skipping identical frames
++        """
++        def sleep_1():
++            time.sleep(0.0001)
++
++        def sleep_2():
++            time.sleep(0.0001)
++
++        with Profiler(collectors=['traces_async'], db=None) as res:
++            start = time.time()
++            while start + 1 > time.time():
++                sleep_1()
++                sleep_2()
++
++        entry_count = len(res.collectors[0].entries)
++        self.assertGreater(entry_count, 700)  # ~920
++
++    def test_traces_async_memory_optimisation(self):
++        """
++        Identical frames should be saved only once.
++        We should only have a few entries on a 1 second sleep.
++        """
++        with Profiler(collectors=['traces_async'], db=None) as res:
++            time.sleep(1)
++        entry_count = len(res.collectors[0].entries)
++        self.assertLess(entry_count, 5)  # ~3
+
+--- a/None
++++ b/odoo/addons/base/views/ir_profile_views.xml
+@@ -0,0 +1,56 @@
++<?xml version="1.0" encoding="utf-8"?>
++<odoo>
++
++    <record id="ir_profile_view_search" model="ir.ui.view">
++        <field name="name">IR Profile Search</field>
++        <field name="model">ir.profile</field>
++        <field name="arch" type="xml">
++            <search>
++                <field name="name" string="Name"/>
++                <field name="session" string="Session"/>
++                <filter name="group_session" string="Session" context="{'group_by':'session'}"/>
++            </search>
++        </field>
++    </record>
++
++    <record id="ir_profile_view_list" model="ir.ui.view">
++        <field name="name">IR Profile List</field>
++        <field name="model">ir.profile</field>
++        <field name="arch" type="xml">
++            <tree string="Profile Session" default_order="session desc, id desc">
++                <field name="create_date"/>
++                <field name="session"/>
++                <field name="name"/>
++                <field name="duration"/>
++            </tree>
++        </field>
++    </record>
++
++    <record id="ir_profile_view_form" model="ir.ui.view">
++        <field name="name">IR Profile Form</field>
++        <field name="model">ir.profile</field>
++        <field name="arch" type="xml">
++            <form string="IR Profile">
++                <group>
++                    <field name="name"/>
++                    <field name="session"/>
++                </group>
++            </form>
++        </field>
++    </record>
++
++    <record id="action_menu_ir_profile" model="ir.actions.act_window">
++        <field name="name">Ir profile</field>
++        <field name="type">ir.actions.act_window</field>
++        <field name="res_model">ir.profile</field>
++        <field name="view_mode">tree,form</field>
++        <field name="context">{'search_default_group_session': 1}</field>
++    </record>
++
++    <menuitem 
++        name="Profiling"
++        action="action_menu_ir_profile" 
++        id="menu_ir_profile" 
++        parent="base.next_id_9"/>
++
++</odoo>

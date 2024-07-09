@@ -1,0 +1,217 @@
+PR: https://github.com/odoo/odoo/pull/
+
+From: beaa30a3d1843de43a45f419bfbc1bfa7613a920
+From: Laurent Smet
+Date: 2019-06-28 11:52:55
+
+Structural Changes: 6
+Total Changes: 174
+
+[IMP/REF] accounting-pocalypse yeaaahh
+
+This commit merges the following models
+ * account.invoice and account.move
+ * account.invoice.line and account.move.line
+ * account.voucher and account.move
+ * account.voucher.line and account.move.line
+
+It was the opportunity for a big cleanup of the code, so it also restructures the whole account module, its different models/fields, the tests etc. for a better world and a better code readability.
+
+==== Rationale ====
+The rationale of this huge change is that we want journal entries / invoices to be easily edited, and changes reflected in the other model. It's a HUGE feature and very strategic for the fiduciary companies. For example, changing the account of a journal entry needs to be automatically reflected on the related invoice.
+
+The same reasoning applies to sale/purchase vouchers.
+
+==== Changes made in features =====
+When creating an invoice, you are now creating a journal entry directly.
+--> The object account.invoice no longer exists.
+In the same fashion when creating an invoice line, you're now adding journal items directly in the journal entry representing the invoice. If this invoice line has some tax, it may create additional journal items as well.
+--> The models account.invoice.line & account.invoice.tax no longer exist
+
+Identically, when creating a sale/purchase receipt with its lines, you are now creating a journal entry directly and there's no more usability difference between encoding a receipt or an invoice.
+--> The object account.voucher no longer exists.
+--> The object account.voucher.line no longer exists.
+--> The whole account_voucher module no longer exists.
+
+Positive side-effects coming from these changes are
+* draft invoices/bills/sale or purchase receipts now create a draft accounting entry. Validate these objects now simply post its journal entry. That means that draft invoices/bills/sale or purchase receipt can straightforwardly be included in reporting or budgets.
+* opening a journal entry in form view will now always open the correct view: if it's a sale/purchase journal entry we will have a customer invoice/vendor bill view or a sale/purchase receipt view, whatever the menu we're coming from.
+* code & business logic simplification. It is also condensed in a single place instead of being partially duplicated on invoices, vouchers and journal entries.
+
+There should be no feature loss, except the one allowing to group multiple journal items together based on the same product during the invoice validation.
+
+==== Changes made in models =====
+* account.invoice: model removed. Instead, now use account.move with following mapping
+
+field (account.invoice) 		field (account.move)
+-----------------------			--------------------
+name 					invoice_payment_ref
+number 					name
+reference 				ref
+comment 				narration
+user_id 				invoice_user_id
+amount_					total_company_signed amount_total_signed
+residual 				amount_residual
+state 					state + invoice_payment_state 		/!\ selection changed
+date_invoice 				invoice_date
+date_due 				invoice_date_due
+sent 					invoice_sent
+origin 					invoice_origin
+payment_term_id 			invoice_payment_term_id
+partner_bank_id 			invoice_partner_bank_id
+incoterm_id 				invoice_incoterm_id
+vendor_bill_id 				invoice_vendor_bill_id
+source_email 				invoice_source_email
+vendor_display_name 			invoice_vendor_display_name
+invoice_icon 				invoice_vendor_icon
+cash_rounding_id 			invoice_cash_rounding_id
+sequence_number_next 			invoice_sequence_number_next
+sequence_number_next_prefix 		invoice_sequence_number_next_prefix
+
+'invoices' subset of account.move can be accessed by using the selection field 'type' or one of the many helpers like is_invoice()
+
+* account.move: now has a valid state 'cancel' that has to be excluded from all business logic
+* account.move: field 'amount' renamed into 'amount_total'
+* account.move: field 'reverse_entry_id' renamed into 'reversed_entry_id'
+* account.move.line: now has a field 'display_type' that has to be excluded from all business logic, in order to support invoice layouting
+* account.invoice.line: model removed. Instead, now use account.move.line with following mapping
+
+field (account.invoice.line) 		field (account.move.line)
+----------------------------		-------------------------
+invoice_id 				move_id
+uom_id 					product_uom_id
+invoice_line_tax_ids 			tax_ids
+account_analytic_id 			analytic_account_id
+
+'invoice lines' subset of all account.move.line from a journal entry can be accessed by using the boolean field 'exclude_from_invoice_tab'
+
+* account.invoice.tax: model removed. Instead, now use account.move.line with following mapping
+
+field (account.invoice.tax) 		field (account.move.line)
+---------------------------		-------------------------
+invoice_id 				move_id
+account_analytic_id 			analytic_account_id
+amount 					price_unit
+base 					tax_base_amount
+
+'tax lines' subset of all account.move.line from a journal entry can be accessed by using the relational field 'tax_line_id'
+
+* account.invoice.confirm: model removed. Instead, now use the 'post()' function of account.move
+* account.invoice.refund: model removed. Instead, now use account.move.reversal to reverse the entries with the same options as we had for invoices
+* account.voucher: model removed. Instead, now use account.move of type in ['out_receipt', 'in_receipt]
+* account.voucher.line: model removed. Instead, now use account.move.line
+
+==== Changes made in functions ====
+* on account.move, method _run_post_draft_to_post() renamed into _autopost_draft_entries()
+* on account.move, method action_account_invoice_payment() renamed into action_invoice_register_payment()
+* on account.move, method action_invoice_reconcile_to_check() renamed into action_open_matching_suspense_moves()
+* on account.move, method _get_domain_edition_mode_available() renamed into _get_domain_matching_supsense_moves()
+* on account.move, method _get_intrastat_country_id() renamed into _get_invoice_intrastat_country_id()
+* on account.move.line, method _get_domain_for_edition_mode() renamed into _get_suspense_moves_domain()
+* in account.bank.statement, contextual key 'edition_mode' renamed into 'suspense_moves_mode'
+
+Was task 1917430
+
+================================= pseudo patch: =================================
+
+--- a/addons/sale_timesheet/models/__init__.py
++++ b/addons/sale_timesheet/models/__init__.py
+@@ -2,7 +2,7 @@
+ # Part of Odoo. See LICENSE file for full copyright and licensing details.
+ 
+ from . import account
+-from . import account_invoice
++from . import account_move
+ from . import product
+ from . import project
+ from . import project_overview
+
+--- a/addons/sale_timesheet/models/account.py
++++ b/addons/sale_timesheet/models/account.py
+@@ -19,7 +19,7 @@ class AccountAnalyticLine(models.Model):
+         ('billable_fixed', 'Billed at a Fixed price'),
+         ('non_billable', 'Non Billable Tasks'),
+         ('non_billable_project', 'No task found')], string="Billable Type", compute='_compute_timesheet_invoice_type', compute_sudo=True, store=True, readonly=True)
+-    timesheet_invoice_id = fields.Many2one('account.invoice', string="Invoice", readonly=True, copy=False, help="Invoice created from the timesheet")
++    timesheet_invoice_id = fields.Many2one('account.move', string="Invoice", readonly=True, copy=False, help="Invoice created from the timesheet")
+ 
+     @api.multi
+     @api.depends('so_line.product_id', 'project_id', 'task_id')
+
+--- a/addons/sale_timesheet/models/account_invoice.py
++++ b/addons/sale_timesheet/models/account_move.py
+@@ -5,8 +5,8 @@ from odoo import api, fields, models, _
+ from odoo.tools.float_utils import float_round, float_is_zero
+ 
+ 
+-class AccountInvoice(models.Model):
+-    _inherit = "account.invoice"
++class AccountMove(models.Model):
++    _inherit = "account.move"
+ 
+     timesheet_ids = fields.One2many('account.analytic.line', 'timesheet_invoice_id', string='Timesheets', readonly=True, copy=False)
+     timesheet_count = fields.Integer("Number of timesheets", compute='_compute_timesheet_count')
+@@ -46,26 +46,28 @@ class AccountInvoice(models.Model):
+         }
+ 
+ 
+-class AccountInvoiceLine(models.Model):
+-    _inherit = 'account.invoice.line'
++class AccountMoveLine(models.Model):
++    _inherit = 'account.move.line'
+ 
+-    @api.model
+-    def create(self, values):
+-        """ Link the timesheet from the SO lines to the corresponding draft invoice.
+-            NOTE: only the timesheets linked to an Sale Line with a product invoiced on delivered quantity
+-            are concerned, since in ordered quantity, the timesheet quantity is not invoiced, but is simply
+-            to compute the delivered one (for reporting).
+-        """
+-        invoice_line = super(AccountInvoiceLine, self).create(values)
+-        if invoice_line.invoice_id.type == 'out_invoice' and invoice_line.invoice_id.state == 'draft':
+-            sale_line_delivery = invoice_line.sale_line_ids.filtered(lambda sol: sol.product_id.invoice_policy == 'delivery' and sol.product_id.service_type == 'timesheet')
++    @api.model_create_multi
++    def create(self, vals_list):
++        # OVERRIDE
++        # Link the timesheet from the SO lines to the corresponding draft invoice.
++        # NOTE: Only the timesheets linked to an Sale Line with a product invoiced on delivered quantity
++        # are concerned, since in ordered quantity, the timesheet quantity is not invoiced, but is simply
++        # to compute the delivered one (for reporting).
++        lines = super(AccountMoveLine, self).create(vals_list)
++        lines_to_process = lines.filtered(lambda line: line.move_id.type == 'out_invoice'
++                                                       and line.move_id.state == 'draft')
++        for line in lines_to_process:
++            sale_line_delivery = line.sale_line_ids.filtered(lambda sol: sol.product_id.invoice_policy == 'delivery' and sol.product_id.service_type == 'timesheet')
+             if sale_line_delivery:
+                 domain = self._timesheet_domain_get_invoiced_lines(sale_line_delivery)
+                 timesheets = self.env['account.analytic.line'].search(domain)
+                 timesheets.write({
+-                    'timesheet_invoice_id': invoice_line.invoice_id.id,
++                    'timesheet_invoice_id': line.move_id.id,
+                 })
+-        return invoice_line
++        return lines
+ 
+     @api.model
+     def _timesheet_domain_get_invoiced_lines(self, sale_line_delivery):
+
+--- a/addons/sale_timesheet/models/project_overview.py
++++ b/addons/sale_timesheet/models/project_overview.py
+@@ -456,7 +456,7 @@ class Project(models.Model):
+ 
+                 invoice_ids = self.env['sale.order'].search_read([('id', 'in', sale_orders.ids)], ['invoice_ids'])
+                 invoice_ids = list(itertools.chain(*[i['invoice_ids'] for i in invoice_ids]))
+-                invoice_ids = self.env['account.invoice'].search_read([('id', 'in', invoice_ids), ('type', '=', 'out_invoice')], ['id'])
++                invoice_ids = self.env['account.move'].search_read([('id', 'in', invoice_ids), ('type', '=', 'out_invoice')], ['id'])
+                 invoice_ids = list(map(lambda x: x['id'], invoice_ids))
+ 
+                 if invoice_ids:
+@@ -465,7 +465,7 @@ class Project(models.Model):
+                         'count': len(invoice_ids),
+                         'icon': 'fa fa-pencil-square-o',
+                         'action': _to_action_data(
+-                            action=self.env.ref('account.action_invoice_tree1'),
++                            action=self.env.ref('account.action_move_out_invoice_type'),
+                             domain=[('id', 'in', invoice_ids), ('type', '=', 'out_invoice')],
+                             context={'create': False, 'delete': False}
+                         )

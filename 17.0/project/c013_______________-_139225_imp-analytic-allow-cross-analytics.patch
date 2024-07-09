@@ -1,0 +1,179 @@
+PR: https://github.com/odoo/odoo/pull/139225
+
+From: dc696c8ed4850a83b6af721002a90f2944891923
+From: william
+Date: 2023-10-25 18:10:57
+
+Structural Changes: 2
+Total Changes: 59
+
+[IMP] analytic: allow cross analytics
+
+Purpose
+=======
+
+Make it possible to compare analytic values between plans by inputting
+up to one account per plan on each line.
+For instance, if we have 2 plans: "Country" and "Product Type", with the
+following accounts
+
+| Country | Product Type |
+| ------- | ------------ |
+| BE      | Drinks       |
+| LU      | Food         |
+
+And the following invoices:
+* 1000€ of drinks in Belgium
+* 2000€ of food in Belgium
+* 3000€ of food in Luxemburg
+
+We want to be able to display the following pivot tables:
+
+|     | Drinks | Food | Total |
+| --- | ------ | ---- | ----- |
+| BE  |   1000 | 2000 |  3000 |
+| LU  |      0 | 3000 |  3000 |
+| Tot |   1000 | 5000 |  6000 |
+
+|        | Total |
+| ------ | ----- |
+| Food   |  5000 |
+| * BE   |  2000 |
+| * LU   |  3000 |
+| Drinks |  1000 |
+| * BE   |  1000 |
+| Total  |  6000 |
+
+Implementation
+==============
+
+* `ir.fields` are added/removed dynamically on `account.analytic.line`
+* Each analytic plan corresponds to one field on `account.analytic.line`
+* The fields are added dynamically in the views.
+* `account.analytic.plan` doesn't have a `company_id` field anymore,
+  meaning that all the companies have access to all the plans. This
+  means that the applicability fields and lines are now company
+  dependent, and those can be used to know which fields/plans to display
+  for which company.
+* There can no longer be one "Project" plan per company, even if the
+  accounts of that project can still be owned by only one company.
+* There is now only one method to get the default (or "Project" plan),
+  which is `_get_plan_columns`
+
+task-3497653
+
+closes odoo/odoo#139225
+
+Related: odoo/upgrade#5306
+Related: odoo/enterprise#49226
+Signed-off-by: William André (wan) <wan@odoo.com>
+Co-authored-by: william <wan@odoo.com>
+Co-authored-by: h4818 <ayh@odoo.com>
+
+================================= pseudo patch: =================================
+
+--- a/addons/project/models/__init__.py
++++ b/addons/project/models/__init__.py
+@@ -14,7 +14,6 @@ from . import project_task_type
+ from . import project_tags
+ from . import project_collaborator
+ from . import project_update
+-from . import res_company
+ from . import res_config_settings
+ from . import res_partner
+ from . import digest_digest
+
+--- a/addons/project/models/project_project.py
++++ b/addons/project/models/project_project.py
+@@ -885,41 +885,24 @@ class Project(models.Model):
+     @api.model
+     def _create_analytic_account_from_values(self, values):
+         company = self.env['res.company'].browse(values.get('company_id', False))
+-        plan = company.analytic_plan_id
+-        if not plan:
+-            plan = self.env['account.analytic.plan'].sudo().search([('company_id', '=', False)], limit=1)
+-            if not plan:
+-                plan = self.env['account.analytic.plan'].sudo().create({
+-                    'name': _('Default'),
+-                    'company_id': False,
+-                })
++        project_plan, _other_plans = self.env['account.analytic.plan']._get_all_plans()
+         analytic_account = self.env['account.analytic.account'].create({
+             'name': values.get('name', _('Unknown Analytic Account')),
+             'company_id': company.id,
+             'partner_id': values.get('partner_id'),
+-            'plan_id': plan.id,
++            'plan_id': project_plan.id,
+         })
+         return analytic_account
+ 
+     def _create_analytic_account(self):
+-        default_plan = self.env['account.analytic.plan'].sudo().search([('company_id', '=', False)], limit=1)
+         for project in self:
+-            company_id = False
+-            if project.company_id:
+-                plan = project.company_id.analytic_plan_id
+-                company_id = project.company_id.id
+-            elif default_plan:
+-                plan = default_plan
+-            else:
+-                plan = self.env['account.analytic.plan'].create({
+-                    'name': _('Default'),
+-                    'company_id': False,
+-                })
++            company_id = project.company_id.id
++            project_plan, _other_plans = self.env['account.analytic.plan']._get_all_plans()
+             analytic_account = self.env['account.analytic.account'].create({
+                 'name': project.name,
+                 'company_id': company_id,
+                 'partner_id': project.partner_id.id,
+-                'plan_id': plan.id,
++                'plan_id': project_plan.id,
+                 'active': True,
+             })
+             project.write({'analytic_account_id': analytic_account.id})
+
+--- a/addons/project/models/res_company.py
++++ b/None
+@@ -1,28 +0,0 @@
+-# -*- coding: utf-8 -*-
+-from odoo import fields, models
+-
+-
+-class ResCompany(models.Model):
+-    _name = "res.company"
+-    _inherit = "res.company"
+-
+-    analytic_plan_id = fields.Many2one(
+-        'account.analytic.plan',
+-        string="Default Plan",
+-        check_company=True,
+-        readonly=False,
+-        compute="_compute_analytic_plan_id",
+-        help="Default Plan for a new analytic account for projects")
+-
+-    def _compute_analytic_plan_id(self):
+-        for company in self:
+-            default_plan = self.env['ir.config_parameter'].with_company(company).sudo().get_param("default_analytic_plan_id_%s" % company.id)
+-            company.analytic_plan_id = int(default_plan) if default_plan else False
+-            if not company.analytic_plan_id:
+-                company.analytic_plan_id = self.env['account.analytic.plan']._get_default()
+-
+-    def write(self, values):
+-        for company in self:
+-            if 'analytic_plan_id' in values:
+-                self.env['ir.config_parameter'].sudo().set_param("default_analytic_plan_id_%s" % company.id, values['analytic_plan_id'])
+-        return super().write(values)
+
+--- a/addons/project/models/res_config_settings.py
++++ b/addons/project/models/res_config_settings.py
+@@ -18,8 +18,7 @@ class ResConfigSettings(models.TransientModel):
+     analytic_plan_id = fields.Many2one(
+         comodel_name='account.analytic.plan',
+         string="Analytic Plan",
+-        readonly=False,
+-        related='company_id.analytic_plan_id',
++        config_parameter="analytic.analytic_plan_projects",
+     )
+ 
+     @api.model

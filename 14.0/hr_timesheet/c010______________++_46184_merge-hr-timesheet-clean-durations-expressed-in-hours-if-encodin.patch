@@ -1,0 +1,200 @@
+PR: https://github.com/odoo/odoo/pull/46184
+
+From: 30d1222d1110682b6a02d984b5e616a289d489ad
+From: Odoo's Mergebot
+Date: 2020-08-03 13:32:46
+
+Structural Changes: 5
+Total Changes: 60
+
+[MERGE] hr_timesheet: clean durations expressed in hours if encoding unit is in days
+
+Purpose
+=======
+
+There are several places where the duration is expressed in hours even though the encoding unit is in Days.
+
+Specifications
+===========
+
+The duration should be expressed in days instead of hours in the following places:
+ [x]    Timesheet Entries
+ [x]    Portal > Tickets
+ [x]    Portal > Timesheets
+ [x]    Portal > Tasks
+ [x]    Portal > Sales Orders
+ [x]    Project Overview
+ [x]    Project task form view (in this case, the label of the field should be 'Planned Days')
+ [x]    Timesheets > HR Timesheet/Attendence Report
+ [x]    Project > All Tasks
+
+Hide the following elements if the encoding unit is in days:
+ [x]    'Timesheet Timer' feature on the project form view
+ [x]    'Timesheet Timer' feature on the Helpdesk team form view
+ [x]    the 'Round timesheets' feature in the settings of Timesheets (except if the 'Awesome Timesheet' feature is enabled)
+
+Bonus point:
+ [x]    Timesheet form view: 0.00 Days should be displayed in read-only if the duration = 0
+
+ Some labels need to be adapted to explicit the unit of measure (is it carrots? potatoes?): e.g. Duration (Days) or Time Spent (Hours) :
+ [x]    Timesheet entries report
+ [x]    on the portal
+ [x]    Project overview: add 'recorded' next to Hours/Days
+ [x]    Project overview: add 'Days/hours Spent' above the total by employee
+ [x]    task form view: make sure the 'sub-tasks days spent' button/label stays on one line
+
+ [x]    hide the 'start' button on project tasks and helpdesk tickets if the encoding unit is in days
+
+Task ID : 2152322
+
+closes odoo/odoo#46184
+
+Signed-off-by: Yannick Tivisse (yti) <yti@odoo.com>
+
+================================= pseudo patch: =================================
+
+--- a/addons/hr_timesheet/models/hr_timesheet.py
++++ b/addons/hr_timesheet/models/hr_timesheet.py
+@@ -189,3 +189,15 @@ class AccountAnalyticLine(models.Model):
+                     'amount': amount_converted,
+                 })
+         return result
++
++    def _is_timesheet_encode_uom_day(self):
++        company_uom = self.env.company.timesheet_encode_uom_id
++        return company_uom == self.env.ref('uom.product_uom_day')
++
++    def _convert_hours_to_days(self, time):
++        uom_hour = self.env.ref('uom.product_uom_hour')
++        uom_day = self.env.ref('uom.product_uom_day')
++        return round(uom_hour._compute_quantity(time, uom_day, raise_if_failure=False), 2)
++
++    def _get_timesheet_time_day(self):
++        return self._convert_hours_to_days(self.unit_amount)
+
+--- a/addons/hr_timesheet/models/project.py
++++ b/addons/hr_timesheet/models/project.py
+@@ -1,6 +1,8 @@
+ # -*- coding: utf-8 -*-
+ # Part of Odoo. See LICENSE file for full copyright and licensing details.
+ 
++from lxml import etree
++
+ from odoo import models, fields, api, _
+ from odoo.exceptions import UserError, ValidationError, RedirectWarning
+ 
+@@ -24,6 +26,10 @@ class Project(models.Model):
+     total_timesheet_time = fields.Integer(
+         compute='_compute_total_timesheet_time',
+         help="Total number of time (in the proper UoM) recorded in the project, rounded to the unit.")
++    encode_uom_in_days = fields.Boolean(compute='_compute_encode_uom_in_days')
++
++    def _compute_encode_uom_in_days(self):
++        self.encode_uom_in_days = self.env.company.timesheet_encode_uom_id == self.env.ref('uom.product_uom_day')
+ 
+     @api.depends('analytic_account_id')
+     def _compute_allow_timesheets(self):
+@@ -106,6 +112,13 @@ class Task(models.Model):
+     overtime = fields.Float(compute='_compute_progress_hours', store=True)
+     subtask_effective_hours = fields.Float("Sub-tasks Hours Spent", compute='_compute_subtask_effective_hours', store=True, help="Time spent on the sub-tasks (and their own sub-tasks) of this task.")
+     timesheet_ids = fields.One2many('account.analytic.line', 'task_id', 'Timesheets')
++    encode_uom_in_days = fields.Boolean(compute='_compute_encode_uom_in_days', default=lambda self: self._uom_in_days())
++
++    def _uom_in_days(self):
++        return self.env.company.timesheet_encode_uom_id == self.env.ref('uom.product_uom_day')
++
++    def _compute_encode_uom_in_days(self):
++        self.encode_uom_in_days = self._uom_in_days()
+ 
+     @api.depends('project_id.analytic_account_id.active')
+     def _compute_analytic_account_active(self):
+@@ -180,7 +193,10 @@ class Task(models.Model):
+         if self.env.context.get('hr_timesheet_display_remaining_hours'):
+             name_mapping = dict(super().name_get())
+             for task in self:
+-                if task.allow_timesheets and task.planned_hours > 0:
++                if task.allow_timesheets and task.planned_hours > 0 and task.encode_uom_in_days:
++                    days_left = _("(%s days remaining)") % task._convert_hours_to_days(task.remaining_hours)
++                    name_mapping[task.id] = name_mapping.get(task.id, '') + " ‒ " + days_left
++                elif task.allow_timesheets and task.planned_hours > 0:
+                     hours, mins = (str(int(duration)).rjust(2, '0') for duration in divmod(abs(task.remaining_hours) * 60, 60))
+                     hours_left = _(
+                         "(%(sign)s%(hours)s:%(minutes)s remaining)",
+@@ -197,8 +213,24 @@ class Task(models.Model):
+         """ Set the correct label for `unit_amount`, depending on company UoM """
+         result = super(Task, self)._fields_view_get(view_id=view_id, view_type=view_type, toolbar=toolbar, submenu=submenu)
+         result['arch'] = self.env['account.analytic.line']._apply_timesheet_label(result['arch'])
++
++        if view_type == 'tree' and self.env.company.timesheet_encode_uom_id == self.env.ref('uom.product_uom_day'):
++            result['arch'] = self._apply_time_label(result['arch'])
+         return result
+ 
++    @api.model
++    def _apply_time_label(self, view_arch):
++        doc = etree.XML(view_arch)
++        encoding_uom = self.env.company.timesheet_encode_uom_id
++
++        for node in doc.xpath("//field[@name='planned_hours'][@widget='timesheet_uom'][not(@string)]"):
++            node.set('string', _('Planned %s') % encoding_uom.name or '')
++        for node in doc.xpath("//field[@name='effective_hours'][@widget='timesheet_uom'][not(@string)]"):
++            node.set('string', _('%s Spent') % encoding_uom.name or '')
++        for node in doc.xpath("//field[@name='remaining_hours'][@widget='timesheet_uom'][not(@string)]"):
++            node.set('string', _('Remaining %s') % encoding_uom.name or '')
++        return etree.tostring(doc, encoding='unicode')
++
+     def unlink(self):
+         """
+         If some tasks to unlink have some timesheets entries, these
+@@ -216,3 +248,8 @@ class Task(models.Model):
+                 warning_msg, self.env.ref('hr_timesheet.timesheet_action_task').id,
+                 _('See timesheet entries'), {'active_ids': tasks_with_timesheets.ids})
+         return super(Task, self).unlink()
++
++    def _convert_hours_to_days(self, time):
++        uom_hour = self.env.ref('uom.product_uom_hour')
++        uom_day = self.env.ref('uom.product_uom_day')
++        return round(uom_hour._compute_quantity(time, uom_day, raise_if_failure=False), 2)
+
+--- a/addons/hr_timesheet/models/res_config_settings.py
++++ b/addons/hr_timesheet/models/res_config_settings.py
+@@ -1,7 +1,7 @@
+ # -*- coding: utf-8 -*-
+ # Part of Odoo. See LICENSE file for full copyright and licensing details.
+ 
+-from odoo import fields, models
++from odoo import api, fields, models
+ 
+ 
+ class ResConfigSettings(models.TransientModel):
+@@ -20,3 +20,10 @@ class ResConfigSettings(models.TransientModel):
+         and widgets to help the encoding. All reporting will still be expressed in hours (default value).""")
+     timesheet_min_duration = fields.Integer('Minimal duration', default=15, config_parameter='hr_timesheet.timesheet_min_duration')
+     timesheet_rounding = fields.Integer('Rounding up', default=15, config_parameter='hr_timesheet.timesheet_rounding')
++    is_encode_uom_days = fields.Boolean(compute='_compute_is_encode_uom_days')
++
++    @api.depends('timesheet_encode_uom_id')
++    def _compute_is_encode_uom_days(self):
++        product_uom_day = self.env.ref('uom.product_uom_day')
++        for settings in self:
++            settings.is_encode_uom_days = settings.timesheet_encode_uom_id == product_uom_day
+
+--- a/addons/hr_timesheet/models/hr_timesheet.py
++++ b/addons/hr_timesheet/models/hr_timesheet.py
+@@ -45,7 +45,7 @@ class AccountAnalyticLine(models.Model):
+         'project.project', 'Project', compute='_compute_project_task_id', store=True, readonly=False,
+         domain=_domain_project_id)
+     user_id = fields.Many2one(compute='_compute_user_id', store=True, readonly=False)
+-    employee_id = fields.Many2one('hr.employee', "Employee", check_company=True, domain=_domain_employee_id)
++    employee_id = fields.Many2one('hr.employee', "Employee", domain=_domain_employee_id)
+     department_id = fields.Many2one('hr.department', "Department", compute='_compute_department_id', store=True, compute_sudo=True)
+     encoding_uom_id = fields.Many2one('uom.uom', compute='_compute_encoding_uom_id')
+ 
+@@ -94,7 +94,7 @@ class AccountAnalyticLine(models.Model):
+ 
+     def write(self, values):
+         # If it's a basic user then check if the timesheet is his own.
+-        if not self.user_has_groups('hr_timesheet.group_hr_timesheet_approver') and any(self.env.user.id != analytic_line.user_id.id for analytic_line in self):
++        if not (self.user_has_groups('hr_timesheet.group_hr_timesheet_approver') or self.env.su) and any(self.env.user.id != analytic_line.user_id.id for analytic_line in self):
+             raise AccessError(_("You cannot access timesheets that are not yours."))
+ 
+         values = self._timesheet_preprocess(values)

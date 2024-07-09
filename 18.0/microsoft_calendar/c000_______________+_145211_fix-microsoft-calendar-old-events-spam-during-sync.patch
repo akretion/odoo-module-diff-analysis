@@ -1,0 +1,89 @@
+PR: https://github.com/odoo/odoo/pull/145211
+
+From: 77d2d9d96cd20ee79e91143bd3671ee1c1f8a563
+From: Gabriel de Paula Felix (gdpf)
+Date: 2023-12-06 22:04:08
+
+Structural Changes: 3
+Total Changes: 32
+
+[FIX] microsoft_calendar: old events spam during sync
+
+Before this commit, there were situations that old events in Odoo which shared the same state with Microsoft got updated (without changes) in Odoo due to a few seconds of update time difference, triggering lots of unwanted spam for attendees on Microsoft side when it shouldn't happen. Additionaly, when restarting the synchronization with Microsoft, the setting parameter `range_days` was being used to update all events in Odoo with `{'need_sync_m': True}`, which also triggered updates in old events and future events on Microsoft side. If `range_days` was too big, lots of events were 'updated' and triggered spam, and if it was too small, only events within the `range_days` range were synchronized with Outlook.
+
+After this commit, using system parameters, old events in Odoo which update time difference between Microsoft and Odoo is too small are not updated in Odoo anymore, thus not triggering unwanted spam for attendees in these situations. Also, one system parameter `lower_bound_range` was added to be used for selecting the range of old events in Odoo that will be synchronized (and send emails).
+
+closes odoo/odoo#145211
+
+Task-id: 3601306
+X-original-commit: 161e93f
+Signed-off-by: Arnaud Joset (arj) <arj@odoo.com>
+Signed-off-by: Gabriel de Paula Felix (gdpf) <gdpf@odoo.com>
+
+================================= pseudo patch: =================================
+
+--- a/addons/microsoft_calendar/models/calendar.py
++++ b/addons/microsoft_calendar/models/calendar.py
+@@ -266,6 +266,10 @@ class Meeting(models.Model):
+         day_range = int(ICP.get_param('microsoft_calendar.sync.range_days', default=365))
+         lower_bound = fields.Datetime.subtract(fields.Datetime.now(), days=day_range)
+         upper_bound = fields.Datetime.add(fields.Datetime.now(), days=day_range)
++        # Define 'custom_lower_bound_range' param for limiting old events updates in Odoo and avoid spam on Microsoft.
++        custom_lower_bound_range = ICP.get_param('microsoft_calendar.sync.lower_bound_range')
++        if custom_lower_bound_range:
++            lower_bound = fields.Datetime.subtract(fields.Datetime.now(), days=int(custom_lower_bound_range))
+         domain = [
+             ('partner_ids.user_ids', 'in', self.env.user.id),
+             ('stop', '>', lower_bound),
+
+--- a/addons/microsoft_calendar/models/microsoft_sync.py
++++ b/addons/microsoft_calendar/models/microsoft_sync.py
+@@ -358,6 +358,10 @@ class MicrosoftSync(models.AbstractModel):
+         synced_recurrences |= cancelled_recurrences
+         synced_events |= cancelled_events | cancelled_recurrences.calendar_event_ids
+ 
++        # Get sync lower bound days range for checking if old events must be updated in Odoo.
++        ICP = self.env['ir.config_parameter'].sudo()
++        lower_bound_day_range = ICP.get_param('microsoft_calendar.sync.lower_bound_range')
++
+         # update other events
+         for mevent in (existing - cancelled).filter(lambda e: e.lastModifiedDateTime):
+             # Last updated wins.
+@@ -371,7 +375,13 @@ class MicrosoftSync(models.AbstractModel):
+                 odoo_event_updated_time = pytz.utc.localize(odoo_event.write_date)
+                 ms_event_updated_time = parse(mevent.lastModifiedDateTime)
+ 
+-                if ms_event_updated_time >= odoo_event_updated_time:
++                # If the update comes from an old event/recurrence, check if time diff between updates is reasonable.
++                old_event_update_condition = True
++                if lower_bound_day_range:
++                    update_time_diff = ms_event_updated_time - odoo_event_updated_time
++                    old_event_update_condition = odoo_event._check_old_event_update_required(int(lower_bound_day_range), update_time_diff)
++
++                if ms_event_updated_time >= odoo_event_updated_time and old_event_update_condition:
+                     vals = dict(odoo_event._microsoft_to_odoo_values(mevent), need_sync_m=False)
+                     odoo_event.with_context(dont_notify=True)._write_from_microsoft(mevent, vals)
+ 
+@@ -384,6 +394,22 @@ class MicrosoftSync(models.AbstractModel):
+ 
+         return synced_events, synced_recurrences
+ 
++    def _check_old_event_update_required(self, lower_bound_day_range, update_time_diff):
++        """
++        Checks if an old event in Odoo should be updated locally. This verification is necessary because
++        sometimes events in Odoo have the same state in Microsoft and even so they trigger updates locally
++        due to a second or less of update time difference, thus spamming unwanted emails on Microsoft side.
++        """
++        # Event can be updated locally if its stop date is bigger than lower bound and the update time difference is reasonable (1 hour).
++        # For recurrences, if any of the occurrences surpass the lower bound range, we update the recurrence.
++        lower_bound = fields.Datetime.subtract(fields.Datetime.now(), days=lower_bound_day_range)
++        stop_date_condition = True
++        if self._name == 'calendar.event':
++            stop_date_condition = self.stop >= lower_bound
++        elif self._name == 'calendar.recurrence':
++            stop_date_condition = any(event.stop >= lower_bound for event in self.calendar_event_ids)
++        return stop_date_condition or update_time_diff >= timedelta(hours=1)
++
+     def _impersonate_user(self, user_id):
+         """ Impersonate a user (mainly the event organizer) to be able to call the Outlook API with its token """
+         return user_id.with_user(user_id)

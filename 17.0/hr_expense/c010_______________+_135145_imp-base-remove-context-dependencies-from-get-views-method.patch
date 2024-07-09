@@ -1,0 +1,145 @@
+PR: https://github.com/odoo/odoo/pull/135145
+
+From: ba1a5509fa49fd846739252d16083dd8cb334b53
+From: Gorash
+Date: 2023-09-21 16:52:10
+
+Structural Changes: 3
+Total Changes: 51
+
+[IMP] base: Remove context dependencies from get_views method
+
+In this viewtiverse, the heroes remove the context dependencies for
+`get_views`, from the views and python fields (such as domain). To reduce
+inconsistencies and the number of rpc.
+
+Current issues:
+* There may be inconsistencies in views at the JavaScript level. Some
+overrides modify the behavior of get_views or domains on fields via
+context keys, therefore by changing the action, the rendering may be
+different. However, these views are cached. However, the cache key
+(Javascript) does not reflect the entire context, and requires additional
+post-processing from the server.
+* Multiple rpc for the same rendering. get_views being dependent on the
+context, as soon as it changes, a new rpc is performed. In most cases,
+when JavaScript needs the same view, there is no change depending on the
+context, the rpc is useless.
+* Inconsistency when rendering subviews, some views could be different
+depending on the context, this context can be modified in the view itself
+via the context attributes. However, the JavaScript client does not redo
+an rpc for each change of these sub-contexts. Therefore the result may be
+inconsistent.
+
+Solution:
+Limit as much as possible the number of context keys provided when calling
+get_views, and use the context provided as a cache key. The authorized
+keys are 'lang' and '*_view_ref'. For the cache key, options are added in
+the get_views method.
+Instead of using the context, it is inserted into python expressions.
+This will be evaluated by JavaScript and thus avoids inconsistencies.
+
+task-3414108
+task-3414068
+
+closes odoo/odoo#135145
+
+Related: odoo/enterprise#47584
+Signed-off-by: Raphael Collet <rco@odoo.com>
+
+================================= pseudo patch: =================================
+
+--- a/addons/hr_expense/models/hr_employee.py
++++ b/addons/hr_expense/models/hr_employee.py
+@@ -24,6 +24,8 @@ class Employee(models.Model):
+         help='Select the user responsible for approving "Expenses" of this employee.\n'
+              'If empty, the approval is done by an Administrator or Approver (determined in settings/users).')
+ 
++    filter_for_expense = fields.Boolean(store=False, search='_search_filter_for_expense')
++
+     @api.depends('parent_id')
+     def _compute_expense_manager(self):
+         for employee in self:
+@@ -37,6 +39,28 @@ class Employee(models.Model):
+     def _get_user_m2o_to_empty_on_archived_employees(self):
+         return super()._get_user_m2o_to_empty_on_archived_employees() + ['expense_manager_id']
+ 
++    def _search_filter_for_expense(self, operator, value):
++        assert operator == '='
++        assert value
++
++        res = [('id', '=', 0)] # Nothing accepted by domain, by default
++        if self.user_has_groups('hr_expense.group_hr_expense_user') or self.user_has_groups('account.group_account_user'):
++            res = "['|', ('company_id', '=', False), ('company_id', '=', company_id)]"  # Then, domain accepts everything
++        elif self.user_has_groups('hr_expense.group_hr_expense_team_approver') and self.env.user.employee_ids:
++            user = self.env.user
++            employee = self.env.user.employee_id
++            res = [
++                '|', '|', '|',
++                ('department_id.manager_id', '=', employee.id),
++                ('parent_id', '=', employee.id),
++                ('id', '=', employee.id),
++                ('expense_manager_id', '=', user.id),
++                '|', ('company_id', '=', False), ('company_id', '=', employee.company_id.id),
++            ]
++        elif self.env.user.employee_id:
++            employee = self.env.user.employee_id
++            res = [('id', '=', employee.id), '|', ('company_id', '=', False), ('company_id', '=', employee.company_id.id)]
++        return res
+ 
+ class EmployeePublic(models.Model):
+     _inherit = 'hr.employee.public'
+
+--- a/addons/hr_expense/models/hr_expense.py
++++ b/addons/hr_expense/models/hr_expense.py
+@@ -25,40 +25,19 @@ class HrExpense(models.Model):
+             raise ValidationError(_('The current user has no related employee. Please, create one.'))
+         return employee
+ 
+-    @api.model
+-    def _get_employee_id_domain(self):
+-        res = [('id', '=', 0)] # Nothing accepted by domain, by default
+-        if self.user_has_groups('hr_expense.group_hr_expense_user') or self.user_has_groups('account.group_account_user'):
+-            res = "['|', ('company_id', '=', False), ('company_id', '=', company_id)]"  # Then, domain accepts everything
+-        elif self.user_has_groups('hr_expense.group_hr_expense_team_approver') and self.env.user.employee_ids:
+-            user = self.env.user
+-            employee = self.env.user.employee_id
+-            res = [
+-                '|', '|', '|',
+-                ('department_id.manager_id', '=', employee.id),
+-                ('parent_id', '=', employee.id),
+-                ('id', '=', employee.id),
+-                ('expense_manager_id', '=', user.id),
+-                '|', ('company_id', '=', False), ('company_id', '=', employee.company_id.id),
+-            ]
+-        elif self.env.user.employee_id:
+-            employee = self.env.user.employee_id
+-            res = [('id', '=', employee.id), '|', ('company_id', '=', False), ('company_id', '=', employee.company_id.id)]
+-        return res
+-
+     name = fields.Char('Description', compute='_compute_name', readonly=False, store=True, precompute=True, required=True, copy=True)
+     date = fields.Date(default=fields.Date.context_today, string="Expense Date")
+     accounting_date = fields.Date(string="Accounting Date", related='sheet_id.accounting_date', store=True, groups='account.group_account_invoice,account.group_account_readonly')
+     employee_id = fields.Many2one('hr.employee', compute='_compute_employee_id', string="Employee",
+         store=True, required=True, readonly=False, tracking=True,
+-        default=_default_employee_id, domain=lambda self: self._get_employee_id_domain(), check_company=True)
++        default=_default_employee_id, domain=[('filter_for_expense', '=', True)], check_company=True)
+     # product_id not required to allow create an expense without product via mail alias, but should be required on the view.
+     product_id = fields.Many2one(
+         'product.product',
+         string='Category',
+         tracking=True,
+         check_company=True,
+-        domain="[('can_be_expensed', '=', True)]",
++        domain=[('can_be_expensed', '=', True)],
+         ondelete='restrict',
+     )
+     product_description = fields.Html(compute='_compute_product_description')
+@@ -1003,7 +982,7 @@ class HrExpenseSheet(models.Model):
+ 
+     company_id = fields.Many2one('res.company', string='Company', required=True, default=lambda self: self.env.company)
+     company_currency_id = fields.Many2one(comodel_name='res.currency', string="Report Company Currency", related='company_id.currency_id')
+-    employee_id = fields.Many2one('hr.employee', string="Employee", required=True, tracking=True, default=_default_employee_id, check_company=True, domain=lambda self: self.env['hr.expense']._get_employee_id_domain())
++    employee_id = fields.Many2one('hr.employee', string="Employee", required=True, tracking=True, default=_default_employee_id, check_company=True, domain=[('filter_for_expense', '=', True)])
+     address_id = fields.Many2one('res.partner', compute='_compute_from_employee_id', store=True, readonly=False, copy=True, string="Employee Home Address", check_company=True)
+     department_id = fields.Many2one('hr.department', compute='_compute_from_employee_id', store=True, readonly=False, copy=False, string='Department')
+     user_id = fields.Many2one('res.users', 'Manager', compute='_compute_from_employee_id', store=True, readonly=False, copy=False, tracking=True, domain=lambda self: [('groups_id', 'in', self.env.ref('hr_expense.group_hr_expense_team_approver').id)])

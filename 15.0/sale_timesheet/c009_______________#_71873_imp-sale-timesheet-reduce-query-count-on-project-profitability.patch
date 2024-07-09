@@ -1,0 +1,228 @@
+PR: https://github.com/odoo/odoo/pull/71873
+
+From: 8f7b9654460427658dce3532cfaaa97c3091de79
+From: Thibault Libioulle
+Date: 2021-08-23 13:21:24
+
+Structural Changes: 2
+Total Changes: 159
+
+[IMP] sale_timesheet: reduce query count on project profitability
+
+Prior to this commit, we queried the project profitability view in order
+to have the total amount of timesheeted time.
+
+With this commit, thanks to the fact that this value was only
+retrieved in the view by subquerying analytic.account.line we can only
+query the analytic.account.line in order to access information.
+This allows us to query the project profitability report only when
+required. Otherwise, only the analytic account line table is queried.
+
+This commit was motivated by the performance issue fixed in PR : #72641
+
+task-2555323
+
+closes odoo/odoo#71873
+
+Related: odoo/enterprise#18851
+Signed-off-by: Yannick Tivisse (yti) <yti@odoo.com>
+
+================================= pseudo patch: =================================
+
+--- a/addons/sale_timesheet/models/project.py
++++ b/addons/sale_timesheet/models/project.py
+@@ -255,9 +255,10 @@ class Project(models.Model):
+     def _get_profitability_items(self):
+         if not self.user_has_groups('project.group_project_manager'):
+             return {'data': []}
+-        profitability = self.get_profitability_common()
++        timesheets = self.allow_timesheets and self.user_has_groups('hr_timesheet.group_hr_timesheet_user')
++        profitability = self._get_profitability_common(costs_revenues=self.allow_billable, timesheets=timesheets)
+         data = []
+-        if self.allow_timesheets and self.user_has_groups('hr_timesheet.group_hr_timesheet_user'):
++        if timesheets:
+             data += [{
+                 'name': _("Timesheets"),
+                 'value': self.env.ref('sale_timesheet.project_profitability_timesheet_panel')._render({
+@@ -288,37 +289,50 @@ class Project(models.Model):
+             'data': data,
+         }
+ 
+-    def get_profitability_common(self):
++    def _get_profitability_common(self, costs_revenues=True, timesheets=True):
+         self.ensure_one()
+-        profitability = self.env['project.profitability.report'].read_group(
+-            [('project_id', '=', self.id)],
+-            ['project_id',
+-             'timesheet_unit_amount',
+-             'amount_untaxed_to_invoice',
+-             'amount_untaxed_invoiced',
+-             'expense_amount_untaxed_to_invoice',
+-             'expense_amount_untaxed_invoiced',
+-             'other_revenues',
+-             'expense_cost',
+-             'timesheet_cost',
+-             'margin'],
+-            ['project_id'])
+-        timesheets = self.env['account.analytic.line'].read_group([('project_id', '=', self.id)], ['so_line', 'unit_amount'], ['so_line'])
+-        timesheet_billable = timesheet_non_billable = 0.0
+-        for timesheet in timesheets:
+-            if timesheet['so_line']:
+-                timesheet_billable += timesheet['unit_amount']
+-            else:
+-                timesheet_non_billable += timesheet['unit_amount']
+-        return {
+-            'costs': profitability and profitability[0]['timesheet_cost'] + profitability[0]['expense_cost'] or 0.0,
+-            'margin': profitability and profitability[0]['margin'] or 0.0,
+-            'revenues': profitability and (profitability[0]['amount_untaxed_invoiced'] + profitability[0]['amount_untaxed_to_invoice'] +
+-                                           profitability[0]['expense_amount_untaxed_invoiced'] + profitability[0]['expense_amount_untaxed_to_invoice'] +
+-                                           profitability[0]['other_revenues']) or 0.0,
+-            'timesheet_unit_amount': profitability and self._convert_project_uom_to_timesheet_encode_uom(profitability[0]['timesheet_unit_amount']) or 0.0,
+-            'timesheet_percentage_billable': timesheet_billable and timesheet_billable / (timesheet_billable + timesheet_non_billable) * 100 or 0.0,
++        result = {
++            'costs': 0.0,
++            'margin': 0.0,
++            'revenues': 0.0,
++            'timesheet_unit_amount': 0.0,
++            'timesheet_percentage_billable': 0.0,
+         }
++        if costs_revenues:
++            profitability = self.env['project.profitability.report'].read_group(
++                [('project_id', '=', self.id)],
++                ['project_id',
++                 'amount_untaxed_to_invoice',
++                 'amount_untaxed_invoiced',
++                 'expense_amount_untaxed_to_invoice',
++                 'expense_amount_untaxed_invoiced',
++                 'other_revenues',
++                 'expense_cost',
++                 'timesheet_cost',
++                 'margin'],
++                ['project_id'], limit=1)
++            if profitability:
++                profitability = profitability[0]
++                result.update({
++                    'costs': profitability['timesheet_cost'] + profitability['expense_cost'],
++                    'margin': profitability['margin'],
++                    'revenues': (profitability['amount_untaxed_invoiced'] + profitability['amount_untaxed_to_invoice'] +
++                                 profitability['expense_amount_untaxed_invoiced'] + profitability['expense_amount_untaxed_to_invoice'] +
++                                 profitability['other_revenues']),
++                })
++        if timesheets:
++            timesheets = self.env['account.analytic.line'].read_group([('project_id', '=', self.id)], ['so_line', 'unit_amount'], ['so_line'])
++            timesheet_billable = timesheet_non_billable = 0.0
++            for timesheet in timesheets:
++                if timesheet['so_line']:
++                    timesheet_billable += timesheet['unit_amount']
++                else:
++                    timesheet_non_billable += timesheet['unit_amount']
++            result.update({
++                'timesheet_unit_amount': self._convert_project_uom_to_timesheet_encode_uom(timesheet_billable + timesheet_non_billable),
++                'timesheet_percentage_billable': timesheet_billable and timesheet_billable / (timesheet_billable + timesheet_non_billable) * 100 or 0.0,
++            })
++        return result
+ 
+ class ProjectTask(models.Model):
+     _inherit = "project.task"
+
+--- a/addons/sale_timesheet/models/project_update.py
++++ b/addons/sale_timesheet/models/project_update.py
+@@ -4,8 +4,7 @@
+ from dateutil.relativedelta import relativedelta
+ 
+ from odoo import api, fields, models
+-from odoo.tools import float_utils, format_amount
+-from odoo.tools.misc import formatLang
++from odoo.tools import float_utils, format_amount, formatLang, format_date, DEFAULT_SERVER_DATE_FORMAT
+ 
+ class ProjectUpdate(models.Model):
+     _inherit = 'project.update'
+@@ -19,46 +18,50 @@ class ProjectUpdate(models.Model):
+ 
+     @api.model
+     def _get_profitability_values(self, project):
+-        if not (self.user_has_groups('project.group_project_manager') and (project.analytic_account_id and project.allow_billable or project.allow_timesheets)):
++        costs_revenues = project.analytic_account_id and project.allow_billable
++        timesheets = project.allow_timesheets and self.user_has_groups('hr_timesheet.group_hr_timesheet_user')
++        if not (self.user_has_groups('project.group_project_manager') and (costs_revenues or timesheets)):
+             return {}
+-        profitability = project.get_profitability_common()
+-        start_of_month = fields.Date.context_today(self) + relativedelta(day=1)
+-        timesheets_this_month = self.env['project.profitability.report'].read_group(
+-            [('project_id', '=', project.id),
+-             ('line_date', '>=', start_of_month)],
+-            ['project_id',
+-             'timesheet_unit_amount'],
+-            ['project_id'])
+-        timesheets_previous_month = self.env['project.profitability.report'].read_group(
+-            [('project_id', '=', project.id),
+-             ('line_date', '>=', start_of_month + relativedelta(months=-1, day=1)),
+-             ('line_date', '<', start_of_month)
+-             ],
+-            ['project_id',
+-             'timesheet_unit_amount'],
+-            ['project_id'])
+-        timesheet_unit_amount = timesheets_this_month and timesheets_this_month[0]['timesheet_unit_amount'] or 0.0
+-        previous_timesheet_unit_amount = timesheets_previous_month and timesheets_previous_month[0]['timesheet_unit_amount'] or 0.0
+-        return {
+-            'allow_timesheets': project.allow_timesheets,
++        this_month = fields.Date.context_today(self) + relativedelta(day=1)
++        previous_month = this_month + relativedelta(months=-1, day=1)
++        result = {
++            'allow_timesheets': timesheets,
++            'allow_costs_and_revenues': costs_revenues,
+             'analytic_account_id': project.analytic_account_id,
+-            'month': start_of_month.strftime('%B %Y'),
+-            'previous_month': (start_of_month + relativedelta(months=-1, day=1)).strftime('%B'),
++            'month': format_date(self.env, this_month, date_format='LLLL y'),
++            'previous_month': format_date(self.env, previous_month, date_format='LLLL'),
+             'is_timesheet_uom_hour': self.env.company._is_timesheet_hour_uom(),
+             'timesheet_uom': self.env.company._timesheet_uom_text(),
+-            'timesheet_unit_amount': formatLang(self.env, project._convert_project_uom_to_timesheet_encode_uom(timesheet_unit_amount), digits=0),
+-            'previous_timesheet_unit_amount': formatLang(self.env, project._convert_project_uom_to_timesheet_encode_uom(previous_timesheet_unit_amount), digits=0),
+-            'timesheet_trend': formatLang(self.env,
+-                                          previous_timesheet_unit_amount > 0 and ((timesheet_unit_amount / previous_timesheet_unit_amount) - 1) * 100 or 0.0,
+-                                          digits=0),
+-            'costs': format_amount(self.env, -profitability['costs'], self.env.company.currency_id),
+-            'revenues': format_amount(self.env, profitability['revenues'], self.env.company.currency_id),
+-            'margin': profitability['margin'],
+-            'margin_formatted': format_amount(self.env, profitability['margin'], self.env.company.currency_id),
+-            'margin_percentage': formatLang(self.env,
+-                                            not float_utils.float_is_zero(profitability['costs'], precision_digits=2) and -(profitability['margin'] / profitability['costs']) * 100 or 0.0,
+-                                            digits=0),
+-            'billing_rate': formatLang(self.env,
+-                                       not float_utils.float_is_zero(profitability['costs'], precision_digits=2) and -(profitability['revenues'] / profitability['costs']) * 100 or 0.0,
+-                                       digits=0),
++            'timesheet_unit_amount': '', 'previous_timesheet_unit_amount': '',
++            'timesheet_trend': '', 'costs': '', 'revenues': '', 'margin': '',
++            'margin_formatted': '', 'margin_percentage': '', 'billing_rate': '',
+         }
++        if timesheets:
++            timesheets_per_month = self.env['account.analytic.line'].read_group(
++                [('project_id', '=', project.id),
++                 ('date', '>=', previous_month)],
++                ['date', 'unit_amount'],
++                ['date:month'])
++            timesheet_unit_amount = {ts['__range']['date']['from']: ts['unit_amount'] for ts in timesheets_per_month}
++            this_amount = timesheet_unit_amount.get(this_month.replace(day=1).strftime(DEFAULT_SERVER_DATE_FORMAT), 0.0)
++            previous_amount = timesheet_unit_amount.get(previous_month.replace(day=1).strftime(DEFAULT_SERVER_DATE_FORMAT), 0.0)
++            result.update({
++                'timesheet_unit_amount': formatLang(self.env, project._convert_project_uom_to_timesheet_encode_uom(this_amount), digits=0),
++                'previous_timesheet_unit_amount': formatLang(self.env, project._convert_project_uom_to_timesheet_encode_uom(previous_amount), digits=0),
++                'timesheet_trend': formatLang(self.env, previous_amount > 0 and ((this_amount / previous_amount) - 1) * 100 or 0.0, digits=0),
++            })
++        if costs_revenues:
++            profitability = project._get_profitability_common(costs_revenues=True, timesheets=False)
++            result.update({
++                'costs': format_amount(self.env, -profitability['costs'], self.env.company.currency_id),
++                'revenues': format_amount(self.env, profitability['revenues'], self.env.company.currency_id),
++                'margin': profitability['margin'],
++                'margin_formatted': format_amount(self.env, profitability['margin'], self.env.company.currency_id),
++                'margin_percentage': formatLang(self.env,
++                                                not float_utils.float_is_zero(profitability['costs'], precision_digits=2) and -(profitability['margin'] / profitability['costs']) * 100 or 0.0,
++                                                digits=0),
++                'billing_rate': formatLang(self.env,
++                                           not float_utils.float_is_zero(profitability['costs'], precision_digits=2) and -(profitability['revenues'] / profitability['costs']) * 100 or 0.0,
++                                           digits=0),
++            })
++        return result

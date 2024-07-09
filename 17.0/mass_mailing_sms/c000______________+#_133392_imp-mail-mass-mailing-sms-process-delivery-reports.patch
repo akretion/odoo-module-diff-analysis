@@ -1,0 +1,223 @@
+PR: https://github.com/odoo/odoo/pull/133392
+
+From: bd5a68a1a77055ae0b560379eb3dc021403bc0d0
+From: Florian Charlier
+Date: 2023-10-24 12:38:13
+
+Structural Changes: 3
+Total Changes: 112
+
+[IMP] mail, mass_mailing, sms: process delivery reports
+
+Also impacts mass_mailing_sms, test_mail_sms,
+test_mass_mailing
+
+This PR adds support to receive sms delivery reports.
+
+Before this PR, an SMS was considered 'sent' when successfully
+handled by the third party. The user couldn't know if/when an
+SMS was actually sent for delivery or delivered to the
+recipient's device.
+This was similar to the behavior for emails as delivery reports
+are not commonly used (and not supported in Odoo).
+
+With this work, the SMS `pending` state is introduced in mail,
+mass_mailing, sms and mass_mailing_sms contexts although only fully
+used in the latter two modules (+tests of course).
+
+Because of the huge cost related to upgrading very large existing
+databases, the following compromises were made:
+
+1. An email and sms notification/trace SENT means DELIVERED.
+  Those that are sent but NOT DELIVERED are PENDING.
+  The difference between email and sms traces reinforced with this PR
+  is that an email sent will be counted as "sent" ~ "delivered"
+  unless an error is returned for emails while for SMS it can only be
+  reached if a delivery report is received.
+2. The Link between an SMS uuid (shared with trusted parties) and
+  the tracking records (notifications or traces) is done via an
+  explicit relationship table (sms_tracker) instead of via a new field.
+  This however allowed to nicely concentrate the state update logic.
+
+A `process` state is added to represent an intermediate
+step in the sending process, such as held at IAP for SMS.
+
+A few adjustments are also included to update for IAP api v3.
+Also, adapts and includes new tests.
+
+Task-2560666
+
+Part-of: odoo/odoo#133392
+
+================================= pseudo patch: =================================
+
+--- a/addons/mass_mailing_sms/models/__init__.py
++++ b/addons/mass_mailing_sms/models/__init__.py
+@@ -7,4 +7,5 @@ from . import mailing_mailing
+ from . import mailing_trace
+ from . import res_users
+ from . import sms_sms
++from . import sms_tracker
+ from . import utm
+
+--- a/addons/mass_mailing_sms/models/mailing_mailing.py
++++ b/addons/mass_mailing_sms/models/mailing_mailing.py
+@@ -247,12 +247,6 @@ class Mailing(models.Model):
+             if res_ids:
+                 composer = self.env['sms.composer'].with_context(active_id=False).create(mailing._send_sms_get_composer_values(res_ids))
+                 composer._action_send_sms()
+-
+-            mailing.write({
+-                'state': 'done',
+-                'sent_date': fields.Datetime.now(),
+-                'kpi_mail_required': not mailing.sent_date,
+-                })
+         return True
+ 
+     # ------------------------------------------------------
+
+--- a/addons/mass_mailing_sms/models/mailing_trace.py
++++ b/addons/mass_mailing_sms/models/mailing_trace.py
+@@ -5,7 +5,6 @@ import random
+ import string
+ 
+ from odoo import api, fields, models
+-from odoo.osv import expression
+ 
+ 
+ class MailingTrace(models.Model):
+@@ -22,20 +21,29 @@ class MailingTrace(models.Model):
+         string='SMS ID (tech)',
+         index='btree_not_null'
+         # Integer because the related sms.sms can be deleted separately from its statistics.
+-        # However the ID is needed for several action and controllers.
++        # However, the ID is needed for several action and controllers.
+     )
++    sms_tracker_ids = fields.One2many('sms.tracker', 'mailing_trace_id', string='SMS Trackers')
+     sms_number = fields.Char('Number')
+     sms_code = fields.Char('Code')
+     failure_type = fields.Selection(selection_add=[
+         ('sms_number_missing', 'Missing Number'),
+         ('sms_number_format', 'Wrong Number Format'),
+         ('sms_credit', 'Insufficient Credit'),
++        ('sms_country_not_supported', 'Country Not Supported'),
++        ('sms_registration_needed', 'Country-specific Registration Required'),
+         ('sms_server', 'Server Error'),
+         ('sms_acc', 'Unregistered Account'),
+         # mass mode specific codes
+         ('sms_blacklist', 'Blacklisted'),
+         ('sms_duplicate', 'Duplicate'),
+         ('sms_optout', 'Opted Out'),
++        # delivery report errors
++        ('sms_expired', 'Expired'),
++        ('sms_invalid_destination', 'Invalid Destination'),
++        ('sms_not_allowed', 'Not Allowed'),
++        ('sms_not_delivered', 'Not Delivered'),
++        ('sms_rejected', 'Rejected'),
+     ])
+ 
+     @api.model_create_multi
+
+--- a/addons/mass_mailing_sms/models/sms_sms.py
++++ b/addons/mass_mailing_sms/models/sms_sms.py
+@@ -27,20 +27,3 @@ class SmsSms(models.Model):
+                     body = re.sub(re.escape(url) + r'(?![\w@:%.+&~#=/-])', url + f'/s/{sms.id}', body)
+             res[sms.id] = body
+         return res
+-
+-    def _postprocess_iap_sent_sms(self, iap_results, failure_reason=None, unlink_failed=False, unlink_sent=True):
+-        all_sms_ids = [item['res_id'] for item in iap_results]
+-        if any(sms.mailing_id for sms in self.env['sms.sms'].sudo().browse(all_sms_ids)):
+-            for state in self.IAP_TO_SMS_STATE.keys():
+-                sms_ids = [item['res_id'] for item in iap_results if item['state'] == state]
+-                traces = self.env['mailing.trace'].sudo().search([
+-                    ('sms_sms_id_int', 'in', sms_ids)
+-                ])
+-                if traces and state == 'success':
+-                    traces.set_sent()
+-                elif traces:
+-                    traces.set_failed(failure_type=self.IAP_TO_SMS_STATE[state])
+-        return super(SmsSms, self)._postprocess_iap_sent_sms(
+-            iap_results, failure_reason=failure_reason,
+-            unlink_failed=unlink_failed, unlink_sent=unlink_sent
+-        )
+
+--- a/None
++++ b/addons/mass_mailing_sms/models/sms_tracker.py
+@@ -0,0 +1,76 @@
++# Part of Odoo. See LICENSE file for full copyright and licensing details.
++
++from odoo import fields, models
++
++
++class SmsTracker(models.Model):
++    _inherit = "sms.tracker"
++
++    SMS_STATE_TO_TRACE_STATUS = {
++        'error': 'error',
++        'process': 'process',
++        'outgoing': 'outgoing',
++        'canceled': 'cancel',
++        'pending': 'pending',
++        'sent': 'sent',
++    }
++
++    mailing_trace_id = fields.Many2one('mailing.trace', ondelete='cascade')
++
++    def _action_update_from_provider_error(self, provider_error):
++        error_status, failure_type, failure_reason = super()._action_update_from_provider_error(provider_error)
++        self._update_sms_traces(error_status or 'error', failure_type=failure_type, failure_reason=failure_reason)
++        return error_status, failure_type, failure_reason
++
++    def _action_update_from_sms_state(self, sms_state, failure_type=False, failure_reason=False):
++        super()._action_update_from_sms_state(sms_state, failure_type=failure_type, failure_reason=failure_reason)
++        trace_status = self.SMS_STATE_TO_TRACE_STATUS[sms_state]
++        traces = self._update_sms_traces(trace_status, failure_type=failure_type, failure_reason=failure_reason)
++        self._update_sms_mailings(trace_status, traces)
++
++    def _update_sms_traces(self, trace_status, failure_type=False, failure_reason=False):
++        if not self.mailing_trace_id:  # avoid a search below
++            return self.env['mailing.trace']
++        # See _update_sms_notifications
++        statuses_to_ignore = {
++            'cancel': ['cancel', 'process', 'pending', 'sent'],
++            'outgoing': ['outgoing', 'process', 'pending', 'sent'],
++            'process': ['process', 'pending', 'sent'],
++            'pending': ['pending', 'sent'],
++            'bounce': ['bounce'],
++            'sent': ['sent'],
++            'error': ['error'],
++        }[trace_status]
++        traces = self.mailing_trace_id.filtered(lambda t: t.trace_status not in statuses_to_ignore)
++        if traces:
++            traces_values = {
++                'trace_status': trace_status,
++                'failure_type': failure_type,
++                'failure_reason': failure_reason,
++                **{'sent_datetime': fields.Datetime.now() if trace_status == 'pending' else {}},
++            }
++            traces.write(traces_values)
++        return traces
++
++    def _update_sms_mailings(self, trace_status, traces):
++        traces.flush_recordset(['trace_status'])
++
++        if trace_status == 'process':
++            traces.mass_mailing_id.write({'state': 'sending'})
++            return
++
++        mailings_to_mark_done = self.env['mailing.mailing'].search([
++            ('id', 'in', traces.mass_mailing_id.ids),
++            '!', ('mailing_trace_ids.trace_status', '=', 'process'),  # = not any trace with 'process' status
++            ('state', '!=', 'done'),
++        ])
++
++        if mailings_to_mark_done:
++            if self.env.user.is_public:  # From webhook event
++                mailings_to_mark_done._track_set_author(self.env.ref('base.partner_root'))
++            for mailing in mailings_to_mark_done:
++                mailing.write({
++                    'state': 'done',
++                    'sent_date': fields.Datetime.now(),
++                    'kpi_mail_required': not mailing.sent_date
++                })

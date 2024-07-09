@@ -1,0 +1,161 @@
+PR: https://github.com/odoo/odoo/pull/45797
+
+From: 231eaa0fd888f5e795fd987111c0bb805fc8fc71
+From: Barad Mahendra
+Date: 2020-06-16 13:18:06
+
+Structural Changes: 16
+Total Changes: 51
+
+[IMP] lunch: Improve the views and multi-company behaviour
+
+Purpose
+=======
+
+Improve the lunch categories and mutli-company environment.
+
+Specifications
+============
+
+- Able to archive a product category and this should archive/unarchive
+all the products in that category also added the filter for same.
+when unrchive the product if category is archived then raise the
+Validation to change the category OR unarchive the category.
+- add a default image for lunch categories
+- Adapt the size of the default image, currently it's too big,
+- On lunch order form view if product images is not set then display
+the category image same as kanban image.
+
+- Add a company field on the Product categories (it's already there
+but it should be visible on the view form). Added the multi company
+rule for the product category and if company is not set on category
+then it will be sharable by all the company. so default company on
+product category null.
+also on lunch product and report check the multi company and display
+the product accroding to company.
+
+closes odoo/odoo#45797
+
+Taskid: 2200002
+Closes: #45797
+Signed-off-by: Yannick Tivisse (yti) <yti@odoo.com>
+
+================================= pseudo patch: =================================
+
+--- a/addons/lunch/models/lunch_order.py
++++ b/addons/lunch/models/lunch_order.py
+@@ -48,13 +48,19 @@ class LunchOrder(models.Model):
+     topping_quantity_1 = fields.Selection(related='product_id.category_id.topping_quantity_1')
+     topping_quantity_2 = fields.Selection(related='product_id.category_id.topping_quantity_2')
+     topping_quantity_3 = fields.Selection(related='product_id.category_id.topping_quantity_3')
+-    image_1920 = fields.Image(related='product_id.image_1920')
+-    image_128 = fields.Image(related='product_id.image_128')
++    image_1920 = fields.Image(compute='_compute_product_images')
++    image_128 = fields.Image(compute='_compute_product_images')
+ 
+     available_toppings_1 = fields.Boolean(help='Are extras available for this product', compute='_compute_available_toppings')
+     available_toppings_2 = fields.Boolean(help='Are extras available for this product', compute='_compute_available_toppings')
+     available_toppings_3 = fields.Boolean(help='Are extras available for this product', compute='_compute_available_toppings')
+ 
++    @api.depends('product_id')
++    def _compute_product_images(self):
++        for line in self:
++            line.image_1920 = line.product_id.image_1920 or line.category_id.image_1920
++            line.image_128 = line.product_id.image_128 or line.category_id.image_128
++
+     @api.depends('category_id')
+     def _compute_available_toppings(self):
+         for line in self:
+@@ -191,6 +197,8 @@ class LunchOrder(models.Model):
+                 raise ValidationError(_('Your wallet does not contain enough money to order that. To add some money to your wallet, please contact your lunch manager.'))
+ 
+     def action_order(self):
++        if self.filtered(lambda line: not line.product_id.active):
++            raise ValidationError(_('Product is no longer available.'))
+         self.write({'state': 'ordered'})
+         self._check_wallet()
+ 
+
+--- a/addons/lunch/models/lunch_product.py
++++ b/addons/lunch/models/lunch_product.py
+@@ -1,8 +1,10 @@
+ # -*- coding: utf-8 -*-
+ # Part of Odoo. See LICENSE file for full copyright and licensing details.
++import base64
+ 
+-from odoo import api, fields, models
+-
++from odoo import api, fields, models, _
++from odoo.exceptions import UserError
++from odoo.modules.module import get_module_resource
+ from odoo.tools import formatLang
+ 
+ 
+@@ -12,8 +14,13 @@ class LunchProductCategory(models.Model):
+     _inherit = 'image.mixin'
+     _description = 'Lunch Product Category'
+ 
++    @api.model
++    def _default_image(self):
++        image_path = get_module_resource('lunch', 'static/img', 'lunch.png')
++        return base64.b64encode(open(image_path, 'rb').read())
++
+     name = fields.Char('Product Category', required=True, translate=True)
+-    company_id = fields.Many2one('res.company', default=lambda self: self.env.company)
++    company_id = fields.Many2one('res.company')
+     currency_id = fields.Many2one('res.currency', related='company_id.currency_id')
+     topping_label_1 = fields.Char('Extra 1 Label', required=True, default='Extras')
+     topping_label_2 = fields.Char('Extra 2 Label', required=True, default='Beverages')
+@@ -34,6 +41,8 @@ class LunchProductCategory(models.Model):
+         ('1_more', 'One or More'),
+         ('1', 'Only One')], 'Extra 3 Quantity', default='0_more', required=True)
+     product_count = fields.Integer(compute='_compute_product_count', help="The number of products related to this category")
++    active = fields.Boolean(string='Active', default=True)
++    image_1920 = fields.Image(default=_default_image)
+ 
+     def _compute_product_count(self):
+         product_data = self.env['lunch.product'].read_group([('category_id', 'in', self.ids)], ['category_id'], ['category_id'])
+@@ -60,6 +69,16 @@ class LunchProductCategory(models.Model):
+                 topping_values.update({'topping_category': 3})
+         return super(LunchProductCategory, self).write(vals)
+ 
++    def toggle_active(self):
++        """ Archiving related lunch product """
++        res = super().toggle_active()
++        Product = self.env['lunch.product'].with_context(active_test=False)
++        all_products = Product.search([('category_id', 'in', self.ids)])
++        for category in self:
++            all_products.filtered(
++                lambda p: p.category_id == category and p.active != category.active
++            ).toggle_active()
++        return res
+ 
+ class LunchTopping(models.Model):
+     """"""
+@@ -88,16 +107,22 @@ class LunchProduct(models.Model):
+     _description = 'Lunch Product'
+     _inherit = 'image.mixin'
+     _order = 'name'
++    _check_company_auto = True
+ 
+     name = fields.Char('Product Name', required=True, translate=True)
+-    category_id = fields.Many2one('lunch.product.category', 'Product Category', required=True)
++    category_id = fields.Many2one('lunch.product.category', 'Product Category', check_company=True, required=True)
+     description = fields.Text('Description', translate=True)
+     price = fields.Float('Price', digits='Account', required=True)
+-    supplier_id = fields.Many2one('lunch.supplier', 'Vendor', required=True)
++    supplier_id = fields.Many2one('lunch.supplier', 'Vendor', check_company=True, required=True)
+     active = fields.Boolean(default=True)
+ 
+-    company_id = fields.Many2one('res.company', related='supplier_id.company_id', store=True)
++    company_id = fields.Many2one('res.company', related='supplier_id.company_id', readonly=False, store=True)
+     currency_id = fields.Many2one('res.currency', related='company_id.currency_id')
+ 
+     new_until = fields.Date('New Until')
+-    favorite_user_ids = fields.Many2many('res.users', 'lunch_product_favorite_user_rel', 'product_id', 'user_id')
++    favorite_user_ids = fields.Many2many('res.users', 'lunch_product_favorite_user_rel', 'product_id', 'user_id', check_company=True)
++
++    def toggle_active(self):
++        if self.filtered(lambda product: not product.active and not product.category_id.active):
++            raise UserError(_("The product category is archived. The user have to unarchive the category or change the category of the product."))
++        return super().toggle_active()

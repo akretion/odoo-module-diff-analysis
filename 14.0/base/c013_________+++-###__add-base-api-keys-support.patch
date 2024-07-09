@@ -1,0 +1,569 @@
+PR: https://github.com/odoo/odoo/pull/
+
+From: d0dbbe23f4b1f797a9ed8c7a4726146d6df902ad
+From: Xavier Morel
+Date: 2020-08-14 23:03:27
+
+Structural Changes: 12
+Total Changes: 420
+
+[ADD] base: API keys support
+
+* ability for a user to request / create keys associated to their user
+* overrides can block RPC solely through API keys, by overriding
+  `_rpc_api_keys_only()` (to require API auth even in
+  situations where the user has not requested it themselves)
+* hash keys just in case as we can do so and might as well, add a
+  cleartext index (first 4 bytes of 20) to avoid blowing up the DB if
+  a user decides to create millions of keys for some daft reason
+* users can delete their own keys, admins can delete (invalidate)
+  anyone's keys
+* `scope` on API keys can be used to restrict usage to certain
+  kind of applications, so API keys can be used for other things
+  than global authentication. New keys manually created by users
+  have no scope by default so they are valid everywhere (global
+  keys). RPC auth (stateless XML-RPC/JSON-RPC) requires global keys
+
+Co-authored-by: Florimond Husquinet <fhu@odoo.com>
+Co-authored-by: Olivier Dony <odo@odoo.com>
+
+================================= pseudo patch: =================================
+
+--- a/odoo/addons/base/models/res_users.py
++++ b/odoo/addons/base/models/res_users.py
+@@ -2,6 +2,7 @@
+ # Part of Odoo. See LICENSE file for full copyright and licensing details.
+ 
+ import base64
++import binascii
+ import contextlib
+ import datetime
+ import hmac
+@@ -9,6 +10,7 @@ import ipaddress
+ import itertools
+ import json
+ import logging
++import os
+ import time
+ from collections import defaultdict
+ from hashlib import sha256
+@@ -114,6 +116,7 @@ def check_identity(fn, self):
+         'type': 'ir.actions.act_window',
+         'res_model': 'res.users.identitycheck',
+         'res_id': w.id,
++        'name': _("Security Control"),
+         'target': 'new',
+         'views': [(False, 'form')],
+     }
+@@ -771,6 +774,10 @@ class Users(models.Model):
+ 
+         # alternatively: use identitycheck wizard?
+         self._check_credentials(old_passwd, {'interactive': True})
++
++        ip = request.httprequest.environ['REMOTE_ADDR'] if request else 'n/a'
++        _logger.info("Password change for '%s' (#%s) from %s", self.env.user.login, self.env.uid, ip)
++
+         # use self.env.user here, because it has uid=SUPERUSER_ID
+         return self.env.user.write({'password': new_passwd})
+ 
+@@ -1447,21 +1454,21 @@ class UsersView(models.Model):
+         return res
+ 
+ class CheckIdentity(models.TransientModel):
+-    _name = 'res.users.identitycheck'
+-    _description = """ Wizard used to re-check the user's credentials (password)
++    """ Wizard used to re-check the user's credentials (password)
+ 
+-Might be useful before the more security-sensitive operations, users might be
+-leaving their computer unlocked & unattended. Re-checking credentials mitigates
+-some of the risk of a third party using such an unattended device to manipulate
+-the account.
+-"""
++    Might be useful before the more security-sensitive operations, users might be
++    leaving their computer unlocked & unattended. Re-checking credentials mitigates
++    some of the risk of a third party using such an unattended device to manipulate
++    the account.
++    """
++    _name = 'res.users.identitycheck'
++    _description = "Password Check Wizard"
+ 
+-    request = fields.Char(readonly=True, groups='.')
+-    password = fields.Char(required=True)
++    request = fields.Char(readonly=True, groups='.') # no access
++    password = fields.Char()
+ 
+     def run_check(self):
+-        if not request:
+-            raise UserError(_("This method can only be accessed over HTTP"))
++        assert request, "This method can only be accessed over HTTP"
+         self.create_uid._check_credentials(self.password, {'interactive': True})
+         self.password = False
+ 
+@@ -1512,3 +1519,150 @@ class ChangePasswordUser(models.TransientModel):
+             line.user_id.write({'password': line.new_passwd})
+         # don't keep temporary passwords in the database longer than necessary
+         self.write({'new_passwd': False})
++
++# API keys support
++API_KEY_SIZE = 20 # in bytes
++INDEX_SIZE = 8 # in hex digits, so 4 bytes, or 20% of the key
++KEY_CRYPT_CONTEXT = passlib.context.CryptContext(
++    # default is 29000 rounds which is 25~50ms, which is probably unnecessary
++    # given in this case all the keys are completely random data: dictionary
++    # attacks on API keys isn't much of a concern
++    ['pbkdf2_sha512'], pbkdf2_sha512__rounds=6000,
++)
++hash_api_key = getattr(KEY_CRYPT_CONTEXT, 'hash', None) or KEY_CRYPT_CONTEXT.encrypt
++class APIKeysUser(models.Model):
++    _inherit = 'res.users'
++
++    api_key_ids = fields.One2many('res.users.apikeys', 'user_id', string="API Keys")
++
++    def __init__(self, pool, cr):
++        init_res = super().__init__(pool, cr)
++        # duplicate list to avoid modifying the original reference
++        type(self).SELF_WRITEABLE_FIELDS = self.SELF_WRITEABLE_FIELDS + ['api_key_ids']
++        type(self).SELF_READABLE_FIELDS = self.SELF_READABLE_FIELDS + ['api_key_ids']
++        return init_res
++
++    def _rpc_api_keys_only(self):
++        """ To be overridden if RPC access needs to be restricted to API keys, e.g. for 2FA """
++        return False
++
++    def _check_credentials(self, password, user_agent_env):
++        if user_agent_env['interactive']:
++            return super()._check_credentials(password, user_agent_env)
++
++        if not self.env.user._rpc_api_keys_only():
++            try:
++                return super()._check_credentials(password, user_agent_env)
++            except AccessDenied:
++                pass
++
++        # 'rpc' scope does not really exist, we basically require a global key (scope NULL)
++        if self.env['res.users.apikeys']._check_credentials(scope='rpc', key=password) == self.env.uid:
++            return
++
++        raise AccessDenied()
++
++    @check_identity
++    def api_key_wizard(self):
++        return {
++            'type': 'ir.actions.act_window',
++            'res_model': 'res.users.apikeys.description',
++            'name': 'New API Key',
++            'target': 'new',
++            'views': [(False, 'form')],
++        }
++
++class APIKeys(models.Model):
++    _name = _description = 'res.users.apikeys'
++    _auto = False # so we can have a secret column
++
++    name = fields.Char("Description", required=True, readonly=True)
++    user_id = fields.Many2one('res.users', index=True, required=True, readonly=True, ondelete="cascade")
++    scope = fields.Char("Scope", readonly=True)
++    create_date = fields.Datetime("Creation Date", readonly=True)
++
++    def init(self):
++        # pylint: disable=sql-injection
++        self.env.cr.execute("""
++        CREATE TABLE IF NOT EXISTS {table} (
++            id serial primary key,
++            name varchar not null,
++            user_id integer not null REFERENCES res_users(id),
++            scope varchar,
++            index varchar({index_size}) not null CHECK (char_length(index) = {index_size}),
++            key varchar not null,
++            create_date timestamp without time zone DEFAULT (now() at time zone 'utc')
++        );
++        CREATE INDEX ON {table} (user_id, index);
++        """.format(table=self._table, index_size=INDEX_SIZE))
++
++    @check_identity
++    def remove(self):
++        if self.env.is_system() or self.mapped('user_id') == self.env.user:
++            ip = request.httprequest.environ['REMOTE_ADDR'] if request else 'n/a'
++            _logger.info("API key(s) removed: scope: <%s> for '%s' (#%s) from %s",
++               self.mapped('scope'), self.env.user.login, self.env.uid, ip)
++            self.sudo().unlink()
++            return {'type': 'ir.actions.act_window_close'}
++        raise AccessError(_("You can not remove API keys unless they're yours or you are a system user"))
++
++    def _check_credentials(self, *, scope, key):
++        assert scope, "scope is required"
++        index = key[:INDEX_SIZE]
++        self.env.cr.execute('SELECT user_id, key FROM res_users_apikeys WHERE index = %s AND (scope IS NULL OR scope = %s)', [index, scope])
++        for user_id, current_key in self.env.cr.fetchall():
++            if KEY_CRYPT_CONTEXT.verify(key, current_key):
++                return user_id
++
++    def _generate(self, scope, name):
++        """Generates an api key.
++        :param str scope: the scope of the key. If None, the key will give access to any rpc.
++        :param str name: the name of the key, mainly intended to be displayed in the UI.
++        :return: str: the key.
++
++        """
++        # no need to clear the LRU when *adding* a key, only when removing
++        k = binascii.hexlify(os.urandom(API_KEY_SIZE)).decode()
++        self.env.cr.execute("""
++        INSERT INTO res_users_apikeys (name, user_id, scope, key, index)
++        VALUES (%s, %s, %s, %s, %s)
++        RETURNING id
++        """,
++        [name, self.env.user.id, scope, hash_api_key(k), k[:INDEX_SIZE]])
++
++        ip = request.httprequest.environ['REMOTE_ADDR'] if request else 'n/a'
++        _logger.info("API key generated: scope: <%s> for '%s' (#%s) from %s",
++            scope, self.env.user.login, self.env.uid, ip)
++
++        return k
++
++class APIKeyDescription(models.TransientModel):
++    _name = _description = 'res.users.apikeys.description'
++
++    name = fields.Char("Description", required=True)
++
++    @check_identity
++    def make_key(self):
++        # only create keys for users who can delete their keys
++        if not self.user_has_groups('base.group_user'):
++            raise AccessError(_("Only internal users can create API keys"))
++
++        description = self.sudo()
++        k = self.env['res.users.apikeys']._generate(None, self.sudo().name)
++        description.unlink()
++
++        return {
++            'type': 'ir.actions.act_window',
++            'res_model': 'res.users.apikeys.show',
++            'name': 'API Key Ready',
++            'views': [(False, 'form')],
++            'target': 'new',
++            'context': {
++                'default_key': k,
++            }
++        }
++
++class APIKeyShow(models.AbstractModel):
++    _name = _description = 'res.users.apikeys.show'
++
++    key = fields.Char(readonly=True)
+
+--- a/odoo/addons/base/security/base_security.xml
++++ b/odoo/addons/base/security/base_security.xml
+@@ -184,5 +184,28 @@
+             <field eval="True" name="global"/>
+             <field name="domain_force">['|', ('share', '=', False), ('company_ids', 'in', company_ids)]</field>
+         </record>
++
++        <!-- rules for API token -->
++        <record id="api_key_public" model="ir.rule">
++            <field name="name">Public users can't interact with keys at all</field>
++            <field name="model_id" ref="model_res_users_apikeys"/>
++            <field name="domain_force">[(0, '=', 1)]</field>
++            <field name="groups" eval="[(4, ref('base.group_public'))]"/>
++        </record>
++        <record id="api_key_user" model="ir.rule">
++            <field name="name">Users can read and delete their own keys</field>
++            <field name="model_id" ref="model_res_users_apikeys"/>
++            <field name="domain_force">[('user_id', '=', user.id)]</field>
++            <field name="groups" eval="[
++                (4, ref('base.group_portal')),
++                (4, ref('base.group_user')),
++            ]"/>
++        </record>
++        <record id="api_key_admin" model="ir.rule">
++            <field name="name">Administrators can view user keys to revoke them</field>
++            <field name="model_id" ref="model_res_users_apikeys"/>
++            <field name="domain_force">[(1, '=', 1)]</field>
++            <field name="groups" eval="[(4, ref('base.group_system'))]"/>
++        </record>
+     </data>
+ </odoo>
+
+--- a/odoo/addons/base/security/ir.model.access.csv
++++ b/odoo/addons/base/security/ir.model.access.csv
+@@ -71,6 +71,11 @@
+ "access_res_users_log_all","res_users_log_all","model_res_users_log",,1,0,1,0
+ "access_res_users_identitycheck_employee","id check employees","model_res_users_identitycheck","group_user",1,1,1,0
+ "access_res_users_identitycheck_portal","id check portal","model_res_users_identitycheck","group_portal",1,1,1,0
++"access_res_users_apikeys_access_employee","API keys access employees","model_res_users_apikeys","group_user",1,0,0,0
++"access_res_users_apikeys_access_portal","API keys access portal","model_res_users_apikeys","group_portal",1,0,0,0
++"access_res_users_apikeys_description_employee","API key wizard employees","model_res_users_apikeys_description","group_user",1,0,1,0
++"access_res_users_apikeys_description_portal","API key wizard","model_res_users_apikeys_description","group_portal",1,0,1,0
++"access_res_users_apikeys_show_employee","API key result employees","model_res_users_apikeys_show","group_user",1,0,1,0
+ "access_ir_actions_all","ir_actions_all","model_ir_actions_actions",,1,0,0,0
+ "access_ir_actions_group_system","ir_actions_group_system","model_ir_actions_actions","group_system",1,1,1,1
+ "access_ir_actions_act_window_all","ir_actions_act_window_all","model_ir_actions_act_window",,1,0,0,0
+
+--- a/odoo/addons/base/tests/test_xmlrpc.py
++++ b/odoo/addons/base/tests/test_xmlrpc.py
+@@ -1,8 +1,14 @@
+ # -*- coding: utf-8 -*-
+ # Part of Odoo. See LICENSE file for full copyright and licensing details.
++import time
++
++from odoo.exceptions import AccessDenied, AccessError
++from odoo.http import _request_stack
+ 
+ import odoo.tools
+ from odoo.tests import common
++from odoo.service import common as auth, model
++from odoo.tools import DotDict
+ 
+ 
+ @common.tagged('post_install', '-at_install')
+@@ -64,3 +70,109 @@ class TestXMLRPC(common.HttpCase):
+                 'args': args
+             }
+         })
++
++# really just for the test cursor
++@common.tagged('post_install', '-at_install')
++class TestAPIKeys(common.HttpCase):
++    def setUp(self):
++        super().setUp()
++        self._user = self.env['res.users'].create({
++            'name': "Bylan",
++            'login': 'byl',
++            'password': 'ananananan',
++            'tz': 'Australia/Eucla',
++        })
++
++        # needs a fake request in order to call methods protected with check_identity
++        fake_req = DotDict({
++            # various things go and access request items
++            'httprequest': DotDict({
++                'environ': {'REMOTE_ADDR': 'localhost'},
++                'cookies': {},
++            }),
++            # bypass check_identity flow
++            'session': {'identity-check-last': time.time()}
++        })
++        _request_stack.push(fake_req)
++        self.addCleanup(_request_stack.pop)
++
++    def test_trivial(self):
++        uid = auth.dispatch('authenticate', [self.env.cr.dbname, 'byl', 'ananananan', {}])
++        self.assertEqual(uid, self._user.id)
++
++        ctx = model.dispatch('execute_kw', [
++            self.env.cr.dbname, uid, 'ananananan',
++            'res.users', 'context_get', []
++        ])
++        self.assertEqual(ctx['tz'], 'Australia/Eucla')
++
++    def test_wrongpw(self):
++        # User.authenticate raises but RPC.authenticate returns False
++        uid = auth.dispatch('authenticate', [self.env.cr.dbname, 'byl', 'aws', {}])
++        self.assertFalse(uid)
++        with self.assertRaises(AccessDenied):
++            model.dispatch('execute_kw', [
++                self.env.cr.dbname, self._user.id, 'aws',
++                'res.users', 'context_get', []
++            ])
++
++    def test_key(self):
++        env = self.env(user=self._user)
++        r = env['res.users.apikeys.description'].create({
++            'name': 'a',
++        }).make_key()
++        k = r['context']['default_key']
++
++        uid = auth.dispatch('authenticate', [self.env.cr.dbname, 'byl', 'ananananan', {}])
++        self.assertEqual(uid, self._user.id)
++
++        uid = auth.dispatch('authenticate', [self.env.cr.dbname, 'byl', k, {}])
++        self.assertEqual(uid, self._user.id)
++
++        ctx = model.dispatch('execute_kw', [
++            self.env.cr.dbname, uid, k,
++            'res.users', 'context_get', []
++        ])
++        self.assertEqual(ctx['tz'], 'Australia/Eucla')
++
++    def test_delete(self):
++        env = self.env(user=self._user)
++        env['res.users.apikeys.description'].create({'name': 'b',}).make_key()
++        env['res.users.apikeys.description'].create({'name': 'b',}).make_key()
++        env['res.users.apikeys.description'].create({'name': 'b',}).make_key()
++        k0, k1, k2 = env['res.users.apikeys'].search([])
++
++        # user can remove their own keys
++        k0.remove()
++        self.assertFalse(k0.exists())
++
++        # admin can remove user keys
++        k1.with_user(self.env.ref('base.user_admin')).remove    ()
++        self.assertFalse(k1.exists())
++
++        # other user can't remove user keys
++        u = self.env['res.users'].create({
++            'name': 'a',
++            'login': 'a',
++            'groups_id': self.env.ref('base.group_user').ids,
++        })
++        with self.assertRaises(AccessError):
++            k2.with_user(u).remove()
++
++    def test_disabled(self):
++        env = self.env(user=self._user)
++        k = env['res.users.apikeys.description'].create({'name': 'b',}).make_key()['context']['default_key']
++
++        self._user.active = False
++
++        with self.assertRaises(AccessDenied):
++            model.dispatch('execute_kw', [
++                self.env.cr.dbname, self._user.id, 'ananananan',
++                'res.users', 'context_get', []
++            ])
++
++        with self.assertRaises(AccessDenied):
++            model.dispatch('execute_kw', [
++                self.env.cr.dbname, self._user.id, k,
++                'res.users', 'context_get', []
++            ])
+
+--- a/odoo/addons/base/views/res_users_views.xml
++++ b/odoo/addons/base/views/res_users_views.xml
+@@ -38,7 +38,7 @@
+         <record id="identity_check_wizard" model="ir.ui.view">
+             <field name="model">res.users.identitycheck</field>
+             <field name="arch" type="xml">
+-                <form>
++                <form string="Security Control">
+                     <sheet>
+                         <div class="row container">
+                             <div class="col-8 offset-2">
+@@ -54,7 +54,9 @@
+                                     This is necessary for security-related changes. The authorization will last for a few minutes.
+                                   </p>
+                                   <div>
+-                                    <label for="password"/><field class="col-4" name="password" autocomplete="current-password" password="True"/>
++                                    <label for="password"/>
++                                    <field class="col-4" name="password" autocomplete="current-password"
++                                           required="True" password="True"/>
+                                   </div>
+                                   <button string="Confirm Password" type="object" name="run_check" class="btn btn-primary mt-3"/>
+                                 </div>
+@@ -370,6 +372,65 @@
+         </record>
+         <menuitem action="action_res_users" id="menu_action_res_users" parent="base.menu_users" sequence="0"/>
+ 
++
++        <record id="action_res_users_keys_description" model="ir.actions.act_window">
++            <field name="name">API Key: description input wizard</field>
++            <field name="res_model">res.users.apikeys.description</field>
++            <field name="target">new</field>
++            <field name="view_mode">form</field>
++        </record>
++        <record id="form_res_users_key_description" model="ir.ui.view">
++            <field name="name">API Key: description input form</field>
++            <field name="model">res.users.apikeys.description</field>
++            <field name="arch" type="xml">
++                <form>
++                    <sheet>
++                    <h3 class="font-weight-bold">
++                        Name your key
++                    </h3>
++                    <p>Enter a description of and purpose for the key.</p>
++                    <field name="name" placeholder="What's this key for?"/>
++                    <p>
++                        It is very important that this description be clear
++                        and complete, <strong>it will be the only way to
++                        identify the key once created</strong>.
++                    </p>
++                    <footer>
++                        <button name="make_key" type="object" string="Generate key" class="btn-primary"/>
++                        <button special="cancel" string="Cancel" class="btn-secondary"/>
++                    </footer>
++                    </sheet>
++                </form>
++            </field>
++        </record>
++
++        <record id="form_res_users_key_show" model="ir.ui.view">
++            <field name="name">API Key: show</field>
++            <field name="model">res.users.apikeys.show</field>
++            <field name="arch" type="xml">
++                <form>
++                    <sheet>
++                        <h3 class="font-weight-bold">
++                            Write down your key
++                        </h3>
++                        <p>
++                            Here is your new API key, use it instead of a password for RPC access.
++                            Your login is still necessary for interactive usage.
++                        </p>
++                        <p><code><field name="key" readonly="True"/></code></p>
++                        <p class="alert alert-warning" role="alert">
++                            <strong>Important:</strong>
++                            The key cannot be retrieved later and provides <b>full access</b>
++                            to your user account, it is very important to store it securely.
++                        </p>
++                        <footer>
++                            <button special="cancel" string="Done!"/>
++                        </footer>
++                    </sheet>
++                </form>
++            </field>
++        </record>
++
+         <record id="view_users_form_simple_modif" model="ir.ui.view">
+             <field name="name">res.users.preferences.form</field>
+             <field name="model">res.users</field>
+@@ -409,6 +470,24 @@
+                             groups="base.group_multi_company"/>
+                     </group>
+                     <group name="preference_contact"></group>
++                    <group>
++                        <group>
++                            <field name="api_keys_only_explicit"
++                                   readonly="0"
++                                   string="Require API key"
++                                   help="Only allow API (RPC) access using API keys, not login/password"/>
++                        </group>
++                    </group>
++                    <group>
++                        <label for="api_key_ids">API Keys</label>
++                        <field name="api_key_ids" nolabel="1" colspan="4" readonly="0">
++                            <tree editable="bottom" create="false" delete="false">
++                                <field name="name"/>
++                                <button type="object" name="remove" icon="fa-trash"/>
++                            </tree>
++                        </field>
++                        <button string="Add Key" type="action" name="%(action_res_users_keys_description)d"/>
++                    </group>
+                     <footer>
+                         <button name="preference_save" type="object" string="Save" class="btn-primary"/>
+                         <button name="preference_cancel" string="Cancel" special="cancel" class="btn-secondary"/>
+@@ -431,6 +510,27 @@
+             <field name="act_window_id" ref="action_res_users_my"/>
+         </record>
+ 
++        <record model="ir.ui.view" id="view_apikeys">
++            <field name="name">API Keys Listing</field>
++            <field name="model">res.users.apikeys</field>
++            <field name="groups_id" eval="[(4, ref('base.group_system'))]"/>
++            <field name="arch" type="xml">
++                <tree create="false" edit="false" delete="false" editable="bottom">
++                    <field name="user_id"/>
++                    <field name="name"/>
++                    <field name="scope"/>
++                    <field name="create_date"/>
++                    <button type="object" name="remove" icon="fa-trash"/>
++                </tree>
++            </field>
++        </record>
++        <record model="ir.actions.act_window" id="action_apikeys_admin">
++            <field name="name">API Keys Listing</field>
++            <field name="res_model">res.users.apikeys</field>
++            <field name="view_mode">tree</field>
++            <field name="groups_id" eval="[(4, ref('base.group_system'))]"/>
++            <field name="view_id" ref="base.view_apikeys"/>
++        </record>
+ 
+     </data>
+ </odoo>

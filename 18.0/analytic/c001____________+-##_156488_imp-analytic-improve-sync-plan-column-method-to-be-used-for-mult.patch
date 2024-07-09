@@ -1,0 +1,315 @@
+PR: https://github.com/odoo/odoo/pull/156488
+
+From: 0fe0246b0d5a0e372e69fbae2b5a2f61143eb93f
+From: Nishant Jain
+Date: 2024-05-30 10:44:14
+
+Structural Changes: 5
+Total Changes: 214
+
+[IMP] analytic: improve _sync_plan_column method to be used for multiple models.
+
+Before this commit:
+_sync_plan_column creates the analytical account field for the plan in the
+analytical item only
+
+After this commit:
+_sync_plan_column will create the analytical account field for the plan in the
+the models returned by the method _get_plan_column_models()
+
+task-3623445
+
+closes odoo/odoo#156488
+
+Related: odoo/upgrade#5785
+Related: odoo/enterprise#53625
+Signed-off-by: William André (wan) <wan@odoo.com>
+
+================================= pseudo patch: =================================
+
+--- a/addons/analytic/models/analytic_account.py
++++ b/addons/analytic/models/analytic_account.py
+@@ -116,6 +116,12 @@ class AccountAnalyticAccount(models.Model):
+                 vals['name'] = _("%s (copy)", account.name)
+         return vals_list
+ 
++    def web_read(self, specification: dict[str, dict]) -> list[dict]:
++        self_context = self
++        if len(self) == 1:
++            self_context = self.with_context(analytic_plan_id=self.plan_id.id)
++        return super(AccountAnalyticAccount, self_context).web_read(specification)
++
+     def _read_group_select(self, aggregate_spec, query):
+         # flag balance/debit/credit as aggregatable, and manually sum the values
+         # from the records in the group
+
+--- a/addons/analytic/models/analytic_line.py
++++ b/addons/analytic/models/analytic_line.py
+@@ -2,12 +2,109 @@
+ # Part of Odoo. See LICENSE file for full copyright and licensing details.
+ from lxml.builder import E
+ 
+-from odoo import api, fields, models
++from odoo import api, fields, models, _
++from odoo.exceptions import ValidationError
+ from odoo.osv.expression import OR
+ 
+ 
++class AnalyticPlanFields(models.AbstractModel):
++    """ Add one field per analytic plan to the model """
++    _name = 'analytic.plan.fields.mixin'
++    _description = 'Analytic Plan Fields'
++
++    account_id = fields.Many2one(
++        'account.analytic.account',
++        'Project Account',
++        ondelete='restrict',
++        index=True,
++        check_company=True,
++    )
++    # Magic column that represents all the plans at the same time, except for the compute
++    # where it is context dependent, and needs the id of the desired plan.
++    # Used as a syntactic sugar for search views, and magic field for one2many relation
++    auto_account_id = fields.Many2one(
++        comodel_name='account.analytic.account',
++        string='Analytic Account',
++        compute='_compute_auto_account',
++        inverse='_inverse_auto_account',
++        search='_search_auto_account',
++    )
++
++    @api.depends_context('analytic_plan_id')
++    def _compute_auto_account(self):
++        plan = self.env['account.analytic.plan'].browse(self.env.context.get('analytic_plan_id'))
++        for line in self:
++            line.auto_account_id = bool(plan) and line[plan._column_name()]
++
++    def _inverse_auto_account(self):
++        for line in self:
++            line[line.auto_account_id.plan_id._column_name()] = line.auto_account_id
++
++    def _search_auto_account(self, operator, value):
++        project_plan, other_plans = self.env['account.analytic.plan']._get_all_plans()
++        return OR([
++            [(plan._column_name(), operator, value)]
++            for plan in project_plan + other_plans
++        ])
++
++    def _get_plan_fnames(self):
++        project_plan, other_plans = self.env['account.analytic.plan']._get_all_plans()
++        return [fname for plan in project_plan + other_plans if (fname := plan._column_name()) in self]
++
++    @api.constrains(lambda self: self._get_plan_fnames())
++    def _check_account_id(self):
++        fnames = self._get_plan_fnames()
++        for line in self:
++            if not any(line[fname] for fname in fnames):
++                raise ValidationError(_("At least one analytic account must be set"))
++
++    @api.model
++    def fields_get(self, allfields=None, attributes=None):
++        fields = super().fields_get(allfields, attributes)
++        if self.env['account.analytic.plan'].check_access_rights('read', raise_exception=False):
++            project_plan, other_plans = self.env['account.analytic.plan']._get_all_plans()
++            for plan in project_plan + other_plans:
++                fname = plan._column_name()
++                if fname in fields:
++                    fields[fname]['string'] = plan.name
++                    fields[fname]['domain'] = f"[('plan_id', 'child_of', {plan.id})]"
++        return fields
++
++    def _get_view(self, view_id=None, view_type='form', **options):
++        arch, view = super()._get_view(view_id, view_type, **options)
++        return self._patch_view(arch, view, view_type)
++
++    def _patch_view(self, arch, view, view_type):
++        if self.env['account.analytic.plan'].check_access_rights('read', raise_exception=False):
++            project_plan, other_plans = self.env['account.analytic.plan']._get_all_plans()
++
++            # Find main account nodes
++            account_node = arch.find('.//field[@name="account_id"]')
++            account_filter_node = arch.find('.//filter[@name="account_id"]')
++
++            # Force domain on main account node as the fields_get doesn't do the trick
++            if account_node is not None and view_type == 'search':
++                account_node.set('domain', repr([('plan_id', 'child_of', project_plan.id)]))
++
++            # If there is a main node, append the ones for other plans
++            if account_node is not None or account_filter_node is not None:
++                for plan in other_plans[::-1]:
++                    fname = plan._column_name()
++                    if account_node is not None:
++                        account_node.addnext(E.field(**{
++                            'optional': 'show',
++                            **account_node.attrib,
++                            'name': fname,
++                            'domain': f"[('plan_id', 'child_of', {plan.id})]",
++                        }))
++                    if account_filter_node is not None:
++                        account_filter_node.addnext(E.filter(name=fname, context=f"{{'group_by': '{fname}'}}"))
++        return arch, view
++
++
+ class AccountAnalyticLine(models.Model):
+     _name = 'account.analytic.line'
++    _inherit = 'analytic.plan.fields.mixin'
+     _description = 'Analytic Line'
+     _order = 'date desc, id desc'
+     _check_company_auto = True
+@@ -41,23 +138,6 @@ class AccountAnalyticLine(models.Model):
+         string='UoM Category',
+         readonly=True,
+     )
+-    account_id = fields.Many2one(
+-        'account.analytic.account',
+-        'Project Account',
+-        ondelete='restrict',
+-        index=True,
+-        check_company=True,
+-    )
+-    # Magic column that represents all the plans at the same time, except for the compute
+-    # where it is context dependent, and needs the id of the desired plan.
+-    # Used as a syntactic sugar for search views, and magic field for one2many relation
+-    auto_account_id = fields.Many2one(
+-        comodel_name='account.analytic.account',
+-        string='Analytic Account',
+-        compute='_compute_auto_account',
+-        inverse='_inverse_auto_account',
+-        search='_search_auto_account',
+-    )
+     partner_id = fields.Many2one(
+         'res.partner',
+         string='Partner',
+@@ -87,55 +167,3 @@ class AccountAnalyticLine(models.Model):
+         [('other', 'Other')],
+         default='other',
+     )
+-
+-    @api.depends_context('analytic_plan_id')
+-    def _compute_auto_account(self):
+-        plan = self.env['account.analytic.plan'].browse(self.env.context.get('analytic_plan_id'))
+-        for line in self:
+-            line.auto_account_id = bool(plan) and line[plan._column_name()]
+-
+-    def _inverse_auto_account(self):
+-        for line in self:
+-            line[line.auto_account_id.plan_id._column_name()] = line.auto_account_id
+-
+-    def _search_auto_account(self, operator, value):
+-        project_plan, other_plans = self.env['account.analytic.plan']._get_all_plans()
+-        return OR([
+-            [(plan._column_name(), operator, value)]
+-            for plan in project_plan + other_plans
+-        ])
+-
+-    def _get_view(self, view_id=None, view_type='form', **options):
+-        arch, view = super()._get_view(view_id, view_type, **options)
+-        if self.env['account.analytic.plan'].check_access_rights('read', raise_exception=False):
+-            project_plan, other_plans = self.env['account.analytic.plan']._get_all_plans()
+-
+-            # Find main account nodes
+-            account_node = arch.find('.//field[@name="account_id"]')
+-            account_filter_node = arch.find('.//filter[@name="account_id"]')
+-
+-            # Force domain on main account node as the fields_get doesn't do the trick
+-            if account_node is not None and view_type == 'search':
+-                account_node.set('domain', repr([('plan_id', 'child_of', project_plan.id)]))
+-
+-            # If there is a main node, append the ones for other plans
+-            if account_node is not None or account_filter_node is not None:
+-                for plan in other_plans[::-1]:
+-                    fname = plan._column_name()
+-                    if account_node is not None:
+-                        account_node.addnext(E.field(name=fname, domain=f"[('plan_id', 'child_of', {plan.id})]", optional="show"))
+-                    if account_filter_node is not None:
+-                        account_filter_node.addnext(E.filter(name=fname, context=f"{{'group_by': '{fname}'}}"))
+-        return arch, view
+-
+-    @api.model
+-    def fields_get(self, allfields=None, attributes=None):
+-        fields = super().fields_get(allfields, attributes)
+-        if self.env['account.analytic.plan'].check_access_rights('read', raise_exception=False):
+-            project_plan, other_plans = self.env['account.analytic.plan']._get_all_plans()
+-            for plan in project_plan + other_plans:
+-                fname = plan._column_name()
+-                if fname in fields:
+-                    fields[fname]['string'] = plan.name
+-                    fields[fname]['domain'] = f"[('plan_id', 'child_of', {plan.id})]"
+-        return fields
+
+--- a/addons/analytic/models/analytic_plan.py
++++ b/addons/analytic/models/analytic_plan.py
+@@ -1,6 +1,5 @@
+ # -*- coding: utf-8 -*-
+ # Part of Odoo. See LICENSE file for full copyright and licensing details.
+-
+ from random import randint
+ 
+ from odoo import api, fields, models, _
+@@ -119,10 +118,10 @@ class AccountAnalyticPlan(models.Model):
+         return self.root_id._strict_column_name()
+ 
+     def _inverse_name(self):
+-        self._sync_plan_column()
++        self._sync_all_plan_column()
+ 
+     def _inverse_parent_id(self):
+-        self._sync_plan_column()
++        self._sync_all_plan_column()
+ 
+     @api.depends('parent_id', 'parent_path')
+     def _compute_root_id(self):
+@@ -247,16 +246,21 @@ class AccountAnalyticPlan(models.Model):
+         self._find_plan_column().unlink()
+         return super().unlink()
+ 
+-    def _find_plan_column(self):
+-        return self.env['ir.model.fields'].sudo().search([
+-            ('name', 'in', [plan._strict_column_name() for plan in self]),
+-            ('model', '=', 'account.analytic.line'),
+-        ])
++    def _find_plan_column(self, model=False):
++        domain = [('name', 'in', [plan._strict_column_name() for plan in self])]
++        if model:
++            domain.append(('model', '=', model))
++        return self.env['ir.model.fields'].search(domain)
++
++    def _sync_all_plan_column(self):
++        model_names = self.env.registry.descendants(['analytic.plan.fields.mixin'], '_inherit') - {'analytic.plan.fields.mixin'}
++        for model in model_names:
++            self._sync_plan_column(model)
+ 
+-    def _sync_plan_column(self):
+-        # Create/delete a new field/column on analytic lines for this plan, and keep the name in sync.
++    def _sync_plan_column(self, model):
++        # Create/delete a new field/column on related models for this plan, and keep the name in sync.
+         for plan in self:
+-            prev = plan._find_plan_column()
++            prev = plan._find_plan_column(model)
+             if plan.parent_id and prev:
+                 prev.unlink()
+             elif prev:
+@@ -267,15 +271,17 @@ class AccountAnalyticPlan(models.Model):
+                     'name': column,
+                     'field_description': plan.name,
+                     'state': 'manual',
+-                    'model': 'account.analytic.line',
+-                    'model_id': self.env['ir.model']._get_id('account.analytic.line'),
++                    'model': model,
++                    'model_id': self.env['ir.model']._get_id(model),
+                     'ttype': 'many2one',
+                     'relation': 'account.analytic.account',
+-                    'store': True,
++                    'copied': True,
+                 })
+-                tablename = self.env['account.analytic.line']._table
+-                indexname = make_index_name(tablename, column)
+-                create_index(self.env.cr, indexname, tablename, [column], 'btree', f'{column} IS NOT NULL')
++                Model = self.env[model]
++                if Model._auto:
++                    tablename = Model._table
++                    indexname = make_index_name(tablename, column)
++                    create_index(self.env.cr, indexname, tablename, [column], 'btree', f'{column} IS NOT NULL')
+ 
+ 
+ class AccountAnalyticApplicability(models.Model):

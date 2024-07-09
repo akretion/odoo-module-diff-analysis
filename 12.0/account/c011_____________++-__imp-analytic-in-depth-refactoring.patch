@@ -1,0 +1,264 @@
+PR: https://github.com/odoo/odoo/pull/
+
+From: 079a13a349c942ab69ca704263bc5cb52c391d92
+From: Joren Van Onder
+Date: 2018-01-31 14:53:04
+
+Structural Changes: 8
+Total Changes: 70
+
+[IMP] analytic: in-depth refactoring
+
+* analytic accounts can be shared among companies
+* amount on analytic lines always refer to amount in company currency of which it belongs to
+* add analytic groups (hierarchical way to classify analytic accounts)
+* analytic tags:
+- only present on analytic lines, not anymore on analytic accounts
+- can be used to distribue/split an analytic lines among several analytic accounts
+- enabled by a dedicated res.group
+- added on several objects (vouchers, expenses, analytic defaults...) as well as in bank statement reconciliation widget (manual counterpart and account.reconcile.model)
+
+* bunch of fixes made related to analytic
+
+Was PR #22124. Was task 32386. Original work by tbe.
+
+================================= pseudo patch: =================================
+
+--- a/addons/account/models/account.py
++++ b/addons/account/models/account.py
+@@ -864,7 +864,10 @@ class AccountTax(models.Model):
+     def get_grouping_key(self, invoice_tax_val):
+         """ Returns a string that will be used to group account.invoice.tax sharing the same properties"""
+         self.ensure_one()
+-        return str(invoice_tax_val['tax_id']) + '-' + str(invoice_tax_val['account_id']) + '-' + str(invoice_tax_val['account_analytic_id'])
++        return str(invoice_tax_val['tax_id']) + '-' + \
++               str(invoice_tax_val['account_id']) + '-' + \
++               str(invoice_tax_val['account_analytic_id']) + '-' + \
++               str(invoice_tax_val.get('analytic_tag_ids', []))
+ 
+     def _compute_amount(self, base_amount, price_unit, quantity=1.0, product=None, partner=None):
+         """ Returns the amount of a single tax. base_amount is the actual amount on which the tax is applied, which is
+@@ -1048,6 +1051,7 @@ class AccountReconcileModel(models.Model):
+     amount = fields.Float(digits=0, required=True, default=100.0, help="Fixed amount will count as a debit if it is negative, as a credit if it is positive.")
+     tax_id = fields.Many2one('account.tax', string='Tax', ondelete='restrict')
+     analytic_account_id = fields.Many2one('account.analytic.account', string='Analytic Account', ondelete='set null')
++    analytic_tag_ids = fields.Many2many('account.analytic.tag', string='Analytic Tags')
+ 
+     second_account_id = fields.Many2one('account.account', string='Second Account', ondelete='cascade', domain=[('deprecated', '=', False)])
+     second_journal_id = fields.Many2one('account.journal', string='Second Journal', ondelete='cascade', help="This field is ignored in a bank statement reconciliation.")
+@@ -1059,6 +1063,7 @@ class AccountReconcileModel(models.Model):
+     second_amount = fields.Float(string='Second Amount', digits=0, required=True, default=100.0, help="Fixed amount will count as a debit if it is negative, as a credit if it is positive.")
+     second_tax_id = fields.Many2one('account.tax', string='Second Tax', ondelete='restrict', domain=[('type_tax_use', '=', 'purchase')])
+     second_analytic_account_id = fields.Many2one('account.analytic.account', string='Second Analytic Account', ondelete='set null')
++    second_analytic_tag_ids = fields.Many2many('account.analytic.tag', string='Second Analytic Tags')
+ 
+     @api.onchange('name')
+     def onchange_name(self):
+
+--- a/addons/account/models/account_analytic_line.py
++++ b/addons/account/models/account_analytic_line.py
+@@ -13,7 +13,7 @@ class AccountAnalyticLine(models.Model):
+     product_id = fields.Many2one('product.product', string='Product')
+     general_account_id = fields.Many2one('account.account', string='Financial Account', ondelete='restrict', readonly=True,
+                                          related='move_id.account_id', store=True, domain=[('deprecated', '=', False)])
+-    move_id = fields.Many2one('account.move.line', string='Move Line', ondelete='cascade', index=True)
++    move_id = fields.Many2one('account.move.line', string='Journal Item', ondelete='cascade', index=True)
+     code = fields.Char(size=8)
+     ref = fields.Char(string='Ref.')
+ 
+
+--- a/addons/account/models/account_invoice.py
++++ b/addons/account/models/account_invoice.py
+@@ -940,6 +940,7 @@ class AccountInvoice(models.Model):
+             'sequence': tax['sequence'],
+             'account_analytic_id': tax['analytic'] and line.account_analytic_id.id or False,
+             'account_id': self.type in ('out_invoice', 'in_invoice') and (tax['account_id'] or line.account_id.id) or (tax['refund_account_id'] or line.account_id.id),
++            'analytic_tag_ids': tax['analytic'] and line.analytic_tag_ids.ids or False,
+         }
+ 
+         # If the taxes generate moves on the same financial account as the invoice line,
+@@ -948,7 +949,6 @@ class AccountInvoice(models.Model):
+         # to ensure the tax move is allocated to the proper analytic account.
+         if not vals.get('account_analytic_id') and line.account_analytic_id and vals['account_id'] == line.account_id.id:
+             vals['account_analytic_id'] = line.account_analytic_id.id
+-
+         return vals
+ 
+     @api.multi
+@@ -1056,9 +1056,9 @@ class AccountInvoice(models.Model):
+                 'product_id': line.product_id.id,
+                 'uom_id': line.uom_id.id,
+                 'account_analytic_id': line.account_analytic_id.id,
++                'analytic_tag_ids': analytic_tag_ids,
+                 'tax_ids': tax_ids,
+                 'invoice_id': self.id,
+-                'analytic_tag_ids': analytic_tag_ids
+             }
+             res.append(move_line_dict)
+         return res
+@@ -1075,6 +1075,8 @@ class AccountInvoice(models.Model):
+                 if tax.amount_type == "group":
+                     for child_tax in tax.children_tax_ids:
+                         done_taxes.append(child_tax.id)
++
++                analytic_tag_ids = [(4, analytic_tag.id, None) for analytic_tag in tax_line.analytic_tag_ids]
+                 res.append({
+                     'invoice_tax_line_id': tax_line.id,
+                     'tax_line_id': tax_line.tax_id.id,
+@@ -1085,6 +1087,7 @@ class AccountInvoice(models.Model):
+                     'price': tax_line.amount_total,
+                     'account_id': tax_line.account_id.id,
+                     'account_analytic_id': tax_line.account_analytic_id.id,
++                    'analytic_tag_ids': analytic_tag_ids,
+                     'invoice_id': self.id,
+                     'tax_ids': [(6, 0, list(done_taxes))] if tax_line.tax_id.include_base_amount else []
+                 })
+@@ -1261,7 +1264,6 @@ class AccountInvoice(models.Model):
+             'debit': line['price'] > 0 and line['price'],
+             'credit': line['price'] < 0 and -line['price'],
+             'account_id': line['account_id'],
+-            'analytic_line_ids': line.get('analytic_line_ids', []),
+             'amount_currency': line['price'] > 0 and abs(line.get('amount_currency', False)) or -abs(line.get('amount_currency', False)),
+             'currency_id': line.get('currency_id', False),
+             'quantity': line.get('quantity', 1.00),
+@@ -1733,6 +1735,7 @@ class AccountInvoiceTax(models.Model):
+                     'tax_id': tax.tax_id.id,
+                     'account_id': tax.account_id.id,
+                     'account_analytic_id': tax.account_analytic_id.id,
++                    'analytic_tag_ids': tax.analytic_tag_ids.ids or False,
+                 })
+                 if tax.invoice_id and key in tax_grouped[tax.invoice_id.id]:
+                     tax.base = tax_grouped[tax.invoice_id.id][key]['base']
+@@ -1744,6 +1747,7 @@ class AccountInvoiceTax(models.Model):
+     tax_id = fields.Many2one('account.tax', string='Tax', ondelete='restrict')
+     account_id = fields.Many2one('account.account', string='Tax Account', required=True, domain=[('deprecated', '=', False)])
+     account_analytic_id = fields.Many2one('account.analytic.account', string='Analytic account')
++    analytic_tag_ids = fields.Many2many('account.analytic.tag', string='Analytic Tags')
+     amount = fields.Monetary('Tax Amount')
+     amount_rounding = fields.Monetary('Amount Delta')
+     amount_total = fields.Monetary(string="Amount Total", compute='_compute_amount_total')
+
+--- a/addons/account/models/account_move.py
++++ b/addons/account/models/account_move.py
+@@ -173,6 +173,8 @@ class AccountMove(models.Model):
+         for move in self:
+             if not move.journal_id.update_posted:
+                 raise UserError(_('You cannot modify a posted entry of this journal.\nFirst you should set the journal to allow cancelling entries.'))
++            # We remove all the analytics entries for this journal
++            move.mapped('line_ids.analytic_line_ids').unlink()
+         if self.ids:
+             self.check_access_rights('write')
+             self.check_access_rule('write')
+@@ -469,7 +471,7 @@ class AccountMoveLine(models.Model):
+     tax_ids = fields.Many2many('account.tax', string='Taxes')
+     tax_line_id = fields.Many2one('account.tax', string='Originator tax', ondelete='restrict')
+     analytic_account_id = fields.Many2one('account.analytic.account', string='Analytic Account')
+-    analytic_tag_ids = fields.Many2many('account.analytic.tag', string='Analytic tags')
++    analytic_tag_ids = fields.Many2many('account.analytic.tag', string='Analytic Tags')
+     company_id = fields.Many2one('res.company', related='account_id.company_id', string='Company', store=True)
+     counterpart = fields.Char("Counterpart", compute='_get_counterpart', help="Compute the counter part accounts of this journal item for this journal entry. This can be needed in reports.")
+ 
+@@ -1452,13 +1454,19 @@ class AccountMoveLine(models.Model):
+             currency_id = invoice_currency.id
+         return debit, credit, amount_currency, currency_id
+ 
++    def _get_analytic_tag_ids(self):
++        self.ensure_one()
++        return self.analytic_tag_ids.filtered(lambda r: not r.active_analytic_distribution).ids
++
+     @api.multi
+     def create_analytic_lines(self):
+-        """ Create analytic items upon validation of an account.move.line having an analytic account. This
+-            method first remove any existing analytic item related to the line before creating any new one.
++        """ Create analytic items upon validation of an account.move.line having an analytic account or an analytic distribution.
+         """
+-        self.mapped('analytic_line_ids').unlink()
+         for obj_line in self:
++            for tag in obj_line.analytic_tag_ids.filtered('active_analytic_distribution'):
++                for distribution in tag.analytic_distribution_ids:
++                    vals_line = obj_line._prepare_analytic_distribution_line(distribution)
++                    self.env['account.analytic.line'].create(vals_line)
+             if obj_line.analytic_account_id:
+                 vals_line = obj_line._prepare_analytic_line()[0]
+                 self.env['account.analytic.line'].create(vals_line)
+@@ -1473,16 +1481,40 @@ class AccountMoveLine(models.Model):
+             'name': self.name,
+             'date': self.date,
+             'account_id': self.analytic_account_id.id,
+-            'tag_ids': [(6, 0, self.analytic_tag_ids.ids)],
++            'tag_ids': [(6, 0, self._get_analytic_tag_ids())],
+             'unit_amount': self.quantity,
+             'product_id': self.product_id and self.product_id.id or False,
+             'product_uom_id': self.product_uom_id and self.product_uom_id.id or False,
+-            'amount': self.company_currency_id.with_context(date=self.date or fields.Date.context_today(self)).compute(amount, self.analytic_account_id.currency_id) if self.analytic_account_id.currency_id else amount,
++            'amount': amount,
+             'general_account_id': self.account_id.id,
+             'ref': self.ref,
+             'move_id': self.id,
+             'user_id': self.invoice_id.user_id.id or self._uid,
+             'partner_id': self.partner_id.id,
++            'company_id': self.env.user.company_id.id,
++        }
++
++    def _prepare_analytic_distribution_line(self, distribution):
++        """ Prepare the values used to create() an account.analytic.line upon validation of an account.move.line having
++            analytic tags with analytic distribution.
++        """
++        self.ensure_one()
++        amount = -self.balance * distribution.percentage / 100.0
++        return {
++            'name': self.name,
++            'date': self.date,
++            'account_id': distribution.account_id.id,
++            'partner_id': self.partner_id.id,
++            'tag_ids': [(6, 0, [distribution.tag_id.id] + self._get_analytic_tag_ids())],
++            'unit_amount': self.quantity,
++            'product_id': self.product_id and self.product_id.id or False,
++            'product_uom_id': self.product_uom_id and self.product_uom_id.id or False,
++            'amount': amount,
++            'general_account_id': self.account_id.id,
++            'ref': self.ref,
++            'move_id': self.id,
++            'user_id': self.invoice_id.user_id.id or self._uid,
++            'company_id': self.env.user.company_id.id
+         }
+ 
+     @api.model
+@@ -1528,7 +1560,7 @@ class AccountMoveLine(models.Model):
+             domain += [('account_id', 'in', context['account_ids'].ids)]
+ 
+         if context.get('analytic_tag_ids'):
+-            domain += ['|', ('analytic_account_id.tag_ids', 'in', context['analytic_tag_ids'].ids), ('analytic_tag_ids', 'in', context['analytic_tag_ids'].ids)]
++            domain += [('analytic_tag_ids', 'in', context['analytic_tag_ids'].ids)]
+ 
+         if context.get('analytic_account_ids'):
+             domain += [('analytic_account_id', 'in', context['analytic_account_ids'].ids)]
+@@ -1689,6 +1721,8 @@ class AccountPartialReconcile(models.Model):
+                             'debit': abs(rounded_amt) if rounded_amt < 0 else 0.0,
+                             'credit': rounded_amt if rounded_amt > 0 else 0.0,
+                             'account_id': line.account_id.id,
++                            'analytic_account_id': line.analytic_account_id.id,
++                            'analytic_tag_ids': line.analytic_tag_ids.ids,
+                             'tax_exigible': True,
+                             'amount_currency': self.amount_currency and line.currency_id.round(-line.amount_currency * amount / line.balance) or 0.0,
+                             'currency_id': line.currency_id.id,
+@@ -1701,6 +1735,8 @@ class AccountPartialReconcile(models.Model):
+                             'debit': rounded_amt if rounded_amt > 0 else 0.0,
+                             'credit': abs(rounded_amt) if rounded_amt < 0 else 0.0,
+                             'account_id': line.tax_line_id.cash_basis_account.id,
++                            'analytic_account_id': line.analytic_account_id.id,
++                            'analytic_tag_ids': line.analytic_tag_ids.ids,
+                             'tax_line_id': line.tax_line_id.id,
+                             'tax_exigible': True,
+                             'amount_currency': self.amount_currency and line.currency_id.round(line.amount_currency * amount / line.balance) or 0.0,
+
+--- a/addons/account/models/res_config_settings.py
++++ b/addons/account/models/res_config_settings.py
+@@ -28,6 +28,7 @@ class ResConfigSettings(models.TransientModel):
+     module_account_accountant = fields.Boolean(string='Accounting')
+     group_analytic_accounting = fields.Boolean(string='Analytic Accounting',
+         implied_group='analytic.group_analytic_accounting')
++    group_analytic_tags = fields.Boolean(string='Analytic Tags', implied_group='analytic.group_analytic_tags')
+     group_warning_account = fields.Boolean(string="Warnings in Invoices", implied_group='account.group_warning_account')
+     group_cash_rounding = fields.Boolean(string="Cash Rounding", implied_group='account.group_cash_rounding')
+     module_account_asset = fields.Boolean(string='Assets Management')

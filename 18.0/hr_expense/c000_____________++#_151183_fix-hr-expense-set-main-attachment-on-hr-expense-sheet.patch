@@ -1,0 +1,234 @@
+PR: https://github.com/odoo/odoo/pull/151183
+
+From: 6679232fe162c0f8e7e41a0aba627be06849c2d6
+From: Victor Piryns (pivi)
+Date: 2024-01-26 09:56:31
+
+Structural Changes: 4
+Total Changes: 107
+
+[FIX] hr_expense: set main attachment on `hr.expense.sheet`
+
+Issue:
+Main attachments on expense sheets was never correctly set, leading
+to missing attachment previous in the hr.expense.sheet form view,
+and unnecessary RPC requests to `register_main_attachment`, because
+the attachment was never set.
+
+Steps to reproduce:
+- Install Expenses
+- Create 2 different expenses with different attachments
+- Create a report from those 2 expenses, save it
+- Notice there is nothing in the preview for the attachments, but if
+  you zoom in or zoom out the page, then you can see it. Also
+  swiping on the list of attachments isn't persistent, once you
+  refresh the page, the main attachment we selected lastly is lost.
+
+Cause:
+There are 2 main issues:
+- `hr.expense.sheet` has `message_main_attachment_id`, but it's
+  never set.
+- When writing an attachment via `register_main_attachment`, we
+  pass only the id of the attachment. Then in the backend, the
+  related record is based on the model of the attachment, but the
+  attachment is linked to `hr.expense`, not `hr.expense.sheet`.
+  Therefor we re-write the same attachment on the record we read the
+  attachment from. And then the frontend will continue to call
+  `register_main_attachment` everytime it tries to find the
+  attachments linked to the sheet, but it's never done.
+
+Fix:
+- Add a compute to initially set the value of the
+  `message_main_attachment_id` based on the spec "we take the first
+  line that has a main attachment (attachment if no main attachment)
+  and we set it on the sheet"
+- The `hr.expense.sheet` now maintains a copies of the attachments
+  linked to it's expenses, for proper ACL and functionality of
+  `register_main_attachment`.
+
+Affected versions:
+16.0 up to master = saas-17.1
+
+Reference:
+task-3572440
+
+closes odoo/odoo#151183
+
+X-original-commit: 6ae472959e963cab2278eb56d7e2ba0983d6b078
+Signed-off-by: Cedric Snauwaert <csn@odoo.com>
+Signed-off-by: Piryns Victor (pivi) <pivi@odoo.com>
+
+================================= pseudo patch: =================================
+
+--- a/addons/hr_expense/models/__init__.py
++++ b/addons/hr_expense/models/__init__.py
+@@ -8,6 +8,7 @@ from . import account_tax
+ from . import hr_department
+ from . import hr_expense
+ from . import hr_expense_sheet
++from . import ir_attachment
+ from . import product_product
+ from . import product_template
+ from . import res_config_settings
+
+--- a/addons/hr_expense/models/hr_expense.py
++++ b/addons/hr_expense/models/hr_expense.py
+@@ -76,6 +76,12 @@ class HrExpense(models.Model):
+     quantity = fields.Float(required=True, digits='Product Unit of Measure', default=1)
+     description = fields.Text(string="Internal Notes")
+     nb_attachment = fields.Integer(string="Number of Attachments", compute='_compute_nb_attachment')
++    attachment_ids = fields.One2many(
++        comodel_name='ir.attachment',
++        inverse_name='res_id',
++        domain="[('res_model', '=', 'hr.expense')]",
++        string="Attachments",
++    )
+     state = fields.Selection(
+         selection=[
+             ('draft', 'To Report'),
+@@ -537,8 +543,11 @@ class HrExpense(models.Model):
+                 raise UserError(_('You cannot delete a posted or approved expense.'))
+ 
+     def write(self, vals):
++        expense_to_previous_sheet = {}
+         if 'sheet_id' in vals:
+             self.env['hr.expense.sheet'].browse(vals['sheet_id']).check_access_rule('write')
++            for expense in self:
++                expense_to_previous_sheet[expense] = expense.sheet_id
+         if 'tax_ids' in vals or 'analytic_distribution' in vals or 'account_id' in vals:
+             if any(not expense.is_editable for expense in self):
+                 raise UserError(_('You are not authorized to edit this expense report.'))
+@@ -554,8 +563,35 @@ class HrExpense(models.Model):
+                     self.sheet_id.write({'employee_id': vals['employee_id']})
+                 elif len(employees) > 1:
+                     self.sheet_id = False
++        if 'sheet_id' in vals:
++            # The sheet_id has been modified, either by an explicit write on sheet_id of the expense,
++            # or by processing a command on the sheet's expense_line_ids.
++            # We need to delete the attachments on the previous sheet coming from the expenses that were modified,
++            # and copy the attachments of the expenses to the new sheet,
++            # if it's a no-op (writing same sheet_id as the current sheet_id of the expense),
++            # nothing should be done (no unlink then copy of the same attachments)
++            attachments_to_unlink = self.env['ir.attachment']
++            for expense in self:
++                previous_sheet = expense_to_previous_sheet[expense]
++                checksums = set((expense.attachment_ids - previous_sheet.expense_line_ids.attachment_ids).mapped('checksum'))
++                attachments_to_unlink += previous_sheet.attachment_ids.filtered(lambda att: att.checksum in checksums)
++                if vals['sheet_id'] and expense.sheet_id != previous_sheet:
++                    for attachment in expense.attachment_ids.with_context(sync_attachment=False):
++                        attachment.copy({
++                            'res_model': 'hr.expense.sheet',
++                            'res_id': vals['sheet_id'],
++                        })
++            attachments_to_unlink.with_context(sync_attachment=False).unlink()
+         return res
+ 
++    def unlink(self):
++        attachments_to_unlink = self.env['ir.attachment']
++        for sheet in self.sheet_id:
++            checksums = set((sheet.expense_line_ids.attachment_ids & self.attachment_ids).mapped('checksum'))
++            attachments_to_unlink += sheet.attachment_ids.filtered(lambda att: att.checksum in checksums)
++        attachments_to_unlink.with_context(sync_attachment=False).unlink()
++        return super().unlink()
++
+     @api.model
+     def get_empty_list_help(self, help_message):
+         return super().get_empty_list_help((help_message or '') + self._get_empty_list_mail_alias())
+
+--- a/addons/hr_expense/models/hr_expense_sheet.py
++++ b/addons/hr_expense/models/hr_expense_sheet.py
+@@ -195,6 +195,13 @@ class HrExpenseSheet(models.Model):
+         domain="[('id', 'in', selectable_payment_method_line_ids)]",
+         help="The payment method used when the expense is paid by the company.",
+     )
++    attachment_ids = fields.One2many(
++        comodel_name='ir.attachment',
++        inverse_name='res_id',
++        domain="[('res_model', '=', 'hr.expense.sheet')]",
++        string='Attachments of expenses',
++    )
++    message_main_attachment_id = fields.Many2one(compute='_compute_main_attachment', store=True)
+     accounting_date = fields.Date(string="Accounting Date", compute='_compute_accounting_date', store=True)
+     account_move_ids = fields.One2many(
+         string="Journal Entries",
+@@ -294,6 +301,17 @@ class HrExpenseSheet(models.Model):
+             else:
+                 sheet.state = 'draft'
+ 
++    @api.depends('expense_line_ids.attachment_ids')
++    def _compute_main_attachment(self):
++        for sheet in self:
++            attachments = sheet.attachment_ids
++            if not sheet.message_main_attachment_id or sheet.message_main_attachment_id not in attachments:
++                expenses = sheet.expense_line_ids
++                expenses_mma_checksums = expenses.message_main_attachment_id.mapped('checksum')
++                sheet.message_main_attachment_id = attachments.filtered(
++                    lambda att: att.checksum in expenses_mma_checksums
++                )[:1] or attachments[:1]
++
+     @api.depends('expense_line_ids.currency_id', 'company_currency_id')
+     def _compute_currency_id(self):
+         for sheet in self:
+@@ -456,19 +474,6 @@ class HrExpenseSheet(models.Model):
+     # Mail Thread
+     # --------------------------------------------
+ 
+-    def _get_mail_thread_data_attachments(self):
+-        """
+-            In order to see in the sheet attachment preview the corresponding
+-            expenses' attachments, the latter attachments are added to the fetched data for the sheet record.
+-        """
+-        self.ensure_one()
+-        res = super()._get_mail_thread_data_attachments()
+-        expense_attachments = self.env['ir.attachment'].search(
+-            [('res_id', 'in', self.expense_line_ids.ids), ('res_model', '=', 'hr.expense')],
+-            order='id desc',
+-        )
+-        return res | expense_attachments
+-
+     def _track_subtype(self, init_values):
+         self.ensure_one()
+         if 'state' in init_values and self.state == 'draft':
+
+--- a/None
++++ b/addons/hr_expense/models/ir_attachment.py
+@@ -0,0 +1,39 @@
++from odoo import models, api
++
++
++class IrAttachment(models.Model):
++    _inherit = 'ir.attachment'
++
++    @api.model_create_multi
++    def create(self, vals_list):
++        attachments = super().create(vals_list)
++        if self.env.context.get('sync_attachment', True):
++            expenses_attachments = attachments.filtered(lambda att: att.res_model == 'hr.expense')
++            if expenses_attachments:
++                expenses = self.env['hr.expense'].browse(expenses_attachments.mapped('res_id'))
++                for expense in expenses.filtered('sheet_id'):
++                    checksums = set(expense.sheet_id.attachment_ids.mapped('checksum'))
++                    for attachment in expense.attachment_ids.filtered(lambda att: att.checksum not in checksums):
++                        attachment.copy({
++                            'res_model': 'hr.expense.sheet',
++                            'res_id': expense.sheet_id.id,
++                        })
++        return attachments
++
++    def unlink(self):
++        if self.env.context.get('sync_attachment', True):
++            attachments_to_unlink = self.env['ir.attachment']
++            expenses_attachments = self.filtered(lambda att: att.res_model == 'hr.expense')
++            if expenses_attachments:
++                expenses = self.env['hr.expense'].browse(expenses_attachments.mapped('res_id'))
++                for expense in expenses.exists().filtered('sheet_id'):
++                    checksums = set(expense.attachment_ids.mapped('checksum'))
++                    attachments_to_unlink += expense.sheet_id.attachment_ids.filtered(lambda att: att.checksum in checksums)
++            sheets_attachments = self.filtered(lambda att: att.res_model == 'hr.expense.sheet')
++            if sheets_attachments:
++                sheets = self.env['hr.expense.sheet'].browse(sheets_attachments.mapped('res_id'))
++                for sheet in sheets.exists():
++                    checksums = set((sheet.attachment_ids & sheets_attachments).mapped('checksum'))
++                    attachments_to_unlink += sheet.expense_line_ids.attachment_ids.filtered(lambda att: att.checksum in checksums)
++            super(IrAttachment, attachments_to_unlink).unlink()
++        return super().unlink()

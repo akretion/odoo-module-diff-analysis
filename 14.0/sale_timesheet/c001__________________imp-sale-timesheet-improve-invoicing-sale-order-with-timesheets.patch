@@ -1,0 +1,152 @@
+PR: https://github.com/odoo/odoo/pull/
+
+From: 46d70e30ef9da4427aed5c74e16cd9541f1c4ebc
+From: Xavier Bol (xbo)
+Date: 2019-12-19 09:20:27
+
+Structural Changes: 2
+Total Changes: 75
+
+[IMP] sale_timesheet: improve invoicing sale order with timesheets
+
+TaskID: 2088586
+
+Add an 'Invoice timesheets up to mm/dd/yyyy' field on the Invoice
+Creation modal. This field is only visible when we want to create an
+invoice for a Service whose Service Policy is set on 'Timesheets on
+tasks'.
+This field allows to invoice the timesheets of a service up to the date
+set on this field.
+
+Before this commit, when we create the account.moves.line records, we
+link timesheets of a service to an invoice. Now, we need to check which
+timesheets are invoiced, because with the adding of the date for the
+creation of invoices, we cannot invoice the timesheets after to this
+date. Then, the process is done at the end of '_create_invoices' in
+'sale.order' model when the invoices are created.
+
+Override an ir.rule in accout module, because this rule accept all
+account.analytic.line in its domain and we don't want to accept all
+timesheets when the user has the access right : "See own timesheets".
+Therefore, we need to override this rule to apply the others rules in
+this model for the timesheets.
+
+================================= pseudo patch: =================================
+
+--- a/addons/sale_timesheet/models/account_move.py
++++ b/addons/sale_timesheet/models/account_move.py
+@@ -2,7 +2,7 @@
+ # Part of Odoo. See LICENSE file for full copyright and licensing details.
+ 
+ from odoo import api, fields, models, _
+-from odoo.tools.float_utils import float_round, float_is_zero
++from odoo.osv import expression
+ 
+ 
+ class AccountMove(models.Model):
+@@ -43,29 +43,28 @@ class AccountMove(models.Model):
+             }
+         }
+ 
++    def _link_timesheets_to_invoice(self, date=None):
++        """ Search timesheets and link this timesheets to the invoice
+ 
+-class AccountMoveLine(models.Model):
+-    _inherit = 'account.move.line'
++            When we create an invoice from a sale order, we need to
++            link the timesheets in this sale order to the invoice.
++            Then, we can know which timesheets are invoiced in the sale order.
+ 
+-    @api.model_create_multi
+-    def create(self, vals_list):
+-        # OVERRIDE
+-        # Link the timesheet from the SO lines to the corresponding draft invoice.
+-        # NOTE: Only the timesheets linked to an Sale Line with a product invoiced on delivered quantity
+-        # are concerned, since in ordered quantity, the timesheet quantity is not invoiced, but is simply
+-        # to compute the delivered one (for reporting).
+-        lines = super(AccountMoveLine, self).create(vals_list)
+-        lines_to_process = lines.filtered(lambda line: line.move_id.type == 'out_invoice'
+-                                                       and line.move_id.state == 'draft')
+-        for line in lines_to_process:
++            :param date: All timesheets on task before or equals this date
++                        in the sale order are invoiced.
++        """
++        for line in self.filtered(lambda i: i.type == 'out_invoice' and i.state == 'draft').invoice_line_ids:
+             sale_line_delivery = line.sale_line_ids.filtered(lambda sol: sol.product_id.invoice_policy == 'delivery' and sol.product_id.service_type == 'timesheet')
+             if sale_line_delivery:
+-                domain = self._timesheet_domain_get_invoiced_lines(sale_line_delivery)
++                domain = line._timesheet_domain_get_invoiced_lines(sale_line_delivery)
++                if date:
++                    domain = expression.AND([domain, [('date', '<=', date)]])
+                 timesheets = self.env['account.analytic.line'].search(domain).sudo()
+-                timesheets.write({
+-                    'timesheet_invoice_id': line.move_id.id,
+-                })
+-        return lines
++                timesheets.write({'timesheet_invoice_id': line.move_id.id})
++
++
++class AccountMoveLine(models.Model):
++    _inherit = 'account.move.line'
+ 
+     @api.model
+     def _timesheet_domain_get_invoiced_lines(self, sale_line_delivery):
+
+--- a/addons/sale_timesheet/models/product.py
++++ b/addons/sale_timesheet/models/product.py
+@@ -113,3 +113,8 @@ class ProductProduct(models.Model):
+             self.project_template_id = False
+         elif self.service_tracking in ['task_in_project', 'project_only']:
+             self.project_id = False
++
++    def _is_delivered_timesheet(self):
++        """ Check if the product is a delivered timesheet """
++        self.ensure_one()
++        return self.type == 'service' and self.service_policy == 'delivered_timesheet'
+
+--- a/addons/sale_timesheet/models/sale_order.py
++++ b/addons/sale_timesheet/models/sale_order.py
+@@ -148,6 +148,19 @@ class SaleOrder(models.Model):
+             action = {'type': 'ir.actions.act_window_close'}
+         return action
+ 
++    def _create_invoices(self, grouped=False, final=False, date=None):
++        """ Override the _create_invoice method in sale.order model in sale module
++
++            Add new parameter in this method, to invoice sale.order with a date. This date is used in sale_make_invoice_advance_inv into this module.
++
++            :param date
++
++            :return {account.move}: the invoices created
++        """
++        moves = super(SaleOrder, self)._create_invoices(grouped, final)
++        moves._link_timesheets_to_invoice(date)
++        return moves
++
+ 
+ class SaleOrderLine(models.Model):
+     _inherit = "sale.order.line"
+@@ -389,3 +402,23 @@ class SaleOrderLine(models.Model):
+                         project = map_so_project[so_line.order_id.id]
+                 if not so_line.task_id:
+                     so_line._timesheet_create_task(project=project)
++
++    def _recompute_qty_to_invoice(self, date):
++        """ Recompute the qty_to_invoice field for product containing timesheets
++
++            Search the existed timesheets up the given date in parameter.
++            Retrieve the unit_amount of this timesheet and then recompute
++            the qty_to_invoice for each current product.
++
++            :param date: date to search timesheets before this date.
++        """
++        lines_by_timesheet = self.filtered(lambda sol: sol.product_id._is_delivered_timesheet())
++        domain = lines_by_timesheet._timesheet_compute_delivered_quantity_domain()
++        domain = expression.AND([domain, [
++            ('date', '<=', date),
++            ('timesheet_invoice_id', '=', False)]])
++        mapping = lines_by_timesheet.sudo()._get_delivered_quantity_by_analytic(domain)
++
++        for line in lines_by_timesheet:
++            if line.product_id._is_delivered_timesheet():
++                line.qty_to_invoice = mapping.get(line.id, 0.0)

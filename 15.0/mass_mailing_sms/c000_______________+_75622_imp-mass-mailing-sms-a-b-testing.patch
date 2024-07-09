@@ -1,0 +1,144 @@
+PR: https://github.com/odoo/odoo/pull/75622
+
+From: bc8f4373c32449cd1ef95ea7ed40fb53fd7f3dd8
+From: Jérémy Hennecart
+Date: 2021-09-07 18:08:03
+
+Structural Changes: 3
+Total Changes: 70
+
+[IMP] mass_mailing(_sms): a/b testing
+
+Manage correctly a/b testing in mass_mailing.
+We can now organize a mass_mailing campaign by testing
+multiple mailings for the recipients targeted (subject,
+templates, design, ...)
+
+For this a new tab on the mailing record is added to better
+promote the existence of the feature.
+
+When an user has the group to manage mailing campaign, he can
+access the tab A/B Test. This tab allows to enable A/B testing
+for the mailing. If there is no campaign set for the mailing,
+one is automatically created allowing the user to continue
+smoothly.
+
+Once A/B testing enable, the percentage of recipients use can be
+set for each mailings. Also, the user can choose the deciding factor
+that will set the final mailing as winner.
+In a case, the user is not in manual mode, he can set the schedule datetime
+for sending the final mailing.
+
+task-2123242
+COM PR: odoo/odoo#75622
+ENT PR: odoo/enterprise#20454
+UPG PR: odoo/upgrade#2781
+
+Signed-off-by: Thibault Delavallee (tde) <tde@openerp.com>
+
+================================= pseudo patch: =================================
+
+--- a/addons/mass_mailing_sms/models/mailing_mailing.py
++++ b/addons/mass_mailing_sms/models/mailing_mailing.py
+@@ -46,6 +46,8 @@ class Mailing(models.Model):
+         'Send Directly', help='Immediately send the SMS Mailing instead of queuing up. Use at your own risk.')
+     # opt_out_link
+     sms_allow_unsubscribe = fields.Boolean('Include opt-out link', default=False)
++    # A/B Testing
++    ab_testing_sms_winner_selection = fields.Selection(related="campaign_id.ab_testing_sms_winner_selection", default="clicks_ratio", readonly=False, copy=True)
+ 
+     @api.depends('mailing_type')
+     def _compute_medium_id(self):
+@@ -82,7 +84,6 @@ class Mailing(models.Model):
+                 mail.sms_has_insufficient_credit = trace_dict[mail.id]['sms_credit']
+                 mail.sms_has_unregistered_account = trace_dict[mail.id]['sms_acc']
+ 
+-
+     # --------------------------------------------------
+     # ORM OVERRIDES
+     # --------------------------------------------------
+@@ -318,3 +319,47 @@ class Mailing(models.Model):
+             res[mailing.id] = body
+         res.update(super(Mailing, self - sms_mailings).convert_links())
+         return res
++
++    # ------------------------------------------------------
++    # A/B Test Override
++    # ------------------------------------------------------
++
++    def _get_ab_testing_description_modifying_fields(self):
++        fields_list = super()._get_ab_testing_description_modifying_fields()
++        return fields_list + ['ab_testing_sms_winner_selection']
++
++    def _get_ab_testing_description_values(self):
++        values = super()._get_ab_testing_description_values()
++        if self.mailing_type == 'sms':
++            values.update({
++                'ab_testing_winner_selection': self.ab_testing_sms_winner_selection,
++            })
++        return values
++
++    def _get_ab_testing_winner_selection(self):
++        result = super()._get_ab_testing_winner_selection()
++        if self.mailing_type == 'sms':
++            ab_testing_winner_selection_description = dict(
++                self._fields.get('ab_testing_sms_winner_selection').related_field.selection
++            ).get(self.ab_testing_sms_winner_selection)
++            result.update({
++                'value': self.campaign_id.ab_testing_sms_winner_selection,
++                'description': ab_testing_winner_selection_description
++            })
++        return result
++
++    def _get_ab_testing_siblings_mailings(self):
++        mailings = super()._get_ab_testing_siblings_mailings()
++        if self.mailing_type == 'sms':
++            mailings = self.campaign_id.mailing_sms_ids.filtered('ab_testing_enabled')
++        return mailings
++
++    def _get_default_ab_testing_campaign_values(self, values=None):
++        campaign_values = super()._get_default_ab_testing_campaign_values(values)
++        values = values or dict()
++        if self.mailing_type == 'sms':
++            sms_subject = values.get('sms_subject') or self.sms_subject
++            if sms_subject:
++                campaign_values['name'] = _("A/B Test: %s", sms_subject)
++            campaign_values['ab_testing_sms_winner_selection'] = self.ab_testing_sms_winner_selection
++        return campaign_values
+
+--- a/addons/mass_mailing_sms/models/utm.py
++++ b/addons/mass_mailing_sms/models/utm.py
+@@ -13,6 +13,19 @@ class UtmCampaign(models.Model):
+         string='Mass SMS')
+     mailing_sms_count = fields.Integer('Number of Mass SMS', compute="_compute_mailing_sms_count")
+ 
++    # A/B Testing
++    ab_testing_sms_winner_selection = fields.Selection([
++        ('manual', 'Manual'),
++        ('clicks_ratio', 'Highest Click Rate')], string="SMS Winner Selection", default="clicks_ratio")
++
++    @api.depends('mailing_mail_ids', 'mailing_sms_ids')
++    def _compute_ab_testing_total_pc(self):
++        super()._compute_ab_testing_total_pc()
++        for campaign in self:
++            campaign.ab_testing_total_pc += sum([
++                mailing.ab_testing_pc for mailing in campaign.mailing_sms_ids.filtered('ab_testing_enabled')
++            ])
++
+     @api.depends('mailing_sms_ids')
+     def _compute_mailing_sms_count(self):
+         for campaign in self:
+@@ -40,3 +53,13 @@ class UtmCampaign(models.Model):
+         }
+         action['domain'] = [('mailing_type', '=', 'sms')]
+         return action
++
++    @api.model
++    def _cron_process_mass_mailing_ab_testing(self):
++        ab_testing_campaign = super()._cron_process_mass_mailing_ab_testing()
++        for campaign in ab_testing_campaign:
++            ab_testing_mailings = campaign.mailing_sms_ids.filtered(lambda m: m.ab_testing_enabled)
++            if not ab_testing_mailings.filtered(lambda m: m.state == 'done'):
++                continue
++            ab_testing_mailings.action_send_winner_mailing()
++        return ab_testing_campaign

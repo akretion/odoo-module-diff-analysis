@@ -1,0 +1,173 @@
+PR: https://github.com/odoo/odoo/pull/
+
+From: 46a339fc9e98e4bb2604a272bc6a90c7ea2a416f
+From: wan
+Date: 2019-04-02 11:11:00
+
+Structural Changes: 4
+Total Changes: 86
+
+[ADD] account: new european invoice reference
+Task 1920906
+Rework of the invoice references. We can now select references based on partner or on invoice number, and the Odoo way, or the (newly implemented) european way (SEPA RF references)
+The reference type informations are no longer stored on the company but on the sales journals
+
+================================= pseudo patch: =================================
+
+--- a/addons/account/models/account.py
++++ b/addons/account/models/account.py
+@@ -452,6 +452,9 @@ class AccountJournal(models.Model):
+         compute='_compute_refund_seq_number_next',
+         inverse='_inverse_refund_seq_number_next')
+ 
++    invoice_reference_type = fields.Selection(string='Communication Type', required=True, selection=[('none', 'Free'), ('partner', 'Based on Partner'), ('invoice', 'Based on Invoice')], default='none', help='You can set here the default communication that will appear on customer invoices, once validated, to help the customer to refer to that particular invoice when making the payment.')
++    invoice_reference_model = fields.Selection(string='Communication Standard', required=True, selection=[('odoo', 'Odoo'),('euro', 'European')], default='odoo', help="You can choose different models for each type of reference. The default one is the Odoo reference.")
++
+     #groups_id = fields.Many2many('res.groups', 'account_journal_group_rel', 'journal_id', 'group_id', string='Groups')
+     currency_id = fields.Many2one('res.currency', help='The currency used to enter statement', string="Currency", oldname='currency')
+     company_id = fields.Many2one('res.company', string='Company', required=True, index=True, default=lambda self: self.env.user.company_id,
+
+--- a/addons/account/models/account_invoice.py
++++ b/addons/account/models/account_invoice.py
+@@ -5,6 +5,8 @@ import json
+ import re
+ import uuid
+ from functools import partial
++from stdnum.iso7064 import mod_97_10
++from itertools import zip_longest
+ 
+ from lxml import etree
+ 
+@@ -424,24 +426,66 @@ class AccountInvoice(models.Model):
+                     invoice.invoice_icon = '#'
+             invoice.vendor_display_name = vendor_display_name
+ 
++    def _get_reference_euro_invoice(self):
++        """ This computes the reference based on the RF Creditor Reference.
++            The data of the reference is the database id number of the invoice.
++            For instance, if an invoice is issued with id 43, the check number
++            is 07 so the reference will be 'RF07 43'.
++        """
++        self.ensure_one()
++        base = self.id
++        check_digits = mod_97_10.calc_check_digits('{}RF'.format(base))
++        reference = 'RF{} {}'.format(check_digits, " ".join(["".join(x) for x in zip_longest(*[iter(str(base))]*4, fillvalue="")]))
++        return reference
++
++    def _get_reference_euro_partner(self):
++        """ This computes the reference based on the RF Creditor Reference.
++            The data of the reference is the user defined reference of the
++            partner or the database id number of the parter.
++            For instance, if an invoice is issued for the partner with internal
++            reference 'food buyer 654', the digits will be extracted and used as
++            the data. This will lead to a check number equal to 00 and the
++            reference will be 'RF00 654'.
++            If no reference is set for the partner, its id in the database will
++            be used.
++        """
++        self.ensure_one()
++        partner_ref = self.partner_id.ref
++        partner_ref_nr = re.sub('\D', '', partner_ref or '')[-21:] or str(self.partner_id.id)[-21:]
++        partner_ref_nr = partner_ref_nr[-21:]
++        check_digits = mod_97_10.calc_check_digits('{}RF'.format(partner_ref_nr))
++        reference = 'RF{} {}'.format(check_digits, " ".join(["".join(x) for x in zip_longest(*[iter(partner_ref_nr)]*4, fillvalue="")]))
++        return reference
++
++    def _get_reference_odoo_invoice(self):
++        """ This computes the reference based on the Odoo format.
++            We simply return the number of the invoice, defined on the journal
++            sequence.
++        """
++        self.ensure_one()
++        return self.number
++
++    def _get_reference_odoo_partner(self):
++        """ This computes the reference based on the Odoo format.
++            The data used is the reference set on the partner or its database
++            id otherwise. For instance if the reference of the customer is
++            'dumb customer 97', the reference will be 'CUST/dumb customer 97'.
++        """
++        ref = self.partner_id.ref or str(self.partner_id.id)
++        prefix = _('CUST')
++        return '%s/%s' % (prefix, ref)
++
+     @api.multi
+     def _get_computed_reference(self):
+         self.ensure_one()
+-        if self.company_id.invoice_reference_type == 'invoice_number':
+-            seq_suffix = self.journal_id.sequence_id.suffix or ''
+-            regex_number = '.*?([0-9]+)%s$' % seq_suffix
+-            exact_match = re.match(regex_number, self.number)
+-            if exact_match:
+-                identification_number = int(exact_match.group(1))
+-            else:
+-                ran_num = str(uuid.uuid4().int)
+-                identification_number = int(ran_num[:5] + ran_num[-5:])
+-            prefix = self.number
++        if self.journal_id.invoice_reference_type == 'none':
++            return ''
+         else:
+-            #self.company_id.invoice_reference_type == 'partner'
+-            identification_number = self.partner_id.id
+-            prefix = 'CUST'
+-        return '%s/%s' % (prefix, str(identification_number % 97).rjust(2, '0'))
++            ref_function = getattr(self, '_get_reference_{}_{}'.format(self.journal_id.invoice_reference_model, self.journal_id.invoice_reference_type))
++            if ref_function:
++                return ref_function()
++            else:
++                raise UserError(_('The combination of reference model and reference type on the journal is not implemented'))
+ 
+     # Load all Vendor Bill lines
+     @api.onchange('vendor_bill_id')
+@@ -632,7 +676,7 @@ class AccountInvoice(models.Model):
+             return self.env.ref('account.account_invoices').report_action(self)
+         else:
+             return self.env.ref('account.account_invoices_without_payment').report_action(self)
+-    
++
+     @api.multi
+     def action_reconcile_to_check(self, params):
+         self.ensure_one()
+@@ -1830,7 +1874,7 @@ class AccountInvoiceLine(models.Model):
+             self_lang = self
+             if part.lang:
+                 self_lang = self.with_context(lang=part.lang)
+-   
++
+             product = self_lang.product_id
+             account = self.get_invoice_line_account(type, product, fpos, company)
+             if account:
+
+--- a/addons/account/models/company.py
++++ b/addons/account/models/company.py
+@@ -31,9 +31,6 @@ MONTH_SELECTION = [
+ class ResCompany(models.Model):
+     _inherit = "res.company"
+ 
+-    def _get_invoice_reference_types(self):
+-        return [('invoice_number', _('Based on Invoice Number')), ('partner', _('Based on Customer'))]
+-
+     #TODO check all the options/fields are in the views (settings + company form view)
+     fiscalyear_last_day = fields.Integer(default=31, required=True)
+     fiscalyear_last_month = fields.Selection(MONTH_SELECTION, default='12', required=True)
+@@ -80,8 +77,6 @@ Best Regards,'''))
+ 
+     incoterm_id = fields.Many2one('account.incoterms', string='Default incoterm',
+         help='International Commercial Terms are a series of predefined commercial terms used in international transactions.')
+-    invoice_reference_type = fields.Selection(string='Default Communication Type', selection='_get_invoice_reference_types',
+-                                              default='invoice_number', help='You can set here the default communication that will appear on customer invoices, once validated, to help the customer to refer to that particular invoice when making the payment.')
+ 
+     qr_code = fields.Boolean(string='Display SEPA QR code')
+ 
+
+--- a/addons/account/models/res_config_settings.py
++++ b/addons/account/models/res_config_settings.py
+@@ -79,8 +79,6 @@ class ResConfigSettings(models.TransientModel):
+     module_snailmail_account = fields.Boolean(string="Snailmail")
+     tax_exigibility = fields.Boolean(string='Cash Basis', related='company_id.tax_exigibility', readonly=False)
+     tax_cash_basis_journal_id = fields.Many2one('account.journal', related='company_id.tax_cash_basis_journal_id', string="Tax Cash Basis Journal", readonly=False)
+-    invoice_reference_type = fields.Selection(string='Communication',
+-        related='company_id.invoice_reference_type', help='Default Reference Type on Invoices.', readonly=False)
+     account_bank_reconciliation_start = fields.Date(string="Bank Reconciliation Threshold",
+         related='company_id.account_bank_reconciliation_start', readonly=False,
+         help="""The bank reconciliation widget won't ask to reconcile payments older than this date.

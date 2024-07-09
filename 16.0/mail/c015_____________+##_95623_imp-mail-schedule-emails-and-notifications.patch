@@ -1,0 +1,349 @@
+PR: https://github.com/odoo/odoo/pull/95623
+
+From: 9b11a9d82b52b4750f11c56a7b6be3af1fca269d
+From: std-odoo
+Date: 2022-08-25 17:57:16
+
+Structural Changes: 3
+Total Changes: 201
+
+[IMP] mail: schedule emails and notifications
+
+Purpose
+=======
+
+Currently, only email sending can be scheduled with the `scheduled_date` field
+defined on on <mail.mail>. It's not possible to delay the sending of
+notifications.
+
+We want to be able to delay the sending of the emails, but also the inbox
+and bus bus notifications.
+
+Technical
+=========
+
+For that purpose, we created a new model which stores the message we need to
+notify with the scheduled date. When a scheduled_datetime is given we skip the
+notification process. Instead an entry in that new model is created. A cron
+regularly polls the scheduled message and launch the notification process on
+messages that are ready to be sent.
+
+Task-2207626 (Rating: Delay rating notification to ease feedback)
+
+Part-of: odoo/odoo#95623
+Co-authored-by: Thibault Delavallée <tde@odoo.com>
+
+================================= pseudo patch: =================================
+
+--- a/addons/mail/models/__init__.py
++++ b/addons/mail/models/__init__.py
+@@ -24,6 +24,7 @@ from . import mail_blacklist
+ from . import mail_followers
+ from . import mail_gateway_allowed
+ from . import mail_message_reaction
++from . import mail_message_schedule
+ from . import mail_message_subtype
+ from . import mail_message
+ from . import mail_mail
+
+--- a/addons/mail/models/mail_channel.py
++++ b/addons/mail/models/mail_channel.py
+@@ -498,13 +498,14 @@ class Channel(models.Model):
+     # MAILING
+     # ------------------------------------------------------------
+ 
+-    def _notify_get_recipients(self, message, msg_vals):
++    def _notify_get_recipients(self, message, msg_vals, **kwargs):
+         """ Override recipients computation as channel is not a standard
+         mail.thread document. Indeed there are no followers on a channel.
+         Instead of followers it has members that should be notified.
+ 
+         :param message: see ``MailThread._notify_get_recipients()``;
+         :param msg_vals: see ``MailThread._notify_get_recipients()``;
++        :param kwargs: see ``MailThread._notify_get_recipients()``;
+ 
+         :return recipients: structured data holding recipients data. See
+           ``MailThread._notify_thread()`` for more details about its content
+
+--- a/None
++++ b/addons/mail/models/mail_message_schedule.py
+@@ -0,0 +1,135 @@
++# -*- coding: utf-8 -*-
++# Part of Odoo. See LICENSE file for full copyright and licensing details.
++
++import json
++import logging
++
++from datetime import datetime
++
++from odoo import api, fields, models
++
++_logger = logging.getLogger(__name__)
++
++
++class MailMessageSchedule(models.Model):
++    """ Mail message notification schedule queue.
++
++    This model is used to store the mail messages scheduled. So we can
++    delay the sending of the notifications. A scheduled date field already
++    exists on the <mail.mail> but it does not allow us to delay the sending
++    of the <bus.bus> notifications.
++    """
++    _name = 'mail.message.schedule'
++    _description = 'Scheduled Messages'
++    _order = 'scheduled_datetime DESC, id DESC'
++    _rec_name = 'mail_message_id'
++
++    mail_message_id = fields.Many2one(
++        'mail.message', string='Message',
++        ondelete='cascade', required=True)
++    notification_parameters = fields.Text('Notification Parameter')
++    scheduled_datetime = fields.Datetime(
++        'Scheduled Send Date', required=True,
++        help='Datetime at which notification should be sent.')
++
++    @api.model_create_multi
++    def create(self, vals_list):
++        schedules = super().create(vals_list)
++        if schedules:
++            self.env.ref('mail.ir_cron_send_scheduled_message')._trigger_list(
++                set(schedules.mapped('scheduled_datetime'))
++            )
++        return schedules
++
++    @api.model
++    def _send_notifications_cron(self):
++        messages_scheduled = self.env['mail.message.schedule'].search(
++            [('scheduled_datetime', '<=', datetime.utcnow())]
++        )
++        if messages_scheduled:
++            _logger.info('Send %s scheduled messages', len(messages_scheduled))
++            messages_scheduled._send_notifications()
++
++    def force_send(self):
++        """ Launch notification process independently from the expected date. """
++        return self._send_notifications()
++
++    def _send_notifications(self, default_notify_kwargs=None):
++        """ Send notification for scheduled messages.
++
++        :param dict default_notify_kwargs: optional parameters to propagate to
++          ``notify_thread``. Those are default values overridden by content of
++          ``notification_parameters`` field.
++        """
++        for model, schedules in self._group_by_model().items():
++            if model:
++                records = self.env[model].browse(schedules.mapped('mail_message_id.res_id'))
++            else:
++                records = [self.env['mail.thread']] * len(schedules)
++
++            for record, schedule in zip(records, schedules):
++                notify_kwargs = dict(default_notify_kwargs or {}, skip_existing=True)
++                try:
++                    schedule_notify_kwargs = json.loads(schedule.notification_parameters)
++                except Exception:
++                    pass
++                else:
++                    schedule_notify_kwargs.pop('scheduled_date', None)
++                    notify_kwargs.update(schedule_notify_kwargs)
++
++                record._notify_thread(schedule.mail_message_id, msg_vals=False, **notify_kwargs)
++
++        self.unlink()
++        return True
++
++    @api.model
++    def _send_message_notifications(self, messages, default_notify_kwargs=None):
++        """ Send scheduled notification for given messages.
++
++        :param <mail.message> messages: scheduled sending related to those messages
++          will be sent now;
++        :param dict default_notify_kwargs: optional parameters to propagate to
++          ``notify_thread``. Those are default values overridden by content of
++          ``notification_parameters`` field.
++
++        :return bool: False if no schedule has been found, True otherwise
++        """
++        messages_scheduled = self.search(
++            [('mail_message_id', 'in', messages.ids)]
++        )
++        if not messages_scheduled:
++            return False
++
++        messages_scheduled._send_notifications(default_notify_kwargs=default_notify_kwargs)
++        return True
++
++    @api.model
++    def _update_message_scheduled_datetime(self, messages, new_datetime):
++        """ Update scheduled datetime for scheduled sending related to messages.
++
++        :param <mail.message> messages: scheduled sending related to those messages
++          will be updated. Missing one are skipped;
++        :param datetime new_datetime: new datetime for sending. New triggers
++          are created based on it;
++
++        :return bool: False if no schedule has been found, True otherwise
++        """
++        messages_scheduled = self.search(
++            [('mail_message_id', 'in', messages.ids)]
++        )
++        if not messages_scheduled:
++            return False
++
++        messages_scheduled.scheduled_datetime = new_datetime
++        self.env.ref('mail.ir_cron_send_scheduled_message')._trigger(new_datetime)
++        return True
++
++    def _group_by_model(self):
++        grouped = {}
++        for schedule in self:
++            model = schedule.mail_message_id.model if schedule.mail_message_id.model and schedule.mail_message_id.res_id else False
++            if model not in grouped:
++                grouped[model] = schedule
++            else:
++                grouped[model] += schedule
++        return grouped
+
+--- a/addons/mail/models/mail_thread.py
++++ b/addons/mail/models/mail_thread.py
+@@ -9,6 +9,7 @@ import email
+ import email.policy
+ import hashlib
+ import hmac
++import json
+ import lxml
+ import logging
+ import pytz
+@@ -18,7 +19,7 @@ import threading
+ 
+ from collections import namedtuple
+ from email.message import EmailMessage
+-from email import message_from_string, policy
++from email import message_from_string
+ from lxml import etree
+ from werkzeug import urls
+ from xmlrpc import client as xmlrpclib
+@@ -1423,7 +1424,7 @@ class MailThread(models.AbstractModel):
+         if email_part:
+             if email_part.get_content_type() == 'text/rfc822-headers':
+                 # Convert the message body into a message itself
+-                email_payload = message_from_string(email_part.get_payload(), policy=policy.SMTP)
++                email_payload = message_from_string(email_part.get_payload(), policy=email.policy.SMTP)
+             else:
+                 email_payload = email_part.get_payload()[0]
+             bounced_msg_id = tools.mail_header_msgid_re.findall(tools.decode_message_header(email_payload, 'Message-Id'))
+@@ -2304,7 +2305,11 @@ class MailThread(models.AbstractModel):
+           access message content in db;
+ 
+         Kwargs allow to pass various parameters that are given to sub notification
+-        methods. See those methods for more details about the additional parameters.
++        methods. See those methods for more details about supported parameters.
++        Specific kwargs used in this method:
++
++          * ``scheduled_date``: delay notification sending if set in the future.
++            This is done using the ``mail.message.schedule`` intermediate model;
+ 
+         :return: recipients data (see ``MailThread._notify_get_recipients()``)
+         """
+@@ -2312,12 +2317,27 @@ class MailThread(models.AbstractModel):
+         self = self._fallback_lang()
+ 
+         msg_vals = msg_vals if msg_vals else {}
+-        recipients_data = self._notify_get_recipients(message, msg_vals)
++        recipients_data = self._notify_get_recipients(message, msg_vals, **kwargs)
+         if not recipients_data:
+             return recipients_data
+ 
+-        self._notify_thread_by_inbox(message, recipients_data, msg_vals=msg_vals, **kwargs)
+-        self._notify_thread_by_email(message, recipients_data, msg_vals=msg_vals, **kwargs)
++        # if scheduled for later: add in queue instead of generating notifications
++        scheduled_date = kwargs.pop('scheduled_date', None)
++        if scheduled_date:
++            parsed_datetime = self.env['mail.mail']._parse_scheduled_datetime(scheduled_date)
++            scheduled_date = parsed_datetime.replace(tzinfo=None) if parsed_datetime else False
++        if scheduled_date and scheduled_date > datetime.datetime.utcnow():
++            # send the message notifications at the scheduled date
++            self.env['mail.message.schedule'].sudo().create({
++                'scheduled_datetime': scheduled_date,
++                'mail_message_id': message.id,
++                'notification_parameters': json.dumps(kwargs),
++            })
++        else:
++            # generate immediately the <mail.notification>
++            # and send the <mail.mail> and the <bus.bus> notifications
++            self._notify_thread_by_inbox(message, recipients_data, msg_vals=msg_vals, **kwargs)
++            self._notify_thread_by_email(message, recipients_data, msg_vals=msg_vals, **kwargs)
+ 
+         return recipients_data
+ 
+@@ -2363,7 +2383,7 @@ class MailThread(models.AbstractModel):
+     def _notify_thread_by_email(self, message, recipients_data, msg_vals=False,
+                                 mail_auto_delete=True, # mail.mail
+                                 model_description=False, force_email_company=False, force_email_lang=False,  # rendering
+-                                check_existing=False, force_send=True, send_after_commit=True,  # email send
++                                resend_existing=False, force_send=True, send_after_commit=True,  # email send
+                                 **kwargs):
+         """ Method to send email linked to notified messages.
+ 
+@@ -2390,7 +2410,7 @@ class MailThread(models.AbstractModel):
+         :param force_email_company: see ``_notify_by_email_prepare_rendering_context``;
+         :param force_email_lang: see ``_notify_by_email_prepare_rendering_context``;
+ 
+-        :param check_existing: check for existing notifications to update based on
++        :param resend_existing: check for existing notifications to update based on
+           mailed recipient, otherwise create new notifications;
+         :param force_send: send emails directly instead of using queue;
+         :param send_after_commit: if force_send, tells whether to send emails after
+@@ -2455,7 +2475,7 @@ class MailThread(models.AbstractModel):
+ 
+                 if new_email and recipients_ids_chunk:
+                     tocreate_recipient_ids = list(recipients_ids_chunk)
+-                    if check_existing:
++                    if resend_existing:
+                         existing_notifications = self.env['mail.notification'].sudo().search([
+                             ('mail_message_id', '=', message.id),
+                             ('notification_type', '=', 'email'),
+@@ -2660,13 +2680,21 @@ class MailThread(models.AbstractModel):
+             final_mail_values.update(additional_values)
+         return final_mail_values
+ 
+-    def _notify_get_recipients(self, message, msg_vals):
++    def _notify_get_recipients(self, message, msg_vals, **kwargs):
+         """ Compute recipients to notify based on subtype and followers. This
+         method returns data structured as expected for ``_notify_recipients``.
+ 
+         TDE/XDO TODO: flag rdata directly, with for example r['notif'] = 'ocn_client' and r['needaction']=False
+         and correctly override _notify_get_recipients
+ 
++        Kwargs allow to pass various parameters that are used by sub notification
++        methods. See those methods for more details about supported parameters.
++        Specific kwargs used in this method:
++
++          * ``skip_existing``: check existing notifications and skip them in order
++            to avoid having several notifications / partner as it would make
++            constraints crash. This is disabled by default to optimize speed;
++
+         :return list recipients_data: this is a list of recipients information (see
+           ``MailFollowers._get_recipient_data()`` for more details) formatted like
+           [{'active': partner.active;
+@@ -2696,6 +2724,20 @@ class MailThread(models.AbstractModel):
+             if pdata['active'] is False:
+                 continue
+             recipients_data.append(pdata)
++
++        # avoid double notification (on demand due to additional queries)
++        if kwargs.pop('skip_existing', False):
++            pids = [r['id'] for r in recipients_data]
++            if pids:
++                existing_notifications = self.env['mail.notification'].sudo().search([
++                    ('res_partner_id', 'in', pids),
++                    ('mail_message_id', 'in', message.ids)
++                ])
++                recipients_data = [
++                    r for r in recipients_data
++                    if r['id'] not in existing_notifications.res_partner_id.ids
++                ]
++
+         return recipients_data
+ 
+     def _notify_get_recipients_groups(self, msg_vals=None):

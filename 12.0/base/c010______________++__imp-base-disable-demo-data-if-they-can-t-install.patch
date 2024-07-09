@@ -1,0 +1,173 @@
+PR: https://github.com/odoo/odoo/pull/
+
+From: e89131381015e0ca155f64500d077a7a7bfff9c8
+From: Xavier Morel
+Date: 2018-07-16 09:44:33
+
+Structural Changes: 5
+Total Changes: 91
+
+[IMP] base: disable demo data if they can't install
+
+Task 1856935
+
+Currently, if installing a module's demo data fails (because the
+module was uninstalled and some were left over and can't be
+reinstalled, or because they're broken, or…) the installation of the
+module fails and further installations are skipped (?).
+
+Since demo data are non-essential (though required to run tests),
+rather than fail everything if they fail just roll them back and
+notify the user.
+
+This change generates a warning log *and* shows a notification popup
+to the end user.
+
+================================= pseudo patch: =================================
+
+--- a/odoo/addons/base/__manifest__.py
++++ b/odoo/addons/base/__manifest__.py
+@@ -57,6 +57,7 @@ The kernel of Odoo, needed for all installation.
+         'wizard/base_update_translations_views.xml',
+         'wizard/base_partner_merge_views.xml',
+         'data/ir_actions_data.xml',
++        'data/ir_demo_failure_data.xml',
+         'views/res_company_views.xml',
+         'views/res_lang_views.xml',
+         'views/res_partner_views.xml',
+
+--- a/None
++++ b/odoo/addons/base/data/ir_demo_failure_data.xml
+@@ -0,0 +1,51 @@
++<odoo>
++    <record model="ir.actions.server" id="demo_failure_action">
++        <field name="name">Failed to install demo data for some modules, demo disabled</field>
++        <field name="model_id" ref="base.model_ir_demo_failure_wizard"/>
++        <field name="state">code</field>
++        <field name="code">
++failures = env['ir.demo_failure'].search([
++    ('wizard_id', '=', False),
++])
++record = model.create({
++    'failure_ids': [(6, 0, failures.ids)],
++})
++action = {
++    'type': 'ir.actions.act_window',
++    'res_id': record.id,
++    'res_model': 'ir.demo_failure.wizard',
++    'target': 'new',
++    'views': [(env.ref('base.demo_failures_dialog').id, 'form')],
++}
++        </field>
++    </record>
++
++    <record model="ir.ui.view" id="demo_failures_dialog">
++        <field name="name">Demo Failure Dialog</field>
++        <field name="model">ir.demo_failure.wizard</field>
++        <field name="arch" type="xml">
++            <form>
++                <h3>
++                    The demonstration data of <field name="failures_count"/>
++                    module(s) failed to install and were disabled
++                </h3>
++                <field name="failure_ids">
++                    <tree>
++                        <field name="module_id"/>
++                        <field name="error"/>
++                    </tree>
++                </field>
++                <footer>
++                    <button string="Ok" class="oe_highlight" type="object" name="done"/>
++                </footer>
++            </form>
++        </field>
++    </record>
++
++    <record model="ir.actions.todo" id="demo_failure_todo">
++        <field name="name">Demo Failure Notification</field>
++        <field name="sequence">1</field>
++        <field name="state">done</field>
++        <field name="action_id" ref="base.demo_failure_action"/>
++    </record>
++</odoo>
+
+--- a/odoo/addons/base/models/__init__.py
++++ b/odoo/addons/base/models/__init__.py
+@@ -28,6 +28,7 @@ from . import ir_logging
+ from . import ir_property
+ from . import ir_module
+ from . import ir_demo
++from . import ir_demo_failure
+ from . import report_paperformat
+ from . import res_country
+ from . import res_lang
+
+--- a/odoo/addons/base/models/ir_actions.py
++++ b/odoo/addons/base/models/ir_actions.py
+@@ -661,17 +661,18 @@ class IrActionsTodo(models.Model):
+         return super(IrActionsTodo, self)._name_search(name, args=args, operator=operator, limit=limit, name_get_uid=name_get_uid)
+ 
+     @api.multi
+-    def action_launch(self, context=None):
++    def action_launch(self):
+         """ Launch Action of Wizard"""
+         self.ensure_one()
+ 
+         self.write({'state': 'done'})
+ 
+         # Load action
+-        action = self.env[self.action_id.type].browse(self.action_id.id)
++        action_type = self.action_id.type
++        action = self.env[action_type].browse(self.action_id.id)
+ 
+         result = action.read()[0]
+-        if action._name != 'ir.actions.act_window':
++        if action_type != 'ir.actions.act_window':
+             return result
+         result.setdefault('context', '{}')
+ 
+
+--- a/None
++++ b/odoo/addons/base/models/ir_demo_failure.py
+@@ -0,0 +1,29 @@
++from odoo import api, fields, models
++
++
++class DemoFailure(models.TransientModel):
++    """ Stores modules for which we could not install demo data
++    """
++    _name = 'ir.demo_failure'
++
++    module_id = fields.Many2one('ir.module.module', required=True, string="Module")
++    error = fields.Char(string="Error")
++    wizard_id = fields.Many2one('ir.demo_failure.wizard')
++
++class DemoFailureWizard(models.TransientModel):
++    _name = 'ir.demo_failure.wizard'
++
++    failure_ids = fields.One2many(
++        'ir.demo_failure', 'wizard_id', readonly=True,
++        string="Demo Installation Failures"
++    )
++    failures_count = fields.Integer(compute='_compute_failures_count')
++
++    @api.depends('failure_ids')
++    def _compute_failures_count(self):
++        for r in self:
++            r.failures_count = len(r.failure_ids)
++
++    def done(self):
++        # pylint: disable=next-method-called
++        return self.env['ir.module.module'].next()
+
+--- a/odoo/addons/base/models/ir_module.py
++++ b/odoo/addons/base/models/ir_module.py
+@@ -516,7 +516,7 @@ class Module(models.Model):
+         _logger.info('getting next %s', Todos)
+         active_todo = Todos.search([('state', '=', 'open')], limit=1)
+         if active_todo:
+-            _logger.info('next action is %s', active_todo)
++            _logger.info('next action is "%s"', active_todo.name)
+             return active_todo.action_launch()
+         return {
+             'type': 'ir.actions.act_url',

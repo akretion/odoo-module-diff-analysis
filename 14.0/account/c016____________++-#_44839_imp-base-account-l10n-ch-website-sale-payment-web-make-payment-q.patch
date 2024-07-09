@@ -1,0 +1,291 @@
+PR: https://github.com/odoo/odoo/pull/44839
+
+From: 0eef278268d1f4cce30c97bfef723f769b1a48e0
+From: oco-odoo
+Date: 2020-03-30 11:28:41
+
+Structural Changes: 8
+Total Changes: 175
+
+[IMP] base, account, l10n_ch, website_sale, payment, web: make payment QR-code generation more generic
+
+This new modelling makes it easier to add new QR-code formats, and allows using all of them in website_sale and account.payment's form view as well (so, Swiss QR codes are now available there, while they were restricted to only invoices in the past). All barcodes are now generated as reports, from a dedicated route. This was only partly the case before : Swiss QR added a cross on top of the QR-code directly in the template, it wasn't part of the image returned by the route; now it is.
+
+[ADD] base_qr_code_sepa: new module decoupling SEPA QR-codes generation from the base module
+
+Each new QR-code generation option should thus be done in a dedicated module (or added to a localization) in the future.
+
+[IMP] base_qr_code_sepa: update the generated QR codes to version 2 of the specification
+
+Version 1 is still supported, so no need to backport this.
+
+[IMP] l10n_ch: make Swiss QR-codes compatible with the new version of the specification (the old one is deprecated)
+
+This will be backported to 11.0 and 12.0, as these QR-codes will soon replace ISR.
+
+[IMP] account: make it possible to mark manual payments as sent with a button on the form view
+
+This way, when making them directly with a QR-code (or doing a more classical wire transfer), people can keep track of what they already have asked the bank to do, and what they still have to treat.
+
+closes odoo/odoo#44839
+
+Related: odoo/enterprise#8262
+Related: odoo/upgrade#992
+Signed-off-by: Laurent Smet <smetl@users.noreply.github.com>
+
+================================= pseudo patch: =================================
+
+--- a/addons/account/models/__init__.py
++++ b/addons/account/models/__init__.py
+@@ -23,3 +23,4 @@ from . import digest
+ from . import res_users
+ from . import ir_actions_report
+ from . import res_currency
++from . import res_bank
+
+--- a/addons/account/models/account_move.py
++++ b/addons/account/models/account_move.py
+@@ -242,6 +242,10 @@ class AccountMove(models.Model):
+     invoice_incoterm_id = fields.Many2one('account.incoterms', string='Incoterm',
+         default=_get_default_invoice_incoterm,
+         help='International Commercial Terms are a series of predefined commercial terms used in international transactions.')
++    display_qr_code = fields.Boolean(string="Display QR-code", related='company_id.qr_code')
++    qr_code_method = fields.Selection(string="Payment QR-code",
++        selection=lambda self: self.env['res.partner.bank'].get_available_qr_methods_in_sequence(),
++        help="Type of QR-code to be generated for the payment of this invoice, when printing it. If left blank, the first available and usable method will be used.")
+ 
+     # ==== Payment widget fields ====
+     invoice_outstanding_credits_debits_widget = fields.Text(groups="account.group_account_invoice,account.group_account_readonly",
+@@ -2469,6 +2473,45 @@ class AccountMove(models.Model):
+             line[2]['credit'] = currency_id and formatLang(self.env, line[2]['credit'], currency_obj=currency_id) or line[2]['debit']
+         return preview_vals
+ 
++    def generate_qr_code(self):
++        """ Generates and returns a QR-code generation URL for this invoice,
++        raising an error message if something is misconfigured.
++
++        The chosen QR generation method is the one set in qr_method field if there is one,
++        or the first eligible one found. If this search had to be performed and
++        and eligible method was found, qr_method field is set to this method before
++        returning the URL. If no eligible QR method could be found, we return None.
++        """
++        self.ensure_one()
++
++        if not self.is_invoice():
++            raise UserError(_("QR-codes can only be generated for invoice entries."))
++
++        qr_code_method = self.qr_code_method
++        if qr_code_method:
++            # If the user set a qr code generator manually, we check that we can use it
++            if not self.invoice_partner_bank_id._eligible_for_qr_code(self.qr_code_method, self.partner_id, self.currency_id):
++                raise UserError(_("The chosen QR-code type is not eligible for this invoice."))
++        else:
++            # Else we find one that's eligible and assign it to the invoice
++            for candidate_method, candidate_name in self.env['res.partner.bank'].get_available_qr_methods_in_sequence():
++                if self.invoice_partner_bank_id._eligible_for_qr_code(candidate_method, self.partner_id, self.currency_id):
++                    qr_code_method = candidate_method
++                    break
++
++        if not qr_code_method:
++            # No eligible method could be found; we can't generate the QR-code
++            return None
++
++        unstruct_ref = self.ref if self.ref else self.name
++        rslt = self.invoice_partner_bank_id.build_qr_code_url(self.amount_residual, unstruct_ref, self.invoice_payment_ref, self.currency_id, self.partner_id, qr_code_method, silent_errors=False)
++
++        # We only set qr_code_method after generating the url; otherwise, it
++        # could be set even in case of a failure in the QR code generation
++        # (which would change the field, but not refresh UI, making the displayed data inconsistent with db)
++        self.qr_code_method = qr_code_method
++
++        return rslt
+ 
+ class AccountMoveLine(models.Model):
+     _name = "account.move.line"
+
+--- a/addons/account/models/account_payment.py
++++ b/addons/account/models/account_payment.py
+@@ -94,6 +94,7 @@ class account_payment(models.Model):
+     possible_bank_partner_ids = fields.Many2many('res.partner', compute='_compute_possible_bank_partners')
+     show_partner_bank_account = fields.Boolean(compute='_compute_show_partner_bank', help='Technical field used to know whether the field `partner_bank_account_id` needs to be displayed or not in the payments form views')
+     require_partner_bank_account = fields.Boolean(compute='_compute_show_partner_bank', help='Technical field used to know whether the field `partner_bank_account_id` needs to be required or not in the payments form views')
++    qr_code = fields.Char(string="QR Code", compute="_compute_qr_code", help="QR-code report URL to use to generate the QR-code to scan with a banking app to perform this payment.")
+ 
+     @api.model
+     def default_get(self, default_fields):
+@@ -171,6 +172,28 @@ class account_payment(models.Model):
+                 payment_methods = p.journal_id.outbound_payment_method_ids
+             p._payment_methods = default | payment_methods
+ 
++    @api.depends('partner_bank_account_id', 'amount', 'communication', 'currency_id', 'journal_id', 'state', 'payment_method_id', 'payment_type')
++    def _compute_qr_code(self):
++        for record in self:
++            if record.state in ('draft', 'posted') \
++                and record.partner_bank_account_id \
++                and record.payment_method_id.code == 'manual' \
++                and record.payment_type == 'outbound':
++
++                currency = record.currency_id or record.company_id.currency_id
++                qr_code = record.partner_bank_account_id and record.partner_bank_account_id.build_qr_code_url(record.amount, record.communication, None, currency, record.partner_id) or None
++                if qr_code:
++                    record.qr_code = '''
++                        <br/>
++                        <img class="border border-dark rounded" src="{qr_code}"/>
++                        <br/>
++                        <strong class="text-center">{txt}</strong>
++                        '''.format(txt = _('Scan me with your banking app.'),
++                                   qr_code = qr_code)
++                    continue
++
++            record.qr_code = None
++
+     @api.constrains('amount')
+     def _check_amount(self):
+         for payment in self:
+@@ -179,7 +202,7 @@ class account_payment(models.Model):
+ 
+     @api.model
+     def _get_method_codes_using_bank_account(self):
+-        return []
++        return ['manual']
+ 
+     @api.model
+     def _get_method_codes_needing_bank_account(self):
+@@ -414,6 +437,12 @@ class account_payment(models.Model):
+             'context': {'create': False},
+         }
+ 
++    def mark_as_sent(self):
++        self.write({'state': 'sent'})
++
++    def unmark_as_sent(self):
++        self.write({'state': 'posted'})
++
+     def unreconcile(self):
+         """ Set back the payments in 'posted' or 'sent' state, without deleting the journal entries.
+             Called when cancelling a bank statement line linked to a pre-registered payment.
+
+--- a/addons/account/models/company.py
++++ b/addons/account/models/company.py
+@@ -71,7 +71,7 @@ class ResCompany(models.Model):
+     incoterm_id = fields.Many2one('account.incoterms', string='Default incoterm',
+         help='International Commercial Terms are a series of predefined commercial terms used in international transactions.')
+ 
+-    qr_code = fields.Boolean(string='Display SEPA QR code')
++    qr_code = fields.Boolean(string='Display QR-code on invoices')
+ 
+     invoice_is_email = fields.Boolean('Email by default', default=True)
+     invoice_is_print = fields.Boolean('Print by default', default=True)
+
+--- a/None
++++ b/addons/account/models/res_bank.py
+@@ -0,0 +1,96 @@
++# -*- coding: utf-8 -*-
++
++from odoo import api, models, fields, _
++from odoo.exceptions import UserError
++
++class ResPartnerBank(models.Model):
++    _inherit = 'res.partner.bank'
++
++    def build_qr_code_url(self, amount, free_communication, structured_communication, currency, debtor_partner, qr_method=None, silent_errors=True):
++        """ Returns the QR-code report URL to pay to this account with the given parameters,
++        or None if no QR-code could be generated.
++
++        :param amount: The amount to be paid
++        :param free_communication: Free communication to add to the payment when generating one with the QR-code
++        :param structured_communication: Structured communication to add to the payment when generating one with the QR-code
++        :param currency: The currency in which amount is expressed
++        :param debtor_partner: The partner to which this QR-code is aimed (so the one who will have to pay)
++        :param qr_method: The QR generation method to be used to make the QR-code. If None, the first one giving a result will be used.
++        :param silent_errors: If true, forbids errors to be raised if some tested QR-code format can't be generated because of incorrect data.
++        """
++        if not self:
++            return None
++
++        self.ensure_one()
++
++        if not currency:
++            raise UserError(_("Currency must always be provided in order to generate a QR-code"))
++
++        available_qr_methods = self.get_available_qr_methods_in_sequence()
++        candidate_methods = qr_method and [(qr_method, dict(available_qr_methods)[qr_method])] or available_qr_methods
++        for candidate_method, candidate_name in candidate_methods:
++            if self._eligible_for_qr_code(candidate_method, debtor_partner, currency):
++                error_message = self._check_for_qr_code_errors(candidate_method, amount, currency, debtor_partner, free_communication, structured_communication)
++
++                if not error_message:
++                    return self._get_qr_code_url(candidate_method, amount, currency, debtor_partner, free_communication, structured_communication)
++
++                elif not silent_errors:
++                    error_header = _("The following error prevented '%s' QR-code to be generated though it was detected as eligible: ") % candidate_name
++                    raise UserError( error_header + error_message)
++
++        return None
++
++    def _get_qr_code_url(self, qr_method, amount, currency, debtor_partner, free_communication, structured_communication):
++        """ Hook for extension, to support the different QR generation methods.
++        This function uses the provided qr_method to try generation a QR-code for
++        the given data. It it succeeds, it returns the report URL to make this
++        QR-code; else None.
++
++        :param qr_method: The QR generation method to be used to make the QR-code.
++        :param amount: The amount to be paid
++        :param currency: The currency in which amount is expressed
++        :param debtor_partner: The partner to which this QR-code is aimed (so the one who will have to pay)
++        :param free_communication: Free communication to add to the payment when generating one with the QR-code
++        :param structured_communication: Structured communication to add to the payment when generating one with the QR-code
++        """
++        return None
++
++    @api.model
++    def _get_available_qr_methods(self):
++        """ Returns the QR-code generation methods that are available on this db,
++        in the form of a list of (code, name, sequence) elements, where
++        'code' is a unique string identifier, 'name' the name to display
++        to the user to designate the method, and 'sequence' is a positive integer
++        indicating the order in which those mehtods need to be checked, to avoid
++        shadowing between them (lower sequence means more prioritary).
++        """
++        return []
++
++    @api.model
++    def get_available_qr_methods_in_sequence(self):
++        """ Same as _get_available_qr_methods but without returning the sequence,
++        and using it directly to order the returned list.
++        """
++        all_available = self._get_available_qr_methods()
++        all_available.sort(key=lambda x: x[2])
++        return [(code, name) for (code, name, sequence) in all_available]
++
++
++    def _eligible_for_qr_code(self, qr_method, debtor_partner, currency):
++        """ Tells whether or not the criteria to apply QR-generation
++        method qr_method are met for a payment on this account, in the
++        given currency, by debtor_partner. This does not impeach generation errors,
++        it only checks that this type of QR-code *should be* possible to generate.
++        Consistency of the required field needs then to be checked by _check_for_qr_code_errors().
++        """
++        return False
++
++    def _check_for_qr_code_errors(self, qr_method, amount, currency, debtor_partner, free_communication, structured_communication):
++        """ Checks the data before generating a QR-code for the specified qr_method
++        (this method must have been checked for eligbility by _eligible_for_qr_code() first).
++
++        Returns None if no error was found, or a string describing the first error encountered
++        so that it can be reported to the user.
++        """
++        return None
+\ No newline at end of file
+
+--- a/addons/account/models/res_config_settings.py
++++ b/addons/account/models/res_config_settings.py
+@@ -80,7 +80,7 @@ class ResConfigSettings(models.TransientModel):
+                This is useful if you install accounting after having used invoicing for some time and
+                don't want to reconcile all the past payments with bank statements.""")
+ 
+-    qr_code = fields.Boolean(string='Display SEPA QR code', related='company_id.qr_code', readonly=False)
++    qr_code = fields.Boolean(string='Display SEPA QR-code', related='company_id.qr_code', readonly=False)
+     invoice_is_print = fields.Boolean(string='Print', related='company_id.invoice_is_print', readonly=False)
+     invoice_is_email = fields.Boolean(string='Send Email', related='company_id.invoice_is_email', readonly=False)
+     incoterm_id = fields.Many2one('account.incoterms', string='Default incoterm', related='company_id.incoterm_id', help='International Commercial Terms are a series of predefined commercial terms used in international transactions.', readonly=False)

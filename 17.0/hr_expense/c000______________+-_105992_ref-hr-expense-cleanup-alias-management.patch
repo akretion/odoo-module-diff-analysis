@@ -1,0 +1,149 @@
+PR: https://github.com/odoo/odoo/pull/105992
+
+From: 5eca7b7378a0ce9cd96f8366091434d9d71f069b
+From: Thibault Delavallée
+Date: 2022-11-18 12:59:53
+
+Structural Changes: 4
+Total Changes: 63
+
+[REF] hr_expense: cleanup alias management
+
+Purpose of this commit is to cleanup alias usage in hr_expense. Indeed it
+is currently used as a master data without being cleanly supported.
+
+In this commit we
+
+  * globally avoid crashes if the alias data has been removed;
+  * recreate Xml ID record if it has been removed as it is considered as
+    being a master data;
+  * avoid issues when trying to configure the expense alias in settings if
+    alias has been manually removed. Setting a name now creates the alias
+    and an XmlID if it has been removed;
+  * rename a generic 'use_mail_gateway' field into 'expense_use_mail_gateway'
+    in order to avoid conflicts with future changes in generic settings linked
+    to email gateway and configuration
+  * fix empty list helper: it is now translated and correctly encode parameters
+    given to 'mailto';
+
+Task-2710804 (Mail: Clean MailThread Posting API)
+Prepares Task-36879 (Mail: Support MultiCompany Aliases)
+
+Part-of: odoo/odoo#105992
+
+================================= pseudo patch: =================================
+
+--- a/addons/hr_expense/models/__init__.py
++++ b/addons/hr_expense/models/__init__.py
+@@ -1,4 +1,5 @@
+ # -*- coding: utf-8 -*-
++# Part of Odoo. See LICENSE file for full copyright and licensing details.
+ 
+ from . import hr_employee
+ from . import account_move
+
+--- a/addons/hr_expense/models/hr_expense.py
++++ b/addons/hr_expense/models/hr_expense.py
+@@ -3,6 +3,8 @@
+ 
+ import re
+ from markupsafe import Markup
++import werkzeug
++
+ from odoo import api, fields, Command, models, _
+ from odoo.tools import float_round
+ from odoo.exceptions import UserError, ValidationError
+@@ -403,17 +405,23 @@ class HrExpense(models.Model):
+ 
+     @api.model
+     def get_empty_list_help(self, help_message):
+-        return super(HrExpense, self).get_empty_list_help(help_message or '' + self._get_empty_list_mail_alias())
++        return super().get_empty_list_help((help_message or '') + self._get_empty_list_mail_alias())
+ 
+     @api.model
+     def _get_empty_list_mail_alias(self):
+         use_mailgateway = self.env['ir.config_parameter'].sudo().get_param('hr_expense.use_mailgateway')
+-        alias_record = use_mailgateway and self.env.ref('hr_expense.mail_alias_expense') or False
+-        if alias_record and alias_record.alias_domain and alias_record.alias_name:
+-            return Markup("""
+-<p>
+-Or send your receipts at <a href="mailto:%(email)s?subject=Lunch%%20with%%20customer%%3A%%20%%2412.32">%(email)s</a>.
+-</p>""") % {'email': '%s@%s' % (alias_record.alias_name, alias_record.alias_domain)}
++        expense_alias = self.env.ref('hr_expense.mail_alias_expense') if use_mailgateway else False
++        if expense_alias and expense_alias.alias_domain and expense_alias.alias_name:
++            alias_email = f'{expense_alias.alias_name}@{expense_alias.alias_domain}'
++            # encode, but force %20 encoding for space instead of a + (URL / mailto difference)
++            params = werkzeug.urls.url_encode({'subject': _("Lunch with customer $12.32")}).replace('+', '%20')
++            return Markup(
++                """<p>%(send_string)s <a href="mailto:%(alias_email)s?%(params)s">%(alias_email)s</a></p>"""
++            ) % {
++                'alias_email': alias_email,
++                'params': params,
++                'send_string': _("Or send your receipts at"),
++            }
+         return ""
+ 
+     # ----------------------------------------
+
+--- a/addons/hr_expense/models/res_config_settings.py
++++ b/addons/hr_expense/models/res_config_settings.py
+@@ -6,14 +6,13 @@ from odoo import api, fields, models
+ class ResConfigSettings(models.TransientModel):
+     _inherit = 'res.config.settings'
+ 
+-    expense_alias_prefix = fields.Char(
++    hr_expense_alias_prefix = fields.Char(
+         'Default Alias Name for Expenses',
+-        compute='_compute_expense_alias_prefix',
++        compute='_compute_hr_expense_alias_prefix',
+         store=True,
+         readonly=False)
+-    use_mailgateway = fields.Boolean(string='Let your employees record expenses by email',
+-                                     config_parameter='hr_expense.use_mailgateway')
+-
++    hr_expense_use_mailgateway = fields.Boolean(string='Let your employees record expenses by email',
++                                             config_parameter='hr_expense.use_mailgateway')
+     module_hr_payroll_expense = fields.Boolean(string='Reimburse Expenses in Payslip')
+     module_hr_expense_extract = fields.Boolean(string='Send bills to OCR to generate expenses')
+     expense_journal_id = fields.Many2one('account.journal', related='company_id.expense_journal_id', readonly=False)
+@@ -22,17 +21,32 @@ class ResConfigSettings(models.TransientModel):
+     @api.model
+     def get_values(self):
+         res = super(ResConfigSettings, self).get_values()
++        expense_alias = self.env.ref('hr_expense.mail_alias_expense', raise_if_not_found=False)
+         res.update(
+-            expense_alias_prefix=self.env.ref('hr_expense.mail_alias_expense').alias_name,
++            hr_expense_alias_prefix=expense_alias.alias_name if expense_alias else False,
+         )
+         return res
+ 
+     def set_values(self):
+         super().set_values()
+-        alias = self.env.ref('hr_expense.mail_alias_expense', raise_if_not_found=False)
+-        if alias and alias.alias_name != self.expense_alias_prefix:
+-            alias.alias_name = self.expense_alias_prefix
+-
+-    @api.depends('use_mailgateway')
+-    def _compute_expense_alias_prefix(self):
+-        self.filtered(lambda w: not w.use_mailgateway).update({'expense_alias_prefix': False})
++        expense_alias = self.env.ref('hr_expense.mail_alias_expense', raise_if_not_found=False)
++        if not expense_alias and self.hr_expense_alias_prefix:
++            # create data again
++            alias = self.env['mail.alias'].sudo().create({
++                'alias_contact': 'employees',
++                'alias_model_id': self.env['ir.model']._get_id('hr.expense'),
++                'alias_name': self.hr_expense_alias_prefix,
++            })
++            self.env['ir.model.data'].sudo().create({
++                'name': 'mail_alias_expense',
++                'module': 'hr_expense',
++                'model': 'mail.alias',
++                'noupdate': True,
++                'res_id': alias.id,
++            })
++        elif expense_alias and expense_alias.alias_name != self.hr_expense_alias_prefix:
++            expense_alias.alias_name = self.hr_expense_alias_prefix
++
++    @api.depends('hr_expense_use_mailgateway')
++    def _compute_hr_expense_alias_prefix(self):
++        self.filtered(lambda w: not w.hr_expense_use_mailgateway).hr_expense_alias_prefix = False

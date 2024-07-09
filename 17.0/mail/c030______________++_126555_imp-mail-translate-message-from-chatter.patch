@@ -1,0 +1,142 @@
+PR: https://github.com/odoo/odoo/pull/126555
+
+From: a3bab45dbec269dc6a67cb9534ab9102c8aa9129
+From: Killian Frappart
+Date: 2023-10-25 11:37:17
+
+Structural Changes: 7
+Total Changes: 51
+
+[IMP] mail: translate message from chatter
+
+This commit introduces a new optional feature in the chatter.
+
+Users can request translation from the Google Cloud Translation API.
+Documentation: <https://cloud.google.com/translate/docs#docs>
+
+Adding the key in settings will instantly enable the feature for all
+users of the database and consumption is not measured nor limited
+by Odoo as it is natively supported using the Google Cloud Console.
+
+Translation values are stored in the database to reduce cost as
+much as possible. Therefore, translation values are automatically
+garbage collected every 2 weeks to prevent database pollution.
+
+Task-3338165
+
+closes odoo/odoo#126555
+
+Signed-off-by: Sébastien Theys (seb) <seb@odoo.com>
+
+================================= pseudo patch: =================================
+
+--- a/addons/mail/models/__init__.py
++++ b/addons/mail/models/__init__.py
+@@ -33,6 +33,7 @@ from . import mail_link_preview
+ from . import mail_message_reaction
+ from . import mail_message_schedule
+ from . import mail_message_subtype
++from . import mail_message_translation
+ from . import mail_message
+ from . import mail_mail
+ from . import mail_tracking_value
+
+--- a/addons/mail/models/discuss/mail_guest.py
++++ b/addons/mail/models/discuss/mail_guest.py
+@@ -147,6 +147,7 @@ class MailGuest(models.Model):
+              # sudo: ir.config_parameter: safe to check for existence of tenor api key
+             'hasGifPickerFeature': bool(self.env["ir.config_parameter"].sudo().get_param("discuss.tenor_api_key")),
+             'hasLinkPreviewFeature': self.env['mail.link.preview']._is_link_preview_enabled(),
++            'hasMessageTranslationFeature': False,
+              # sudo: bus.bus: reading non-sensitive last id
+             'initBusId': self.env['bus.bus'].sudo()._bus_last_id(),
+             'menu_id': False,
+
+--- a/addons/mail/models/discuss/res_users.py
++++ b/addons/mail/models/discuss/res_users.py
+@@ -61,5 +61,7 @@ class ResUsers(models.Model):
+             "channels": channels._channel_info(),
+             # sudo: ir.config_parameter - reading hard-coded key to check its existence, safe to return if the feature is enabled
+             "hasGifPickerFeature": bool(self.env["ir.config_parameter"].sudo().get_param("discuss.tenor_api_key")),
++            # sudo: ir.config_parameter - reading hard-coded key to check its existence, safe to return if the feature is enabled
++            'hasMessageTranslationFeature': bool(self.env["ir.config_parameter"].sudo().get_param("mail.google_translate_api_key")),
+             **super()._init_messaging(),
+         }
+
+--- a/None
++++ b/addons/mail/models/mail_message_translation.py
+@@ -0,0 +1,32 @@
++# Part of Odoo. See LICENSE file for full copyright and licensing details.
++
++from dateutil.relativedelta import relativedelta
++
++from odoo import api, fields, models
++
++
++class MessageTranslation(models.Model):
++    _name = "mail.message.translation"
++    _description = "Message Translation"
++
++    message_id = fields.Many2one("mail.message", "Message", required=True, ondelete="cascade")
++    source_lang = fields.Char(
++        "Source Language", required=True, help="Result of the language detection based on its content."
++    )
++    target_lang = fields.Char(
++        "Target Language", required=True, help="Shortened language code used as the target for the translation request."
++    )
++    body = fields.Html(
++        "Translation Body", required=True, sanitize_style=True, help="String received from the translation request."
++    )
++    create_date = fields.Datetime(index=True)
++
++    def init(self):
++        self.env.cr.execute(
++            f"CREATE UNIQUE INDEX IF NOT EXISTS mail_message_translation_unique ON {self._table} (message_id, target_lang)"
++        )
++
++    @api.autovacuum
++    def _gc_translations(self):
++        treshold = fields.Datetime().now() - relativedelta(weeks=2)
++        self.search([("create_date", "<", treshold)]).unlink()
+
+--- a/addons/mail/models/mail_thread.py
++++ b/addons/mail/models/mail_thread.py
+@@ -4197,8 +4197,7 @@ class MailThread(models.AbstractModel):
+         empty_messages = message.sudo()._filter_empty()
+         empty_messages._cleanup_side_records()
+         empty_messages.write({'pinned_at': None})
+-
+-        self.env['bus.bus']._sendone(message._bus_notification_target(), 'mail.record/insert', {
++        payload = {
+             'Message': {
+                 'id': message.id,
+                 'body': message.body,
+@@ -4207,7 +4206,12 @@ class MailThread(models.AbstractModel):
+                 'recipients': [{'id': p.id, 'name': p.name, 'type': "partner"} for p in message.partner_ids],
+                 'write_date': message.write_date,
+             }
+-        })
++        }
++        if "body" in msg_values:
++            # sudo: mail.message.translation - discarding translations of message after editing it
++            self.env["mail.message.translation"].sudo().search([("message_id", "=", message.id)]).unlink()
++            payload["Message"]["translationValue"] = False
++        self.env["bus.bus"]._sendone(message._bus_notification_target(), "mail.record/insert", payload)
+ 
+     # ------------------------------------------------------
+     # CONTROLLERS
+
+--- a/addons/mail/models/res_config_settings.py
++++ b/addons/mail/models/res_config_settings.py
+@@ -65,6 +65,11 @@ class ResConfigSettings(models.TransientModel):
+         config_parameter='discuss.tenor_gif_limit',
+         help="Fetch up to the specified number of GIF.",
+     )
++    google_translate_api_key = fields.Char(
++        "Message Translation API Key",
++        help="A valid Google API key is required to enable message translation. https://cloud.google.com/translate/docs/setup",
++        config_parameter="mail.google_translate_api_key",
++    )
+ 
+     def _compute_fail_counter(self):
+         previous_date = fields.Datetime.now() - datetime.timedelta(days=30)

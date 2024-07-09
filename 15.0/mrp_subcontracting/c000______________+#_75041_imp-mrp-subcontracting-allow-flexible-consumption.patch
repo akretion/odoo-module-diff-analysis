@@ -1,0 +1,334 @@
+PR: https://github.com/odoo/odoo/pull/75041
+
+From: ff4d25a427c33ac001de285dadc511049cf29158
+From: Rémy Voet (ryv)
+Date: 2021-09-03 10:37:48
+
+Structural Changes: 3
+Total Changes: 137
+
+[IMP] mrp_subcontracting: allow flexible consumption
+Take in account the bom consumption of subcontracting BoM:
+- In flexible and warning we can now record extra component
+(even if there isn't tracked component).
+- In the warning case, we get a warning issue in during the recording
+of component if we consume more than expected
+- In case of script consumption, we cannot record component expected
+if some are tracked. In this case we can consume more than expected
+only if the user is a mrp manager.
+
+Also fix "Set quantities" Button for the subcontracting
+
+task-2486811
+
+closes odoo/odoo#75041
+
+Related: odoo/enterprise#20350
+Related: odoo/upgrade#2750
+Signed-off-by: Arnold Moyaux <amoyaux@users.noreply.github.com>
+
+================================= pseudo patch: =================================
+
+--- a/addons/mrp_subcontracting/models/mrp_production.py
++++ b/addons/mrp_subcontracting/models/mrp_production.py
+@@ -14,6 +14,7 @@ class MrpProduction(models.Model):
+         'stock.move.line', string="Detail Component", readonly=False,
+         inverse='_inverse_move_line_raw_ids', compute='_compute_move_line_raw_ids'
+     )
++    subcontracting_has_been_recorded = fields.Boolean("Has been recorded?", copy=False)
+ 
+     @api.depends('move_raw_ids.move_line_ids')
+     def _compute_move_line_raw_ids(self):
+@@ -36,13 +37,20 @@ class MrpProduction(models.Model):
+ 
+     def subcontracting_record_component(self):
+         self.ensure_one()
+-        assert self.env.context.get('subcontract_move_id')
++        if not self._get_subcontract_move():
++            raise UserError(_("This MO isn't related to a subcontracted move"))
+         if float_is_zero(self.qty_producing, precision_rounding=self.product_uom_id.rounding):
+             return {'type': 'ir.actions.act_window_close'}
+         for sml in self.move_raw_ids.move_line_ids:
+             if sml.tracking != 'none' and not sml.lot_id:
+                 raise UserError(_('You must enter a serial number for each line of %s') % sml.product_id.name)
++        consumption_issues = self._get_consumption_issues()
++        if consumption_issues:
++            return self._action_generate_consumption_wizard(consumption_issues)
++
+         self._update_finished_move()
++        self.subcontracting_has_been_recorded = True
++
+         quantity_issues = self._get_quantity_produced_issues()
+         if quantity_issues:
+             backorder = self._generate_backorder_productions(close_mo=False)
+@@ -54,23 +62,21 @@ class MrpProduction(models.Model):
+             backorder._set_qty_producing()
+ 
+             self.product_qty = self.qty_producing
+-            subcontract_move_id = self.env['stock.move'].browse(self.env.context.get('subcontract_move_id'))
+-            action = subcontract_move_id._action_record_components()
+-            action.update({'res_id': backorder.id})
++            action = self._get_subcontract_move()._action_record_components()
++            action['res_id'] = backorder.id
+             return action
+         return {'type': 'ir.actions.act_window_close'}
+ 
+     def _pre_button_mark_done(self):
+-        if self.env.context.get('subcontract_move_id'):
++        if self._get_subcontract_move():
+             return True
+         return super()._pre_button_mark_done()
+ 
+     def _update_finished_move(self):
+         """ After producing, set the move line on the subcontract picking. """
+         self.ensure_one()
+-        subcontract_move_id = self.env.context.get('subcontract_move_id')
++        subcontract_move_id = self._get_subcontract_move()
+         if subcontract_move_id:
+-            subcontract_move_id = self.env['stock.move'].browse(subcontract_move_id)
+             quantity = self.qty_producing
+             if self.lot_producing_id:
+                 move_lines = subcontract_move_id.move_line_ids.filtered(lambda ml: ml.lot_id == self.lot_producing_id or not ml.lot_id)
+@@ -138,3 +144,15 @@ class MrpProduction(models.Model):
+             return True
+ 
+         return self.filtered(filter_in)
++
++    def _has_been_recorded(self):
++        self.ensure_one()
++        if self.state in ('cancel', 'done'):
++            return True
++        return self.subcontracting_has_been_recorded
++
++    def _has_tracked_component(self):
++        return any(m.has_tracking != 'none' for m in self.move_raw_ids)
++
++    def _get_subcontract_move(self):
++        return self.move_finished_ids.move_dest_ids.filtered(lambda m: m.is_subcontract)
+
+--- a/addons/mrp_subcontracting/models/stock_move.py
++++ b/addons/mrp_subcontracting/models/stock_move.py
+@@ -18,12 +18,16 @@ class StockMove(models.Model):
+ 
+     def _compute_show_subcontracting_details_visible(self):
+         """ Compute if the action button in order to see moves raw is visible """
++        self.show_subcontracting_details_visible = False
+         for move in self:
+-            if move.is_subcontract and move._has_tracked_subcontract_components() and\
+-                    not float_is_zero(move.quantity_done, precision_rounding=move.product_uom.rounding):
+-                move.show_subcontracting_details_visible = True
+-            else:
+-                move.show_subcontracting_details_visible = False
++            if not move.is_subcontract:
++                continue
++            if float_is_zero(move.quantity_done, precision_rounding=move.product_uom.rounding):
++                continue
++            productions = move._get_subcontract_production()
++            if not productions or (productions[:1].consumption == 'strict' and not productions[:1]._has_tracked_component()):
++                continue
++            move.show_subcontracting_details_visible = True
+ 
+     def _compute_show_details_visible(self):
+         """ If the move is subcontract and the components are tracked. Then the
+@@ -33,7 +37,7 @@ class StockMove(models.Model):
+         for move in self:
+             if not move.is_subcontract:
+                 continue
+-            if not move._has_tracked_subcontract_components():
++            if not move._get_subcontract_production()._has_tracked_component():
+                 continue
+             move.show_details_visible = True
+         return res
+@@ -69,10 +73,10 @@ class StockMove(models.Model):
+         subcontracted product. Otherwise use standard behavior.
+         """
+         self.ensure_one()
+-        if self._has_components_to_record():
++        if self._subcontrating_can_be_record():
+             return self._action_record_components()
+         action = super(StockMove, self).action_show_details()
+-        if self.is_subcontract and self._has_tracked_subcontract_components():
++        if self.is_subcontract and self._get_subcontract_production():
+             action['views'] = [(self.env.ref('stock.view_stock_move_operations').id, 'form')]
+             action['context'].update({
+                 'show_lots_m2o': self.has_tracking != 'none',
+@@ -82,10 +86,10 @@ class StockMove(models.Model):
+ 
+     def action_show_subcontract_details(self):
+         """ Display moves raw for subcontracted product self. """
+-        moves = self.move_orig_ids.production_id.move_raw_ids
++        moves = self._get_subcontract_production().move_raw_ids
+         tree_view = self.env.ref('mrp_subcontracting.mrp_subcontracting_move_tree_view')
+         form_view = self.env.ref('mrp_subcontracting.mrp_subcontracting_move_form_view')
+-        ctx = dict(self._context, search_default_by_product=True, subcontract_move_id=self.id)
++        ctx = dict(self._context, search_default_by_product=True)
+         return {
+             'name': _('Raw Materials for %s') % (self.product_id.display_name),
+             'type': 'ir.actions.act_window',
+@@ -141,7 +145,7 @@ class StockMove(models.Model):
+ 
+     def _action_record_components(self):
+         self.ensure_one()
+-        production = self.move_orig_ids.production_id[-1:]
++        production = self._get_subcontract_production()[-1:]
+         view = self.env.ref('mrp_subcontracting.mrp_production_subcontracting_form_view')
+         return {
+             'name': _('Subcontract'),
+@@ -152,7 +156,7 @@ class StockMove(models.Model):
+             'view_id': view.id,
+             'target': 'new',
+             'res_id': production.id,
+-            'context': dict(self.env.context, subcontract_move_id=self.id),
++            'context': self.env.context,
+         }
+ 
+     def _get_subcontract_bom(self):
+@@ -166,20 +170,17 @@ class StockMove(models.Model):
+         )
+         return bom
+ 
+-    def _has_components_to_record(self):
+-        """ Returns true if the move has still some tracked components to record. """
+-        self.ensure_one()
+-        if not self.is_subcontract:
+-            return False
+-        rounding = self.product_uom.rounding
+-        production = self.move_orig_ids.production_id[-1:]
+-        return self._has_tracked_subcontract_components() and\
+-            float_compare(production.qty_produced, production.product_uom_qty, precision_rounding=rounding) < 0 and\
+-            float_compare(self.quantity_done, self.product_uom_qty, precision_rounding=rounding) < 0
++    def _subcontrating_should_be_record(self):
++        return self._get_subcontract_production().filtered(lambda p: not p._has_been_recorded() and p._has_tracked_component())
++
++    def _subcontrating_can_be_record(self):
++        return self._get_subcontract_production().filtered(lambda p: not p._has_been_recorded() and p.consumption != 'strict')
++
++    def _get_subcontract_production(self):
++        return self.filtered(lambda m: m.is_subcontract).move_orig_ids.production_id
+ 
+     def _has_tracked_subcontract_components(self):
+-        self.ensure_one()
+-        return any(m.has_tracking != 'none' for m in self.move_orig_ids.production_id.move_raw_ids)
++        return any(m.has_tracking != 'none' for m in self._get_subcontract_production().move_raw_ids)
+ 
+     def _prepare_extra_move_vals(self, qty):
+         vals = super(StockMove, self)._prepare_extra_move_vals(qty)
+@@ -192,7 +193,7 @@ class StockMove(models.Model):
+         return vals
+ 
+     def _should_bypass_set_qty_producing(self):
+-        if self.env.context.get('subcontract_move_id'):
++        if (self.production_id | self.raw_material_production_id)._get_subcontract_move():
+             return False
+         return super()._should_bypass_set_qty_producing()
+ 
+
+--- a/addons/mrp_subcontracting/models/stock_picking.py
++++ b/addons/mrp_subcontracting/models/stock_picking.py
+@@ -3,7 +3,8 @@
+ 
+ from datetime import timedelta
+ 
+-from odoo import api, fields, models
++from odoo import api, fields, models, _
++from odoo.exceptions import UserError
+ from odoo.tools.float_utils import float_compare
+ from dateutil.relativedelta import relativedelta
+ 
+@@ -11,21 +12,23 @@ from dateutil.relativedelta import relativedelta
+ class StockPicking(models.Model):
+     _inherit = 'stock.picking'
+ 
+-    display_action_record_components = fields.Boolean(compute='_compute_display_action_record_components')
++    display_action_record_components = fields.Selection(
++        [('hide', 'Hide'), ('facultative', 'Facultative'), ('mandatory', 'Mandatory')],
++        compute='_compute_display_action_record_components')
+ 
+-    @api.depends('state')
++    @api.depends('state', 'move_lines')
+     def _compute_display_action_record_components(self):
++        self.display_action_record_components = 'hide'
+         for picking in self:
+-            # Hide if not encoding state
+-            if picking.state in ('draft', 'cancel', 'done'):
+-                picking.display_action_record_components = False
++            # Hide if not encoding state or it is not a subcontracting picking
++            if picking.state in ('draft', 'cancel', 'done') or not picking._is_subcontract():
+                 continue
+-            if not picking._is_subcontract():
+-                picking.display_action_record_components = False
++            subconctracted_moves = picking.move_lines.filtered(lambda m: m.is_subcontract)
++            if subconctracted_moves._subcontrating_should_be_record():
++                picking.display_action_record_components = 'mandatory'
+                 continue
+-            # Hide if all tracked product move lines are already recorded.
+-            picking.display_action_record_components = any(
+-                move._has_components_to_record() for move in picking.move_lines)
++            if subconctracted_moves._subcontrating_can_be_record():
++                picking.display_action_record_components = 'facultative'
+ 
+     # -------------------------------------------------------------------------
+     # Action methods
+@@ -34,13 +37,13 @@ class StockPicking(models.Model):
+         res = super(StockPicking, self)._action_done()
+ 
+         for move in self.move_lines.filtered(lambda move: move.is_subcontract):
+-            # Auto set qty_producing/lot_producing_id of MO if there isn't tracked component
+-            # If there is tracked component, the flow use subcontracting_record_component instead
+-            if move._has_tracked_subcontract_components():
+-                continue
+-            production = move.move_orig_ids.production_id.filtered(lambda p: p.state not in ('done', 'cancel'))[-1:]
++            # Auto set qty_producing/lot_producing_id of MO wasn't recorded
++            # manually (if the flexible + record_component or has tracked component)
++            production = move._get_subcontract_production().filtered(lambda p: not p._has_been_recorded())
+             if not production:
+                 continue
++            if len(production) > 1:
++                raise UserError("It shouldn't happen to have multiple production to record for the same subconctracted move")
+             # Manage additional quantities
+             quantity_done_move = move.product_uom._compute_quantity(move.quantity_done, production.product_uom_id)
+             if float_compare(production.product_qty, quantity_done_move, precision_rounding=production.product_uom_id.rounding) == -1:
+@@ -63,11 +66,11 @@ class StockPicking(models.Model):
+                     production = backorder
+ 
+         for picking in self:
+-            productions_to_done = picking._get_subcontracted_productions()._subcontracting_filter_to_done()
++            productions_to_done = picking._get_subcontract_production()._subcontracting_filter_to_done()
+             production_ids_backorder = []
+             if not self.env.context.get('cancel_backorder'):
+                 production_ids_backorder = productions_to_done.filtered(lambda mo: mo.state == "progress").ids
+-            productions_to_done.with_context(subcontract_move_id=True, mo_ids_to_backorder=production_ids_backorder).button_mark_done()
++            productions_to_done.with_context(mo_ids_to_backorder=production_ids_backorder).button_mark_done()
+             # For concistency, set the date on production move before the date
+             # on picking. (Traceability report + Product Moves menu item)
+             minimum_date = min(picking.move_line_ids.mapped('date'))
+@@ -78,9 +81,16 @@ class StockPicking(models.Model):
+ 
+     def action_record_components(self):
+         self.ensure_one()
+-        for move in self.move_lines:
+-            if move._has_components_to_record():
++        move_subcontracted = self.move_lines.filtered(lambda m: m.is_subcontract)
++        for move in move_subcontracted:
++            production = move._subcontrating_should_be_record()
++            if production:
++                return move._action_record_components()
++        for move in move_subcontracted:
++            production = move._subcontrating_can_be_record()
++            if production:
+                 return move._action_record_components()
++        raise UserError(_("Nothing to record"))
+ 
+     # -------------------------------------------------------------------------
+     # Subcontract helpers
+@@ -89,8 +99,8 @@ class StockPicking(models.Model):
+         self.ensure_one()
+         return self.picking_type_id.code == 'incoming' and any(m.is_subcontract for m in self.move_lines)
+ 
+-    def _get_subcontracted_productions(self):
+-        return self.move_lines.filtered(lambda move: move.is_subcontract).move_orig_ids.production_id
++    def _get_subcontract_production(self):
++        return self.move_lines._get_subcontract_production()
+ 
+     def _get_warehouse(self, subcontract_move):
+         return subcontract_move.warehouse_id or self.picking_type_id.warehouse_id or subcontract_move.move_dest_ids.picking_type_id.warehouse_id

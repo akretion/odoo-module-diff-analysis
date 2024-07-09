@@ -1,0 +1,136 @@
+PR: https://github.com/odoo/odoo/pull/
+
+From: 4aa2fad313112a7a45a86b67e806f5a3af22d73b
+From: Yannick Tivisse
+Date: 2017-06-02 13:31:47
+
+Structural Changes: 8
+Total Changes: 42
+
+[IMP] payment: Remove auto_confirm field and simplify views.
+
+PURPOSE
+=======
+
+The field auto_confirm is complicated to understand for common users. Furthermore, on of its options is only useful for authorize module.
+
+SPECIFICATION
+=============
+
+Remove the auto_confirm field. The destinies of its options are the following:
+- none: Simply disappear.
+- authorize: Become capture_manually. It has nothing to do with the auto_confirm field has it's related to the autorize module (And could be extended to other payment acquirers too).
+- confirm_so: Remove it. Will be automatic, and we will always validate the sales order and generate the accounting entries on acquirer validation.
+- generate_and_pay_invoice: Is linked to the journal_id. The field journal_id is always set and we will use it to validate the sales order and generate the accounting entries on acquirer validation.
+
+Bonus: website_sale: Allow to create/validate invoice automatically on `Mark as Paid`
+
+================================= pseudo patch: =================================
+
+--- a/addons/payment/models/account_payment.py
++++ b/addons/payment/models/account_payment.py
+@@ -10,7 +10,7 @@ class AccountPayment(models.Model):
+     _inherit = 'account.payment'
+ 
+     payment_transaction_id = fields.Many2one('payment.transaction', string="Payment Transaction")
+-    payment_token_id = fields.Many2one('payment.token', string="Saved payment token", domain=[('acquirer_id.auto_confirm', '!=', 'authorize')],
++    payment_token_id = fields.Many2one('payment.token', string="Saved payment token", domain=[('acquirer_id.capture_manually', '=', False)],
+                                        help="Note that tokens from acquirers set to only authorize transactions (instead of capturing the amount) are not available.")
+ 
+     @api.onchange('partner_id')
+@@ -18,14 +18,14 @@ class AccountPayment(models.Model):
+         res = {}
+         if self.partner_id:
+             partners = self.partner_id | self.partner_id.commercial_partner_id | self.partner_id.commercial_partner_id.child_ids
+-            res['domain'] = {'payment_token_id': [('partner_id', 'in', partners.ids), ('acquirer_id.auto_confirm', '!=', 'authorize')]}
++            res['domain'] = {'payment_token_id': [('partner_id', 'in', partners.ids), ('acquirer_id.capture_manually', '=', False)]}
+ 
+         return res
+ 
+     @api.onchange('payment_method_id', 'journal_id')
+     def _onchange_payment_method(self):
+         if self.payment_method_code == 'electronic':
+-            self.payment_token_id = self.env['payment.token'].search([('partner_id', '=', self.partner_id.id), ('acquirer_id.auto_confirm', '!=', 'authorize')], limit=1)
++            self.payment_token_id = self.env['payment.token'].search([('partner_id', '=', self.partner_id.id), ('acquirer_id.capture_manually', '=', False)], limit=1)
+         else:
+             self.payment_token_id = False
+ 
+@@ -38,7 +38,7 @@ class AccountPayment(models.Model):
+         return account_payment
+ 
+     def _do_payment(self):
+-        if self.payment_token_id.acquirer_id.auto_confirm == 'authorize':
++        if self.payment_token_id.acquirer_id.capture_manually:
+             raise ValidationError(_('This feature is not available for payment acquirers set to the "Authorize" mode.\n'
+                                   'Please use a token from another provider than %s.') % self.payment_token_id.acquirer_id.name)
+         reference = "P-%s-%s" % (self.id, datetime.datetime.now().strftime('%y%m%d_%H%M%S'))
+
+--- a/addons/payment/models/payment_acquirer.py
++++ b/addons/payment/models/payment_acquirer.py
+@@ -71,15 +71,22 @@ class PaymentAcquirer(models.Model):
+     website_published = fields.Boolean(
+         'Visible in Portal / Website', copy=False,
+         help="Make this payment acquirer available (Customer invoices, etc.)")
+-    auto_confirm = fields.Selection([
+-        ('none', 'No automatic confirmation'),
+-        ('authorize', 'Authorize the amount and confirm the order on acquirer confirmation (capture manually)'),
+-        ('confirm_so', 'Authorize & capture the amount and confirm the order on acquirer confirmation'),
+-        ('generate_and_pay_invoice', 'Authorize & capture the amount, confirm the order and auto-validate the invoice on acquirer confirmation')],
+-        string='Order Confirmation', default='confirm_so', required=True)
++    # Formerly associated to `authorize` option from auto_confirm
++    capture_manually = fields.Boolean(string="Capture Amount Manually",
++        help="Capture the amount from Odoo, when the delivery is completed.")
++    # Formerly associated to `generate_and_pay_invoice` option from auto_confirm
+     journal_id = fields.Many2one(
+-        'account.journal', 'Payment Journal',
+-        help="Account journal used for automatic payment reconciliation.")
++        'account.journal', 'Payment Journal', domain=[('type', '=', 'bank')],
++        default=lambda self: self.env['account.journal'].search([('type', '=', 'bank')], limit=1),
++        help="""Payments will be registered into this journal. If you get paid straight on your bank account,
++                select your bank account. If you get paid in batch for several transactions, create a specific
++                payment journal for this payment acquirer to easily manage the bank reconciliation. You hold
++                the amount in a temporary transfer account of your books (created automatically when you create
++                the payment journal). Then when you get paid on your bank account by the payment acquirer, you
++                reconcile the bank statement line with this temporary transfer account. Use reconciliation
++                templates to do it in one-click.""")
++    specific_countries = fields.Boolean(string="Specific Countries",
++        help="If you leave it empty, the payment acquirer will be available for all the countries.")
+     country_ids = fields.Many2many(
+         'res.country', 'payment_country_rel',
+         'payment_id', 'country_id', 'Countries',
+@@ -116,7 +123,7 @@ class PaymentAcquirer(models.Model):
+              "If you manage subscriptions (recurring invoicing), you need it to automatically charge the customer when you "
+              "issue an invoice.")
+     token_implemented = fields.Boolean('Saving Card Data supported', compute='_compute_feature_support')
+-
++    authorize_implemented = fields.Boolean('Authorize Mechanism Supported', compute='_compute_feature_support')
+     fees_implemented = fields.Boolean('Fees Computation Supported', compute='_compute_feature_support')
+     fees_active = fields.Boolean('Add Extra Fees')
+     fees_dom_fixed = fields.Float('Fixed domestic fees')
+@@ -142,11 +149,11 @@ class PaymentAcquirer(models.Model):
+              "resized as a 64x64px image, with aspect ratio preserved. "
+              "Use this field anywhere a small image is required.")
+ 
+-    @api.multi
+     def _compute_feature_support(self):
+         feature_support = self._get_feature_support()
+         for acquirer in self:
+             acquirer.fees_implemented = acquirer.provider in feature_support['fees']
++            acquirer.authorize_implemented = acquirer.provider in feature_support['authorize']
+             acquirer.token_implemented = acquirer.provider in feature_support['tokenize']
+ 
+     @api.multi
+@@ -158,13 +165,6 @@ class PaymentAcquirer(models.Model):
+                 return False
+         return True
+ 
+-    @api.constrains('auto_confirm')
+-    def _check_authorization_support(self):
+-        for acquirer in self:
+-            if acquirer.auto_confirm == 'authorize' and acquirer.provider not in self._get_feature_support()['authorize']:
+-                raise ValidationError(_('You cannot capture payments manually with this payment method. Please choose another Order Confirmation mode (in Configuration tab).'))
+-        return True
+-
+     _constraints = [
+         (_check_required_if_provider, 'Required fields not filled', []),
+     ]

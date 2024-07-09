@@ -1,0 +1,1352 @@
+PR: https://github.com/odoo/odoo/pull/99572
+
+From: d9057e332d04e676a926fcc7852008349556c4a4
+From: Camille Spiritus
+Date: 2022-09-15 19:12:47
+
+Structural Changes: 20
+Total Changes: 930
+
+[IMP] account: early payment discount reboot
+
+Purpose :
+Improve multiple use cases while handling the Accounting part of Cash Discounts in Odoo.
+
+When creating a Payment Term, the user can now specifically design an early payment discount for each payment term lines.
+The user can choose between three different kind of tax computation for the discount. If the conditions for the cash discount are fulfilled, the tax will either be:
+- included : the tax and base amounts will be discounted.
+- excluded : the tax will be left untouched, the base amount will be discounted.
+- mixed : the tax is durably discounted, the base is discounted if the early payment occurs.
+
+The discounted amount and the conditions to fulfill are printed below the invoice PDF if the option to do so is checked.
+
+Took the opportunity to improve the display of the payment terms on the invoice in general.
+
+Registering a payment while filling the condition for an early payment discount will prefill the fields accordingly.
+
+The Journal Items in the account.move, the payment and the reconciliation are modified as needed to take the discount into account.
+
+Reconciliation --> In the reconciliation widget, the logic of Early Payments Discounts is also applied to allow as often as possible for an automatic reconciliation.
+
+Related : odoo/enterprise#28607
+Task-2968644
+
+closes odoo/odoo#99572
+
+Related: odoo/enterprise#31225
+Signed-off-by: Laurent Smet <las@odoo.com>
+
+================================= pseudo patch: =================================
+
+--- a/addons/account/models/account_move.py
++++ b/addons/account/models/account_move.py
+@@ -543,6 +543,11 @@ class AccountMove(models.Model):
+     )
+     duplicated_ref_ids = fields.Many2many(comodel_name='account.move', compute='_compute_duplicated_ref_ids')
+ 
++    # used to display the various dates and amount dues on the invoice's PDF
++    payment_term_details = fields.Binary(compute="_compute_payment_term_details")
++    show_payment_term_details = fields.Boolean(compute="_compute_show_payment_term_details")
++    show_discount_details = fields.Boolean(compute="_compute_show_payment_term_details")
++
+     def _auto_init(self):
+         super()._auto_init()
+         if self.pool.has_trigram:
+@@ -992,19 +997,34 @@ class AccountMove(models.Model):
+         for invoice in self:
+             invoice.needed_terms = {}
+             invoice.needed_terms_dirty = True
++            sign = 1 if invoice.is_inbound(include_receipts=True) else -1
+             if invoice.is_invoice(True):
+                 if invoice.invoice_payment_term_id:
+-                    for date, (company_amount, foreign_amount) in invoice.invoice_payment_term_id.compute(
+-                        company_value=invoice.amount_total_signed,
+-                        foreign_value=invoice.amount_total_in_currency_signed,
++                    invoice_payment_terms = invoice.invoice_payment_term_id._compute_terms(
+                         date_ref=invoice.invoice_date or invoice.date or fields.Date.today(),
+                         currency=invoice.currency_id,
+-                    ):
+-                        key = frozendict({'move_id': invoice.id, 'date_maturity': fields.Date.to_date(date)})
++                        tax_amount_currency=invoice.amount_tax * sign,
++                        tax_amount=invoice.amount_tax_signed,
++                        untaxed_amount_currency=invoice.amount_untaxed * sign,
++                        untaxed_amount=invoice.amount_untaxed_signed,
++                        company=invoice.company_id,
++                        sign=sign
++                    )
++                    for term in invoice_payment_terms:
++                        key = frozendict({
++                            'move_id': invoice.id,
++                            'date_maturity': fields.Date.to_date(term.get('date')),
++                            'discount_date': term.get('discount_date'),
++                            'discount_percentage': term.get('discount_percentage'),
++                        })
+                         values = {
+-                            'balance': company_amount,
+-                            'amount_currency': foreign_amount,
++                            'balance': term['company_amount'],
++                            'amount_currency': term['foreign_amount'],
+                             'name': invoice.payment_reference or '',
++                            'discount_amount_currency': term['discount_amount_currency'] or 0.0,
++                            'discount_balance': term['discount_balance'] or 0.0,
++                            'discount_date': term['discount_date'],
++                            'discount_percentage': term['discount_percentage'],
+                         }
+                         if key not in invoice.needed_terms:
+                             invoice.needed_terms[key] = values
+@@ -1015,6 +1035,8 @@ class AccountMove(models.Model):
+                     invoice.needed_terms[frozendict({
+                         'move_id': invoice.id,
+                         'date_maturity': fields.Date.to_date(invoice.invoice_date_due),
++                        'discount_date': False,
++                        'discount_percentage': 0
+                     })] = {
+                         'balance': invoice.amount_total_signed,
+                         'amount_currency': invoice.amount_total_in_currency_signed,
+@@ -1128,6 +1150,7 @@ class AccountMove(models.Model):
+         'invoice_line_ids.tax_line_id',
+         'invoice_line_ids.price_total',
+         'invoice_line_ids.price_subtotal',
++        'invoice_payment_term_id',
+         'partner_id',
+         'currency_id',
+     )
+@@ -1137,23 +1160,108 @@ class AccountMove(models.Model):
+         """
+         for move in self:
+             if move.is_invoice(include_receipts=True):
++                base_lines = move.invoice_line_ids.filtered(lambda line: line.display_type == 'product')
++                base_line_values_list = [line._convert_to_tax_base_line_dict() for line in base_lines]
++
++                if move.id:
++                    # The invoice is stored so we can add the early payment discount lines directly to reduce the
++                    # tax amount without touching the untaxed amount.
++                    sign = -1 if move.is_inbound(include_receipts=True) else 1
++                    base_line_values_list += [
++                        {
++                            **line._convert_to_tax_base_line_dict(),
++                            'handle_price_include': False,
++                            'quantity': 1.0,
++                            'price_unit': sign * line.amount_currency,
++                        }
++                        for line in move.line_ids.filtered(lambda line: line.display_type == 'epd')
++                    ]
++
+                 kwargs = {
+-                    'base_lines': [
+-                        line._convert_to_tax_base_line_dict()
+-                        for line in move.invoice_line_ids.filtered(lambda line: line.display_type == 'product')
+-                    ],
++                    'base_lines': base_line_values_list,
+                     'currency': move.currency_id,
+                 }
++
+                 if move.id:
+                     kwargs['tax_lines'] = [
+                         line._convert_to_tax_line_dict()
+                         for line in move.line_ids.filtered(lambda line: line.display_type == 'tax')
+                     ]
++                else:
++                    # In case the invoice isn't yet stored, the early payment discount lines are not there. Then,
++                    # we need to simulate them.
++                    epd_aggregated_values = {}
++                    for base_line in base_lines:
++                        if not base_line.epd_needed:
++                            continue
++                        for grouping_dict, values in base_line.epd_needed.items():
++                            epd_values = epd_aggregated_values.setdefault(grouping_dict, {'price_subtotal': 0.0})
++                            epd_values['price_subtotal'] += values['price_subtotal']
++
++                    for grouping_dict, values in epd_aggregated_values.items():
++                        taxes = None
++                        if grouping_dict.get('tax_ids'):
++                            taxes = self.env['account.tax'].browse(grouping_dict['tax_ids'][0][2])
++                        analytic_account = None
++                        if grouping_dict.get('analytic_account_id'):
++                            analytic_account = self.env['account.analytic.account'].browse(grouping_dict['analytic_account_id'])
++                        analytic_tags = None
++                        if grouping_dict.get('analytic_tag_ids'):
++                            analytic_tags = self.env['account.analytic.tag'].browse(grouping_dict['analytic_tag_ids'][0][2])
++
++                        kwargs['base_lines'].append(self.env['account.tax']._convert_to_tax_base_line_dict(
++                            None,
++                            partner=move.partner_id,
++                            currency=move.currency_id,
++                            taxes=taxes,
++                            price_unit=values['price_subtotal'],
++                            quantity=1.0,
++                            account=self.env['account.account'].browse(grouping_dict['account_id']),
++                            analytic_account=analytic_account,
++                            analytic_tags=analytic_tags,
++                            price_subtotal=values['price_subtotal'],
++                            is_refund=move.move_type in ('out_refund', 'in_refund'),
++                            handle_price_include=False,
++                        ))
+                 move.tax_totals = self.env['account.tax']._prepare_tax_totals(**kwargs)
+             else:
+                 # Non-invoice moves don't support that field (because of multicurrency: all lines of the invoice share the same currency)
+                 move.tax_totals = None
+ 
++    @api.depends('show_payment_term_details')
++    def _compute_payment_term_details(self):
++        '''
++        Returns an [] containing the payment term's information to be displayed on the invoice's PDF.
++        '''
++        for invoice in self:
++            invoice.payment_term_details = False
++            if invoice.show_payment_term_details:
++                sign = 1 if invoice.is_inbound(include_receipts=True) else -1
++                payment_term_details = []
++                for line in invoice.line_ids.filtered(lambda l: l.display_type == 'payment_term'):
++                    payment_term_details.append({
++                        'date': format_date(self.env, line.date_maturity),
++                        'amount': sign * line.amount_currency,
++                        'discount_date': format_date(self.env, line.discount_date),
++                        'discount_amount_currency': sign * line.discount_amount_currency,
++                    })
++                invoice.payment_term_details = sorted(payment_term_details, key=lambda t: t.get('date'))
++
++    @api.depends('move_type', 'payment_state', 'invoice_payment_term_id')
++    def _compute_show_payment_term_details(self):
++        '''
++        Determines :
++        - whether or not an additional table should be added at the end of the invoice to display the various
++        - whether or not there is an early pay discount in this invoice that should be displayed
++        '''
++        for invoice in self:
++            if invoice.move_type in ('out_invoice', 'out_receipt', 'in_invoice', 'in_receipt') and invoice.payment_state == 'not_paid':
++                payment_term_lines = invoice.line_ids.filtered(lambda l: l.display_type == 'payment_term')
++                invoice.show_discount_details = any(line.discount_date for line in payment_term_lines)
++                invoice.show_payment_term_details = len(payment_term_lines) > 1 or invoice.show_discount_details
++            else:
++                invoice.show_payment_term_details = False
++
+     @api.depends('partner_id', 'invoice_source_email', 'partner_id.name')
+     def _compute_invoice_partner_display_info(self):
+         for move in self:
+@@ -1971,6 +2079,13 @@ class AccountMove(models.Model):
+                     line_type='tax',
+                     container=tax_container,
+                 ))
++                stack.enter_context(self._sync_dynamic_line(
++                    existing_key_fname='epd_key',
++                    needed_vals_fname='line_ids.epd_needed',
++                    needed_dirty_fname='line_ids.epd_dirty',
++                    line_type='epd',
++                    container=invoice_container,
++                ))
+                 stack.enter_context(self._sync_invoice(invoice_container))
+                 line_container = {'records': self.line_ids}
+                 with self.line_ids._sync_invoice(line_container):
+@@ -2599,6 +2714,256 @@ class AccountMove(models.Model):
+             grouping_key_generator=grouping_key_generator,
+         )
+ 
++    def _get_invoice_counterpart_amls_for_early_payment_discount_per_payment_term_line(self):
++        """ Helper to get the values to create the counterpart journal items on the register payment wizard and the
++        bank reconciliation widget in case of an early payment discount. When the early payment discount computation
++        is included, we need to compute the base amounts / tax amounts for each receivable / payable but we need to
++        take care about the rounding issues. For others computations, we need to balance the discount you get.
++
++        :return: A list of values to create the counterpart journal items split in 3 categories:
++            * term_lines:   The journal items containing the discount amounts for each receivable line when the
++                            discount computation is excluded / mixed.
++            * tax_lines:    The journal items acting as tax lines when the discount computation is included.
++            * base_lines:   The journal items acting as base for tax lines when the discount computation is included.
++        """
++        self.ensure_one()
++
++        def grouping_key_generator(base_line, tax_values):
++            return self.env['account.tax']._get_generation_dict_from_base_line(base_line, tax_values)
++
++        # Get the current tax amounts in the current invoice.
++        tax_amounts = {
++            line.tax_repartition_line_id.id: {
++                'amount_currency': line.amount_currency,
++                'balance': line.balance,
++            }
++            for line in self.line_ids.filtered(lambda x: x.display_type == 'tax')
++        }
++
++        product_lines = self.line_ids.filtered(lambda x: x.display_type == 'product')
++        base_lines = [x._convert_to_tax_base_line_dict() for x in product_lines]
++
++        if self.is_inbound(include_receipts=True):
++            cash_discount_account = self.company_id.account_journal_early_pay_discount_loss_account_id
++        else:
++            cash_discount_account = self.company_id.account_journal_early_pay_discount_gain_account_id
++
++        res = {
++            'term_lines': defaultdict(lambda: {}),
++            'tax_lines': defaultdict(lambda: {}),
++            'base_lines': defaultdict(lambda: {}),
++        }
++
++        early_pay_discount_computation = self.company_id.early_pay_discount_computation
++
++        base_per_percentage = {}
++        tax_computation_per_percentage = {}
++        for aml in self.line_ids.filtered(lambda x: x.display_type == 'payment_term'):
++            if not aml.discount_percentage:
++                continue
++
++            term_amount_currency = aml.amount_currency - aml.discount_amount_currency
++            term_balance = aml.balance - aml.discount_balance
++
++            if early_pay_discount_computation == 'included' and product_lines.tax_ids:
++
++                # Compute the amounts for each percentage.
++                if aml.discount_percentage not in tax_computation_per_percentage:
++
++                    # Compute the base amounts.
++                    base_per_percentage[aml.discount_percentage] = resulting_delta_base_details = {}
++                    to_process = []
++                    for base_line in base_lines:
++                        invoice_line = base_line['record']
++                        to_update_vals, tax_values_list = self.env['account.tax']._compute_taxes_for_single_line(
++                            base_line,
++                            early_pay_discount_computation=early_pay_discount_computation,
++                            early_pay_discount_percentage=aml.discount_percentage,
++                        )
++                        to_process.append((base_line, to_update_vals, tax_values_list))
++
++                        grouping_dict = {
++                            'tax_ids': [Command.set(base_line['taxes'].ids)],
++                            'tax_tag_ids': to_update_vals['tax_tag_ids'],
++                            'partner_id': base_line['partner'].id,
++                            'currency_id': base_line['currency'].id,
++                            'account_id': cash_discount_account.id,
++                            'analytic_account_id': base_line['analytic_account'].id,
++                            'analytic_tag_ids': [Command.set(base_line['analytic_tags'].ids)],
++                        }
++                        base_detail = resulting_delta_base_details.setdefault(frozendict(grouping_dict), {
++                            'balance': 0.0,
++                            'amount_currency': 0.0,
++                        })
++
++                        amount_currency = self.currency_id\
++                            .round(self.direction_sign * to_update_vals['price_subtotal'] - invoice_line.amount_currency)
++                        balance = self.company_currency_id\
++                            .round(amount_currency / base_line['rate'])
++
++                        base_detail['balance'] += balance
++                        base_detail['amount_currency'] += amount_currency
++
++                    # Compute the tax amounts.
++                    tax_details_with_epd = self.env['account.tax']._aggregate_taxes(
++                        to_process,
++                        grouping_key_generator=grouping_key_generator,
++                    )
++
++                    tax_computation_per_percentage[aml.discount_percentage] = resulting_delta_tax_details = {}
++                    for tax_detail in tax_details_with_epd['tax_details'].values():
++                        tax_amount_without_epd = tax_amounts.get(tax_detail['tax_repartition_line_id'])
++                        if not tax_amount_without_epd:
++                            continue
++
++                        tax_amount_currency = self.currency_id\
++                            .round(self.direction_sign * tax_detail['tax_amount_currency'] - tax_amount_without_epd['amount_currency'])
++                        tax_amount = self.company_currency_id\
++                            .round(self.direction_sign * tax_detail['tax_amount'] - tax_amount_without_epd['balance'])
++
++                        if self.currency_id.is_zero(tax_amount_currency) and self.company_currency_id.is_zero(tax_amount):
++                            continue
++
++                        resulting_delta_tax_details[tax_detail['tax_repartition_line_id']] = {
++                            **tax_detail,
++                            'amount_currency': tax_amount_currency,
++                            'balance': tax_amount,
++                        }
++
++                # Multiply each amount by the percentage paid by the current payment term line.
++                percentage_paid = abs(aml.amount_residual_currency / self.amount_total)
++                for tax_detail in tax_computation_per_percentage[aml.discount_percentage].values():
++                    tax_rep = self.env['account.tax.repartition.line'].browse(tax_detail['tax_repartition_line_id'])
++                    tax = tax_rep.tax_id
++
++                    grouping_dict = {
++                        'account_id': tax_detail['account_id'],
++                        'partner_id': tax_detail['partner_id'],
++                        'currency_id': tax_detail['currency_id'],
++                        'analytic_account_id': tax_detail['analytic_account_id'],
++                        'analytic_tag_ids': tax_detail['analytic_tag_ids'],
++                        'tax_repartition_line_id': tax_rep.id,
++                        'tax_ids': tax_detail['tax_ids'],
++                        'tax_tag_ids': tax_detail['tax_tag_ids'],
++                        'group_tax_id': tax_detail['tax_id'] if tax_detail['tax_id'] != tax.id else None,
++                    }
++
++                    res['tax_lines'][aml][frozendict(grouping_dict)] = {
++                        'name': _("Early Payment Discount (%s)", tax.name),
++                        'amount_currency': aml.currency_id.round(tax_detail['amount_currency'] * percentage_paid),
++                        'balance': aml.company_currency_id.round(tax_detail['balance'] * percentage_paid),
++                    }
++
++                for grouping_dict, base_detail in base_per_percentage[aml.discount_percentage].items():
++                    res['base_lines'][aml][grouping_dict] = {
++                        'name': _("Early Payment Discount"),
++                        'amount_currency': aml.currency_id.round(base_detail['amount_currency'] * percentage_paid),
++                        'balance': aml.company_currency_id.round(base_detail['balance'] * percentage_paid),
++                    }
++
++                # Fix the rounding issue if any.
++                delta_amount_currency = term_amount_currency \
++                                        - sum(x['amount_currency'] for x in res['base_lines'][aml].values()) \
++                                        - sum(x['amount_currency'] for x in res['tax_lines'][aml].values())
++                delta_balance = term_balance \
++                                - sum(x['balance'] for x in res['base_lines'][aml].values()) \
++                                - sum(x['balance'] for x in res['tax_lines'][aml].values())
++
++                last_tax_line = (list(res['tax_lines'][aml].values()) or list(res['base_lines'][aml].values()))[-1]
++                last_tax_line['amount_currency'] += delta_amount_currency
++                last_tax_line['balance'] += delta_balance
++
++            else:
++                grouping_dict = {'account_id': cash_discount_account.id}
++
++                res['term_lines'][aml][frozendict(grouping_dict)] = {
++                    'name': _("Early Payment Discount"),
++                    'partner_id': aml.partner_id.id,
++                    'currency_id': aml.currency_id.id,
++                    'amount_currency': term_amount_currency,
++                    'balance': term_balance,
++                }
++
++        return res
++
++    @api.model
++    def _get_invoice_counterpart_amls_for_early_payment_discount(self, aml_values_list, open_balance):
++        """ Helper to get the values to create the counterpart journal items on the register payment wizard and the
++        bank reconciliation widget in case of an early payment discount by taking care of the payment term lines we
++        are matching and the exchange difference in case of multi-currencies.
++
++        :param aml_values_list: A list of dictionaries containing:
++            * aml:              The payment term line we match.
++            * amount_currency:  The matched amount_currency for this line.
++            * balance:          The matched balance for this line (could be different in case of multi-currencies).
++        :param open_balance:    The current open balance to be covered by the early payment discount.
++        :return: A list of values to create the counterpart journal items split in 3 categories:
++            * term_lines:       The journal items containing the discount amounts for each receivable line when the
++                                discount computation is excluded / mixed.
++            * tax_lines:        The journal items acting as tax lines when the discount computation is included.
++            * base_lines:       The journal items acting as base for tax lines when the discount computation is included.
++            * exchange_lines:   The journal items representing the exchange differences in case of multi-currencies.
++        """
++        res = {
++            'base_lines': {},
++            'tax_lines': {},
++            'term_lines': {},
++            'exchange_lines': {},
++        }
++
++        res_per_invoice = {}
++        for aml_values in aml_values_list:
++            aml = aml_values['aml']
++            invoice = aml.move_id
++
++            if invoice not in res_per_invoice:
++                res_per_invoice[invoice] = invoice._get_invoice_counterpart_amls_for_early_payment_discount_per_payment_term_line()
++
++            for key in ('base_lines', 'tax_lines', 'term_lines'):
++                for grouping_dict, vals in res_per_invoice[invoice][key][aml].items():
++                    line_vals = res[key].setdefault(grouping_dict, {
++                        **vals,
++                        'amount_currency': 0.0,
++                        'balance': 0.0,
++                    })
++                    line_vals['amount_currency'] += vals['amount_currency']
++                    line_vals['balance'] += vals['balance']
++
++                    # Track the balance to handle the exchange difference.
++                    open_balance -= vals['balance']
++
++        exchange_diff_sign = aml.company_currency_id.compare_amounts(open_balance, 0.0)
++        if exchange_diff_sign != 0.0:
++
++            if exchange_diff_sign > 0.0:
++                exchange_line_account = aml.company_id.expense_currency_exchange_account_id
++            else:
++                exchange_line_account = aml.company_id.income_currency_exchange_account_id
++
++            grouping_dict = {
++                'account_id': exchange_line_account.id,
++                'currency_id': aml.currency_id.id,
++                'partner_id': aml.partner_id.id,
++            }
++            line_vals = res['exchange_lines'].setdefault(frozendict(grouping_dict), {
++                **grouping_dict,
++                'name': _("Early Payment Discount (Exchange Difference)"),
++                'amount_currency': 0.0,
++                'balance': 0.0,
++            })
++            line_vals['balance'] += open_balance
++
++        return {
++            key: [
++                {
++                    **grouping_dict,
++                    **vals,
++                }
++                for grouping_dict, vals in mapping.items()
++            ]
++            for key, mapping in res.items()
++        }
++
+     def _affect_tax_report(self):
+         return any(line._affect_tax_report() for line in self.line_ids)
+ 
+
+--- a/addons/account/models/account_move_line.py
++++ b/addons/account/models/account_move_line.py
+@@ -276,6 +276,7 @@ class AccountMoveLine(models.Model):
+             ('payment_term', 'Payment Term'),
+             ('line_section', 'Section'),
+             ('line_note', 'Note'),
++            ('epd', 'Early Payment Discount')
+         ],
+         compute='_compute_display_type', store=True, readonly=False, precompute=True,
+         required=True,
+@@ -339,6 +340,9 @@ class AccountMoveLine(models.Model):
+     tax_key = fields.Binary(compute='_compute_tax_key')
+     compute_all_tax = fields.Binary(compute='_compute_all_tax')
+     compute_all_tax_dirty = fields.Boolean(compute='_compute_all_tax')
++    epd_key = fields.Binary(compute='_compute_epd_key')
++    epd_needed = fields.Binary(compute='_compute_epd_needed')
++    epd_dirty = fields.Boolean(compute='_compute_epd_needed')
+ 
+     # === Analytic fields === #
+     analytic_line_ids = fields.One2many(
+@@ -361,6 +365,26 @@ class AccountMoveLine(models.Model):
+         copy=True,
+     )
+ 
++    # === Early Pay fields === #
++    discount_date = fields.Date(
++        string='Discount Date',
++        store=True,
++        help='Last date at which the discounted amount must be paid in order for the Early Payment Discount to be granted'
++    )
++    # Discounted amount to pay when the early payment discount is applied
++    discount_amount_currency = fields.Monetary(
++        string='Discount amount in Currency',
++        store=True,
++        currency_field='currency_id',
++    )
++    # Discounted balance when the early payment discount is applied
++    discount_balance = fields.Monetary(
++        string='Discount Balance',
++        store=True,
++        currency_field='company_currency_id',
++    )
++    discount_percentage = fields.Float(store=True,)
++
+     # === Misc Information === #
+     blocked = fields.Boolean(
+         string='No Follow-up',
+@@ -896,14 +920,16 @@ class AccountMoveLine(models.Model):
+                 amount_currency = sign * line.price_unit * (1 - line.discount / 100)
+                 amount = sign * line.price_unit / line.currency_rate * (1 - line.discount / 100)
+                 handle_price_include = True
++                quantity = line.quantity
+             else:
+                 amount_currency = line.amount_currency
+                 amount = line.balance
+                 handle_price_include = False
++                quantity = 1
+             compute_all_currency = line.tax_ids.compute_all(
+                 amount_currency,
+                 currency=line.currency_id,
+-                quantity=line.quantity,
++                quantity=quantity,
+                 product=line.product_id,
+                 partner=line.move_id.partner_id or line.partner_id,
+                 is_refund=line.is_refund,
+@@ -914,7 +940,7 @@ class AccountMoveLine(models.Model):
+             compute_all = line.tax_ids.compute_all(
+                 amount,
+                 currency=line.company_id.currency_id,
+-                quantity=line.quantity,
++                quantity=quantity,
+                 product=line.product_id,
+                 partner=line.move_id.partner_id or line.partner_id,
+                 is_refund=line.is_refund,
+@@ -949,6 +975,79 @@ class AccountMoveLine(models.Model):
+                     'tax_tag_ids': [(6, 0, compute_all['base_tags'])],
+                 }
+ 
++    @api.depends('tax_ids', 'account_id', 'company_id')
++    def _compute_epd_key(self):
++        for line in self:
++            if line.display_type == 'epd' and line.company_id.early_pay_discount_computation == 'mixed':
++                line.epd_key = frozendict({
++                    'account_id': line.account_id.id,
++                    'analytic_account_id': line.analytic_account_id.id,
++                    'analytic_tag_ids': [Command.set(line.analytic_tag_ids.ids)],
++                    'tax_ids': [Command.set(line.tax_ids.ids)],
++                    'tax_tag_ids': [Command.set(line.tax_tag_ids.ids)],
++                    'move_id': line.move_id.id,
++                })
++            else:
++                line.epd_key = False
++
++    @api.depends('move_id.needed_terms', 'account_id', 'analytic_account_id', 'analytic_tag_ids', 'tax_ids', 'tax_tag_ids', 'company_id')
++    def _compute_epd_needed(self):
++        for line in self:
++            line.epd_dirty = True
++            line.epd_needed = False
++            if line.display_type != 'product' or not line.tax_ids.ids or line.company_id.early_pay_discount_computation != 'mixed':
++                continue
++
++            discount_percentages = [
++                x['discount_percentage']
++                for x in line.move_id.needed_terms.values()
++                if x.get('discount_percentage')
++            ]
++            if not discount_percentages:
++                continue
++
++            epd_needed = {}
++            for discount_percentage in discount_percentages:
++                percentage = discount_percentage / 100
++                epd_needed_vals = epd_needed.setdefault(
++                    frozendict({
++                        'move_id': line.move_id.id,
++                        'account_id': line.account_id.id,
++                        'analytic_account_id': line.analytic_account_id.id,
++                        'analytic_tag_ids': [Command.set(line.analytic_tag_ids.ids)],
++                        'tax_ids': [Command.set(line.tax_ids.ids)],
++                        'tax_tag_ids': [Command.set(line.tax_tag_ids.ids)],
++                        'display_type': 'epd',
++                    }),
++                    {
++                        'name': _("Early Payment Discount (%s%%)", discount_percentage),
++                        'amount_currency': 0.0,
++                        'balance': 0.0,
++                        'price_subtotal': 0.0,
++                    },
++                )
++                epd_needed_vals['amount_currency'] -= line.amount_currency * percentage
++                epd_needed_vals['balance'] -= line.balance * percentage
++                epd_needed_vals['price_subtotal'] -= line.price_subtotal * percentage
++                epd_needed_vals = epd_needed.setdefault(
++                    frozendict({
++                        'move_id': line.move_id.id,
++                        'account_id': line.account_id.id,
++                        'display_type': 'epd',
++                    }),
++                    {
++                        'name': _("Early Payment Discount (%s%%)", discount_percentage),
++                        'amount_currency': 0.0,
++                        'balance': 0.0,
++                        'price_subtotal': 0.0,
++                        'tax_ids': [],
++                    },
++                )
++                epd_needed_vals['amount_currency'] += line.amount_currency * percentage
++                epd_needed_vals['balance'] += line.balance * percentage
++                epd_needed_vals['price_subtotal'] += line.price_subtotal * percentage
++            line.epd_needed = {k: frozendict(v) for k, v in epd_needed.items()}
++
+     @api.depends('move_id.move_type', 'balance', 'tax_ids')
+     def _compute_is_refund(self):
+         for line in self:
+@@ -967,10 +1066,12 @@ class AccountMoveLine(models.Model):
+     @api.depends('date_maturity')
+     def _compute_term_key(self):
+         for line in self:
+-            if line.display_type in 'payment_term':
++            if line.display_type == 'payment_term':
+                 line.term_key = frozendict({
+                     'move_id': line.move_id.id,
+                     'date_maturity': fields.Date.to_date(line.date_maturity),
++                    'discount_date': line.discount_date,
++                    'discount_percentage': line.discount_percentage
+                 })
+             else:
+                 line.term_key = False
+@@ -2442,6 +2543,16 @@ class AccountMoveLine(models.Model):
+             'template': '/account/static/xls/aml_import_template.xlsx'
+         }]
+ 
++    def _is_eligible_for_early_payment_discount(self, currency, reference_date):
++        self.ensure_one()
++        return self.display_type == 'payment_term' \
++            and self.currency_id == currency \
++            and self.move_id.move_type in ('out_invoice', 'out_receipt', 'in_invoice', 'in_receipt') \
++            and not self.matched_debit_ids \
++            and not self.matched_credit_ids \
++            and self.discount_date \
++            and reference_date <= self.discount_date
++
+     # -------------------------------------------------------------------------
+     # PUBLIC ACTIONS
+     # -------------------------------------------------------------------------
+
+--- a/addons/account/models/account_payment.py
++++ b/addons/account/models/account_payment.py
+@@ -266,7 +266,7 @@ class AccountPayment(models.Model):
+ 
+     def _prepare_move_line_default_vals(self, write_off_line_vals=None):
+         ''' Prepare the dictionary to create the default account.move.lines for the current payment.
+-        :param write_off_line_vals: Optional dictionary to create a write-off account.move.line easily containing:
++        :param write_off_line_vals: Optional list of dictionaries to create a write-off account.move.line easily containing:
+             * amount:       The amount to be added to the counterpart amount.
+             * name:         The label to set on the line.
+             * account_id:   The account on which create the write-off.
+@@ -281,7 +281,9 @@ class AccountPayment(models.Model):
+                 self.payment_method_line_id.name, self.journal_id.display_name))
+ 
+         # Compute amounts.
+-        write_off_amount_currency = write_off_line_vals.get('amount', 0.0)
++        write_off_line_vals_list = write_off_line_vals or []
++        write_off_amount_currency = sum(x['amount_currency'] for x in write_off_line_vals_list)
++        write_off_balance = sum(x['balance'] for x in write_off_line_vals_list)
+ 
+         if self.payment_type == 'inbound':
+             # Receive money.
+@@ -289,16 +291,9 @@ class AccountPayment(models.Model):
+         elif self.payment_type == 'outbound':
+             # Send money.
+             liquidity_amount_currency = -self.amount
+-            write_off_amount_currency *= -1
+         else:
+-            liquidity_amount_currency = write_off_amount_currency = 0.0
++            liquidity_amount_currency = 0.0
+ 
+-        write_off_balance = self.currency_id._convert(
+-            write_off_amount_currency,
+-            self.company_id.currency_id,
+-            self.company_id,
+-            self.date,
+-        )
+         liquidity_balance = self.currency_id._convert(
+             liquidity_amount_currency,
+             self.company_id.currency_id,
+@@ -337,19 +332,7 @@ class AccountPayment(models.Model):
+                 'account_id': self.destination_account_id.id,
+             },
+         ]
+-        if not self.currency_id.is_zero(write_off_amount_currency):
+-            # Write-off line.
+-            default_line_name = ''.join(x[1] for x in self._get_aml_default_display_name_list())
+-            line_vals_list.append({
+-                'name': write_off_line_vals.get('name') or default_line_name,
+-                'amount_currency': write_off_amount_currency,
+-                'currency_id': currency_id,
+-                'debit': write_off_balance if write_off_balance > 0.0 else 0.0,
+-                'credit': -write_off_balance if write_off_balance < 0.0 else 0.0,
+-                'partner_id': self.partner_id.id,
+-                'account_id': write_off_line_vals.get('account_id'),
+-            })
+-        return line_vals_list
++        return line_vals_list + write_off_line_vals_list
+ 
+     # -------------------------------------------------------------------------
+     # COMPUTE METHODS
+@@ -797,13 +780,6 @@ class AccountPayment(models.Model):
+                         move.display_name,
+                     ))
+ 
+-                if writeoff_lines and len(writeoff_lines.account_id) != 1:
+-                    raise UserError(_(
+-                        "Journal Entry %s is not valid. In order to proceed, "
+-                        "all optional journal items must share the same account.",
+-                        move.display_name,
+-                    ))
+-
+                 if any(line.currency_id != all_lines[0].currency_id for line in all_lines):
+                     raise UserError(_(
+                         "Journal Entry %s is not valid. In order to proceed, the journal items must "
+@@ -863,26 +839,16 @@ class AccountPayment(models.Model):
+             # Make sure to preserve the write-off amount.
+             # This allows to create a new payment with custom 'line_ids'.
+ 
++            write_off_line_vals = []
+             if writeoff_lines:
+-                counterpart_amount = sum(counterpart_lines.mapped('amount_currency'))
+-                writeoff_amount = sum(writeoff_lines.mapped('amount_currency'))
+-
+-                # To be consistent with the payment_difference made in account.payment.register,
+-                # 'writeoff_amount' needs to be signed regarding the 'amount' field before the write.
+-                # Since the write is already done at this point, we need to base the computation on accounting values.
+-                if (counterpart_amount > 0.0) == (writeoff_amount > 0.0):
+-                    sign = -1
+-                else:
+-                    sign = 1
+-                writeoff_amount = abs(writeoff_amount) * sign
+-
+-                write_off_line_vals = {
++                write_off_line_vals.append({
+                     'name': writeoff_lines[0].name,
+-                    'amount': writeoff_amount,
+                     'account_id': writeoff_lines[0].account_id.id,
+-                }
+-            else:
+-                write_off_line_vals = {}
++                    'partner_id': writeoff_lines[0].partner_id.id,
++                    'currency_id': writeoff_lines[0].currency_id.id,
++                    'amount_currency': sum(writeoff_lines.mapped('amount_currency')),
++                    'balance': sum(writeoff_lines.mapped('balance')),
++                })
+ 
+             line_vals_list = pay._prepare_move_line_default_vals(write_off_line_vals=write_off_line_vals)
+ 
+
+--- a/addons/account/models/account_payment_term.py
++++ b/addons/account/models/account_payment_term.py
+@@ -2,7 +2,7 @@
+ 
+ from odoo import api, fields, models, _, Command
+ from odoo.exceptions import UserError, ValidationError
+-from odoo.tools import format_date, formatLang
++from odoo.tools import format_date, formatLang, frozendict
+ 
+ from dateutil.relativedelta import relativedelta
+ 
+@@ -39,8 +39,20 @@ class AccountPaymentTerm(models.Model):
+             example_preview = ""
+             if not record.example_invalid:
+                 currency = self.env.company.currency_id
+-                terms = record.compute(record.example_amount, record.example_amount, record.example_date, currency)
+-                for i, (date, amount) in enumerate(record._get_amount_by_date(terms, currency).items()):
++                terms = record._compute_terms(
++                    date_ref=record.example_date,
++                    currency=currency,
++                    company=self.env.company,
++                    tax_amount=0,
++                    tax_amount_currency=0,
++                    untaxed_amount=record.example_amount,
++                    untaxed_amount_currency=record.example_amount,
++                    sign=1)
++                for i, info_by_dates in enumerate(record._get_amount_by_date(terms, currency).items()):
++                    date = info_by_dates[1]['date']
++                    discount_date = info_by_dates[1]['discount_date']
++                    amount = info_by_dates[1]['amount']
++                    discount_amount = info_by_dates[1]['discounted_amount'] or 0.0
+                     example_preview += f"""
+                         <div style='margin-left: 20px;'>
+                             <b>{i+1}#</b>
+@@ -48,21 +60,44 @@ class AccountPaymentTerm(models.Model):
+                             <b>{formatLang(self.env, amount, monetary=True, currency_obj=currency)}</b>
+                             on 
+                             <b style='color: #704A66;'>{date}</b>
+-                        </div>
+                     """
++                    if discount_date:
++                        example_preview += f"""
++                         (<b>{formatLang(self.env, discount_amount, monetary=True, currency_obj=currency)}</b> if paid before <b>{format_date(self.env, terms[i].get('discount_date'))}</b>)
++                    """
++                    example_preview += "</div>"
++
+             record.example_preview = example_preview
+ 
+     @api.model
+     def _get_amount_by_date(self, terms, currency):
+         """
+-        Returns a dictionary with the amount for each date of the payment term (grouped by date, sorted by date and ignoring null amounts).
++        Returns a dictionary with the amount for each date of the payment term
++        (grouped by date, discounted percentage and discount last date,
++        sorted by date and ignoring null amounts).
+         """
+-        terms = sorted(terms)
++        terms = sorted(terms, key=lambda t: t.get('date'))
+         amount_by_date = {}
+-        for date, amount in terms:
+-            date = format_date(self.env, date)
+-            if currency.compare_amounts(amount[0], 0) > 0:
+-                amount_by_date[date] = amount_by_date.get(date, 0) + amount[0]
++        for term in terms:
++            key = frozendict({
++                'date': term['date'],
++                'discount_date': term['discount_date'],
++                'discount_percentage': term['discount_percentage'],
++            })
++            if not amount_by_date.get(key):
++                amount_by_date[key] = {
++                    'date': format_date(self.env, term['date']),
++                    'amount': 0.0,
++                    'discounted_amount': 0.0,
++                }
++            if not currency.round(term['company_amount']) > 0.0:
++                amount_by_date[key]['amount'] += term['company_amount']
++
++            amount_by_date[key]['discount_date'] = format_date(self.env, term['discount_date']) or False
++            if currency.round(term['discount_amount_currency']) > 0.0:
++                amount_by_date[key]['discounted_amount'] += term.get('discount_amount_currency')
++            else:
++                amount_by_date[key]['discounted_amount'] = 0.0
+         return amount_by_date
+ 
+     @api.constrains('line_ids')
+@@ -70,44 +105,79 @@ class AccountPaymentTerm(models.Model):
+         for terms in self:
+             if len(terms.line_ids.filtered(lambda r: r.value == 'balance')) != 1:
+                 raise ValidationError(_('The Payment Term must have one Balance line.'))
++            if terms.line_ids.filtered(lambda r: r.value == 'fixed' and r.discount_percentage):
++                raise ValidationError(_("You can't mix fixed amount with early payment percentage"))
+ 
+-    def compute(self, company_value, foreign_value, date_ref, currency):
++    def _compute_terms(self, date_ref, currency, company, tax_amount, tax_amount_currency, sign, untaxed_amount, untaxed_amount_currency):
+         """Get the distribution of this payment term.
+-
+-        :param company_value (float): the amount to pay in the company's currency
+-        :param foreign_value (float): the amount to pay in the document's currency
+-        :param date_ref (datetime.date): the reference date
+-        :param currency (Model<res.currency>): the document's currency
++        :param date_ref: The move date to take into account
++        :param currency: the move's currency
++        :param company: the company issuing the move
++        :param tax_amount: the signed tax amount for the move
++        :param tax_amount_currency: the signed tax amount for the move in the move's currency
++        :param untaxed_amount: the signed untaxed amount for the move
++        :param untaxed_amount_currency: the signed untaxed amount for the move in the move's currency
++        :param sign: the sign of the move
+         :return (list<tuple<datetime.date,tuple<float,float>>>): the amount in the company's currency and
+             the document's currency, respectively for each required payment date
+         """
+         self.ensure_one()
+-        date_ref = date_ref or fields.Date.context_today(self)
+-        company_amount = company_value
+-        foreign_amount = foreign_value
+-        sign = company_value < 0 and -1 or 1
++        company_currency = company.currency_id
++        tax_amount_left = tax_amount
++        tax_amount_currency_left = tax_amount_currency
++        untaxed_amount_left = untaxed_amount
++        untaxed_amount_currency_left = untaxed_amount_currency
++        total_amount = tax_amount + untaxed_amount
++        total_amount_currency = tax_amount_currency + untaxed_amount_currency
+         result = []
+-        company_currency = self.env.company.currency_id
++
+         for line in self.line_ids.sorted(lambda line: line.value == 'balance'):
++            term_vals = {
++                'date': line._get_due_date(date_ref),
++                'has_discount': line.discount_percentage,
++                'discount_date': None,
++                'discount_amount_currency': 0.0,
++                'discount_balance': 0.0,
++                'discount_percentage': line.discount_percentage,
++            }
++
+             if line.value == 'fixed':
+-                company_amt = sign * company_currency.round(line.value_amount)
+-                foreign_amt = sign * currency.round(line.value_amount)
++                term_vals['company_amount'] = sign * company_currency.round(line.value_amount)
++                term_vals['foreign_amount'] = sign * currency.round(line.value_amount)
++                line_tax_amount = line_tax_amount_currency = line_untaxed_amount = line_untaxed_amount_currency = 0.0
+             elif line.value == 'percent':
+-                company_amt = company_currency.round(company_value * (line.value_amount / 100.0))
+-                foreign_amt = currency.round(foreign_value * (line.value_amount / 100.0))
+-            elif line.value == 'balance':
+-                company_amt = company_currency.round(company_amount)
+-                foreign_amt = currency.round(foreign_amount)
+-            result.append((line._get_due_date(date_ref), (company_amt, foreign_amt)))
+-            company_amount -= company_amt
+-            foreign_amt -= foreign_amount
+-        company_amount = sum(company_amt for _, (company_amt, _) in result)
+-        company_dist = company_currency.round(company_value - company_amount)
+-        foreign_amount = sum(foreign_amt for _, (_, foreign_amt) in result)
+-        foreign_dist = currency.round(foreign_value - foreign_amount)
+-        if company_dist or foreign_dist:
+-            last_date = result and result[-1][0] or fields.Date.context_today(self)
+-            result.append((last_date, (company_dist, foreign_dist)))
++                term_vals['company_amount'] = company_currency.round(total_amount * (line.value_amount / 100.0))
++                term_vals['foreign_amount'] = currency.round(total_amount_currency * (line.value_amount / 100.0))
++                line_tax_amount = company_currency.round(tax_amount * (line.value_amount / 100.0))
++                line_tax_amount_currency = currency.round(tax_amount_currency * (line.value_amount / 100.0))
++                line_untaxed_amount = term_vals['company_amount'] - line_tax_amount
++                line_untaxed_amount_currency = term_vals['foreign_amount'] - line_tax_amount_currency
++            else:
++                line_tax_amount = line_tax_amount_currency = line_untaxed_amount = line_untaxed_amount_currency = 0.0
++
++            tax_amount_left -= line_tax_amount
++            tax_amount_currency_left -= line_tax_amount_currency
++            untaxed_amount_left -= line_untaxed_amount
++            untaxed_amount_currency_left -= line_untaxed_amount_currency
++
++            if line.value == 'balance':
++                term_vals['company_amount'] = tax_amount_left + untaxed_amount_left
++                term_vals['foreign_amount'] = tax_amount_currency_left + untaxed_amount_currency_left
++                line_tax_amount = tax_amount_left
++                line_tax_amount_currency = tax_amount_currency_left
++                line_untaxed_amount = untaxed_amount_left
++                line_untaxed_amount_currency = untaxed_amount_currency_left
++
++            if line.discount_percentage:
++                if company.early_pay_discount_computation in ('excluded', 'mixed'):
++                    term_vals['discount_balance'] = company_currency.round(term_vals['company_amount'] - line_untaxed_amount * line.discount_percentage / 100.0)
++                    term_vals['discount_amount_currency'] = currency.round(term_vals['foreign_amount'] - line_untaxed_amount_currency * line.discount_percentage / 100.0)
++                else:
++                    term_vals['discount_balance'] = company_currency.round(term_vals['company_amount'] * (1 - (line.discount_percentage / 100.0)))
++                    term_vals['discount_amount_currency'] = currency.round(term_vals['foreign_amount'] * (1 - (line.discount_percentage / 100.0)))
++                term_vals['discount_date'] = date_ref + relativedelta(days=line.discount_days)
++
++            result.append(term_vals)
+         return result
+ 
+     @api.ondelete(at_uninstall=False)
+@@ -139,6 +209,8 @@ class AccountPaymentTermLine(models.Model):
+     days = fields.Integer(string='Days', required=True, default=0)
+     end_month = fields.Boolean(string='End of month', help="Switch to end of the month after having added months or days")
+     days_after = fields.Integer(string='Days after End of month', help="Days to add after the end of the month")
++    discount_percentage = fields.Float(string='Discount %', help='Early Payment Discount granted for this line')
++    discount_days = fields.Integer(string='Discount Days', help='Number of days before the early payment proposition expires')
+     payment_id = fields.Many2one('account.payment.term', string='Payment Terms', required=True, index=True, ondelete='cascade')
+ 
+     def _get_due_date(self, date_ref):
+@@ -150,14 +222,18 @@ class AccountPaymentTermLine(models.Model):
+             due_date += relativedelta(days=self.days_after)
+         return due_date
+ 
+-    @api.constrains('value', 'value_amount')
++    @api.constrains('value', 'value_amount', 'discount_percentage')
+     def _check_percent(self):
+         for term_line in self:
+             if term_line.value == 'percent' and (term_line.value_amount < 0.0 or term_line.value_amount > 100.0):
+                 raise ValidationError(_('Percentages on the Payment Terms lines must be between 0 and 100.'))
++            if term_line.discount_percentage and (term_line.discount_percentage < 0.0 or term_line.discount_percentage > 100.0):
++                raise ValidationError(_('Discount percentages on the Payment Terms lines must be between 0 and 100.'))
+ 
+-    @api.constrains('months', 'days', 'days_after')
++    @api.constrains('months', 'days', 'days_after', 'discount_days')
+     def _check_positive(self):
+         for term_line in self:
+             if term_line.months < 0 or term_line.days < 0:
+                 raise ValidationError(_('The Months and Days of the Payment Terms lines must be positive.'))
++            if term_line.discount_days < 0:
++                raise ValidationError(_('The discount days of the Payment Terms lines must be positive.'))
+
+--- a/addons/account/models/account_reconcile_model.py
++++ b/addons/account/models/account_reconcile_model.py
+@@ -822,74 +822,135 @@ class AccountReconcileModel(models.Model):
+         return self.env['res.partner']
+ 
+     def _get_invoice_matching_amls_result(self, st_line, partner, candidate_vals):
++        def _create_result_dict(amls_values_list, status):
++            if 'rejected' in status:
++                return
++
++            result = {'amls': self.env['account.move.line']}
++            for aml_values in amls_values_list:
++                result['amls'] |= aml_values['aml']
++
++            if 'allow_write_off' in status and self.line_ids:
++                result['status'] = 'write_off'
++
++            if 'allow_auto_reconcile' in status and candidate_vals['allow_auto_reconcile'] and self.auto_reconcile:
++                result['auto_reconcile'] = True
++
++            return result
++
+         st_line_currency = st_line.foreign_currency_id or st_line.currency_id
++        st_line_amount = st_line._prepare_move_line_default_vals()[1]['amount_currency']
++        sign = 1 if st_line_amount > 0.0 else -1
+ 
+         amls = candidate_vals['amls']
+-        if amls.currency_id == st_line_currency:
+-            st_line_amount = st_line._prepare_move_line_default_vals()[1]['amount_currency']
+-            sign = 1 if st_line_amount > 0.0 else -1
++        amls_values_list = []
++        amls_with_epd_values_list = []
++        same_currency_mode = amls.currency_id == st_line_currency
++        for aml in amls:
++            aml_values = {
++                'aml': aml,
++                'amount_residual': aml.amount_residual,
++                'amount_residual_currency': aml.amount_residual_currency,
++            }
++
++            amls_values_list.append(aml_values)
++
++            # Manage the early payment discount.
++            if same_currency_mode \
++                and aml.move_id.move_type in ('out_invoice', 'out_receipt', 'in_invoice', 'in_receipt') \
++                and not aml.matched_debit_ids \
++                and not aml.matched_credit_ids \
++                and aml.discount_date \
++                and st_line.date <= aml.discount_date:
++
++                rate = abs(aml.amount_currency) / abs(aml.balance) if aml.balance else 1.0
++                amls_with_epd_values_list.append({
++                    **aml_values,
++                    'amount_residual': st_line.company_currency_id.round(aml.discount_amount_currency / rate),
++                    'amount_residual_currency': aml.discount_amount_currency,
++                })
++            else:
++                amls_with_epd_values_list.append(aml_values)
++
++        def match_batch_amls(amls_values_list):
++            if not same_currency_mode:
++                return None, []
+ 
+-            kepts_amls = self.env['account.move.line']
+-            sum_aml_residual = 0.0
+-            for aml in amls:
++            kepts_amls_values_list = []
++            sum_amount_residual_currency = 0.0
++            for aml_values in amls_values_list:
+ 
+-                if st_line_currency.compare_amounts(st_line_amount, -aml.amount_residual_currency) == 0:
++                if st_line_currency.compare_amounts(st_line_amount, -aml_values['amount_residual_currency']) == 0:
+                     # Special case: the amounts are the same, submit the line directly.
+-                    kepts_amls = aml
+-                    break
++                    return 'perfect', [aml_values]
+ 
+-                elif st_line_currency.compare_amounts(sign * (st_line_amount + sum_aml_residual), 0.0) > 0:
++                if st_line_currency.compare_amounts(sign * (st_line_amount + sum_amount_residual_currency), 0.0) > 0:
+                     # Here, we still have room for other candidates ; so we add the current one to the list we keep.
+                     # Then, we continue iterating, even if there is no room anymore, just in case one of the following candidates
+                     # is an exact match, which would then be preferred on the current candidates.
+-                    kepts_amls |= aml
+-                    sum_aml_residual += aml.amount_residual_currency
+-        else:
+-            kepts_amls = amls
++                    kepts_amls_values_list.append(aml_values)
++                    sum_amount_residual_currency += aml_values['amount_residual_currency']
+ 
+-        # We check the amount criteria of the reconciliation model, and select the
+-        # kept_candidates if they pass the verification.
+-        status = self._check_rule_propositions(st_line, kepts_amls)
+-        if 'rejected' in status:
+-            return None
++            if st_line_currency.is_zero(sign * (st_line_amount + sum_amount_residual_currency)):
++                return 'perfect', kepts_amls_values_list
++            elif kepts_amls_values_list:
++                return 'partial', kepts_amls_values_list
++            else:
++                return None, []
+ 
+-        rslt = {'amls': kepts_amls}
++        # Try to match a batch with the early payment feature. Only a perfect match is allowed.
++        match_type, kepts_amls_values_list = match_batch_amls(amls_with_epd_values_list)
++        if match_type != 'perfect':
++            kepts_amls_values_list = []
+ 
+-        if 'allow_write_off' in status and self.line_ids:
+-            rslt['status'] = 'write_off'
++        # Try to match the amls having the same currency as the statement line.
++        if not kepts_amls_values_list:
++            _match_type, kepts_amls_values_list = match_batch_amls(amls_values_list)
+ 
+-        if 'allow_auto_reconcile' in status and candidate_vals['allow_auto_reconcile'] and self.auto_reconcile:
+-            rslt['auto_reconcile'] = True
++        # Try to match the whole candidates.
++        if not kepts_amls_values_list:
++            kepts_amls_values_list = amls_values_list
+ 
+-        return rslt
++        # Try to match the amls having the same currency as the statement line.
++        if kepts_amls_values_list:
++            status = self._check_rule_propositions(st_line, kepts_amls_values_list)
++            result = _create_result_dict(kepts_amls_values_list, status)
++            if result:
++                return result
+ 
+-    def _check_rule_propositions(self, st_line, amls):
++    def _check_rule_propositions(self, st_line, amls_values_list):
+         """ Check restrictions that can't be handled for each move.line separately.
+         Note: Only used by models having a type equals to 'invoice_matching'.
+-
+-        :param st_line:     The statement line.
+-        :param amls:        The candidates account.move.line.
++        :param st_line:             The statement line.
++        :param amls_values_list:    The candidates account.move.line as a list of dict:
++            * aml:                          The record.
++            * amount_residual:              The amount residual to consider.
++            * amount_residual_currency:     The amount residual in foreign currency to consider.
+         :return: A string representing what to do with the candidates:
+             * rejected:             Reject candidates.
+             * allow_write_off:      Allow to generate the write-off from the reconcile model lines if specified.
+             * allow_auto_reconcile: Allow to automatically reconcile entries if 'auto_validate' is enabled.
+         """
++        self.ensure_one()
++
+         if not self.allow_payment_tolerance:
+             return {'allow_write_off', 'allow_auto_reconcile'}
+-        if not amls:
+-            return {'rejected'}
+ 
+-        currency = st_line.foreign_currency_id or st_line.currency_id
++        st_line_currency = st_line.foreign_currency_id or st_line.currency_id
+         st_line_amount_curr = st_line._prepare_move_line_default_vals()[1]['amount_currency']
+         amls_amount_curr = sum(
+-            st_line._prepare_counterpart_amounts_using_st_line_rate(aml.currency_id, aml.amount_residual, aml.amount_residual_currency)['amount_currency']
+-            for aml in amls
++            st_line._prepare_counterpart_amounts_using_st_line_rate(
++                aml_values['aml'].currency_id,
++                aml_values['amount_residual'],
++                aml_values['amount_residual_currency'],
++            )['amount_currency']
++            for aml_values in amls_values_list
+         )
+         sign = 1 if st_line_amount_curr > 0.0 else -1
+         amount_curr_after_rec = sign * (amls_amount_curr + st_line_amount_curr)
+ 
+         # The statement line will be fully reconciled.
+-        if currency.is_zero(amount_curr_after_rec):
++        if st_line_currency.is_zero(amount_curr_after_rec):
+             return {'allow_auto_reconcile'}
+ 
+         # The payment amount is higher than the sum of invoices.
+
+--- a/addons/account/models/account_tax.py
++++ b/addons/account/models/account_tax.py
+@@ -810,13 +810,17 @@ class AccountTax(models.Model):
+         }
+ 
+     @api.model
+-    def _compute_taxes_for_single_line(self, base_line, handle_price_include=True, include_caba_tags=False):
++    def _compute_taxes_for_single_line(self, base_line, handle_price_include=True, include_caba_tags=False, early_pay_discount_computation=None, early_pay_discount_percentage=None):
+         orig_price_unit_after_discount = base_line['price_unit'] * (1 - (base_line['discount'] / 100.0))
+         price_unit_after_discount = orig_price_unit_after_discount
+         taxes = base_line['taxes']._origin
+         currency = base_line['currency'] or self.env.company.currency_id
+         rate = base_line['rate']
+ 
++        if early_pay_discount_computation in ('included', 'excluded'):
++            remaining_part_to_consider = (100 - early_pay_discount_percentage) / 100.0
++            price_unit_after_discount = remaining_part_to_consider * price_unit_after_discount
++
+         if taxes:
+ 
+             if handle_price_include is None:
+@@ -841,6 +845,22 @@ class AccountTax(models.Model):
+                 'price_total': taxes_res['total_included'],
+             }
+ 
++            if early_pay_discount_computation == 'excluded':
++                new_taxes_res = taxes.with_context(**base_line['extra_context']).compute_all(
++                    orig_price_unit_after_discount,
++                    currency=currency,
++                    quantity=base_line['quantity'],
++                    product=base_line['product'],
++                    partner=base_line['partner'],
++                    is_refund=base_line['is_refund'],
++                    handle_price_include=manage_price_include,
++                    include_caba_tags=include_caba_tags,
++                )
++                for tax_res, new_taxes_res in zip(taxes_res['taxes'], new_taxes_res['taxes']):
++                    delta_tax = new_taxes_res['amount'] - tax_res['amount']
++                    tax_res['amount'] += delta_tax
++                    to_update_vals['price_total'] += delta_tax
++
+             tax_values_list = []
+             for tax_res in taxes_res['taxes']:
+                 tax_rep = self.env['account.tax.repartition.line'].browse(tax_res['tax_repartition_line_id'])
+@@ -1180,6 +1200,8 @@ class AccountTax(models.Model):
+ 
+         amount_total = amount_untaxed + amount_tax
+ 
++        display_tax_base = len(global_tax_details['tax_details']) == 1 and tax_group_vals['base_amount'] != amount_untaxed
++
+         return {
+             'amount_untaxed': amount_untaxed,
+             'amount_total': amount_total,
+@@ -1188,6 +1210,7 @@ class AccountTax(models.Model):
+             'groups_by_subtotal': groups_by_subtotal,
+             'subtotals': subtotals,
+             'subtotals_order': sorted(subtotal_order.keys(), key=lambda k: subtotal_order[k]),
++            'display_tax_base': display_tax_base
+         }
+ 
+     @api.model
+
+--- a/addons/account/models/chart_template.py
++++ b/addons/account/models/chart_template.py
+@@ -146,6 +146,9 @@ class AccountChartTemplate(models.Model):
+     default_cash_difference_expense_account_id = fields.Many2one('account.account.template', string="Cash Difference Expense Account")
+     default_pos_receivable_account_id = fields.Many2one('account.account.template', string="PoS receivable account")
+ 
++    account_journal_early_pay_discount_loss_account_id = fields.Many2one(comodel_name='account.account.template', string='Cash Discount Write-Off Loss Account', )
++    account_journal_early_pay_discount_gain_account_id = fields.Many2one(comodel_name='account.account.template', string='Cash Discount Write-Off Gain Account', )
++
+     property_account_receivable_id = fields.Many2one('account.account.template', string='Receivable Account')
+     property_account_payable_id = fields.Many2one('account.account.template', string='Payable Account')
+     property_account_expense_categ_id = fields.Many2one('account.account.template', string='Category of Expense Account')
+@@ -207,6 +210,24 @@ class AccountChartTemplate(models.Model):
+             'company_id': company.id,
+         })
+ 
++    @api.model
++    def _create_cash_discount_loss_account(self, company, code_digits):
++        return self.env['account.account'].create({
++            'name': _("Cash Discount Write-Off Loss Account"),
++            'code': 999997,
++            'account_type': 'expense',
++            'company_id': company.id,
++        })
++
++    @api.model
++    def _create_cash_discount_gain_account(self, company, code_digits):
++        return self.env['account.account'].create({
++            'name': _("Cash Discount Write-Off Gain Account"),
++            'code': 999998,
++            'account_type': 'income_other',
++            'company_id': company.id,
++        })
++
+     def try_loading(self, company=False, install_demo=True):
+         """ Installs this chart of accounts for the current company if not chart
+         of accounts had been created for it yet.
+@@ -317,6 +338,14 @@ class AccountChartTemplate(models.Model):
+         # Install all the templates objects and generate the real objects
+         acc_template_ref, taxes_ref = self._install_template(company, code_digits=self.code_digits)
+ 
++        # Set default cash discount write-off accounts
++        if not company.account_journal_early_pay_discount_loss_account_id:
++            company.account_journal_early_pay_discount_loss_account_id = self._create_cash_discount_loss_account(
++                company, self.code_digits)
++        if not company.account_journal_early_pay_discount_gain_account_id:
++            company.account_journal_early_pay_discount_gain_account_id = self._create_cash_discount_gain_account(
++                company, self.code_digits)
++
+         # Set default cash difference account on company
+         if not company.account_journal_suspense_account_id:
+             company.account_journal_suspense_account_id = self._create_liquidity_journal_suspense_account(company, self.code_digits)
+
+--- a/addons/account/models/company.py
++++ b/addons/account/models/company.py
+@@ -65,6 +65,13 @@ class ResCompany(models.Model):
+     account_journal_suspense_account_id = fields.Many2one('account.account', string='Journal Suspense Account')
+     account_journal_payment_debit_account_id = fields.Many2one('account.account', string='Journal Outstanding Receipts Account')
+     account_journal_payment_credit_account_id = fields.Many2one('account.account', string='Journal Outstanding Payments Account')
++    account_journal_early_pay_discount_gain_account_id = fields.Many2one(comodel_name='account.account', string='Cash Discount Write-Off Gain Account')
++    account_journal_early_pay_discount_loss_account_id = fields.Many2one(comodel_name='account.account', string='Cash Discount Write-Off Loss Account')
++    early_pay_discount_computation = fields.Selection([
++        ('included', 'On early payment'),
++        ('excluded', 'Never'),
++        ('mixed', 'Always (upon invoice)')
++    ], string='Cash Discount Tax Reduction', default='included', readonly=False)
+     transfer_account_code_prefix = fields.Char(string='Prefix of the transfer accounts')
+     account_sale_tax_id = fields.Many2one('account.tax', string="Default Sale Tax")
+     account_purchase_tax_id = fields.Many2one('account.tax', string="Default Purchase Tax")
+
+--- a/addons/account/models/res_config_settings.py
++++ b/addons/account/models/res_config_settings.py
+@@ -159,6 +159,24 @@ class ResConfigSettings(models.TransientModel):
+     # Quick encoding (fiduciary mode)
+     quick_edit_mode = fields.Selection(string="Quick encoding", readonly=False, related='company_id.quick_edit_mode')
+ 
++    early_pay_discount_computation = fields.Selection(related='company_id.early_pay_discount_computation', string='Tax setting', readonly=False)
++    account_journal_early_pay_discount_loss_account_id = fields.Many2one(
++        comodel_name='account.account',
++        string='Cash Discount Loss account',
++        help='Account for the difference amount after the expense discount has been granted',
++        readonly=False,
++        related='company_id.account_journal_early_pay_discount_loss_account_id',
++        domain="[('deprecated', '=', False), ('company_id', '=', company_id), ('account_type', 'in', ('expense', 'income', 'income_other'))]",
++    )
++    account_journal_early_pay_discount_gain_account_id = fields.Many2one(
++        comodel_name='account.account',
++        string='Cash Discount Gain account',
++        help='Account for the difference amount after the income discount has been granted',
++        readonly=False,
++        related='company_id.account_journal_early_pay_discount_gain_account_id',
++        domain="[('deprecated', '=', False), ('company_id', '=', company_id), ('account_type', 'in', ('income', 'income_other', 'expense'))]",
++    )
++
+     def set_values(self):
+         super().set_values()
+         # install a chart of accounts for the given company (if required)

@@ -1,0 +1,159 @@
+PR: https://github.com/odoo/odoo/pull/30181
+
+From: 20bc2bbab5839bdbbf6b86972e677e10102e5bac
+From: Lucas Lefèvre
+Date: 2019-02-01 12:16:54
+
+Structural Changes: 2
+Total Changes: 55
+
+[IMP] hr_payroll: add multi contract support
+
+Purpose
+=======
+
+We would like to be able to manage multi contracts payslips and contract transitions.
+
+Specification
+=============
+
+General flow:
+1/ Benefits are generated based on contracts's calendar.
+2/ When validating additionnal benefits, calendar.attendances are created in the contract's calendar
+3/ Create one payslip per contract in state [open|pending|close]
+4/ For each payslip, generate worked day lines based on the contract's calendar
+
+New Constraints:
+1/ An employee cannot have more than one contract at the same time (excluding draft, closed and cancelled contracts).
+2/ A leave cannot overlap multiple contracts.
+3/ A contract cannot have starting and ending dates such that a leave become in the middle of
+   two contacts.
+
+New state for a contract: Incoming. It means it's ready and will be running soon.
+An incoming contract automatically becomes 'Running' if the start date is passed (cron)
+
+Number of hours and days are always correct (according to the contract's calendar) on payslips as the
+flow starts from the contract's calendar.
+However, it is not correct in the Time Off app because it's counted based on the employee's calendar.
+The number of days/hours for hr.leaves should be computed according to
+the contract at the time of the leave.
+e.g. If I currently work full time and I request 2 weeks off next month where I'll be working only
+3 days/week and 5hours/day (other contract), It should count 6 days and 30 hours.
+
+- in hr.benefits form view show the contract (below employee field)
+
+TaskID: 1903483
+
+closes odoo/odoo#30181
+
+================================= pseudo patch: =================================
+
+--- a/addons/hr_contract/models/hr_contract.py
++++ b/addons/hr_contract/models/hr_contract.py
+@@ -16,15 +16,9 @@ class Employee(models.Model):
+     medic_exam = fields.Date(string='Medical Examination Date', groups="hr.group_hr_user")
+     vehicle = fields.Char(string='Company Vehicle', groups="hr.group_hr_user")
+     contract_ids = fields.One2many('hr.contract', 'employee_id', string='Employee Contracts')
+-    contract_id = fields.Many2one('hr.contract', compute='_compute_contract_id', string='Current Contract', help='Latest contract of the employee')
++    contract_id = fields.Many2one('hr.contract', string='Current Contract', help='Current contract of the employee')
+     contracts_count = fields.Integer(compute='_compute_contracts_count', string='Contract Count')
+ 
+-    def _compute_contract_id(self):
+-        """ get the lastest contract """
+-        Contract = self.env['hr.contract']
+-        for employee in self:
+-            employee.contract_id = Contract.search([('employee_id', '=', employee.id)], order='date_start desc', limit=1)
+-
+     def _compute_contracts_count(self):
+         # read_group as sudo, since contract count is displayed on form view
+         contract_data = self.env['hr.contract'].sudo().read_group([('employee_id', 'in', self.ids)], ['employee_id'], ['employee_id'])
+@@ -32,25 +26,28 @@ class Employee(models.Model):
+         for employee in self:
+             employee.contracts_count = result.get(employee.id, 0)
+ 
+-    def _get_contracts(self, date_from, date_to):
++    def _get_contracts(self, date_from, date_to, states=['open', 'pending']):
+         """
+         Returns the contracts of the employee between date_from and date_to
+         """
+         # a contract is valid if it ends between the given dates
+-        if not self:
+-            employees = self.env['hr.employee'].search([])
+-        else:
+-            employees = self
+         clause_1 = ['&', ('date_end', '<=', date_to), ('date_end', '>=', date_from)]
+         # OR if it starts between the given dates
+         clause_2 = ['&', ('date_start', '<=', date_to), ('date_start', '>=', date_from)]
+         # OR if it starts before the date_from and finish after the date_end (or never finish)
+         clause_3 = ['&', ('date_start', '<=', date_from), '|', ('date_end', '=', False), ('date_end', '>=', date_to)]
+         clause_final = expression.AND([
+-            [('employee_id', 'in', employees.ids), ('state', '=', 'open')],
++            [('employee_id', 'in', self.ids), ('state', 'in', states)],
+             expression.OR([clause_1, clause_2, clause_3])])
+         return self.env['hr.contract'].search(clause_final)
+ 
++    @api.model
++    def _get_all_contracts(self, date_from, date_to, states=['open', 'pending']):
++        """
++        Returns the contracts of all employees between date_from and date_to
++        """
++        return self.search([])._get_contracts(date_from, date_to, states=states)
++
+ 
+ class ContractType(models.Model):
+ 
+@@ -88,6 +85,7 @@ class Contract(models.Model):
+     notes = fields.Text('Notes')
+     state = fields.Selection([
+         ('draft', 'New'),
++        ('incoming', 'Incoming'),
+         ('open', 'Running'),
+         ('pending', 'To Renew'),
+         ('close', 'Expired'),
+@@ -112,6 +110,27 @@ class Contract(models.Model):
+             self.department_id = self.employee_id.department_id
+             self.resource_calendar_id = self.employee_id.resource_calendar_id
+ 
++    @api.constrains('employee_id', 'state', 'date_start', 'date_end')
++    def _check_current_contract(self):
++        """ Two contracts in state [incoming | pending | open | close] cannot overlap """
++        for contract in self.filtered(lambda c: c.state not in ['draft', 'cancel']):
++            domain = [
++                ('id', '!=', contract.id),
++                ('employee_id', '=', contract.employee_id.id),
++                ('state', 'in', ['incoming', 'pending', 'open', 'close']),
++            ]
++
++            if not contract.date_end:
++                start_domain = []
++                end_domain = ['|', ('date_end', '>=', contract.date_start), ('date_end', '=', False)]
++            else:
++                start_domain = [('date_start', '<=', contract.date_end)]
++                end_domain = ['|', ('date_end', '>', contract.date_start), ('date_end', '=', False)]
++
++            domain = expression.AND([domain, start_domain, end_domain])
++            if self.search_count(domain):
++                raise ValidationError(_('An employee can only have one contract at the same time. (Excluding Draft and Cancelled contracts)'))
++
+     @api.constrains('date_start', 'date_end')
+     def _check_dates(self):
+         if self.filtered(lambda c: c.date_end and c.date_start > c.date_end):
+@@ -141,8 +160,18 @@ class Contract(models.Model):
+             'state': 'close'
+         })
+ 
++        self.search([('state', '=', 'incoming'), ('date_start', '<=', fields.Date.to_string(date.today())),]).write({
++            'state': 'open'
++        })
+         return True
+ 
++    @api.multi
++    def write(self, vals):
++        if vals.get('state') == 'open':
++            for contract in self:
++                contract.employee_id.contract_id = contract
++        return super(Contract, self).write(vals)
++
+     @api.multi
+     def _track_subtype(self, init_values):
+         self.ensure_one()

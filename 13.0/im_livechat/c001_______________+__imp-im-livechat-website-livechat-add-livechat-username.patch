@@ -1,0 +1,156 @@
+PR: https://github.com/odoo/odoo/pull/
+
+From: f513ee902cd76079a54f0bfadc22bfaeda51cce5
+From: David Beguin
+Date: 2018-12-05 14:37:14
+
+Structural Changes: 3
+Total Changes: 80
+
+[IMP] im_livechat, website_livechat : add livechat username
+
+To avoid that people know the complete name of the support members
+(for privacy purpose), a username can be used.
+Users have the opportunity to set and modify their username in
+their user preferences.
+
+If the username is not set, the complete name will still be used.
+
+If the username is set, it is used for the discussion title, the
+name of the message sender, the name of the team members in the
+channel statistics. All of this, only in the livechat context.
+
+Task ID : 1895998
+Closes PR  #28283
+
+================================= pseudo patch: =================================
+
+--- a/addons/im_livechat/models/__init__.py
++++ b/addons/im_livechat/models/__init__.py
+@@ -1,4 +1,6 @@
+ # -*- coding: utf-8 -*
++from . import res_users
++from . import res_partner
+ from . import im_livechat_channel
+ from . import ir_autovacuum
+ from . import mail_channel
+
+--- a/addons/im_livechat/models/im_livechat_channel.py
++++ b/addons/im_livechat/models/im_livechat_channel.py
+@@ -162,7 +162,7 @@ class ImLivechatChannel(models.Model):
+             'anonymous_name': False if user_id else anonymous_name,
+             'country_id': country_id,
+             'channel_type': 'livechat',
+-            'name': ', '.join([self.env['res.users'].browse(user_id).name if user_id else anonymous_name, operator.name]),
++            'name': ', '.join([self.env['res.users'].browse(user_id).name if user_id else anonymous_name, operator.livechat_username if operator.livechat_username else operator.name]),
+             'public': 'private',
+             'email_send': False,
+         })
+
+--- a/addons/im_livechat/models/mail_channel.py
++++ b/addons/im_livechat/models/mail_channel.py
+@@ -47,7 +47,10 @@ class MailChannel(models.Model):
+             clicking on livechat button). So when the anonymous person is sending its FIRST message, the channel header
+             should be added to the notification, since the user cannot be listining to the channel.
+         """
+-        notifications = super(MailChannel, self)._channel_message_notifications(message)
++        livechat_channels = self.filtered(lambda x: x.channel_type == 'livechat')
++        other_channels = self.filtered(lambda x: x.channel_type != 'livechat')
++        notifications = super(MailChannel, livechat_channels)._channel_message_notifications(message.with_context(im_livechat_use_username=True)) + \
++                        super(MailChannel, other_channels)._channel_message_notifications(message)
+         for channel in self:
+             # add uuid for private livechat channels to allow anonymous to listen
+             if channel.channel_type == 'livechat' and channel.public == 'private':
+@@ -59,6 +62,12 @@ class MailChannel(models.Model):
+                 notifications = self._channel_channel_notifications(unpinned_channel_partner.mapped('partner_id').ids) + notifications
+         return notifications
+ 
++    @api.multi
++    def channel_fetch_message(self, last_id=False, limit=20):
++        """ Override to add the context of the livechat username."""
++        channel = self.with_context(im_livechat_use_username=True) if self.channel_type == 'livechat' else self
++        return super(MailChannel, channel).channel_fetch_message(last_id=last_id, limit=limit)
++
+     @api.multi
+     def channel_info(self, extra_info=False):
+         """ Extends the channel header by adding the livechat operator and the 'anonymous' profile
+@@ -71,7 +80,7 @@ class MailChannel(models.Model):
+             if channel.channel_type == 'livechat':
+                 # add the operator id
+                 if channel.livechat_operator_id:
+-                    channel_infos_dict[channel.id]['operator_pid'] = channel.livechat_operator_id.display_name
++                    channel_infos_dict[channel.id]['operator_pid'] = channel.livechat_operator_id.with_context(im_livechat_use_username=True).name_get()[0]
+                 # add the anonymous or partner name
+                 channel_infos_dict[channel.id]['correspondent_name'] = channel._channel_get_livechat_partner_name()
+                 last_msg = self.env['mail.message'].search([("channel_ids", "in", [channel.id])], limit=1)
+
+--- a/None
++++ b/addons/im_livechat/models/res_partner.py
+@@ -0,0 +1,36 @@
++# -*- coding: utf-8 -*-
++# Part of Odoo. See LICENSE file for full copyright and licensing details.
++
++from odoo import models, api
++
++
++class Partners(models.Model):
++    """ Update of res.partners class
++        - override name_get to take into account the livechat username
++    """
++    _inherit = 'res.partner'
++
++    @api.multi
++    def name_get(self):
++        if self.env.context.get('im_livechat_use_username'):
++            # process the ones with livechat username
++            users_with_livechatname = self.env['res.users'].search([('partner_id', 'in', self.ids), ('livechat_username', '!=', False)])
++            map_with_livechatname = {}
++            for user in users_with_livechatname:
++                map_with_livechatname[user.partner_id.id] = user.livechat_username
++
++            # process the ones without livecaht username
++            partner_without_livechatname = self - users_with_livechatname.mapped('partner_id')
++            no_livechatname_name_get = super(Partners, partner_without_livechatname).name_get()
++            map_without_livechatname = dict(no_livechatname_name_get)
++
++            # restore order
++            result = []
++            for partner in self:
++                name = map_with_livechatname.get(partner.id)
++                if not name:
++                    name = map_without_livechatname.get(partner.id)
++                result.append((partner.id, name))
++        else:
++            result = super(Partners, self).name_get()
++        return result
+
+--- a/None
++++ b/addons/im_livechat/models/res_users.py
+@@ -0,0 +1,27 @@
++# -*- coding: utf-8 -*-
++# Part of Odoo. See LICENSE file for full copyright and licensing details.
++
++from odoo import fields, models, api
++
++
++class Users(models.Model):
++    """ Update of res.users class
++        - add a preference about username for livechat purpose
++    """
++    _inherit = 'res.users'
++
++    livechat_username = fields.Char("Livechat Username", help="This username will be used as your name in the livechat channels.")
++
++    def __init__(self, pool, cr):
++        """ Override of __init__ to add access rights on livechat_username
++            Access rights are disabled by default, but allowed
++            on some specific fields defined in self.SELF_{READ/WRITE}ABLE_FIELDS.
++        """
++        init_res = super(Users, self).__init__(pool, cr)
++        # duplicate list to avoid modifying the original reference
++        type(self).SELF_WRITEABLE_FIELDS = list(self.SELF_WRITEABLE_FIELDS)
++        type(self).SELF_WRITEABLE_FIELDS.extend(['livechat_username'])
++        # duplicate list to avoid modifying the original reference
++        type(self).SELF_READABLE_FIELDS = list(self.SELF_READABLE_FIELDS)
++        type(self).SELF_READABLE_FIELDS.extend(['livechat_username'])
++        return init_res

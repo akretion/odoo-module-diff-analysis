@@ -1,0 +1,535 @@
+PR: https://github.com/odoo/odoo/pull/133392
+
+From: bd5a68a1a77055ae0b560379eb3dc021403bc0d0
+From: Florian Charlier
+Date: 2023-10-24 12:38:13
+
+Structural Changes: 6
+Total Changes: 347
+
+[IMP] mail, mass_mailing, sms: process delivery reports
+
+Also impacts mass_mailing_sms, test_mail_sms,
+test_mass_mailing
+
+This PR adds support to receive sms delivery reports.
+
+Before this PR, an SMS was considered 'sent' when successfully
+handled by the third party. The user couldn't know if/when an
+SMS was actually sent for delivery or delivered to the
+recipient's device.
+This was similar to the behavior for emails as delivery reports
+are not commonly used (and not supported in Odoo).
+
+With this work, the SMS `pending` state is introduced in mail,
+mass_mailing, sms and mass_mailing_sms contexts although only fully
+used in the latter two modules (+tests of course).
+
+Because of the huge cost related to upgrading very large existing
+databases, the following compromises were made:
+
+1. An email and sms notification/trace SENT means DELIVERED.
+  Those that are sent but NOT DELIVERED are PENDING.
+  The difference between email and sms traces reinforced with this PR
+  is that an email sent will be counted as "sent" ~ "delivered"
+  unless an error is returned for emails while for SMS it can only be
+  reached if a delivery report is received.
+2. The Link between an SMS uuid (shared with trusted parties) and
+  the tracking records (notifications or traces) is done via an
+  explicit relationship table (sms_tracker) instead of via a new field.
+  This however allowed to nicely concentrate the state update logic.
+
+A `process` state is added to represent an intermediate
+step in the sending process, such as held at IAP for SMS.
+
+A few adjustments are also included to update for IAP api v3.
+Also, adapts and includes new tests.
+
+Task-2560666
+
+Part-of: odoo/odoo#133392
+
+================================= pseudo patch: =================================
+
+--- a/addons/sms/models/__init__.py
++++ b/addons/sms/models/__init__.py
+@@ -11,3 +11,4 @@ from . import res_partner
+ from . import sms_api
+ from . import sms_sms
+ from . import sms_template
++from . import sms_tracker
+
+--- a/addons/sms/models/mail_notification.py
++++ b/addons/sms/models/mail_notification.py
+@@ -11,11 +11,20 @@ class MailNotification(models.Model):
+         ('sms', 'SMS')
+     ], ondelete={'sms': 'cascade'})
+     sms_id = fields.Many2one('sms.sms', string='SMS', index='btree_not_null', ondelete='set null')
++    sms_tracker_ids = fields.One2many('sms.tracker', 'mail_notification_id', string="SMS Trackers")
+     sms_number = fields.Char('SMS Number')
+     failure_type = fields.Selection(selection_add=[
+         ('sms_number_missing', 'Missing Number'),
+         ('sms_number_format', 'Wrong Number Format'),
+         ('sms_credit', 'Insufficient Credit'),
++        ('sms_country_not_supported', 'Country Not Supported'),
++        ('sms_registration_needed', 'Country-specific Registration Required'),
+         ('sms_server', 'Server Error'),
+-        ('sms_acc', 'Unregistered Account')
++        ('sms_acc', 'Unregistered Account'),
++        # delivery report errors
++        ('sms_expired', 'Expired'),
++        ('sms_invalid_destination', 'Invalid Destination'),
++        ('sms_not_allowed', 'Not Allowed'),
++        ('sms_not_delivered', 'Not Delivered'),
++        ('sms_rejected', 'Rejected'),
+     ])
+
+--- a/addons/sms/models/mail_thread.py
++++ b/addons/sms/models/mail_thread.py
+@@ -3,8 +3,7 @@
+ 
+ import logging
+ 
+-from odoo import api, models, fields
+-from odoo.addons.phone_validation.tools import phone_validation
++from odoo import api, Command, models, fields
+ from odoo.tools import html2plaintext, plaintext2html
+ 
+ _logger = logging.getLogger(__name__)
+@@ -307,6 +306,7 @@ class MailThread(models.AbstractModel):
+                 'sms_number': sms.number,
+                 'notification_type': 'sms',
+                 'sms_id': sms.id,
++                'sms_tracker_ids': [Command.create({'sms_uuid': sms.uuid})] if sms.state == 'outgoing' else False,
+                 'is_read': True,  # discard Inbox notification
+                 'notification_status': 'ready' if sms.state == 'outgoing' else 'exception',
+                 'failure_type': '' if sms.state == 'outgoing' else sms.failure_type,
+@@ -324,6 +324,7 @@ class MailThread(models.AbstractModel):
+                             'notification_type': 'sms',
+                             'notification_status': 'ready',
+                             'sms_id': sms.id,
++                            'sms_tracker_ids': [Command.create({'sms_uuid': sms.uuid})],
+                             'sms_number': sms.number,
+                         })
+ 
+
+--- a/addons/sms/models/sms_api.py
++++ b/addons/sms/models/sms_api.py
+@@ -4,7 +4,7 @@
+ from odoo import _, api, models
+ from odoo.addons.iap.tools import iap_tools
+ 
+-DEFAULT_ENDPOINT = 'https://iap-sms.odoo.com'
++DEFAULT_ENDPOINT = 'https://sms.api.odoo.com'
+ 
+ 
+ class SmsApi(models.AbstractModel):
+@@ -20,57 +20,60 @@ class SmsApi(models.AbstractModel):
+         return iap_tools.iap_jsonrpc(endpoint + local_endpoint, params=params)
+ 
+     @api.model
+-    def _send_sms(self, numbers, message):
+-        """ Send a single message to several numbers
+-
+-        :param numbers: list of E164 formatted phone numbers
+-        :param message: content to send
+-
+-        :raises ? TDE FIXME
+-        """
+-        params = {
+-            'numbers': numbers,
+-            'message': message,
+-        }
+-        return self._contact_iap('/iap/message_send', params)
+-
+-    @api.model
+-    def _send_sms_batch(self, messages):
++    def _send_sms_batch(self, messages, dlr=False):
+         """ Send SMS using IAP in batch mode
+ 
+-        :param messages: list of SMS to send, structured as dict [{
+-            'res_id':  integer: ID of sms.sms,
+-            'number':  string: E164 formatted phone number,
+-            'content': string: content to send
+-        }]
+-
+-        :return: return of /iap/sms/1/send controller which is a list of dict [{
+-            'res_id': integer: ID of sms.sms,
+-            'state':  string: 'insufficient_credit' or 'wrong_number_format' or 'success',
+-            'credit': integer: number of credits spent to send this SMS,
+-        }]
+-
+-        :raises: normally none
++        :param list messages: list of SMS (grouped by content) to send:
++          formatted as ```[
++              {
++                  'content' : str,
++                  'numbers' : [
++                      { 'uuid' : str, 'number' : str },
++                      { 'uuid' : str, 'number' : str },
++                      ...
++                  ]
++              }, ...
++          ]```
++        :param bool dlr: whether to receive delivery reports or not
++        :return: response from the endpoint called, which is a list of results
++          formatted as ```[
++              {
++                  uuid: UUID of the request,
++                  state: ONE of: {
++                      'success', 'processing', 'server_error', 'unregistered', 'insufficient_credit',
++                      'wrong_number_format', 'duplicate_message', 'country_not_supported', 'registration_needed',
++                  },
++                  credit: Optional: Credits spent to send SMS (provided if the actual price is known)
++              }, ...
++          ]```
+         """
+         params = {
+-            'messages': messages
++            'messages': messages,
++            'webhook_url': dlr and (self.get_base_url() + '/sms/status')
+         }
+-        return self._contact_iap('/iap/sms/2/send', params)
++        return self._contact_iap('/iap/sms/3/send', params)
+ 
+     @api.model
+     def _get_sms_api_error_messages(self):
+-        """ Returns a dict containing the error message to display for every known error 'state'
+-        resulting from the '_send_sms_batch' method.
+-        We prefer a dict instead of a message-per-error-state based method so we only call
+-        the 'get_credits_url' once, to avoid extra RPC calls. """
++        """Return a mapping of `_send_sms_batch` errors to an error message.
+ 
+-        buy_credits_url = self.sudo().env['iap.account'].get_credits_url(service_name='sms')
+-        buy_credits = '<a href="%s" target="_blank">%s</a>' % (
+-            buy_credits_url,
+-            _('Buy credits.')
++        We prefer a dict instead of a message-per-error-state based method so that we only call
++        config parameters getters once and avoid extra RPC calls."""
++        buy_credits_url = self.env['iap.account'].sudo().get_credits_url(service_name='sms')
++        buy_credits = f'<a href="{buy_credits_url}" target="_blank">%s</a>' % _('Buy credits.')
++
++        sms_endpoint = self.env['ir.config_parameter'].sudo().get_param('sms.endpoint', DEFAULT_ENDPOINT)
++        sms_account_token = self.env['iap.account'].sudo().get('sms').account_token
++        register_now = f'<a href="{sms_endpoint}/1/account?account_token={sms_account_token}" target="_blank">%s</a>' % (
++            _('Register now.')
+         )
++
+         return {
+             'unregistered': _("You don't have an eligible IAP account."),
+-            'insufficient_credit': ' '.join([_('You don\'t have enough credits on your IAP account.'), buy_credits]),
++            'insufficient_credit': ' '.join([_("You don't have enough credits on your IAP account."), buy_credits]),
+             'wrong_number_format': _("The number you're trying to reach is not correctly formatted."),
++            'duplicate_message': _("This SMS has been removed as the number was already used."),
++            'country_not_supported': _("The destination country is not supported."),
++            'incompatible_content': _("The content of the message violates rules applied by our providers."),
++            'registration_needed': ' '.join([_("Country-specific registration required."), register_now]),
+         }
+
+--- a/addons/sms/models/sms_sms.py
++++ b/addons/sms/models/sms_sms.py
+@@ -3,6 +3,7 @@
+ 
+ import logging
+ import threading
++from uuid import uuid4
+ 
+ from odoo import api, fields, models, tools, _
+ 
+@@ -15,75 +16,74 @@ class SmsSms(models.Model):
+     _rec_name = 'number'
+     _order = 'id DESC'
+ 
+-    IAP_TO_SMS_STATE = {
+-        'success': 'sent',
++    IAP_TO_SMS_STATE_SUCCESS = {
++        'processing': 'process',
++        'success': 'pending',
++        # These below are not returned in responses from IAP API in _send but are received via webhook events.
++        'sent': 'pending',
++        'delivered': 'sent',
++    }
++    IAP_TO_SMS_FAILURE_TYPE = {
+         'insufficient_credit': 'sms_credit',
+         'wrong_number_format': 'sms_number_format',
++        'country_not_supported': 'sms_country_not_supported',
+         'server_error': 'sms_server',
+         'unregistered': 'sms_acc'
+     }
+ 
++    BOUNCE_DELIVERY_ERRORS = {'sms_invalid_destination', 'sms_not_allowed', 'sms_rejected'}
++    DELIVERY_ERRORS = {'sms_expired', 'sms_not_delivered', *BOUNCE_DELIVERY_ERRORS}
++
++    uuid = fields.Char('UUID', copy=False, readonly=True, default=lambda self: uuid4().hex,
++                       help='Alternate way to identify a SMS record, used for delivery reports')
+     number = fields.Char('Number')
+     body = fields.Text()
+     partner_id = fields.Many2one('res.partner', 'Customer')
+     mail_message_id = fields.Many2one('mail.message', index=True)
+     state = fields.Selection([
+         ('outgoing', 'In Queue'),
+-        ('sent', 'Sent'),
++        ('process', 'Processing'),
++        ('pending', 'Sent'),
++        ('sent', 'Delivered'),  # As for notifications and traces
+         ('error', 'Error'),
+         ('canceled', 'Canceled')
+     ], 'SMS Status', readonly=True, copy=False, default='outgoing', required=True)
+     failure_type = fields.Selection([
++        ("unknown", "Unknown error"),
+         ('sms_number_missing', 'Missing Number'),
+         ('sms_number_format', 'Wrong Number Format'),
++        ('sms_country_not_supported', 'Country Not Supported'),
++        ('sms_registration_needed', 'Country-specific Registration Required'),
+         ('sms_credit', 'Insufficient Credit'),
+         ('sms_server', 'Server Error'),
+         ('sms_acc', 'Unregistered Account'),
+-        # mass mode specific codes
++        # mass mode specific codes, generated internally, not returned by IAP.
+         ('sms_blacklist', 'Blacklisted'),
+         ('sms_duplicate', 'Duplicate'),
+         ('sms_optout', 'Opted Out'),
+     ], copy=False)
++    sms_tracker_id = fields.Many2one('sms.tracker', string='SMS trackers', compute='_compute_sms_tracker_id')
++
++    _sql_constraints = [
++        ('uuid_unique', 'unique(uuid)', 'UUID must be unique'),
++    ]
++
++    @api.depends('uuid')
++    def _compute_sms_tracker_id(self):
++        self.sms_tracker_id = False
++        existing_trackers = self.env['sms.tracker'].search([('sms_uuid', 'in', self.filtered('uuid').mapped('uuid'))])
++        tracker_ids_by_sms_uuid = {tracker.sms_uuid: tracker.id for tracker in existing_trackers}
++        for sms in self.filtered(lambda s: s.uuid in tracker_ids_by_sms_uuid):
++            sms.sms_tracker_id = tracker_ids_by_sms_uuid[sms.uuid]
+ 
+     def action_set_canceled(self):
+-        self.state = 'canceled'
+-        notifications = self.env['mail.notification'].sudo().search([
+-            ('sms_id', 'in', self.ids),
+-            # sent is sent -> cannot reset
+-            ('notification_status', 'not in', ['canceled', 'sent']),
+-        ])
+-        if notifications:
+-            notifications.write({'notification_status': 'canceled'})
+-            if not self._context.get('sms_skip_msg_notification', False):
+-                notifications.mail_message_id._notify_message_notification_update()
++        self._update_sms_state_and_trackers('canceled')
+ 
+     def action_set_error(self, failure_type):
+-        self.state = 'error'
+-        self.failure_type = failure_type
+-        notifications = self.env['mail.notification'].sudo().search([
+-            ('sms_id', 'in', self.ids),
+-            # sent can be set to error due to IAP feedback
+-            ('notification_status', '!=', 'exception'),
+-        ])
+-        if notifications:
+-            notifications.write({'notification_status': 'exception', 'failure_type': failure_type})
+-            if not self._context.get('sms_skip_msg_notification', False):
+-                notifications.mail_message_id._notify_message_notification_update()
++        self._update_sms_state_and_trackers('error', failure_type=failure_type)
+ 
+     def action_set_outgoing(self):
+-        self.write({
+-            'state': 'outgoing',
+-            'failure_type': False
+-        })
+-        notifications = self.env['mail.notification'].sudo().search([
+-            ('sms_id', 'in', self.ids),
+-            # sent is sent -> cannot reset
+-            ('notification_status', 'not in', ['ready', 'sent']),
+-        ])
+-        if notifications:
+-            notifications.write({'notification_status': 'ready', 'failure_type': False})
+-            if not self._context.get('sms_skip_msg_notification', False):
+-                notifications.mail_message_id._notify_message_notification_update()
++        self._update_sms_state_and_trackers('outgoing', failure_type=False)
+ 
+     def send(self, unlink_failed=False, unlink_sent=True, auto_commit=False, raise_exception=False):
+         """ Main API method to send SMS.
+@@ -159,59 +159,48 @@ class SmsSms(models.Model):
+             yield sms_batch
+ 
+     def _send(self, unlink_failed=False, unlink_sent=True, raise_exception=False):
+-        """ This method tries to send SMS after checking the number (presence and
+-        formatting). """
+-        iap_data = [{
+-            'res_id': record.id,
+-            'number': record.number,
+-            'content': record.body,
+-        } for record in self]
++        """Send SMS after checking the number (presence and formatting)."""
++        messages = [{
++            'content': body,
++            'numbers': [{'number': sms.number, 'uuid': sms.uuid} for sms in body_sms_records],
++        } for body, body_sms_records in self.grouped('body').items()]
+ 
+         try:
+-            iap_results = self.env['sms.api']._send_sms_batch(iap_data)
++            results = self.env['sms.api']._send_sms_batch(messages, dlr=True)
+         except Exception as e:
+             _logger.info('Sent batch %s SMS: %s: failed with exception %s', len(self.ids), self.ids, e)
+             if raise_exception:
+                 raise
+-            self._postprocess_iap_sent_sms(
+-                [{'res_id': sms.id, 'state': 'server_error'} for sms in self],
+-                unlink_failed=unlink_failed, unlink_sent=unlink_sent)
++            results = [{'uuid': sms.uuid, 'state': 'server_error'} for sms in self]
+         else:
+-            _logger.info('Send batch %s SMS: %s: gave %s', len(self.ids), self.ids, iap_results)
+-            self._postprocess_iap_sent_sms(iap_results, unlink_failed=unlink_failed, unlink_sent=unlink_sent)
+-
+-    def _postprocess_iap_sent_sms(self, iap_results, failure_reason=None, unlink_failed=False, unlink_sent=True):
+-        todelete_sms_ids = []
+-        if unlink_failed:
+-            todelete_sms_ids += [item['res_id'] for item in iap_results if item['state'] != 'success']
+-        if unlink_sent:
+-            todelete_sms_ids += [item['res_id'] for item in iap_results if item['state'] == 'success']
+-
+-        for state in self.IAP_TO_SMS_STATE.keys():
+-            sms_ids = [item['res_id'] for item in iap_results if item['state'] == state]
+-            if sms_ids:
+-                if state != 'success' and not unlink_failed:
+-                    self.env['sms.sms'].sudo().browse(sms_ids).write({
+-                        'state': 'error',
+-                        'failure_type': self.IAP_TO_SMS_STATE[state],
+-                    })
+-                if state == 'success' and not unlink_sent:
+-                    self.env['sms.sms'].sudo().browse(sms_ids).write({
+-                        'state': 'sent',
+-                        'failure_type': False,
+-                    })
+-                notifications = self.env['mail.notification'].sudo().search([
+-                    ('notification_type', '=', 'sms'),
+-                    ('sms_id', 'in', sms_ids),
+-                    ('notification_status', 'not in', ('sent', 'canceled')),
+-                ])
+-                if notifications:
+-                    notifications.write({
+-                        'notification_status': 'sent' if state == 'success' else 'exception',
+-                        'failure_type': self.IAP_TO_SMS_STATE[state] if state != 'success' else False,
+-                        'failure_reason': failure_reason if failure_reason else False,
+-                    })
+-        self.mail_message_id._notify_message_notification_update()
+-
+-        if todelete_sms_ids:
+-            self.browse(todelete_sms_ids).sudo().unlink()
++            _logger.info('Send batch %s SMS: %s: gave %s', len(self.ids), self.ids, results)
++
++        results_uuids = [result['uuid'] for result in results]
++        all_sms_sudo = self.env['sms.sms'].sudo().search([('uuid', 'in', results_uuids)]).with_context(sms_skip_msg_notification=True)
++        mail_message_ids_sudo = all_sms_sudo.mail_message_id
++
++        for iap_state, results_group in tools.groupby(results, key=lambda result: result['state']):
++            sms_sudo = all_sms_sudo.filtered(lambda s: s.uuid in {result['uuid'] for result in results_group})
++            if success_state := self.IAP_TO_SMS_STATE_SUCCESS.get(iap_state):
++                sms_sudo.sms_tracker_id._action_update_from_sms_state(success_state)
++                if unlink_sent:
++                    sms_sudo.unlink()
++                else:
++                    sms_sudo.write({'state': success_state, 'failure_type': False})
++            else:
++                failure_type = self.IAP_TO_SMS_FAILURE_TYPE.get(iap_state, 'unknown')
++                if failure_type != 'unknown':
++                    sms_sudo.sms_tracker_id._action_update_from_sms_state('error', failure_type=failure_type)
++                else:
++                    sms_sudo.sms_tracker_id._action_update_from_provider_error(iap_state)
++                if unlink_failed:
++                    sms_sudo.unlink()
++                else:
++                    sms_sudo.write({'state': 'error', 'failure_type': failure_type})
++
++        mail_message_ids_sudo._notify_message_notification_update()
++
++    def _update_sms_state_and_trackers(self, new_state, failure_type=None):
++        """Update sms state update and related tracking records (notifications, traces)."""
++        self.write({'state': new_state, 'failure_type': failure_type})
++        self.sms_tracker_id._action_update_from_sms_state(new_state, failure_type=failure_type)
+
+--- a/None
++++ b/addons/sms/models/sms_tracker.py
+@@ -0,0 +1,82 @@
++# Part of Odoo. See LICENSE file for full copyright and licensing details.
++
++from odoo import fields, models
++
++
++class SmsTracker(models.Model):
++    """Relationship between a sent SMS and tracking records such as notifications and traces.
++
++    This model acts as an extension of a `mail.notification` or a `mailing.trace` and allows to
++    update those based on the SMS provider responses both at sending and when later receiving
++    sent/delivery reports (see `SmsController`).
++    SMS trackers are supposed to be created manually when necessary, and tied to their related
++    SMS through the SMS UUID field. (They are not tied to the SMS records directly as those can
++    be deleted when sent).
++
++    Note: Only admins/system user should need to access (a fortiori modify) these technical
++      records so no "sudo" is used nor should be required here.
++    """
++    _name = 'sms.tracker'
++    _description = "Link SMS to mailing/sms tracking models"
++
++    SMS_STATE_TO_NOTIFICATION_STATUS = {
++        'canceled': 'canceled',
++        'process': 'process',
++        'error': 'exception',
++        'outgoing': 'ready',
++        'sent': 'sent',
++        'pending': 'pending',
++    }
++
++    sms_uuid = fields.Char('SMS uuid', required=True)
++    mail_notification_id = fields.Many2one('mail.notification', ondelete='cascade')
++
++    _sql_constraints = [
++        ('sms_uuid_unique', 'unique(sms_uuid)', 'A record for this UUID already exists'),
++    ]
++
++    def _action_update_from_provider_error(self, provider_error):
++        """
++        :param str provider_error: value returned by SMS service provider (IAP) or any string.
++            If provided, notification values will be derived from it.
++            (see ``_get_tracker_values_from_provider_error``)
++        """
++        failure_reason = False
++        failure_type = f'sms_{provider_error}'
++        error_status = None
++        if failure_type not in self.env['sms.sms'].DELIVERY_ERRORS:
++            failure_type = 'unknown'
++            failure_reason = provider_error
++        elif failure_type in self.env['sms.sms'].BOUNCE_DELIVERY_ERRORS:
++            error_status = "bounce"
++
++        self._update_sms_notifications(error_status or 'exception', failure_type=failure_type, failure_reason=failure_reason)
++        return error_status, failure_type, failure_reason
++
++    def _action_update_from_sms_state(self, sms_state, failure_type=False, failure_reason=False):
++        notification_status = self.SMS_STATE_TO_NOTIFICATION_STATUS[sms_state]
++        self._update_sms_notifications(notification_status, failure_type=failure_type, failure_reason=failure_reason)
++
++    def _update_sms_notifications(self, notification_status, failure_type=False, failure_reason=False):
++        # canceled is a state which means that the SMS sending order should not be sent to the SMS service.
++        # `process`, `pending` are sent to IAP which is not revertible (as `sent` which means "delivered").
++        notifications_statuses_to_ignore = {
++            'canceled': ['canceled', 'process', 'pending', 'sent'],
++            'ready': ['ready', 'process', 'pending', 'sent'],
++            'process': ['process', 'pending', 'sent'],
++            'pending': ['pending', 'sent'],
++            'bounce': ['bounce', 'sent'],
++            'sent': ['sent'],
++            'exception': ['exception'],
++        }[notification_status]
++        notifications = self.mail_notification_id.filtered(
++            lambda n: n.notification_status not in notifications_statuses_to_ignore
++        )
++        if notifications:
++            notifications.write({
++                'notification_status': notification_status,
++                'failure_type': failure_type,
++                'failure_reason': failure_reason,
++            })
++            if not self.env.context.get('sms_skip_msg_notification'):
++                notifications.mail_message_id._notify_message_notification_update()

@@ -1,0 +1,152 @@
+PR: https://github.com/odoo/odoo/pull/130544
+
+From: 198e226f5bd66dba6598d1ef85e5fa5fb82b38b2
+From: Lucas Perais
+Date: 2023-10-26 12:10:08
+
+Structural Changes: 12
+Total Changes: 75
+
+[IMP] website: Expose models on the website
+
+This commit implements a way to expose any model publicly on the website. Both manual and
+existing models can create such pages called 'Model Pages'.
+A manual model is a model that has been created by the user at runtime, via the technical menu,
+via studio, or with an xml declaration.
+
+The main interface to easily create such page is in Studio, in the tab Website Integration. But a
+partner or developer could easily import those without studio installed. That's the reason most of
+the code to handle the display of such pages is present in the website module directly.
+
+The listing can handle two display modes (Grid or List). Once the user changes the display mode,
+the latest value is set in the session to be remembered for the next visit of the page.
+A default_layout can be set and is customizable in the website editor or from the backend of Website.
+This value is linked to the page to display, so each listing page can use a different layout by default.
+
+The route on which the models are exposed is:
+"/model/<string:page_name_slugified>",
+
+With the derived routes:
+"/model/<string:page_name_slugified>/page/<int:page_number>",
+"/model/<string:page_name_slugified>/<string:record_slug>"
+
+task-id-3231144
+
+Part-of: odoo/odoo#130544
+Co-authored-by: Florent Dardenne (dafl) <dafl@odoo.com>
+Co-authored-by: Luca Vitali (luvi) <luvi@odoo.com>
+
+================================= pseudo patch: =================================
+
+--- a/addons/website/models/__init__.py
++++ b/addons/website/models/__init__.py
+@@ -31,3 +31,4 @@ from . import website_configurator_feature
+ from . import website_form
+ from . import website_snippet_filter
+ from . import website_visitor
++from . import website_controller_page
+
+--- a/addons/website/models/ir_ui_view.py
++++ b/addons/website/models/ir_ui_view.py
+@@ -23,6 +23,7 @@ class View(models.Model):
+ 
+     website_id = fields.Many2one('website', ondelete='cascade', string="Website")
+     page_ids = fields.One2many('website.page', 'view_id')
++    controller_page_ids = fields.One2many('website.controller.page', 'view_id')
+     first_page_id = fields.Many2one('website.page', string='Website Page', help='First page linked to this view', compute='_compute_first_page_id')
+     track = fields.Boolean(string='Track', default=False, help="Allow to specify for one page of the website to be trackable or not")
+     visibility = fields.Selection([('', 'All'), ('connected', 'Signed In'), ('restricted_group', 'Restricted Group'), ('password', 'With Password')], default='')
+
+--- a/None
++++ b/addons/website/models/website_controller_page.py
+@@ -0,0 +1,64 @@
++# -*- coding: utf-8 -*-
++# Part of Odoo. See LICENSE file for full copyright and licensing details.
++from odoo.addons.http_routing.models.ir_http import slugify
++from odoo import api, fields, models
++
++
++class WebsiteControllerPage(models.Model):
++    _name = 'website.controller.page'
++    _inherits = {'ir.ui.view': 'view_id'}
++    _inherit = [
++        'website.published.multi.mixin',
++        'website.searchable.mixin',
++    ]
++    _description = 'Model Page'
++    _order = 'website_id'
++
++    view_id = fields.Many2one('ir.ui.view', string='View', required=True, ondelete="cascade")
++    menu_ids = fields.One2many('website.menu', 'controller_page_id', 'Related Menus')
++
++    website_id = fields.Many2one(related='view_id.website_id', store=True, readonly=False, ondelete='cascade')
++
++    # Bindings to model/records, to expose the page on the website.
++    # Route: /model/<string:page_name_slugified>
++    page_name = fields.Char(string="Name", help="The name is used to generate the URL and is shown in the browser title bar", required=True)
++    name_slugified = fields.Char(compute="_compute_name_slugified", store=True,
++        string="URL", help="The name of the page usable in a URL")
++    page_type = fields.Selection(selection=[("listing", "Listing"), ("single", "Single record")],
++        default="listing", string="Page Type",
++        help="The type of the page. If set, it indicates whether the page displays a list of records or a single record")
++    record_domain = fields.Char(string="Domain", help="Domain to restrict records that can be viewed publicly")
++    default_layout = fields.Selection(
++        selection=[
++            ('grid', "Grid"),
++            ('list', "List"),
++        ],
++        default="grid",
++    )
++
++    @api.constrains('view_id', 'model_id', "model")
++    def _check_user_has_model_access(self):
++        for record in self:
++            self.env[record.model_id.model].check_access_rights('read')
++
++    @api.depends("model_id", "page_name")
++    def _compute_name_slugified(self):
++        for rec in self:
++            if not rec.model_id or not rec.page_type:
++                continue
++            rec.name_slugified = slugify(rec.page_name or '')
++
++    def unlink(self):
++        # When a website_controller_page is deleted, the ORM does not delete its
++        # ir_ui_view. So we got to delete it ourself, but only if the
++        # ir_ui_view is not used by another website_page.
++        views_to_delete = self.view_id.filtered(
++            lambda v: v.controller_page_ids <= self and not v.inherit_children_ids
++        )
++        # Rebind self to avoid unlink already deleted records from `ondelete="cascade"`
++        self = self - views_to_delete.controller_page_ids
++        views_to_delete.unlink()
++
++        # Make sure website._get_menu_ids() will be recomputed
++        self.env.registry.clear_cache()
++        return super().unlink()
+
+--- a/addons/website/models/website_menu.py
++++ b/addons/website/models/website_menu.py
+@@ -41,6 +41,7 @@ class Menu(models.Model):
+     name = fields.Char('Menu', required=True, translate=True)
+     url = fields.Char('Url', default='')
+     page_id = fields.Many2one('website.page', 'Related Page', ondelete='cascade')
++    controller_page_id = fields.Many2one('website.controller.page', 'Related Model Page', ondelete='cascade')
+     new_window = fields.Boolean('New Window')
+     sequence = fields.Integer(default=_default_sequence)
+     website_id = fields.Many2one('website', 'Website', ondelete='cascade')
+@@ -125,6 +126,14 @@ class Menu(models.Model):
+                     or (not page_sudo.view_id._handle_visibility(do_raise=False)
+                         and page_sudo.view_id._get_cached_visibility() != "password")):
+                     visible = False
++
++            if menu.controller_page_id and not menu.user_has_groups('base.group_user'):
++                controller_page_sudo = menu.controller_page_id.sudo()
++                if (not controller_page_sudo.is_published
++                    or (not controller_page_sudo.view_id._handle_visibility(do_raise=False)
++                        and controller_page_sudo.view_id._get_cached_visibility() != "password")):
++                    visible = False
++
+             menu.is_visible = visible
+ 
+     def _clean_url(self):

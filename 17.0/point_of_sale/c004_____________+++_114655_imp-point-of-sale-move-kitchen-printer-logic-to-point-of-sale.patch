@@ -1,0 +1,229 @@
+PR: https://github.com/odoo/odoo/pull/114655
+
+From: 73aae73f1ba4ad9471d0cded3d8f02cac8cc3669
+From: David Monnom (moda)
+Date: 2023-05-03 10:39:17
+
+Structural Changes: 13
+Total Changes: 62
+
+[IMP] point_of_sale,*: move kitchen printer logic to point_of_sale
+
+*:pos_epson_printer,pos_epson_printer_restaurant,point_of_sale,
+pos_restaurant,pos_hr_restaurant
+
+Before the printers only worked in the pos_restaurant and not in the
+point_of_sale. Indeed, the methods managing the printers were located
+in the pos_restaurant.
+
+Now all these methods have been moved.
+For the community part here are the affected modules:
+- The methods in pos_epson_printer_restaurant have been moved to
+pos_epson_printer.
+- The methods in pos_restaurant have been moved to point_of_sale.
+- The module pos_epson_printer_restaurant has been removed as it only
+handled printers.
+
+Some of these methods have been adapted/renamed to better suit
+the needs.
+
+This branch the first part of the following task: 3224508
+
+closes odoo/odoo#114655
+
+Related: odoo/upgrade#4414
+Related: odoo/enterprise#37901
+Signed-off-by: Joseph Caburnay (jcb) <jcb@odoo.com>
+
+================================= pseudo patch: =================================
+
+--- a/addons/point_of_sale/models/__init__.py
++++ b/addons/point_of_sale/models/__init__.py
+@@ -24,3 +24,4 @@ from . import pos_payment
+ from . import pos_payment_method
+ from . import pos_bill
+ from . import report_sale_details
++from . import pos_printer
+
+--- a/addons/point_of_sale/models/pos_config.py
++++ b/addons/point_of_sale/models/pos_config.py
+@@ -47,6 +47,8 @@ class PosConfig(models.Model):
+         return self.env.ref('point_of_sale.group_pos_user')
+ 
+     name = fields.Char(string='Point of Sale', required=True, help="An internal identification of the point of sale.")
++    printer_ids = fields.Many2many('pos.printer', 'pos_config_printer_rel', 'config_id', 'printer_id', string='Order Printers')
++    is_order_printer = fields.Boolean('Order Printer')
+     is_installed_account_accountant = fields.Boolean(string="Is the Full Accounting Installed",
+         compute="_compute_is_installed_account_accountant")
+     picking_type_id = fields.Many2one(
+@@ -402,6 +404,9 @@ class PosConfig(models.Model):
+ 
+     def write(self, vals):
+         self._reset_default_on_vals(vals)
++        if ('is_order_printer' in vals and not vals['is_order_printer']):
++            vals['printer_ids'] = [fields.Command.clear()]
++
+         opened_session = self.mapped('session_ids').filtered(lambda s: s.state != 'closed')
+         if opened_session:
+             forbidden_fields = []
+@@ -484,7 +489,7 @@ class PosConfig(models.Model):
+ 
+     def _force_http(self):
+         enforce_https = self.env['ir.config_parameter'].sudo().get_param('point_of_sale.enforce_https')
+-        if not enforce_https and self.other_devices:
++        if not enforce_https and (self.other_devices or self.printer_ids.filtered(lambda pt: pt.printer_type == 'epson_epos')):
+             return True
+         return False
+ 
+
+--- a/addons/point_of_sale/models/pos_order.py
++++ b/addons/point_of_sale/models/pos_order.py
+@@ -59,6 +59,7 @@ class PosOrder(models.Model):
+             'tip_amount': ui_order.get('tip_amount', 0),
+             'access_token': ui_order.get('access_token', ''),
+             'ticket_code': ui_order.get('ticket_code', ''),
++            'last_order_preparation_change': ui_order.get('last_order_preparation_change', False),
+         }
+ 
+     @api.model
+@@ -237,6 +238,7 @@ class PosOrder(models.Model):
+         return price_unit
+ 
+     name = fields.Char(string='Order Ref', required=True, readonly=True, copy=False, default='/')
++    last_order_preparation_change = fields.Char(string='Last preparation change', help="Last printed state of the order")
+     date_order = fields.Datetime(string='Date', readonly=True, index=True, default=fields.Datetime.now)
+     user_id = fields.Many2one(
+         comodel_name='res.users', string='Responsible',
+@@ -280,7 +282,7 @@ class PosOrder(models.Model):
+     picking_type_id = fields.Many2one('stock.picking.type', related='session_id.config_id.picking_type_id', string="Operation Type", readonly=False)
+     procurement_group_id = fields.Many2one('procurement.group', 'Procurement Group', copy=False)
+ 
+-    note = fields.Text(string='Kitchen Notes')
++    note = fields.Text(string='Internal Notes')
+     nb_print = fields.Integer(string='Number of Print', readonly=True, copy=False, default=0)
+     pos_reference = fields.Char(string='Receipt Number', readonly=True, copy=False)
+     sale_journal = fields.Many2one('account.journal', related='session_id.config_id.journal_id', string='Sales Journal', store=True, readonly=True, ondelete='restrict')
+@@ -1103,6 +1105,7 @@ class PosOrder(models.Model):
+             'create_uid',
+             'create_date',
+             'fiscal_position_id',
++            'last_order_preparation_change',
+             'to_invoice',
+             'access_token',
+             'ticket_code',
+@@ -1232,7 +1235,9 @@ class PosOrder(models.Model):
+         """This function is here to be overriden"""
+         fields = [
+             'id',
++            'uuid',
+             'discount',
++            'skip_change',
+             'product_id',
+             'price_unit',
+             'order_id',
+@@ -1278,6 +1283,7 @@ class PosOrderLine(models.Model):
+ 
+     company_id = fields.Many2one('res.company', string='Company', related="order_id.company_id", store=True)
+     name = fields.Char(string='Line No', required=True, copy=False)
++    skip_change = fields.Boolean('Skip line when sending ticket to kitchen printers.')
+     notice = fields.Char(string='Discount Notice')
+     product_id = fields.Many2one('product.product', string='Product', domain=[('sale_ok', '=', True)], required=True, change_default=True)
+     price_unit = fields.Float(string='Unit Price', digits=0)
+@@ -1303,6 +1309,7 @@ class PosOrderLine(models.Model):
+     refund_orderline_ids = fields.One2many('pos.order.line', 'refunded_orderline_id', 'Refund Order Lines', help='Orderlines in this field are the lines that refunded this orderline.')
+     refunded_orderline_id = fields.Many2one('pos.order.line', 'Refunded Order Line', help='If this orderline is a refund, then the refunded orderline is specified in this field.')
+     refunded_qty = fields.Float('Refunded Quantity', compute='_compute_refund_qty', help='Number of items refunded in this orderline.')
++    uuid = fields.Char(string='Uuid', readonly=True, copy=False)
+ 
+     @api.depends('refund_orderline_ids')
+     def _compute_refund_qty(self):
+@@ -1402,6 +1409,8 @@ class PosOrderLine(models.Model):
+         return {
+             'qty': orderline.qty,
+             'price_unit': orderline.price_unit,
++            'skip_change': orderline.skip_change,
++            'uuid': orderline.uuid,
+             'price_subtotal': orderline.price_subtotal,
+             'price_subtotal_incl': orderline.price_subtotal_incl,
+             'product_id': orderline.product_id.id,
+
+--- a/None
++++ b/addons/point_of_sale/models/pos_printer.py
+@@ -0,0 +1,22 @@
++# -*- coding: utf-8 -*-
++# Part of Odoo. See LICENSE file for full copyright and licensing details.
++
++from odoo import fields, models, api, _
++from odoo.exceptions import ValidationError
++
++class PosPrinter(models.Model):
++
++    _name = 'pos.printer'
++    _description = 'Point of Sale Printer'
++
++    name = fields.Char('Printer Name', required=True, default='Printer', help='An internal identification of the printer')
++    printer_type = fields.Selection(string='Printer Type', default='iot',
++        selection=[('iot', ' Use a printer connected to the IoT Box')])
++    proxy_ip = fields.Char('Proxy IP Address', help="The IP Address or hostname of the Printer's hardware proxy")
++    product_categories_ids = fields.Many2many('pos.category', 'printer_category_rel', 'printer_id', 'category_id', string='Printed Product Categories')
++
++    @api.constrains('proxy_ip')
++    def _constrains_proxy_ip(self):
++        for record in self:
++            if record.printer_type == 'iot' and not record.proxy_ip:
++                raise ValidationError(_("Proxy IP cannot be empty."))
+
+--- a/addons/point_of_sale/models/pos_session.py
++++ b/addons/point_of_sale/models/pos_session.py
+@@ -1654,6 +1654,7 @@ class PosSession(models.Model):
+             'account.tax',
+             'pos.session',
+             'pos.config',
++            'pos.printer',
+             'pos.bill',
+             'res.partner',
+             'stock.picking.type',
+@@ -1887,6 +1888,17 @@ class PosSession(models.Model):
+     def _get_pos_ui_res_currency(self, params):
+         return self.env['res.currency'].search_read(**params['search_params'])[0]
+ 
++    def _get_pos_ui_pos_printer(self, params):
++        return self.env['pos.printer'].search_read(**params['search_params'])
++
++    def _loader_params_pos_printer(self):
++        return {
++            'search_params': {
++                'domain': [('id', 'in', self.config_id.printer_ids.ids)],
++                'fields': ['name', 'proxy_ip', 'product_categories_ids', 'printer_type'],
++            },
++        }
++
+     def _loader_params_pos_category(self):
+         domain = []
+         if self.config_id.limit_categories and self.config_id.iface_available_categ_ids:
+
+--- a/addons/point_of_sale/models/res_config_settings.py
++++ b/addons/point_of_sale/models/res_config_settings.py
+@@ -45,6 +45,8 @@ class ResConfigSettings(models.TransientModel):
+     pos_module_pos_discount = fields.Boolean(related='pos_config_id.module_pos_discount', readonly=False)
+     pos_module_pos_hr = fields.Boolean(related='pos_config_id.module_pos_hr', readonly=False)
+     pos_module_pos_restaurant = fields.Boolean(related='pos_config_id.module_pos_restaurant', readonly=False)
++    pos_is_order_printer = fields.Boolean(compute='_compute_pos_printer', store=True, readonly=False)
++    pos_printer_ids = fields.Many2many(related='pos_config_id.printer_ids', readonly=False)
+ 
+     pos_allowed_pricelist_ids = fields.Many2many('product.pricelist', compute='_compute_pos_allowed_pricelist_ids')
+     pos_amount_authorized_diff = fields.Float(related='pos_config_id.amount_authorized_diff', readonly=False)
+@@ -182,6 +184,13 @@ class ResConfigSettings(models.TransientModel):
+     def _is_cashdrawer_displayed(self, res_config):
+         return res_config.pos_iface_print_via_proxy
+ 
++    @api.depends('pos_module_pos_restaurant', 'pos_config_id')
++    def _compute_pos_printer(self):
++        for res_config in self:
++            res_config.update({
++                'pos_is_order_printer': res_config.pos_config_id.is_order_printer,
++            })
++
+     @api.depends('pos_limit_categories', 'pos_config_id')
+     def _compute_pos_iface_available_categ_ids(self):
+         for res_config in self:

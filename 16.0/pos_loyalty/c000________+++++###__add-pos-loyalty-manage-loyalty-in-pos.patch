@@ -1,0 +1,594 @@
+PR: https://github.com/odoo/odoo/pull/
+
+From: 26e79061f5aeb687455e99f817870027af91f1a1
+From: William Braeckman
+Date: 2022-04-08 09:04:44
+
+Structural Changes: 32
+Total Changes: 537
+
+[ADD] pos_loyalty: manage loyalty in PoS
+
+This module was moved from enterprise to community and now includes
+pos_coupon and pos_gift_card aswell.
+
+TaskId-2675382
+
+================================= pseudo patch: =================================
+
+--- a/None
++++ b/addons/pos_loyalty/models/__init__.py
+@@ -0,0 +1,12 @@
++# -*- coding: utf-8 -*-
++# Part of Odoo. See LICENSE file for full copyright and licensing details.
++
++from . import barcode_rule
++from . import loyalty_card
++from . import loyalty_mail
++from . import loyalty_program
++from . import loyalty_rule
++from . import pos_config
++from . import pos_order_line
++from . import pos_order
++from . import pos_session
+
+--- a/None
++++ b/addons/pos_loyalty/models/barcode_rule.py
+@@ -0,0 +1,10 @@
++# -*- coding: utf-8 -*-
++# Part of Odoo. See LICENSE file for full copyright and licensing details.
++
++from odoo import models, fields
++
++
++class BarcodeRule(models.Model):
++    _inherit = 'barcode.rule'
++
++    type = fields.Selection(selection_add=[('coupon', 'Coupon')], ondelete={'coupon': 'set default'})
+
+--- a/None
++++ b/addons/pos_loyalty/models/loyalty_card.py
+@@ -0,0 +1,30 @@
++# -*- coding: utf-8 -*-
++# Part of Odoo. See LICENSE file for full copyright and licensing details.
++
++from odoo import fields, models
++
++class LoyaltyCard(models.Model):
++    _inherit = 'loyalty.card'
++
++    source_pos_order_id = fields.Many2one('pos.order', "PoS Order Reference",
++        help="PoS order where this coupon was generated.")
++
++    def _get_default_template(self):
++        self.ensure_one()
++        if self.source_pos_order_id:
++            return self.env.ref('pos_loyalty.mail_coupon_template', False)
++        return super()._get_default_template()
++
++    def _get_mail_partner(self):
++        return super()._get_mail_partner() or self.source_pos_order_id.partner_id
++
++    def _get_signature(self):
++        return self.source_pos_order_id.user_id.signature or super()._get_signature()
++
++    def _compute_use_count(self):
++        super()._compute_use_count()
++        read_group_res = self.env['pos.order.line']._read_group(
++            [('coupon_id', 'in', self.ids)], ['id'], ['coupon_id'])
++        count_per_coupon = {r['coupon_id'][0]: r['coupon_id_count'] for r in read_group_res}
++        for card in self:
++            card.use_count += count_per_coupon.get(card.id, 0)
+
+--- a/None
++++ b/addons/pos_loyalty/models/loyalty_mail.py
+@@ -0,0 +1,11 @@
++# -*- coding: utf-8 -*-
++# Part of Odoo. See LICENSE file for full copyright and licensing details.
++
++from odoo import fields, models
++
++class LoyaltyMail(models.Model):
++    _inherit = 'loyalty.mail'
++
++    pos_report_print_id = fields.Many2one('ir.actions.report', string="Print Report", domain=[('model', '=', 'loyalty.card')],
++        help="The report action to be executed when creating a coupon/gift card/loyalty card in the PoS.",
++    )
+
+--- a/None
++++ b/addons/pos_loyalty/models/loyalty_program.py
+@@ -0,0 +1,36 @@
++# -*- coding: utf-8 -*-
++# Part of Odoo. See LICENSE file for full copyright and licensing details.
++
++from odoo import _, fields, models
++from odoo.tools import unique
++
++class LoyaltyProgram(models.Model):
++    _inherit = 'loyalty.program'
++
++    pos_config_ids = fields.Many2many('pos.config', string="Point of Sales", readonly=True)
++    pos_order_count = fields.Integer("PoS Order Count", compute='_compute_pos_order_count')
++
++    def _compute_pos_order_count(self):
++        read_group_res = self.env['pos.order.line']._read_group(
++            [('reward_id', 'in', self.reward_ids.ids)], ['reward_id:array_agg'], ['order_id'])
++        for program in self:
++            program_reward_ids = program.reward_ids.ids
++            program.pos_order_count = sum(1 if any(id in group['reward_id'] for id in program_reward_ids) else 0 for group in read_group_res)
++
++    def _compute_total_order_count(self):
++        super()._compute_total_order_count()
++        for program in self:
++            program.total_order_count += program.pos_order_count
++
++    def action_view_pos_orders(self):
++        self.ensure_one()
++        pos_order_ids = list(unique(r['order_id'] for r in\
++                self.env['pos.order.line'].search_read([('reward_id', 'in', self.reward_ids.ids)], fields=['order_id'])))
++        return {
++            'name': _("PoS Orders"),
++            'view_mode': 'tree,form',
++            'res_model': 'pos.order',
++            'type': 'ir.actions.act_window',
++            'domain': [('id', 'in', pos_order_ids)],
++            'context': dict(self._context, create=False),
++        }
+
+--- a/None
++++ b/addons/pos_loyalty/models/loyalty_rule.py
+@@ -0,0 +1,39 @@
++# -*- coding: utf-8 -*-
++# Part of Odoo. See LICENSE file for full copyright and licensing details.
++
++from odoo import api, fields, models
++from odoo.osv import expression
++
++class LoyaltyRule(models.Model):
++    _inherit = 'loyalty.rule'
++
++    valid_product_ids = fields.Many2many(
++        'product.product', "Valid Products", compute='_compute_valid_product_ids',
++        help="These are the products that are valid for this rule.")
++    any_product = fields.Boolean(
++        compute='_compute_valid_product_ids', help="Technical field, whether all product match")
++
++    promo_barcode = fields.Char("Barcode", compute='_compute_promo_barcode', store=True, readonly=False,
++        help="A technical field used as an alternative to the promo code. "
++        "This is automatically generated when the promo code is changed."
++    )
++
++    @api.depends('product_ids', 'product_category_id', 'product_tag_id') #TODO later: product tags
++    def _compute_valid_product_ids(self):
++        for rule in self:
++            if rule.product_ids or\
++                rule.product_category_id or\
++                rule.product_tag_id or\
++                rule.product_domain not in ('[]', "[['sale_ok', '=', True]]"):
++                domain = rule._get_valid_product_domain()
++                domain = expression.AND([[('available_in_pos', '=', True)], domain])
++                rule.valid_product_ids = self.env['product.product'].search(domain)
++                rule.any_product = False
++            else:
++                rule.any_product = True
++                rule.valid_product_ids = self.env['product.product']
++
++    @api.depends('code')
++    def _compute_promo_barcode(self):
++        for rule in self:
++            rule.promo_barcode = self.env['loyalty.card']._generate_code()
+
+--- a/None
++++ b/addons/pos_loyalty/models/pos_config.py
+@@ -0,0 +1,147 @@
++# -*- coding: utf-8 -*-
++# Part of Odoo. See LICENSE file for full copyright and licensing details.
++
++from odoo import _, api, fields, models
++from odoo.exceptions import UserError
++
++class PosConfig(models.Model):
++    _inherit = 'pos.config'
++
++    def _default_loyalty_program(self):
++        return self.env['loyalty.program'].search([('program_type', '=', 'loyalty')], limit=1)
++
++    use_coupon_programs = fields.Boolean('Coupons & Promotions',
++        help="Use coupon and promotion programs in this PoS configuration.")
++    coupon_program_ids = fields.Many2many(
++        'loyalty.program', string="Coupon Programs", domain=[('program_type', '=', 'coupons')],
++        relation='pos_config_coupon_program_rel')
++    promo_program_ids = fields.Many2many(
++        'loyalty.program', string="Promotion Programs", domain=[('program_type', '=', 'promotion')],
++        relation='pos_config_promo_program_rel')
++
++    loyalty_program_id = fields.Many2one('loyalty.program', "PoS Loyalty Programs", domain=[('program_type', '=', 'loyalty')], default=_default_loyalty_program)
++
++    use_gift_card = fields.Boolean('Gift Cards')
++    gift_card_program_id = fields.Many2one('loyalty.program', "PoS Gift Card Program", domain=[('program_type', '=', 'gift_card')])
++    gift_card_settings = fields.Selection(
++        [
++            ("create_set", "Generate a new barcode and set a price"),
++            ("scan_set", "Scan an existing barcode and set a price"),
++            ("scan_use", "Scan an existing barcode with an existing price"),
++        ],
++        string="Gift Cards settings",
++        default="create_set",
++        help="Defines the way you want to set your gift cards.",
++    )
++
++    # While we select all program types separately they will all behave the same
++    all_program_ids = fields.Many2many('loyalty.program', compute='_compute_all_programs')
++
++    @api.depends('use_coupon_programs', 'coupon_program_ids', 'promo_program_ids',
++        'loyalty_program_id', 'use_gift_card', 'gift_card_program_id')
++    def _compute_all_programs(self):
++        for config in self:
++            programs = self.env['loyalty.program']
++            if config.use_coupon_programs:
++                programs |= config.coupon_program_ids
++                programs |= config.promo_program_ids
++            # This may be a separate field on the config but it actually will be handled just like any other program
++            if config.loyalty_program_id:
++                programs |= config.loyalty_program_id
++            # We also include the gift card program to be able to claim the reward (discount)
++            # This one will behave a little differently as it will display more options
++            if config.use_gift_card:
++                programs |= config.gift_card_program_id
++            config.all_program_ids = programs
++
++    @api.model
++    def set_loyalty_program_to_main_config(self):
++        main_config = self.env.ref('point_of_sale.pos_config_main')
++        default_loyalty_program = self._default_loyalty_program()
++        main_config.write({'module_pos_loyalty': bool(default_loyalty_program), 'loyalty_program_id': default_loyalty_program.id})
++
++    def open_session_cb(self):
++        self.ensure_one()
++        # Check validity of programs before opening a new session
++        invalid_reward_products_msg = ''
++        for reward in self.all_program_ids.reward_ids:
++            if reward.reward_type == 'product':
++                for product in reward.reward_product_ids:
++                    if product.available_in_pos:
++                        continue
++                    invalid_reward_products_msg += "\n\t"
++                    invalid_reward_products_msg += _(
++                        "Program: %(name)s, Reward Product: `%(reward_product)s`",
++                        name=reward.program_id.name,
++                        reward_product=product.name,
++                    )
++        if self.gift_card_program_id:
++            for product in self.gift_card_program_id.rule_ids.valid_product_ids:
++                if product.available_in_pos:
++                    continue
++                invalid_reward_products_msg += "\n\t"
++                invalid_reward_products_msg += _(
++                    "Program: %(name)s, Rule Product: `%(rule_product)s`",
++                    name=reward.program_id.name,
++                    rule_product=product.name,
++                )
++
++        if invalid_reward_products_msg:
++            prefix_error_msg = _("To continue, make the following reward products available in Point of Sale.")
++            raise UserError(f"{prefix_error_msg}\n{invalid_reward_products_msg}")
++        if self.use_gift_card and self.gift_card_program_id:
++            # Do not allow gift_card_program_id with more than one rule or reward, and check that they make sense
++            gc_program = self.gift_card_program_id
++            if len(gc_program.reward_ids) > 1:
++                raise UserError(_('Invalid gift card program. More than one reward.'))
++            elif len(gc_program.rule_ids) > 1:
++                raise UserError(_('Invalid gift card program. More than one rule.'))
++            rule = gc_program.rule_ids
++            if rule.reward_point_amount != 1 or rule.reward_point_mode != 'money':
++                raise UserError(_('Invalid gift card program rule. Use 1 point per currency spent.'))
++            reward = gc_program.reward_ids
++            if reward.reward_type != 'discount' or reward.discount_mode != 'per_point' or reward.discount != 1:
++                raise UserError(_('Invalid gift card program reward. Use 1 currency per point discount.'))
++        return super().open_session_cb()
++
++    def use_coupon_code(self, code, creation_date, partner_id):
++        self.ensure_one()
++        # Ordering by partner id to use the first assigned to the partner in case multiple coupons have the same code
++        #  it could happen with loyalty programs using a code
++        # Points desc so that in coupon mode one could use a coupon multiple times
++        coupon = self.env['loyalty.card'].search(
++            [('program_id', 'in', self.all_program_ids.ids), ('partner_id', 'in', (False, partner_id)), ('code', '=', code)],
++            order='partner_id, points desc', limit=1)
++        if not coupon or not coupon.program_id.active:
++            return {
++                'successful': False,
++                'payload': {
++                    'error_message': _('This coupon is invalid (%s).', code),
++                },
++            }
++        check_date = fields.Date.from_string(creation_date[:11])
++        if (coupon.expiration_date and coupon.expiration_date < check_date) or\
++            (coupon.program_id.date_to and coupon.program_id.date_to <= fields.Date.context_today(self)) or\
++            (coupon.program_id.limit_usage and coupon.program_id.total_order_count >= coupon.program_id.max_usage):
++            return {
++                'successful': False,
++                'payload': {
++                    'error_message': _('This coupon is expired (%s).', code),
++                },
++            }
++        if not coupon.program_id.reward_ids or not any(reward.required_points <= coupon.points for reward in coupon.program_id.reward_ids):
++            return {
++                'successful': False,
++                'payload': {
++                    'error_message': _('No reward can be claimed with this coupon.'),
++                },
++            }
++        return {
++            'successful': True,
++            'payload': {
++                'program_id': coupon.program_id.id,
++                'coupon_id': coupon.id,
++                'coupon_partner_id': coupon.partner_id.id,
++                'points': coupon.points,
++            },
++        }
+
+--- a/None
++++ b/addons/pos_loyalty/models/pos_order.py
+@@ -0,0 +1,126 @@
++# -*- coding: utf-8 -*-
++# Part of Odoo. See LICENSE file for full copyright and licensing details.
++
++from collections import defaultdict
++from odoo import _, models
++
++class PosOrder(models.Model):
++    _inherit = 'pos.order'
++
++    def validate_coupon_programs(self, point_changes, new_codes):
++        """
++        This is called upon validating the order in the pos.
++
++        This will check the balance for any pre-existing coupon to make sure that the rewards are in fact all claimable.
++        This will also check that any set code for coupons do not exist in the database.
++        """
++        point_changes = {int(k): v for k, v in point_changes.items()}
++        coupon_ids_from_pos = set(point_changes.keys())
++        coupons = self.env['loyalty.card'].browse(coupon_ids_from_pos).exists().filtered('program_id.active')
++        coupon_difference = set(coupons.ids) ^ coupon_ids_from_pos
++        if coupon_difference:
++            return {
++                'successful': False,
++                'payload': {
++                    'message': _('Some coupons are invalid. The applied coupons have been updated. Please check the order.'),
++                    'removed_coupons': list(coupon_difference),
++                }
++            }
++        for coupon in coupons:
++            if (coupon.points + point_changes[coupon.id]) < 0:
++                return {
++                    'successful': False,
++                    'payload': {
++                        'message': _('There are not enough points for the coupon: %s.', coupon.code),
++                        'updated_points': {c.id: c.points for c in coupons}
++                    }
++                }
++        # Check existing coupons
++        coupons = self.env['loyalty.card'].search([('code', 'in', new_codes)])
++        if coupons:
++            return {
++                'successful': False,
++                'payload': {
++                    'message': _('The following codes already exist in the database, perhaps they were already sold?\n%s',
++                        ', '.join(coupons.mapped('code'))),
++                }
++            }
++        return {
++            'successful': True,
++            'payload': {},
++        }
++
++    def confirm_coupon_programs(self, coupon_data):
++        """
++        This is called after the order is created.
++
++        This will create all necessary coupons and link them to their line orders etc..
++
++        It will also return the points of all concerned coupons to be updated in the cache.
++        """
++        # Keys are stringified when using rpc
++        coupon_data = {int(k): v for k, v in coupon_data.items()}
++        # Map negative id to newly created ids.
++        coupon_new_id_map = {k: k for k in coupon_data.keys() if k > 0}
++
++        # Create the coupons that were awarded by the order.
++        coupons_to_create = {k: v for k, v in coupon_data.items() if k < 0}
++        coupon_create_vals = [{
++            'program_id': p['program_id'],
++            'partner_id': p.get('partner_id', False),
++            'code': p.get('barcode') or self.env['loyalty.card']._generate_code(),
++            'points': 0,
++            'source_pos_order_id': self.id,
++        } for p in coupons_to_create.values()]
++        # Pos users don't have the create permission
++        new_coupons = self.env['loyalty.card'].sudo().create(coupon_create_vals)
++        # Map the newly created coupons
++        for old_id, new_id in zip(coupons_to_create.keys(), new_coupons):
++            coupon_new_id_map[new_id.id] = old_id
++
++        all_coupons = self.env['loyalty.card'].browse(coupon_new_id_map.keys()).exists()
++        lines_per_reward_code = defaultdict(lambda: self.env['pos.order.line'])
++        for line in self.lines:
++            if not line.reward_identifier_code:
++                continue
++            lines_per_reward_code[line.reward_identifier_code] |= line
++        for coupon in all_coupons:
++            if coupon.id in coupon_new_id_map:
++                # Coupon existed previously, update amount of points.
++                coupon.points += coupon_data[coupon_new_id_map[coupon.id]]['points']
++            for reward_code in coupon_data[coupon_new_id_map[coupon.id]].get('line_codes', []):
++                lines_per_reward_code[reward_code].coupon_id = coupon
++        # Reports per program
++        report_per_program = {}
++        coupon_per_report = defaultdict(list)
++        for coupon in new_coupons:
++            if coupon.program_id not in report_per_program:
++                report_per_program[coupon.program_id] = coupon.program_id.communication_plan_ids.\
++                    filtered(lambda c: c.trigger == 'create').pos_report_print_id
++            for report in report_per_program[coupon.program_id]:
++                coupon_per_report[report.id].append(coupon.id)
++        return {
++            'coupon_updates': [{
++                'old_id': coupon_new_id_map[coupon.id],
++                'id': coupon.id,
++                'points': coupon.points,
++                'code': coupon.code,
++                'program_id': coupon.program_id.id,
++                'partner_id': coupon.partner_id.id,
++            } for coupon in all_coupons if coupon.program_id.is_nominative],
++            'program_updates': [{
++                'program_id': program.id,
++                'usages': program.total_order_count,
++            } for program in all_coupons.program_id],
++            'new_coupon_info': [{
++                'program_name': coupon.program_id.name,
++                'expiration_date': coupon.expiration_date,
++                'code': coupon.code,
++            } for coupon in new_coupons if coupon.program_id.applies_on == 'future'],
++            'coupon_report': coupon_per_report,
++        }
++
++    def _get_fields_for_order_line(self):
++        fields = super(PosOrder, self)._get_fields_for_order_line()
++        fields.extend(['is_reward_line', 'reward_id', 'coupon_id', 'reward_identifier_code', 'points_cost'])
++        return fields
+
+--- a/None
++++ b/addons/pos_loyalty/models/pos_order_line.py
+@@ -0,0 +1,30 @@
++# -*- coding: utf-8 -*-
++# Part of Odoo. See LICENSE file for full copyright and licensing details.
++
++from odoo import fields, models
++
++class PosOrderLine(models.Model):
++    _inherit = 'pos.order.line'
++
++    is_reward_line = fields.Boolean(
++        help="Whether this line is part of a reward or not.")
++    reward_id = fields.Many2one(
++        'loyalty.reward', "Reward", ondelete='restrict',
++        help="The reward associated with this line.")
++    coupon_id = fields.Many2one(
++        'loyalty.card', "Coupon", ondelete='restrict',
++        help="The coupon used to claim that reward.")
++    reward_identifier_code = fields.Char(help="""
++        Technical field used to link multiple reward lines from the same reward together.
++    """)
++    points_cost = fields.Float(help="How many point this reward cost on the coupon.")
++
++    def _order_line_fields(self, line, session_id=None):
++        res = super()._order_line_fields(line, session_id)
++        # coupon_id may be negative in case of new coupons, they will be added after validating the order.
++        if 'coupon_id' in res[2] and res[2]['coupon_id'] < 1:
++            res[2].pop('coupon_id')
++        return res
++
++    def _is_not_sellable_line(self):
++        return super().is_not_sellable_line() or self.reward_id
+
+--- a/None
++++ b/addons/pos_loyalty/models/pos_session.py
+@@ -0,0 +1,96 @@
++# -*- coding: utf-8 -*-
++# Part of Odoo. See LICENSE file for full copyright and licensing details.
++
++from odoo import models
++from odoo.osv.expression import OR
++
++class PosSession(models.Model):
++    _inherit = 'pos.session'
++
++    def _pos_ui_models_to_load(self):
++        result = super()._pos_ui_models_to_load()
++        if self.config_id.all_program_ids:
++            result += [
++                'loyalty.program',
++                'loyalty.rule',
++                'loyalty.reward',
++            ]
++        return result
++
++    def _loader_params_loyalty_program(self):
++        return {
++            'search_params': {
++                'domain': [('id', 'in', self.config_id.all_program_ids.ids)],
++                'fields': ['name', 'trigger', 'applies_on', 'program_type', 'date_to',
++                    'limit_usage', 'max_usage', 'is_nominative', 'portal_point_name'],
++            },
++        }
++
++    def _loader_params_loyalty_rule(self):
++        return {
++            'search_params': {
++                'domain': [('program_id', 'in', self.config_id.all_program_ids.ids)],
++                'fields': ['program_id', 'valid_product_ids', 'any_product', 'currency_id',
++                    'reward_point_amount', 'reward_point_split', 'reward_point_mode',
++                    'minimum_qty', 'minimum_amount', 'minimum_amount_tax_mode', 'mode', 'code'],
++            }
++        }
++
++    def _loader_params_loyalty_reward(self):
++        return {
++            'search_params': {
++                'domain': [('program_id', 'in', self.config_id.all_program_ids.ids)],
++                'fields': ['description', 'program_id', 'reward_type', 'required_points', 'clear_wallet', 'currency_id',
++                    'discount', 'discount_mode', 'discount_applicability', 'all_discount_product_ids', 'is_global_discount',
++                    'discount_max_amount', 'discount_line_product_id',
++                    'multi_product', 'reward_product_ids', 'reward_product_qty', 'reward_product_uom_id'],
++            }
++        }
++
++    def _get_pos_ui_loyalty_program(self, params):
++        return self.env['loyalty.program'].search_read(**params['search_params'])
++
++    def _get_pos_ui_loyalty_rule(self, params):
++        return self.env['loyalty.rule'].search_read(**params['search_params'])
++
++    def _get_pos_ui_loyalty_reward(self, params):
++        return self.env['loyalty.reward'].search_read(**params['search_params'])
++
++    def _get_pos_ui_res_partner(self, params):
++        result = super()._get_pos_ui_res_partner(params)
++        # In order to make loyalty programs work offline we load the partner's point into
++        # a non-existant field 'loyalty_points'.
++        if self.config_id.loyalty_program_id:
++            # collect ids in a list, group by id and default points to 0
++            partner_ids = []
++            res_by_id = {}
++            for res in result:
++                partner_ids.append(res['id'])
++                res_by_id[res['id']] = res
++                res['loyalty_points'] = 0
++                res['loyalty_card_id'] = False
++            # Direct query to avoid loading loyalty cards in the cache for no reason.
++            # There is no context where we would need to flush.
++            query = self.env['loyalty.card']._search(
++                [('program_id', '=', self.config_id.loyalty_program_id.id), ('partner_id', 'in', partner_ids)]
++            )
++            query_str, params = query.select('id', 'partner_id', 'points')
++            self.env.cr.execute(query_str, params)
++            for res in self.env.cr.dictfetchall():
++                # The result of where_calc also includes partner_id is null.
++                if not res.get('partner_id'):
++                    continue
++                res_by_id[res['partner_id']]['loyalty_points'] = res['points']
++                res_by_id[res['partner_id']]['loyalty_card_id'] = res['id']
++        return result
++
++    def _loader_params_product_product(self):
++        result = super(PosSession, self)._loader_params_product_product()
++        config = self.config_id
++        if config.all_program_ids:
++            programs = config.all_program_ids
++            rewards = programs.reward_ids
++            products = (programs.rule_ids.valid_product_ids | rewards.discount_line_product_id) |\
++                (rewards.all_discount_product_ids | rewards.reward_product_ids)
++            result['search_params']['domain'] = OR([result['search_params']['domain'], [('id', 'in', products.ids)]])
++        return result

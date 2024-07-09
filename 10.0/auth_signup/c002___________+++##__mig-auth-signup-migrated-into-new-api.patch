@@ -1,0 +1,474 @@
+PR: https://github.com/odoo/odoo/pull/
+
+From: 416903d1b953459bf1c3a01ffc7c6bb474789724
+From: Kinjal Mehta
+Date: 2015-12-16 12:39:41
+
+Structural Changes: 9
+Total Changes: 280
+
+[MIG] auth_signup: Migrated into new api.
+
+================================= pseudo patch: =================================
+
+--- a/addons/auth_signup/models/res_config.py
++++ b/addons/auth_signup/models/res_config.py
+@@ -1,34 +1,31 @@
+ # -*- coding: utf-8 -*-
+ # Part of Odoo. See LICENSE file for full copyright and licensing details.
+ 
+-from openerp.osv import osv, fields
+-from openerp.tools.safe_eval import safe_eval
++from odoo import api, fields, models
++from odoo.tools.safe_eval import safe_eval
+ 
+-class base_config_settings(osv.TransientModel):
++class BaseConfigSettings(models.TransientModel):
+     _inherit = 'base.config.settings'
+ 
+-    _columns = {
+-        'auth_signup_reset_password': fields.boolean('Enable password reset from Login page',
+-            help="This allows users to trigger a password reset from the Login page."),
+-        'auth_signup_uninvited': fields.boolean('Allow external users to sign up',
+-            help="If unchecked, only invited users may sign up."),
+-        'auth_signup_template_user_id': fields.many2one('res.users',
+-            string='Template user for new users created through signup'),
+-    }
++    auth_signup_reset_password = fields.Boolean(string='Enable password reset from Login page', help="This allows users to trigger a password reset from the Login page.")
++    auth_signup_uninvited = fields.Boolean(string='Allow external users to sign up', help="If unchecked, only invited users may sign up.")
++    auth_signup_template_user_id = fields.Many2one('res.users', string='Template user for new users created through signup')
+ 
+-    def get_default_auth_signup_template_user_id(self, cr, uid, fields, context=None):
+-        icp = self.pool.get('ir.config_parameter')
++    @api.model
++    def get_default_auth_signup_template_user_id(self, fields):
++        IrConfigParam = self.env['ir.config_parameter']
+         # we use safe_eval on the result, since the value of the parameter is a nonempty string
+         return {
+-            'auth_signup_reset_password': safe_eval(icp.get_param(cr, uid, 'auth_signup.reset_password', 'False')),
+-            'auth_signup_uninvited': safe_eval(icp.get_param(cr, uid, 'auth_signup.allow_uninvited', 'False')),
+-            'auth_signup_template_user_id': safe_eval(icp.get_param(cr, uid, 'auth_signup.template_user_id', 'False')),
++            'auth_signup_reset_password': safe_eval(IrConfigParam.get_param('auth_signup.reset_password', 'False')),
++            'auth_signup_uninvited': safe_eval(IrConfigParam.get_param('auth_signup.allow_uninvited', 'False')),
++            'auth_signup_template_user_id': safe_eval(IrConfigParam.get_param('auth_signup.template_user_id', 'False')),
+         }
+ 
+-    def set_auth_signup_template_user_id(self, cr, uid, ids, context=None):
+-        config = self.browse(cr, uid, ids[0], context=context)
+-        icp = self.pool.get('ir.config_parameter')
++    @api.multi
++    def set_auth_signup_template_user_id(self):
++        self.ensure_one()
++        IrConfigParam = self.env['ir.config_parameter']
+         # we store the repr of the values, since the value of the parameter is a required string
+-        icp.set_param(cr, uid, 'auth_signup.reset_password', repr(config.auth_signup_reset_password))
+-        icp.set_param(cr, uid, 'auth_signup.allow_uninvited', repr(config.auth_signup_uninvited))
+-        icp.set_param(cr, uid, 'auth_signup.template_user_id', repr(config.auth_signup_template_user_id.id))
++        IrConfigParam.set_param('auth_signup.reset_password', repr(self.auth_signup_reset_password))
++        IrConfigParam.set_param('auth_signup.allow_uninvited', repr(self.auth_signup_uninvited))
++        IrConfigParam.set_param('auth_signup.template_user_id', repr(self.auth_signup_template_user_id.id))
+
+--- a/addons/auth_signup/models/res_partner.py
++++ b/addons/auth_signup/models/res_partner.py
+@@ -1,14 +1,14 @@
+ # -*- coding: utf-8 -*-
+ # Part of Odoo. See LICENSE file for full copyright and licensing details.
+ 
+-from datetime import datetime, timedelta
+ import random
+-from urlparse import urljoin
+ import werkzeug
+ 
+-from openerp.osv import osv, fields
+-from openerp.tools.misc import DEFAULT_SERVER_DATETIME_FORMAT, ustr
+-from openerp.tools.translate import _
++from datetime import datetime, timedelta
++from urlparse import urljoin
++
++from odoo import api, fields, models, _
++
+ 
+ class SignupError(Exception):
+     pass
+@@ -20,35 +20,48 @@ def random_token():
+ 
+ def now(**kwargs):
+     dt = datetime.now() + timedelta(**kwargs)
+-    return dt.strftime(DEFAULT_SERVER_DATETIME_FORMAT)
++    return fields.Datetime.to_string(dt)
++
+ 
+-class res_partner(osv.Model):
++class ResPartner(models.Model):
+     _inherit = 'res.partner'
+ 
+-    def _get_signup_valid(self, cr, uid, ids, name, arg, context=None):
++    signup_token = fields.Char(copy=False)
++    signup_type = fields.Char(string='Signup Token Type', copy=False)
++    signup_expiration = fields.Datetime(copy=False)
++    signup_valid = fields.Boolean(compute='_compute_signup_valid', string='Signup Token is Valid')
++    signup_url = fields.Char(compute='_compute_signup_url', string='Signup URL')
++
++    @api.multi
++    def _compute_signup_valid(self):
+         dt = now()
+-        res = {}
+-        for partner in self.browse(cr, uid, ids, context):
+-            res[partner.id] = bool(partner.signup_token) and \
+-                                (not partner.signup_expiration or dt <= partner.signup_expiration)
+-        return res
++        for partner in self:
++            partner.signup_valid = bool(partner.signup_token) and \
++            (not partner.signup_expiration or dt <= partner.signup_expiration)
+ 
+-    def _get_signup_url_for_action(self, cr, uid, ids, action=None, view_type=None, menu_id=None, res_id=None, model=None, context=None):
++    @api.multi
++    def _compute_signup_url(self):
++        """ proxy for function field towards actual implementation """
++        result = self._get_signup_url_for_action()
++        for partner in self:
++            partner.signup_url = result.get(partner.id, False)
++
++    @api.multi
++    def _get_signup_url_for_action(self, action=None, view_type=None, menu_id=None, res_id=None, model=None):
+         """ generate a signup url for the given partner ids and action, possibly overriding
+             the url state components (menu_id, id, view_type) """
+-        if context is None:
+-            context= {}
+-        res = dict.fromkeys(ids, False)
+-        base_url = self.pool.get('ir.config_parameter').get_param(cr, uid, 'web.base.url')
+-        for partner in self.browse(cr, uid, ids, context):
++
++        res = dict.fromkeys(self.ids, False)
++        base_url = self.env['ir.config_parameter'].get_param('web.base.url')
++        for partner in self:
+             # when required, make sure the partner has a valid signup token
+-            if context.get('signup_valid') and not partner.user_ids:
+-                self.signup_prepare(cr, uid, [partner.id], context=context)
++            if self.env.context.get('signup_valid') and not partner.user_ids:
++                partner.signup_prepare()
+ 
+             route = 'login'
+             # the parameters to encode for the query
+-            query = dict(db=cr.dbname)
+-            signup_type = context.get('signup_force_type_in_url', partner.signup_type or '')
++            query = dict(db=self.env.cr.dbname)
++            signup_type = self.env.context.get('signup_force_type_in_url', partner.signup_type or '')
+             if signup_type:
+                 route = 'reset_password' if signup_type == 'reset' else signup_type
+ 
+@@ -75,60 +88,50 @@ class res_partner(osv.Model):
+                 query['redirect'] = '/web#' + werkzeug.url_encode(fragment)
+ 
+             res[partner.id] = urljoin(base_url, "/web/%s?%s" % (route, werkzeug.url_encode(query)))
+-
+         return res
+ 
+-    def _get_signup_url(self, cr, uid, ids, name, arg, context=None):
+-        """ proxy for function field towards actual implementation """
+-        return self._get_signup_url_for_action(cr, uid, ids, context=context)
+-
+-    _columns = {
+-        'signup_token': fields.char('Signup Token', copy=False),
+-        'signup_type': fields.char('Signup Token Type', copy=False),
+-        'signup_expiration': fields.datetime('Signup Expiration', copy=False),
+-        'signup_valid': fields.function(_get_signup_valid, type='boolean', string='Signup Token is Valid'),
+-        'signup_url': fields.function(_get_signup_url, type='char', string='Signup URL'),
+-    }
++    @api.multi
++    def action_signup_prepare(self):
++        return self.signup_prepare()
+ 
+-    def action_signup_prepare(self, cr, uid, ids, context=None):
+-        return self.signup_prepare(cr, uid, ids, context=context)
++    @api.multi
++    def signup_cancel(self):
++        return self.write({'signup_token': False, 'signup_type': False, 'signup_expiration': False})
+ 
+-    def signup_cancel(self, cr, uid, ids, context=None):
+-        return self.write(cr, uid, ids, {'signup_token': False, 'signup_type': False, 'signup_expiration': False}, context=context)
+-
+-    def signup_prepare(self, cr, uid, ids, signup_type="signup", expiration=False, context=None):
++    @api.multi
++    def signup_prepare(self, signup_type="signup", expiration=False):
+         """ generate a new token for the partners with the given validity, if necessary
+             :param expiration: the expiration datetime of the token (string, optional)
+         """
+-        for partner in self.browse(cr, uid, ids, context):
++        for partner in self:
+             if expiration or not partner.signup_valid:
+                 token = random_token()
+-                while self._signup_retrieve_partner(cr, uid, token, context=context):
++                while self._signup_retrieve_partner(token):
+                     token = random_token()
+                 partner.write({'signup_token': token, 'signup_type': signup_type, 'signup_expiration': expiration})
+         return True
+ 
+-    def _signup_retrieve_partner(self, cr, uid, token,
+-            check_validity=False, raise_exception=False, context=None):
++    @api.model
++    def _signup_retrieve_partner(self, token, check_validity=False, raise_exception=False):
+         """ find the partner corresponding to a token, and possibly check its validity
+             :param token: the token to resolve
+             :param check_validity: if True, also check validity
+             :param raise_exception: if True, raise exception instead of returning False
+             :return: partner (browse record) or False (if raise_exception is False)
+         """
+-        partner_ids = self.search(cr, uid, [('signup_token', '=', token)], context=context)
+-        if not partner_ids:
++        partner = self.search([('signup_token', '=', token)], limit=1)
++        if not partner:
+             if raise_exception:
+                 raise SignupError("Signup token '%s' is not valid" % token)
+             return False
+-        partner = self.browse(cr, uid, partner_ids[0], context)
+         if check_validity and not partner.signup_valid:
+             if raise_exception:
+                 raise SignupError("Signup token '%s' is no longer valid" % token)
+             return False
+         return partner
+ 
+-    def signup_retrieve_info(self, cr, uid, token, context=None):
++    @api.model
++    def signup_retrieve_info(self, token):
+         """ retrieve the user info about the token
+             :return: a dictionary with the user information:
+                 - 'db': the name of the database
+@@ -137,8 +140,8 @@ class res_partner(osv.Model):
+                 - 'login': the user login, if the user already exists
+                 - 'email': the partner email, if the user does not exist
+         """
+-        partner = self._signup_retrieve_partner(cr, uid, token, raise_exception=True, context=None)
+-        res = {'db': cr.dbname}
++        partner = self._signup_retrieve_partner(token, raise_exception=True)
++        res = {'db': self.env.cr.dbname}
+         if partner.signup_valid:
+             res['token'] = token
+             res['name'] = partner.name
+@@ -146,4 +149,4 @@ class res_partner(osv.Model):
+             res['login'] = partner.user_ids[0].login
+         else:
+             res['email'] = partner.email or ''
+-        return res
+\ No newline at end of file
++        return res
+
+--- a/addons/auth_signup/models/res_users.py
++++ b/addons/auth_signup/models/res_users.py
+@@ -1,44 +1,30 @@
+ # -*- coding: utf-8 -*-
+ # Part of Odoo. See LICENSE file for full copyright and licensing details.
+ 
+-from datetime import datetime, timedelta
+-import random
+-import werkzeug
+ 
+-from openerp.addons.base.ir.ir_mail_server import MailDeliveryException
+-from openerp.osv import osv, fields
+-from openerp.tools.misc import DEFAULT_SERVER_DATETIME_FORMAT, ustr
+ from ast import literal_eval
+-from openerp.tools.translate import _
+-from openerp.exceptions import UserError
+ 
+-class SignupError(Exception):
+-    pass
++from odoo import api, fields, models, _
++from odoo.exceptions import UserError
++from odoo.tools.misc import ustr
+ 
+-def random_token():
+-    # the token has an entropy of about 120 bits (6 bits/char * 20 chars)
+-    chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789'
+-    return ''.join(random.SystemRandom().choice(chars) for i in xrange(20))
++from odoo.addons.base.ir.ir_mail_server import MailDeliveryException
++from odoo.addons.auth_signup.models.res_partner import SignupError, now
+ 
+-def now(**kwargs):
+-    dt = datetime.now() + timedelta(**kwargs)
+-    return dt.strftime(DEFAULT_SERVER_DATETIME_FORMAT)
+ 
+-class res_users(osv.Model):
++class ResUsers(models.Model):
+     _inherit = 'res.users'
+ 
+-    def _get_state(self, cr, uid, ids, name, arg, context=None):
+-        res = {}
+-        for user in self.browse(cr, uid, ids, context):
+-            res[user.id] = ('active' if user.login_date else 'new')
+-        return res
++    state = fields.Selection(compute='_compute_state', string='Status',
++                 selection=[('new', 'Never Connected'), ('active', 'Activated')])
+ 
+-    _columns = {
+-        'state': fields.function(_get_state, string='Status', type='selection',
+-                    selection=[('new', 'Never Connected'), ('active', 'Connected')]),
+-    }
++    @api.multi
++    def _compute_state(self):
++        for user in self:
++            user.state = 'active' if user.login_date else 'new'
+ 
+-    def signup(self, cr, uid, values, token=None, context=None):
++    @api.model
++    def signup(self, values, token=None):
+         """ signup a user, to either:
+             - create a new user (no token), or
+             - create a user for a partner (with token, but no user for partner), or
+@@ -49,9 +35,7 @@ class res_users(osv.Model):
+         """
+         if token:
+             # signup with a token: find the corresponding partner id
+-            res_partner = self.pool.get('res.partner')
+-            partner = res_partner._signup_retrieve_partner(
+-                            cr, uid, token, check_validity=True, raise_exception=True, context=None)
++            partner = self.env['res.partner']._signup_retrieve_partner(token, check_validity=True, raise_exception=True)
+             # invalidate signup token
+             partner.write({'signup_token': False, 'signup_type': False, 'signup_expiration': False})
+ 
+@@ -69,7 +53,7 @@ class res_users(osv.Model):
+                 values.pop('login', None)
+                 values.pop('name', None)
+                 partner_user.write(values)
+-                return (cr.dbname, partner_user.login, values.get('password'))
++                return (self.env.cr.dbname, partner_user.login, values.get('password'))
+             else:
+                 # user does not exist: sign up invited user
+                 values.update({
+@@ -80,23 +64,25 @@ class res_users(osv.Model):
+                 if partner.company_id:
+                     values['company_id'] = partner.company_id.id
+                     values['company_ids'] = [(6, 0, [partner.company_id.id])]
+-                self._signup_create_user(cr, uid, values, context=context)
++                self._signup_create_user(values)
+         else:
+             # no token, sign up an external user
+             values['email'] = values.get('email') or values.get('login')
+-            self._signup_create_user(cr, uid, values, context=context)
++            self._signup_create_user(values)
+ 
+-        return (cr.dbname, values.get('login'), values.get('password'))
++        return (self.env.cr.dbname, values.get('login'), values.get('password'))
+ 
+-    def _signup_create_user(self, cr, uid, values, context=None):
++    @api.model
++    def _signup_create_user(self, values):
+         """ create a new user from the template user """
+-        ir_config_parameter = self.pool.get('ir.config_parameter')
+-        template_user_id = literal_eval(ir_config_parameter.get_param(cr, uid, 'auth_signup.template_user_id', 'False'))
+-        assert template_user_id and self.exists(cr, uid, template_user_id, context=context), 'Signup: invalid template user'
++        IrConfigParam = self.env['ir.config_parameter']
++        template_user_id = literal_eval(IrConfigParam.get_param('auth_signup.template_user_id', 'False'))
++        template_user = self.browse(template_user_id)
++        assert template_user.exists(), 'Signup: invalid template user'
+ 
+         # check that uninvited users may sign up
+         if 'partner_id' not in values:
+-            if not literal_eval(ir_config_parameter.get_param(cr, uid, 'auth_signup.allow_uninvited', 'False')):
++            if not literal_eval(IrConfigParam.get_param('auth_signup.allow_uninvited', 'False')):
+                 raise SignupError('Signup is not allowed for uninvited users')
+ 
+         assert values.get('login'), "Signup: no login given for new user"
+@@ -104,73 +90,67 @@ class res_users(osv.Model):
+ 
+         # create a copy of the template user (attached to a specific partner_id if given)
+         values['active'] = True
+-        context = dict(context or {}, no_reset_password=True)
+         try:
+-            with cr.savepoint():
+-                return self.copy(cr, uid, template_user_id, values, context=context)
++            with self.env.cr.savepoint():
++                return template_user.with_context(no_reset_password=True).copy(values)
+         except Exception, e:
+             # copy may failed if asked login is not available.
+             raise SignupError(ustr(e))
+ 
+-    def reset_password(self, cr, uid, login, context=None):
++    def reset_password(self, login):
+         """ retrieve the user corresponding to login (login or email),
+             and reset their password
+         """
+-        user_ids = self.search(cr, uid, [('login', '=', login)], context=context)
+-        if not user_ids:
+-            user_ids = self.search(cr, uid, [('email', '=', login)], context=context)
+-        if len(user_ids) != 1:
++        users = self.search([('login', '=', login)])
++        if not users:
++            users = self.search([('email', '=', login)])
++        if len(users) != 1:
+             raise Exception(_('Reset password: invalid username or email'))
+-        return self.action_reset_password(cr, uid, user_ids, context=context)
++        return users.action_reset_password()
+ 
+-    def action_reset_password(self, cr, uid, ids, context=None):
++    @api.multi
++    def action_reset_password(self):
+         """ create signup token for each user, and send their signup url by email """
+         # prepare reset password signup
+-        create_mode = bool(context.get('create_user'))
+-        res_partner = self.pool.get('res.partner')
+-        partner_ids = [user.partner_id.id for user in self.browse(cr, uid, ids, context)]
++        create_mode = bool(self.env.context.get('create_user'))
+ 
+         # no time limit for initial invitation, only for reset password
+         expiration = False if create_mode else now(days=+1)
+ 
+-        res_partner.signup_prepare(cr, uid, partner_ids, signup_type="reset", expiration=expiration, context=context)
+-
+-        context = dict(context or {})
++        self.mapped('partner_id').signup_prepare(signup_type="reset", expiration=expiration)
+ 
+         # send email to users with their signup url
+         template = False
+         if create_mode:
+             try:
+-                # get_object() raises ValueError if record does not exist
+-                template = self.pool.get('ir.model.data').get_object(cr, uid, 'auth_signup', 'set_password_email')
++                template = self.env.ref('auth_signup.set_password_email', raise_if_not_found=False)
+             except ValueError:
+                 pass
+-        if not bool(template):
+-            template = self.pool.get('ir.model.data').get_object(cr, uid, 'auth_signup', 'reset_password_email')
++        if not template:
++            template = self.env.ref('auth_signup.reset_password_email')
+         assert template._name == 'mail.template'
+ 
+-        for user in self.browse(cr, uid, ids, context):
++        for user in self:
+             if not user.email:
+                 raise UserError(_("Cannot send email: user %s has no email address.") % user.name)
+-            context['lang'] = user.lang                
+-            self.pool.get('mail.template').send_mail(cr, uid, template.id, user.id, force_send=True, raise_exception=True, context=context)
++            template.with_context(lang=user.lang).send_mail(user.id, force_send=True, raise_exception=True)
+ 
+-    def create(self, cr, uid, values, context=None):
+-        if context is None:
+-            context = {}
++    @api.model
++    def create(self, values):
+         # overridden to automatically invite user to sign up
+-        user_id = super(res_users, self).create(cr, uid, values, context=context)
+-        user = self.browse(cr, uid, user_id, context=context)
+-        if user.email and not context.get('no_reset_password'):
+-            context = dict(context, create_user=True)
++        user = super(ResUsers, self).create(values)
++        if user.email and not self.env.context.get('no_reset_password'):
+             try:
+-                self.action_reset_password(cr, uid, [user.id], context=context)
++                user.with_context(create_user=True).action_reset_password()
+             except MailDeliveryException:
+-                self.pool.get('res.partner').signup_cancel(cr, uid, [user.partner_id.id], context=context)
+-        return user_id
++                user.partner_id.with_context(create_user=True).signup_cancel()
++        return user
+ 
+-    def copy(self, cr, uid, id, default=None, context=None):
++    @api.multi
++    def copy(self, default=None):
++        self.ensure_one()
++        context = self.env.context
+         if not default or not default.get('email'):
+             # avoid sending email to the user we are duplicating
+-            context = dict(context or {}, reset_password=False)
+-        return super(res_users, self).copy(cr, uid, id, default=default, context=context)
++            context['reset_password'] = False
++        return super(ResUsers, self.with_context(context)).copy(default=default)

@@ -1,0 +1,196 @@
+PR: https://github.com/odoo/odoo/pull/142689
+
+From: 4bddbf30cb91fd051f456676b935bad879dca010
+From: Ahmed Khalaf
+Date: 2023-11-23 21:39:40
+
+Structural Changes: 6
+Total Changes: 70
+
+[IMP] stock: move detailed operation view to smart button
+
+After this commit, detailed operations is no longer a tab in the picking
+but under a smart button in the form.
+
+The field `show_operations` on picking type is no longer useful and will
+be removed in a later PR targeting master
+
+closes odoo/odoo#142689
+
+Taskid: 3486636
+X-original-commit: 5a69ef6e04013ca0eb6417d1f390d577950761a4
+Related: odoo/enterprise#51025
+Signed-off-by: Arnold Moyaux (arm) <arm@odoo.com>
+Signed-off-by: Ahmed Khalaf (ahkh) <ahkh@odoo.com>
+
+================================= pseudo patch: =================================
+
+--- a/addons/stock/models/res_config_settings.py
++++ b/addons/stock/models/res_config_settings.py
+@@ -93,7 +93,6 @@ class ResConfigSettings(models.TransientModel):
+                 putaway_rules.active = False
+ 
+         previous_group = self.default_get(['group_stock_multi_locations', 'group_stock_production_lot', 'group_stock_tracking_lot'])
+-        was_operations_showed = self.env['stock.picking.type'].with_user(SUPERUSER_ID)._default_show_operations()
+         super().set_values()
+ 
+         if not self.user_has_groups('stock.group_stock_manager'):
+@@ -128,12 +127,6 @@ class ResConfigSettings(models.TransientModel):
+                 if view:
+                     view.active = True
+ 
+-        if not was_operations_showed and self.env['stock.picking.type'].with_user(SUPERUSER_ID)._default_show_operations():
+-            self.env['stock.picking.type'].with_context(active_test=False).sudo().search([
+-                ('code', '!=', 'incoming'),
+-                ('show_operations', '=', False)
+-            ]).show_operations = True
+-
+         if not self.group_stock_production_lot and previous_group.get('group_stock_production_lot'):
+             if self.env['product.product'].search_count([('tracking', '!=', 'none')], limit=1):
+                 raise UserError(_("You have product(s) in stock that have lot/serial number tracking enabled. \nSwitch off tracking on all the products before switching off this setting."))
+
+--- a/addons/stock/models/stock_move.py
++++ b/addons/stock/models/stock_move.py
+@@ -155,6 +155,7 @@ class StockMove(models.Model):
+     has_tracking = fields.Selection(related='product_id.tracking', string='Product with Tracking')
+     quantity = fields.Float(
+         'Quantity', compute='_compute_quantity', digits='Product Unit of Measure', inverse='_set_quantity', store=True)
++    # TODO: delete this field `show_operations`
+     show_operations = fields.Boolean(related='picking_id.picking_type_id.show_operations')
+     picking_code = fields.Selection(related='picking_id.picking_type_id.code', readonly=True)
+     show_details_visible = fields.Boolean('Details Visible', compute='_compute_show_details_visible')
+
+--- a/addons/stock/models/stock_move_line.py
++++ b/addons/stock/models/stock_move_line.py
+@@ -84,6 +84,8 @@ class StockMoveLine(models.Model):
+     description_picking = fields.Text(string="Description picking")
+     quant_id = fields.Many2one('stock.quant', "Pick From", store=False)  # Dummy field for the detailed operation view
+     product_packaging_qty = fields.Float(string="Reserved Packaging Quantity", compute='_compute_product_packaging_qty')
++    picking_location_id = fields.Many2one(related='picking_id.location_id')
++    picking_location_dest_id = fields.Many2one(related='picking_id.location_dest_id')
+ 
+     @api.depends('product_uom_id.category_id', 'product_id.uom_id.category_id', 'move_id.product_uom', 'product_id.uom_id')
+     def _compute_product_uom_id(self):
+@@ -885,6 +887,11 @@ class StockMoveLine(models.Model):
+             'res_id': self.id,
+         }
+ 
++    def action_put_in_pack(self):
++        for picking in self.picking_id:
++            picking.action_put_in_pack()
++        return self.picking_id.action_detailed_operations()
++
+     def _get_revert_inventory_move_values(self):
+         self.ensure_one()
+         return {
+
+--- a/addons/stock/models/stock_picking.py
++++ b/addons/stock/models/stock_picking.py
+@@ -24,11 +24,6 @@ class PickingType(models.Model):
+     _rec_names_search = ['name', 'warehouse_id.name']
+     _check_company_auto = True
+ 
+-    def _default_show_operations(self):
+-        return self.user_has_groups('stock.group_production_lot,'
+-                                    'stock.group_stock_multi_locations,'
+-                                    'stock.group_tracking_lot')
+-
+     name = fields.Char('Operation Type', required=True, translate=True)
+     color = fields.Integer('Color')
+     sequence = fields.Integer('Sequence', help="Used to order the 'All Operations' kanban view")
+@@ -67,8 +62,9 @@ class PickingType(models.Model):
+     print_label = fields.Boolean(
+         'Print Label',
+         help="If this checkbox is ticked, label will be print in this operation.")
++    # TODO: delete this field `show_operations`
+     show_operations = fields.Boolean(
+-        'Show Detailed Operations', default=_default_show_operations,
++        'Show Detailed Operations', default=False,
+         help="If this checkbox is ticked, the pickings lines will represent detailed stock operations. If not, the picking lines will represent an aggregate of detailed stock operations.")
+     reservation_method = fields.Selection(
+         [('at_confirm', 'At Confirmation'), ('manual', 'Manually'), ('by_date', 'Before scheduled date')],
+@@ -270,15 +266,6 @@ class PickingType(models.Model):
+             elif picking_type.code == 'outgoing':
+                 picking_type.print_label = True
+ 
+-    @api.depends('code')
+-    def _compute_show_operations(self):
+-        for picking_type in self:
+-            picking_type.show_operations = picking_type.code != 'incoming' and picking_type.user_has_groups(
+-                'stock.group_production_lot,'
+-                'stock.group_stock_multi_locations,'
+-                'stock.group_tracking_lot'
+-            )
+-
+     @api.onchange('code')
+     def _onchange_picking_code(self):
+         if self.code == 'internal' and not self.user_has_groups('stock.group_stock_multi_locations'):
+@@ -491,8 +478,8 @@ class Picking(models.Model):
+     # Used to search on pickings
+     product_id = fields.Many2one('product.product', 'Product', related='move_ids.product_id', readonly=True)
+     lot_id = fields.Many2one('stock.lot', 'Lot/Serial Number', related='move_line_ids.lot_id', readonly=True)
+-
+-    show_operations = fields.Boolean(compute='_compute_show_operations')
++    # TODO: delete this field `show_operations`
++    show_operations = fields.Boolean(related='picking_type_id.show_operations')
+     show_lots_text = fields.Boolean(compute='_compute_show_lots_text')
+     has_tracking = fields.Boolean(compute='_compute_has_tracking')
+     package_level_ids = fields.One2many('stock.package_level', 'picking_id')
+@@ -563,20 +550,6 @@ class Picking(models.Model):
+                     picking.products_availability = _('Exp %s', format_date(self.env, forecast_date))
+                     picking.products_availability_state = 'late' if picking.scheduled_date and picking.scheduled_date < forecast_date else 'expected'
+ 
+-    @api.depends('picking_type_id.show_operations')
+-    def _compute_show_operations(self):
+-        for picking in self:
+-            if self.env.context.get('force_detailed_view'):
+-                picking.show_operations = True
+-                continue
+-            if picking.picking_type_id.show_operations:
+-                if (picking.state == 'draft') or picking.state != 'draft':
+-                    picking.show_operations = True
+-                else:
+-                    picking.show_operations = False
+-            else:
+-                picking.show_operations = False
+-
+     @api.depends('move_line_ids', 'picking_type_id.use_create_lots', 'picking_type_id.use_existing_lots', 'state')
+     def _compute_show_lots_text(self):
+         group_production_lot_enabled = self.user_has_groups('stock.group_production_lot')
+@@ -931,6 +904,25 @@ class Picking(models.Model):
+         self.filtered(lambda x: not x.move_ids).state = 'cancel'
+         return True
+ 
++    def action_detailed_operations(self):
++        view_id = self.env.ref('stock.view_stock_move_line_detailed_operation_tree').id
++        return {
++            'name': _('Detailed Operations'),
++            'view_mode': 'tree',
++            'type': 'ir.actions.act_window',
++            'res_model': 'stock.move.line',
++            'views': [(view_id, 'tree')],
++            'domain': [('id', 'in', self.move_line_ids.ids)],
++            'context': {
++                'default_picking_id': self.id,
++                'default_location_id': self.location_id.id,
++                'default_location_dest_id': self.location_dest_id.id,
++                'default_company_id': self.company_id.id,
++                'show_lots_text': self.show_lots_text,
++                'picking_code': self.picking_type_code,
++            }
++        }
++
+     def _action_done(self):
+         """Call `_action_done` on the `stock.move` of the `stock.picking` in `self`.
+         This method makes sure every `stock.move.line` is linked to a `stock.move` by either
+
+--- a/addons/stock/models/stock_warehouse.py
++++ b/addons/stock/models/stock_warehouse.py
+@@ -967,7 +967,6 @@ class Warehouse(models.Model):
+                 'use_existing_lots': False,
+                 'default_location_src_id': False,
+                 'sequence': max_sequence + 1,
+-                'show_operations': False,
+                 'sequence_code': 'IN',
+                 'company_id': self.company_id.id,
+             }, 'out_type_id': {

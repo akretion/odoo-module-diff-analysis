@@ -1,0 +1,201 @@
+PR: https://github.com/odoo/odoo/pull/
+
+From: e239934abe456257c9dc285d1ad9829c0353900c
+From: Jeremy Kersten
+Date: 2019-10-29 16:04:47
+
+Structural Changes: 3
+Total Changes: 71
+
+[FIX] website: allow to modify the visibility of a page
+
+Now, you can define a Visibility mode between:
+    Public (All poeple)
+    Connected (Portal or Employee)
+    Restricted Group (Has this group or is Employee)
+    With Password (Know password or is Employee)
+    Internal Users (Is Employee)
+
+It is a 'fair' feature, but without really warranty that the content is
+really unreadable via others methods, ...
+
+It is more for frontend display, that real secret. Dont use this like
+a keychain ;)
+
+We only catch the visibility on the main view and not the t-call inside.
+
+Even if it should work on controller too, it is only display now on the
+page property menu. (Or on the view directly in backend)
+
+task-2091365
+
+================================= pseudo patch: =================================
+
+--- a/addons/website/models/ir_http.py
++++ b/addons/website/models/ir_http.py
+@@ -271,6 +271,10 @@ class Http(models.AbstractModel):
+         if request.website.is_publisher() and isinstance(exception, werkzeug.exceptions.NotFound):
+             code = 'page_404'
+             values['path'] = request.httprequest.path[1:]
++        if isinstance(exception, werkzeug.exceptions.Forbidden) and \
++           exception.description == "website_visibility_password_required":
++            code = 'protected_403'
++            values['path'] = request.httprequest.path
+         return (code, values)
+ 
+     @classmethod
+@@ -304,8 +308,8 @@ class Http(models.AbstractModel):
+ 
+     @classmethod
+     def _get_error_html(cls, env, code, values):
+-        if code == 'page_404':
+-            return env['ir.ui.view'].render_template('website.%s' % code, values)
++        if code in ('page_404', 'protected_403'):
++            return code.split('_')[1], env['ir.ui.view'].render_template('website.%s' % code, values)
+         return super(Http, cls)._get_error_html(env, code, values)
+ 
+     def binary_content(self, xmlid=None, model='ir.attachment', id=None, field='datas',
+
+--- a/addons/website/models/ir_ui_view.py
++++ b/addons/website/models/ir_ui_view.py
+@@ -2,6 +2,7 @@
+ # Part of Odoo. See LICENSE file for full copyright and licensing details.
+ 
+ import logging
++import werkzeug
+ import uuid
+ from itertools import groupby
+ 
+@@ -24,6 +25,9 @@ class View(models.Model):
+     page_ids = fields.One2many('website.page', 'view_id')
+     first_page_id = fields.Many2one('website.page', string='Website Page', help='First page linked to this view', compute='_compute_first_page_id')
+     track = fields.Boolean(string='Track', default=False, help="Allow to specify for one page of the website to be trackable or not")
++    visibility = fields.Selection([('', 'All'), ('connected', 'Connected'), ('restricted_group', 'Restricted Group'), ('password', 'With Password'), ('employee', 'Internal Users')], default='')
++    visibility_group = fields.Many2one('res.groups')
++    visibility_password = fields.Char(groups='base.group_system')
+ 
+     def _compute_first_page_id(self):
+         for view in self:
+@@ -291,12 +295,19 @@ class View(models.Model):
+             current_website = self.env['website'].browse(self._context.get('website_id'))
+             domain = ['&', ('key', '=', xml_id)] + current_website.website_domain()
+ 
+-            view = self.search(domain, order='website_id', limit=1)
++            view = self.sudo().search(domain, order='website_id', limit=1)
+             if not view:
+                 _logger.warning("Could not find view object with xml_id '%s'", xml_id)
+                 raise ValueError('View %r in website %r not found' % (xml_id, self._context['website_id']))
+             return view.id
+-        return super(View, self).get_view_id(xml_id)
++        return super(View, self.sudo()).get_view_id(xml_id)
++
++    @api.model
++    def read_template(self, xml_id):
++        view_sudo = self._view_obj(self.get_view_id(xml_id)).sudo()
++        if view_sudo.visibility and view_sudo.handle_visibility(do_raise=False):
++            self = self.sudo()
++        return super(View, self).read_template(xml_id)
+ 
+     def _get_original_view(self):
+         """Given a view, retrieve the original view it was COW'd from.
+@@ -307,8 +318,38 @@ class View(models.Model):
+         domain = [('key', '=', self.key), ('model_data_id', '!=', None)]
+         return self.with_context(active_test=False).search(domain, limit=1)  # Useless limit has multiple xmlid should not be possible
+ 
++    def handle_visibility(self, do_raise=True):
++        """ Check the visibility set on the main view and raise 403 if you should not have access.
++            Order is: Public, Connected, Has group, Password, Employee
++            An user type can see all previous type. So an employee can see password page withtout
++            know the password.
++
++            It only check the visibility on the main content, others views called stay available in
++            rpc or via other way.
++        """
++        error = False
++        self = self.sudo()
++        if self.visibility and not request.env.user.has_group('website.group_website_designer'):
++            if (self.visibility == 'connected' and request.website.is_public_user()) or \
++               (self.visibility == 'employee' and request.env.user.share) or \
++               (self.visibility == 'restricted_group' and request.env.user.share and self.visibility_group and
++                    request.env.user.id not in self.visibility_group.sudo().users.ids):
++                error = werkzeug.exceptions.Forbidden()
++            elif self.visibility == 'password' and request.env.user.share and (request.website.is_public_user() or self.id not in request.session.get('views_unlock', [])):
++                if self.sudo().visibility_password == request.params.get('visibility_password'):
++                    request.session.setdefault('views_unlock', list()).append(self.id)
++                else:
++                    error = werkzeug.exceptions.Forbidden('website_visibility_password_required')
++        if error:
++            if do_raise:
++                raise error
++            else:
++                return False
++        return True
++
+     def render(self, values=None, engine='ir.qweb', minimal_qcontext=False):
+         """ Render the template. If website is enabled on request, then extend rendering context with website values. """
++        self.handle_visibility(do_raise=True)
+         new_context = dict(self._context)
+         if request and getattr(request, 'is_frontend', False):
+ 
+
+--- a/addons/website/models/website.py
++++ b/addons/website/models/website.py
+@@ -650,7 +650,7 @@ class Website(models.Model):
+             view_id = View.get_view_id(template)
+         if not view_id:
+             raise NotFound
+-        return View.browse(view_id)
++        return View.sudo().browse(view_id)
+ 
+     @api.model
+     def pager(self, url, total, page=1, step=30, scope=5, url_args=None):
+@@ -764,7 +764,7 @@ class Website(models.Model):
+                     yield page
+ 
+         # '/' already has a http.route & is in the routing_map so it will already have an entry in the xml
+-        domain = [('url', '!=', '/')]
++        domain = [('url', '!=', '/'), ('visibility', '=', False)]
+         if not force:
+             domain += [('website_indexed', '=', True)]
+             # is_visible
+
+--- a/addons/website/models/website_menu.py
++++ b/addons/website/models/website_menu.py
+@@ -103,7 +103,10 @@ class Menu(models.Model):
+     def _compute_visible(self):
+         for menu in self:
+             visible = True
+-            if menu.page_id and not menu.page_id.sudo().is_visible and not menu.user_has_groups('base.group_user'):
++            if menu.page_id and not menu.user_has_groups('base.group_user') and \
++                (not menu.page_id.sudo().is_visible or
++                 (not menu.page_id.view_id.handle_visibility(do_raise=False) and
++                 menu.page_id.view_id.visibility != "password")):
+                 visible = False
+             menu.is_visible = visible
+ 
+
+--- a/addons/website/models/website_page.py
++++ b/addons/website/models/website_page.py
+@@ -58,12 +58,6 @@ class Page(models.Model):
+ 
+         return most_specific_page == page_to_test
+ 
+-    @api.model
+-    def get_page_info(self, id):
+-        return self.browse(id).read(
+-            ['id', 'name', 'url', 'website_published', 'website_indexed', 'date_publish', 'menu_ids', 'is_homepage', 'website_id'],
+-        )
+-
+     def get_view_identifier(self):
+         """ Get identifier of this page view that may be used to render it """
+         return self.view_id.id
+@@ -117,6 +111,9 @@ class Page(models.Model):
+             'website_indexed': data['website_indexed'],
+             'date_publish': data['date_publish'] or None,
+             'is_homepage': data['is_homepage'],
++            'visibility': data['visibility'],
++            'visibility_password': data['visibility'] == "password" and data['visibility_password'] or '',
++            'visibility_group': data['visibility'] == "restricted_group" and data['visibility_group'],
+         }
+         page.with_context(no_cow=True).write(w_vals)
+ 

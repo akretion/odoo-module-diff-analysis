@@ -1,0 +1,202 @@
+PR: https://github.com/odoo/odoo/pull/128395
+
+From: e289c4f0868de2ffd4ca011d6d4279f41b3c2a34
+From: Laurent Smet
+Date: 2023-07-20 18:53:06
+
+Structural Changes: 1
+Total Changes: 130
+
+[IMP] account_edi: Remove management of payments
+
+Since the dependency to account_edi has been removed from l10n_mx_edi
+and knowing we plan to remove completely the account_edi module and
+since it's the single localization needing an EDI on payments, all this
+code can be removed.
+
+Task: 3069324
+Part-of: odoo/odoo#128395
+
+================================= pseudo patch: =================================
+
+--- a/addons/account_edi/models/__init__.py
++++ b/addons/account_edi/models/__init__.py
+@@ -4,7 +4,6 @@ from . import account_move
+ from . import account_journal
+ from . import account_edi_format
+ from . import account_edi_document
+-from . import account_payment
+ from . import ir_actions_report
+ from . import ir_attachment
+ from . import uom
+
+--- a/addons/account_edi/models/account_edi_document.py
++++ b/addons/account_edi/models/account_edi_document.py
+@@ -72,7 +72,7 @@ class AccountEdiDocument(models.Model):
+     def _prepare_jobs(self):
+         """Creates a list of jobs to be performed by '_process_job' for the documents in self.
+         Each document represent a job, BUT if multiple documents have the same state, edi_format_id,
+-        doc_type (invoice or payment) and company_id AND the edi_format_id supports batching, they are grouped
++        doc_type invoice and company_id AND the edi_format_id supports batching, they are grouped
+         into a single job.
+ 
+         :returns:  [{
+@@ -106,8 +106,7 @@ class AccountEdiDocument(models.Model):
+ 
+     @api.model
+     def _process_job(self, job):
+-        """Post or cancel move_id (invoice or payment) by calling the related methods on edi_format_id.
+-        Invoices are processed before payments.
++        """Post or cancel move_id by calling the related methods on edi_format_id.
+ 
+         :param job:  {
+             'documents': account.edi.document,
+@@ -196,10 +195,7 @@ class AccountEdiDocument(models.Model):
+         documents.move_id.line_ids.flush_recordset()  # manual flush for tax details
+         moves = documents.move_id
+         if state == 'to_send':
+-            if all(move.is_invoice(include_receipts=True) for move in moves):
+-                with moves._send_only_when_ready():
+-                    edi_result = method_to_call(moves)
+-            else:
++            with moves._send_only_when_ready():
+                 edi_result = method_to_call(moves)
+             _postprocess_post_edi_results(documents, edi_result)
+         elif state == 'to_cancel':
+
+--- a/addons/account_edi/models/account_move.py
++++ b/addons/account_edi/models/account_move.py
+@@ -252,43 +252,6 @@ class AccountMove(models.Model):
+ 
+         return res
+ 
+-    def _update_payments_edi_documents(self):
+-        ''' Update the edi documents linked to the current journal entries. These journal entries must be linked to an
+-        account.payment of an account.bank.statement.line. This additional method is needed because the payment flow is
+-        not the same as the invoice one. Indeed, the edi documents must be updated when the reconciliation with some
+-        invoices is changing.
+-        '''
+-        edi_document_vals_list = []
+-        for payment in self:
+-            edi_formats = payment._get_reconciled_invoices().journal_id.edi_format_ids + payment.edi_document_ids.edi_format_id
+-            edi_formats = self.env['account.edi.format'].browse(edi_formats.ids) # Avoid duplicates
+-            for edi_format in edi_formats:
+-                existing_edi_document = payment.edi_document_ids.filtered(lambda x: x.edi_format_id == edi_format)
+-                move_applicability = edi_format._get_move_applicability(payment)
+-
+-                if move_applicability:
+-                    if existing_edi_document:
+-                        existing_edi_document.write({
+-                            'state': 'to_send',
+-                            'error': False,
+-                            'blocking_level': False,
+-                        })
+-                    else:
+-                        edi_document_vals_list.append({
+-                            'edi_format_id': edi_format.id,
+-                            'move_id': payment.id,
+-                            'state': 'to_send',
+-                        })
+-                elif existing_edi_document:
+-                    existing_edi_document.write({
+-                        'state': False,
+-                        'error': False,
+-                        'blocking_level': False,
+-                    })
+-
+-        self.env['account.edi.document'].create(edi_document_vals_list)
+-        self.edi_document_ids._process_documents_no_web_services()
+-
+     def _is_ready_to_be_sent(self):
+         # OVERRIDE
+         # Prevent a mail to be sent to the customer if the EDI document is not sent.
+@@ -502,55 +465,3 @@ class AccountMoveLine(models.Model):
+             'unece_uom_code': self.product_id.product_tmpl_id.uom_id._get_unece_code(),
+         }
+         return res
+-
+-    def _reconcile_pre_hook(self):
+-        # EXTENDS 'account'
+-        # In some countries, the payments must be sent to the government under some condition. One of them could be
+-        # there is at least one reconciled invoice to the payment. Then, we need to update the state of the edi
+-        # documents during the reconciliation.
+-        results = super()._reconcile_pre_hook()
+-        all_lines = self + self.matched_debit_ids.debit_move_id + self.matched_credit_ids.credit_move_id
+-        results['edi_payments'] = all_lines.move_id\
+-            .filtered(lambda move: move.payment_id or move.statement_line_id)
+-        results['edi_invoices_per_payment_before'] = {
+-            pay: pay._get_reconciled_invoices()
+-            for pay in results['edi_payments']
+-        }
+-        return results
+-
+-    def _reconcile_post_hook(self, data):
+-        # EXTENDS 'account'
+-        super()._reconcile_post_hook(data)
+-        payments = data['edi_payments']
+-        invoices_per_payment_before = data['edi_invoices_per_payment_before']
+-        invoices_per_payment_after = {pay: pay._get_reconciled_invoices() for pay in payments}
+-
+-        changed_payments = self.env['account.move']
+-        for payment, invoices_after in invoices_per_payment_after.items():
+-            invoices_before = invoices_per_payment_before[payment]
+-
+-            if set(invoices_after.ids) != set(invoices_before.ids):
+-                changed_payments |= payment
+-        changed_payments._update_payments_edi_documents()
+-
+-    def remove_move_reconcile(self):
+-        # OVERRIDE
+-        # When a payment has been sent to the government, it usually contains some information about reconciled
+-        # invoices. If the user breaks a reconciliation, the related payments must be cancelled properly and then, a new
+-        # electronic document must be generated.
+-        all_lines = self + self.matched_debit_ids.debit_move_id + self.matched_credit_ids.credit_move_id
+-        payments = all_lines.move_id.filtered(lambda move: move.payment_id or move.statement_line_id)
+-
+-        invoices_per_payment_before = {pay: pay._get_reconciled_invoices() for pay in payments}
+-        res = super().remove_move_reconcile()
+-        invoices_per_payment_after = {pay: pay._get_reconciled_invoices() for pay in payments}
+-
+-        changed_payments = self.env['account.move']
+-        for payment, invoices_after in invoices_per_payment_after.items():
+-            invoices_before = invoices_per_payment_before[payment]
+-
+-            if set(invoices_after.ids) != set(invoices_before.ids):
+-                changed_payments |= payment
+-        changed_payments._update_payments_edi_documents()
+-
+-        return res
+
+--- a/addons/account_edi/models/account_payment.py
++++ b/None
+@@ -1,30 +0,0 @@
+-# -*- coding: utf-8 -*-
+-# Part of Odoo. See LICENSE file for full copyright and licensing details.
+-
+-from odoo import models, fields, api, _
+-
+-
+-class AccountPayment(models.Model):
+-    _inherit = 'account.payment'
+-
+-    def action_process_edi_web_services(self):
+-        return self.move_id.action_process_edi_web_services()
+-
+-    def action_retry_edi_documents_error(self):
+-        self.ensure_one()
+-        return self.move_id.action_retry_edi_documents_error()
+-
+-    ####################################################
+-    # Mailing
+-    ####################################################
+-
+-    def _process_attachments_for_template_post(self, mail_template):
+-        """ Add Edi attachments to templates. """
+-        result = super()._process_attachments_for_template_post(mail_template)
+-        for payment in self.filtered('edi_document_ids'):
+-            payment_result = result.setdefault(payment.id, {})
+-            for edi_doc in payment.edi_document_ids:
+-                edi_attachments = edi_doc._filter_edi_attachments_for_mailing()
+-                payment_result.setdefault('attachment_ids', []).extend(edi_attachments.get('attachment_ids', []))
+-                payment_result.setdefault('attachments', []).extend(edi_attachments.get('attachments', []))
+-        return result

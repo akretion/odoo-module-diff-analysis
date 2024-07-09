@@ -1,0 +1,118 @@
+PR: https://github.com/odoo/odoo/pull/
+
+From: 0d61d3fccbf74e59cff5d3f4a664b88c8b48e5fa
+From: Tiffany Chang (tic)
+Date: 2021-03-29 06:54:30
+
+Structural Changes: 5
+Total Changes: 34
+
+[IMP] mrp, stock: update reservation logic
+
+This commit adds 2 small feature additions to reservation logic:
+
+1. Add another # days parameter for reserve "before scheduled date"
+   option for priority moves (i.e. so they can be marked for reservation
+   earlier)
+2. Add Reserve button in the forecast report
+
+It also cleans up some auto-reserving logic:
+- 'at confirm' now has a reservation_date = day of confirmation:
+  - removes need to check `reservation_method` when doing automated
+    _action_assign (i.e. in scheduler + completed incoming move).
+  - allows ordering by reservation_date during automated _action_assign
+    for more consistent and logical reservations.
+
+Task: 2418907
+Upgrade PR: odoo/upgrade#2143
+
+================================= pseudo patch: =================================
+
+--- a/addons/stock/models/stock_move.py
++++ b/addons/stock/models/stock_move.py
+@@ -496,13 +496,14 @@ class StockMove(models.Model):
+                     move_lines_commands.append((0, 0, move_line_vals))
+             move.write({'move_line_ids': move_lines_commands})
+ 
+-    @api.depends('picking_type_id', 'date')
++    @api.depends('picking_type_id', 'date', 'priority')
+     def _compute_reservation_date(self):
+         for move in self:
+-            if move.state not in ['draft', 'confirmed', 'waiting', 'partially_available']:
+-                continue
+-            if move.picking_type_id and move.picking_type_id.reservation_method == 'by_date':
+-                move.reservation_date = fields.Date.to_date(move.date) - timedelta(days=move.picking_type_id.reservation_days_before)
++            if move.picking_type_id.reservation_method == 'by_date' and move.state in ['draft', 'confirmed', 'waiting', 'partially_available']:
++                days = move.picking_type_id.reservation_days_before
++                if move.priority == '1':
++                    days = move.picking_type_id.reservation_days_before_priority
++                move.reservation_date = fields.Date.to_date(move.date) - timedelta(days=days)
+ 
+     @api.constrains('product_uom')
+     def _check_uom(self):
+@@ -1144,6 +1145,9 @@ class StockMove(models.Model):
+ 
+         move_to_confirm.write({'state': 'confirmed'})
+         (move_waiting | move_create_proc).write({'state': 'waiting'})
++        # procure_method sometimes changes with certain workflows so just in case, apply to all moves
++        (move_to_confirm | move_waiting | move_create_proc).filtered(lambda m: m.picking_type_id.reservation_method == 'at_confirm')\
++            .write({'reservation_date': fields.Date.today()})
+ 
+         # assign picking in batch for all confirmed move that share the same details
+         for moves_ids in to_assign.values():
+@@ -1826,8 +1830,9 @@ class StockMove(models.Model):
+         domains = []
+         for move in self:
+             domains.append([('product_id', '=', move.product_id.id), ('location_id', '=', move.location_dest_id.id)])
+-        static_domain = [('state', 'in', ['confirmed', 'partially_available']), ('procure_method', '=', 'make_to_stock')]
+-        reservation_domain = ['|', ('picking_type_id.reservation_method', '=', 'at_confirm'),
+-                                   ('reservation_date', '<=', fields.Date.today())]
+-        moves_to_reserve = self.env['stock.move'].search(expression.AND([static_domain, expression.OR(domains), reservation_domain]))
++        static_domain = [('state', 'in', ['confirmed', 'partially_available']),
++                         ('procure_method', '=', 'make_to_stock'),
++                         ('reservation_date', '<=', fields.Date.today())]
++        moves_to_reserve = self.env['stock.move'].search(expression.AND([static_domain, expression.OR(domains)]),
++                                                         order='reservation_date, priority desc, date asc')
+         moves_to_reserve._action_assign()
+
+--- a/addons/stock/models/stock_picking.py
++++ b/addons/stock/models/stock_picking.py
+@@ -69,11 +69,11 @@ class PickingType(models.Model):
+         help="If this checkbox is ticked, Odoo will automatically pre-fill the detailed "
+         "operations with the corresponding products, locations and lot/serial numbers.")
+     reservation_method = fields.Selection(
+-        [('by_date', 'before scheduled date'), ('at_confirm', 'At Confirmation'), ('manual', 'Manually')],
++        [('at_confirm', 'At Confirmation'), ('manual', 'Manually'), ('by_date', 'Before scheduled date')],
+         'Reservation Method', required=True, default='at_confirm',
+         help="How products in transfers of this operation type should be reserved.")
+     reservation_days_before = fields.Integer('Days', help="Maximum number of days before scheduled date that products should be reserved.")
+-
++    reservation_days_before_priority = fields.Integer('Days when starred', help="Maximum number of days before scheduled date that priority picking products should be reserved.")
+ 
+     count_picking_draft = fields.Integer(compute='_compute_picking_count')
+     count_picking_ready = fields.Integer(compute='_compute_picking_count')
+
+--- a/addons/stock/models/stock_rule.py
++++ b/addons/stock/models/stock_rule.py
+@@ -483,10 +483,9 @@ class ProcurementGroup(models.Model):
+     def _get_moves_to_assign_domain(self, company_id):
+         moves_domain = [
+             ('state', 'in', ['confirmed', 'partially_available']),
+-            ('product_uom_qty', '!=', 0.0)
++            ('product_uom_qty', '!=', 0.0),
++            ('reservation_date', '<=', fields.Date.today())
+         ]
+-        moves_domain = expression.AND([moves_domain, ['|', ('picking_type_id.reservation_method', '=', 'at_confirm'),
+-                                                           ('reservation_date', '<=', fields.Date.today())]])
+         if company_id:
+             moves_domain = expression.AND([[('company_id', '=', company_id)], moves_domain])
+         return moves_domain
+@@ -506,7 +505,7 @@ class ProcurementGroup(models.Model):
+         # Search all confirmed stock_moves and try to assign them
+         domain = self._get_moves_to_assign_domain(company_id)
+         moves_to_assign = self.env['stock.move'].search(domain, limit=None,
+-            order='priority desc, date asc')
++            order='reservation_date, priority desc, date asc')
+         for moves_chunk in split_every(100, moves_to_assign.ids):
+             self.env['stock.move'].browse(moves_chunk).sudo()._action_assign()
+             if use_new_cursor:

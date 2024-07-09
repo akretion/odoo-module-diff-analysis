@@ -1,0 +1,226 @@
+PR: https://github.com/odoo/odoo/pull/
+
+From: add7d995a81288bec869346ac86e07e9c9e06104
+From: Romain Derie
+Date: 2021-06-02 10:04:27
+
+Structural Changes: 5
+Total Changes: 91
+
+[IMP] website: better retrieval of base URL
+
+This commit improves the mechanism to find the best URL given a record.
+To find the best suited URL, the following heuristic will be done:
+  - If record has a website_id, use that website's domain
+  - Else if a record has a company_id, use the company's website's domain [1]
+  - Else use the `web.base.url` ICP
+
+The following commit will replace (almost) every occurence of ICP by the
+`get_base_url()` helper method.
+
+[1] Before this commit, there was no way to know which website was the one from
+    a company, has a company could have no website but could also have multiple
+    websites.
+    We now consider the first found website for a company as the company's
+    website. The use of a new sequence on `website` will allow user to chose
+    which website to use.
+
+Community: https://github.com/odoo/odoo/pull/68201
+Enterprise: https://github.com/odoo/enterprise/pull/17538
+Upgrade: https://github.com/odoo/upgrade/pull/2372
+
+task-2476101
+
+================================= pseudo patch: =================================
+
+--- a/addons/website/models/__init__.py
++++ b/addons/website/models/__init__.py
+@@ -6,6 +6,7 @@ from . import ir_actions
+ from . import ir_asset
+ from . import ir_attachment
+ from . import ir_http
++from . import ir_model
+ from . import ir_module_module
+ from . import ir_qweb
+ from . import ir_qweb_fields
+
+--- a/None
++++ b/addons/website/models/ir_model.py
+@@ -0,0 +1,36 @@
++# -*- coding: utf-8 -*-
++# Part of Odoo. See LICENSE file for full copyright and licensing details.
++
++from odoo import models
++
++
++class BaseModel(models.AbstractModel):
++    _inherit = 'base'
++
++    def get_base_url(self):
++        """
++        Returns the base url for a given record, given the following priority:
++        1. If the record has a `website_id` field, we use the url from this
++           website as base url, if set.
++        2. If the record has a `company_id` field, we use the website from that
++           company (if set). Note that a company doesn't really have a website,
++           it is retrieve through some heuristic in its `website_id`'s compute.
++        3. Use the ICP `web.base.url` (super)
++
++        :return: the base url for this record
++        :rtype: string
++        """
++        self.ensure_one()
++        if self._name == 'website':
++            # Note that website_1.company_id.website_id might not be website_1
++            return self._get_http_domain() or super().get_base_url()
++        if 'website_id' in self and self.website_id.domain:
++            return self.website_id._get_http_domain()
++        if 'company_id' in self and self.company_id.website_id.domain:
++            return self.company_id.website_id._get_http_domain()
++        return super().get_base_url()
++
++    def get_website_meta(self):
++        # dummy version of 'get_website_meta' above; this is a graceful fallback
++        # for models that don't inherit from 'website.seo.metadata'
++        return {}
+
+--- a/addons/website/models/res_company.py
++++ b/addons/website/models/res_company.py
+@@ -2,12 +2,17 @@
+ # Part of Odoo. See LICENSE file for full copyright and licensing details.
+ 
+ from odoo import api, fields, models
+-from ast import literal_eval
+ 
+ 
+ class Company(models.Model):
+     _inherit = "res.company"
+ 
++    website_id = fields.Many2one('website', compute='_compute_website_id', store=True)
++
++    def _compute_website_id(self):
++        for company in self:
++            company.website_id = self.env['website'].search([('company_id', '=', company.id)], limit=1)
++
+     @api.model
+     def action_open_website_theme_selector(self):
+         action = self.env["ir.actions.actions"]._for_xml_id("website.theme_install_kanban_action")
+
+--- a/addons/website/models/website.py
++++ b/addons/website/models/website.py
+@@ -8,7 +8,6 @@ import hashlib
+ import requests
+ import re
+ 
+-
+ from lxml import html
+ from werkzeug import urls
+ from werkzeug.datastructures import OrderedMultiDict
+@@ -41,10 +40,12 @@ DEFAULT_CDN_FILTERS = [
+ 
+ DEFAULT_ENDPOINT = 'https://website.api.odoo.com'
+ 
++
+ class Website(models.Model):
+ 
+     _name = "website"
+     _description = "Website"
++    _order = "sequence, id"
+ 
+     @api.model
+     def website_domain(self, website_id=False):
+@@ -59,8 +60,9 @@ class Website(models.Model):
+         return def_lang_id or self._active_languages()[0]
+ 
+     name = fields.Char('Website Name', required=True)
++    sequence = fields.Integer(default=10)
+     domain = fields.Char('Website Domain',
+-        help='Will be prefixed by http in canonical URLs if no scheme is specified')
++                         help='Will be prefixed by http in canonical URLs if no scheme is specified')
+     country_group_ids = fields.Many2many('res.country.group', 'website_country_group_rel', 'website_id', 'country_group_id',
+                                          string='Country Groups', help='Used when multiple websites have the same domain.')
+     company_id = fields.Many2one('res.company', string="Company", default=lambda self: self.env.company, required=True)
+@@ -176,6 +178,7 @@ class Website(models.Model):
+             vals['user_id'] = company._get_public_user().id if company else self.env.ref('base.public_user').id
+ 
+         res = super(Website, self).create(vals)
++        res.company_id._compute_website_id()
+         res._bootstrap_homepage()
+ 
+         if not self.env.user.has_group('website.group_multi_website') and self.search_count([]) > 1:
+@@ -187,6 +190,7 @@ class Website(models.Model):
+ 
+     def write(self, values):
+         public_user_to_change_websites = self.env['website']
++        original_company = self.company_id
+         self._handle_favicon(values)
+ 
+         self.clear_caches()
+@@ -198,10 +202,15 @@ class Website(models.Model):
+                 super(Website, public_user_to_change_websites).write(dict(values, user_id=company and company._get_public_user().id))
+ 
+         result = super(Website, self - public_user_to_change_websites).write(values)
++
+         if 'cdn_activated' in values or 'cdn_url' in values or 'cdn_filters' in values:
+             # invalidate the caches from static node at compile time
+             self.env['ir.qweb'].clear_caches()
+ 
++        # invalidate cache for `company.website_id` to be recomputed
++        if 'sequence' in values or 'company_id' in values:
++            (original_company | self.company_id)._compute_website_id()
++
+         if 'cookies_bar' in values:
+             existing_policy_page = self.env['website.page'].search([
+                 ('website_id', '=', self.id),
+@@ -245,7 +254,10 @@ class Website(models.Model):
+             ('url', 'ilike', '.assets\\_'),
+         ])
+         attachments_to_unlink.unlink()
+-        return super(Website, self).unlink()
++        companies = self.company_id
++        res = super(Website, self).unlink()
++        companies._compute_website_id()
++        return res
+ 
+     def create_and_redirect_configurator(self):
+         self._force()
+@@ -1097,10 +1109,6 @@ class Website(models.Model):
+         res = urls.url_parse(self.domain)
+         return 'http://' + self.domain if not res.scheme else self.domain
+ 
+-    def get_base_url(self):
+-        self.ensure_one()
+-        return self._get_http_domain() or super(BaseModel, self).get_base_url()
+-
+     def _get_canonical_url_localized(self, lang, canonical_params):
+         """Returns the canonical URL for the current request with translatable
+         elements appropriately translated in `lang`.
+@@ -1161,28 +1169,3 @@ class Website(models.Model):
+ 
+     def _get_cached(self, field):
+         return self._get_cached_values()[field]
+-
+-
+-class BaseModel(models.AbstractModel):
+-    _inherit = 'base'
+-
+-    def get_base_url(self):
+-        """
+-        Returns baseurl about one given record.
+-        If a website_id field exists in the current record we use the url
+-        from this website as base url.
+-
+-        :return: the base url for this record
+-        :rtype: string
+-
+-        """
+-        self.ensure_one()
+-        if 'website_id' in self and self.website_id.domain:
+-            return self.website_id._get_http_domain()
+-        else:
+-            return super(BaseModel, self).get_base_url()
+-
+-    def get_website_meta(self):
+-        # dummy version of 'get_website_meta' above; this is a graceful fallback
+-        # for models that don't inherit from 'website.seo.metadata'
+-        return {}

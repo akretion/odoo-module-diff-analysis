@@ -1,0 +1,285 @@
+PR: https://github.com/odoo/odoo/pull/137969
+
+From: 7053e37df1d69d3cf7901593e0b00120739dd2b4
+From: Pierre-Yves Dufays
+Date: 2023-10-12 16:12:09
+
+Structural Changes: 26
+Total Changes: 171
+
+[IMP] hr(_contract/_fleet): convert hr.plan to mail.activity.plan
+
+We convert the custom plan implementation to use the generic one. As the
+generic one can define plans for multiple model. We use the check
+dedicated_to_res_model == 'hr.employee' to activate the specific feature for
+hr.employee. Indeed, that field contains the model name when the plan is
+applicable only for one model.
+
+We also remove the 'launch plan' button as we can now launch a plan directly
+from the activities button in the chatter.
+
+Technical notes:
+For the activity schedule wizard, we add the support for active_ids and
+active_model as default values for res_ids and res_model because it is used as
+link in the chatter to launch the wizard and we want to avoid a big migration
+by keeping the link identical (and there are probably no simple solution to
+keep the same behavior).
+
+HR CONTRACT
+
+Before the first contract date of the first selected element was chosen to
+determine the planned due date if all first contract date were different
+otherwise the minimum was chosen. So if the selection included 2 different date
+among 3, the minimum was chosen but the first if the 3 were different.
+With this change, the minimum is always used to determine the default planned
+due date.
+
+Task-3390865
+
+Part-of: odoo/odoo#137969
+
+================================= pseudo patch: =================================
+
+--- a/addons/hr/models/__init__.py
++++ b/addons/hr/models/__init__.py
+@@ -9,10 +9,9 @@ from . import hr_employee_public
+ from . import hr_department
+ from . import hr_departure_reason
+ from . import hr_job
+-from . import hr_plan
+-from . import hr_plan_activity_type
+-from . import hr_plan_employee_activity
+ from . import hr_work_location
++from . import mail_activity_plan
++from . import mail_activity_plan_template
+ from . import mail_alias
+ from . import discuss_channel
+ from . import models
+
+--- a/addons/hr/models/hr_department.py
++++ b/addons/hr/models/hr_department.py
+@@ -23,7 +23,7 @@ class Department(models.Model):
+     member_ids = fields.One2many('hr.employee', 'department_id', string='Members', readonly=True)
+     total_employee = fields.Integer(compute='_compute_total_employee', string='Total Employee')
+     jobs_ids = fields.One2many('hr.job', 'department_id', string='Jobs')
+-    plan_ids = fields.One2many('hr.plan', 'department_id')
++    plan_ids = fields.One2many('mail.activity.plan', 'department_id')
+     plans_count = fields.Integer(compute='_compute_plan_count')
+     note = fields.Text('Note')
+     color = fields.Integer('Color Index')
+@@ -63,7 +63,7 @@ class Department(models.Model):
+             department.total_employee = result.get(department.id, 0)
+ 
+     def _compute_plan_count(self):
+-        plans_data = self.env['hr.plan']._read_group([('department_id', 'in', self.ids)], ['department_id'], ['__count'])
++        plans_data = self.env['mail.activity.plan']._read_group([('department_id', 'in', self.ids)], ['department_id'], ['__count'])
+         plans_count = {department.id: count for department, count in plans_data}
+         for department in self:
+             department.plans_count = plans_count.get(department.id, 0)
+@@ -128,7 +128,7 @@ class Department(models.Model):
+         return res
+ 
+     def action_plan_from_department(self):
+-        action = self.env['ir.actions.actions']._for_xml_id('hr.hr_plan_action')
++        action = self.env['ir.actions.actions']._for_xml_id('hr.mail_activity_plan_action')
+         action['context'] = {'default_department_id': self.id, 'search_default_department_id': self.id}
+         return action
+ 
+
+--- a/addons/hr/models/hr_plan_employee_activity.py
++++ b/None
+@@ -1,32 +0,0 @@
+-# Part of Odoo. See LICENSE file for full copyright and licensing details.
+-
+-from odoo import api, fields, models
+-
+-
+-class HrPlanEmployeeActivity(models.Model):
+-    _name = 'hr.plan.employee.activity'
+-    _description = 'Plan'
+-    _inherit = ['mail.thread', 'mail.activity.mixin']
+-    _mail_post_access = 'read'
+-    _rec_name = 'employee_id'
+-
+-    employee_id = fields.Many2one('hr.employee', required=True, ondelete='cascade')
+-    department_id = fields.Many2one(related='employee_id.department_id')
+-    image_128 = fields.Image(related='employee_id.image_128')
+-    company_id = fields.Many2one(related='employee_id.company_id')
+-    user_id = fields.Many2one(related='employee_id.user_id')
+-    summary = fields.Html(compute='_compute_summary')
+-
+-    @api.depends('activity_ids.summary')
+-    def _compute_summary(self):
+-        for plan in self:
+-            plan.summary = self.env['ir.ui.view']._render_template('hr.hr_employee_plan_activity_summary', {
+-                'activity_ids': plan.activity_ids,
+-            })
+-
+-    @api.autovacuum
+-    def _gc_employee_plan_activity(self):
+-        no_activities = self.env['hr.plan.employee.activity'].search(
+-            [('activity_ids', '=', False)]
+-        )
+-        no_activities.unlink()
+
+--- a/addons/hr/models/mail_activity_plan.py
++++ b/addons/hr/models/mail_activity_plan.py
+@@ -1,27 +1,38 @@
+ # -*- coding: utf-8 -*-
+ # Part of Odoo. See LICENSE file for full copyright and licensing details.
+ 
+-from odoo import api, fields, models
++from odoo import api, fields, models, _
++from odoo.exceptions import UserError
+ 
+ 
+-class HrPlan(models.Model):
+-    _name = 'hr.plan'
+-    _description = 'plan'
++class MailActivityPlan(models.Model):
++    _inherit = 'mail.activity.plan'
+ 
+-    name = fields.Char('Name', required=True)
+-    company_id = fields.Many2one(
+-        'res.company', default=lambda self: self.env.company)
+-    department_id = fields.Many2one('hr.department', check_company=True)
+-    plan_activity_type_ids = fields.One2many(
+-        'hr.plan.activity.type', 'plan_id',
+-        string='Activities',
+-        check_company=True)
+-    active = fields.Boolean(default=True)
+-    steps_count = fields.Integer(compute='_compute_steps_count')
++    department_id = fields.Many2one(
++        'hr.department', check_company=True,
++        compute='_compute_department_id', ondelete='cascade', readonly=False, store=True)
+ 
+-    @api.depends('plan_activity_type_ids')
+-    def _compute_steps_count(self):
+-        activity_type_data = self.env['hr.plan.activity.type']._read_group([('plan_id', 'in', self.ids)], ['plan_id'], ['__count'])
+-        steps_count = {plan.id: count for plan, count in activity_type_data}
+-        for plan in self:
+-            plan.steps_count = steps_count.get(plan.id, 0)
++    @api.constrains('res_model')
++    def _check_compatibility_with_model(self):
++        """ Check that when the model is updated to a model different from employee,
++        there are no remaining specific values to employee. """
++        plan_tocheck = self.filtered(lambda plan: plan.res_model != 'hr.employee')
++        failing_plans = plan_tocheck.filtered('department_id')
++        if failing_plans:
++            raise UserError(
++                _('Plan %(plan_names)s cannot use a department as it is used only for employee plans.',
++                  plan_names=', '.join(failing_plans.mapped('name')))
++            )
++        failing_templates = plan_tocheck.template_ids.filtered(
++            lambda tpl: tpl.responsible_type in {'coach', 'manager', 'employee'}
++        )
++        if failing_templates:
++            raise UserError(
++                _('Plan activities %(template_names)s cannot use coach, manager or employee responsible as it is used only for employee plans.',
++                  template_names=', '.join(failing_templates.mapped('activity_type_id.name')))
++            )
++
++    @api.onchange('res_model')
++    def _compute_department_id(self):
++        for plan in self.filtered(lambda plan: plan.res_model != 'hr.employee'):
++            plan.department_id = False
+
+--- a/addons/hr/models/mail_activity_plan_template.py
++++ b/addons/hr/models/mail_activity_plan_template.py
+@@ -2,67 +2,48 @@
+ # Part of Odoo. See LICENSE file for full copyright and licensing details.
+ 
+ from odoo import api, fields, models, _
+-from odoo.exceptions import UserError
++from odoo.exceptions import ValidationError
+ 
+ 
+-class HrPlanActivityType(models.Model):
+-    _name = 'hr.plan.activity.type'
+-    _description = 'Plan activity type'
+-    _rec_name = 'summary'
+-    _check_company_auto = True
++class MailActivityPLanTemplate(models.Model):
++    _inherit = 'mail.activity.plan.template'
+ 
+-    company_id = fields.Many2one('res.company', default=lambda self: self.env.company)
+-    activity_type_id = fields.Many2one(
+-        'mail.activity.type', 'Activity Type',
+-        default=lambda self: self.env.ref('mail.mail_activity_data_todo'),
+-        domain=lambda self: ['|', ('res_model', '=', False), ('res_model', '=', 'hr.employee')],
+-        ondelete='restrict'
+-    )
+-    summary = fields.Char('Summary', compute="_compute_default_summary", store=True, readonly=False)
+-    responsible = fields.Selection([
++    responsible_type = fields.Selection(selection_add=[
+         ('coach', 'Coach'),
+         ('manager', 'Manager'),
+         ('employee', 'Employee'),
+-        ('other', 'Other')], default='employee', string='Responsible', required=True)
+-    responsible_id = fields.Many2one(
+-        'res.users',
+-        'Other Responsible',
+-        check_company=True,
+-        help='Specific responsible of activity if not linked to the employee.')
+-    plan_id = fields.Many2one('hr.plan')
+-    note = fields.Html('Note')
++    ], ondelete={'coach': 'cascade', 'manager': 'cascade', 'employee': 'cascade'})
+ 
+-    @api.depends('activity_type_id')
+-    def _compute_default_summary(self):
+-        for plan_type in self:
+-            if plan_type.activity_type_id and plan_type.activity_type_id.summary:
+-                plan_type.summary = plan_type.activity_type_id.summary
+-            else:
+-                plan_type.summary = False
++    @api.constrains('plan_id', 'responsible_type')
++    def _check_responsible_hr(self):
++        """ Ensure that hr types are used only on employee model """
++        for template in self.filtered(lambda tpl: tpl.plan_id.res_model != 'hr.employee'):
++            if template.responsible_type in {'coach', 'manager', 'employee'}:
++                raise ValidationError(_('Those responsible types are limited to Employee plans.'))
+ 
+-    def get_responsible_id(self, employee):
+-        warning = False
+-        if self.responsible == 'coach':
++    def _determine_responsible(self, on_demand_responsible, employee):
++        if self.plan_id.res_model != 'hr.employee' or self.responsible_type not in {'coach', 'manager', 'employee'}:
++            return super()._determine_responsible(on_demand_responsible, employee)
++        error = False
++        responsible = False
++        if self.responsible_type == 'coach':
+             if not employee.coach_id:
+-                warning = _('Coach of employee %s is not set.', employee.name)
++                error = _('Coach of employee %s is not set.', employee.name)
+             responsible = employee.coach_id.user_id
+             if employee.coach_id and not responsible:
+-                warning = _("The user of %s's coach is not set.", employee.name)
+-        elif self.responsible == 'manager':
++                error = _("The user of %s's coach is not set.", employee.name)
++        elif self.responsible_type == 'manager':
+             if not employee.parent_id:
+-                warning = _('Manager of employee %s is not set.', employee.name)
++                error = _('Manager of employee %s is not set.', employee.name)
+             responsible = employee.parent_id.user_id
+             if employee.parent_id and not responsible:
+-                warning = _("The manager of %s should be linked to a user.", employee.name)
+-        elif self.responsible == 'employee':
++                error = _("The manager of %s should be linked to a user.", employee.name)
++        elif self.responsible_type == 'employee':
+             responsible = employee.user_id
+             if not responsible:
+-                warning = _('The employee %s should be linked to a user.', employee.name)
+-        elif self.responsible == 'other':
+-            responsible = self.responsible_id
+-            if not responsible:
+-                warning = _('No specific user given on activity %s.', self.activity_type_id.name)
+-        return {
+-            'responsible': responsible,
+-            'warning': warning,
+-        }
++                error = _('The employee %s should be linked to a user.', employee.name)
++        if error or responsible:
++            return {
++                'responsible': responsible,
++                'error': error,
++            }

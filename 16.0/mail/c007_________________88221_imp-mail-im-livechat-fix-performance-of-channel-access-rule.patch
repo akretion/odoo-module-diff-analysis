@@ -1,0 +1,93 @@
+PR: https://github.com/odoo/odoo/pull/88221
+
+From: a29a7183a4a265fdbdac111719f4c3ed382dc667
+From: Sébastien Theys
+Date: 2022-04-08 13:52:31
+
+Structural Changes: 2
+Total Changes: 41
+
+[IMP] mail, im_livechat: fix performance of channel access rule
+
+Current access rule requires fetching all members of each channel, which does not scale.
+
+Use is_member field instead, and make sure itself does not fetch all members.
+
+task-2818759
+
+closes odoo/odoo#88221
+
+Related: odoo/upgrade#3422
+Signed-off-by: Sébastien Theys (seb) <seb@odoo.com>
+
+================================= pseudo patch: =================================
+
+--- a/addons/mail/models/mail_channel.py
++++ b/addons/mail/models/mail_channel.py
+@@ -73,7 +73,7 @@ class Channel(models.Model):
+         'mail.channel.partner', 'channel_id', string='Last Seen',
+         groups='base.group_user')
+     rtc_session_ids = fields.One2many('mail.channel.rtc.session', 'channel_id', groups="base.group_system")
+-    is_member = fields.Boolean('Is Member', compute='_compute_is_member', compute_sudo=True)
++    is_member = fields.Boolean('Is Member', compute='_compute_is_member', search='_search_is_member')
+     member_count = fields.Integer(string="Member Count", compute='_compute_member_count', compute_sudo=True, help="Excluding guests from count.")
+     group_ids = fields.Many2many(
+         'res.groups', string='Auto Subscription',
+@@ -166,10 +166,38 @@ class Channel(models.Model):
+             ])
+         )]
+ 
+-    @api.depends('channel_partner_ids')
++    @api.depends_context('uid', 'guest')
++    @api.depends('channel_last_seen_partner_ids')
+     def _compute_is_member(self):
++        if not self:
++            return
++        if self.env.user._is_public():
++            guest = self.env['mail.guest']._get_guest_from_context()
++            if not guest:
++                self.is_member = False
++                return
++            user_domain = [('guest_id', '=', guest.id)]
++        else:
++            user_domain = [('partner_id', '=', self.env.user.partner_id.id)]
++        members = self.env['mail.channel.partner'].sudo().search(expression.AND([[('channel_id', 'in', self.ids)], user_domain]))
++        is_member_channels = {member.channel_id for member in members}
+         for channel in self:
+-            channel.is_member = self.env.user.partner_id in channel.channel_partner_ids
++            channel.is_member = channel in is_member_channels
++
++    def _search_is_member(self, operator, operand):
++        is_in = (operator == '=' and operand) or (operator == '!=' and not operand)
++        if self.env.user._is_public():
++            guest = self.env['mail.guest']._get_guest_from_context()
++            if not guest:
++                return expression.FALSE_DOMAIN if is_in else expression.TRUE_DOMAIN
++            user_domain = [('guest_id', '=', guest.id)]
++        else:
++            user_domain = [('partner_id', '=', self.env.user.partner_id.id)]
++        return [(
++            'channel_last_seen_partner_ids',
++            'in' if is_in else 'not in',
++            self.env['mail.channel.partner'].sudo()._search(user_domain)
++        )]
+ 
+     @api.depends('channel_partner_ids')
+     def _compute_member_count(self):
+
+--- a/addons/mail/models/mail_guest.py
++++ b/addons/mail/models/mail_guest.py
+@@ -29,6 +29,13 @@ class MailGuest(models.Model):
+     timezone = fields.Selection(string="Timezone", selection=_tz_get)
+     channel_ids = fields.Many2many(string="Channels", comodel_name='mail.channel', relation='mail_channel_partner', column1='guest_id', column2='channel_id', copy=False)
+ 
++    def _get_guest_from_context(self):
++        """Returns the current guest record from the context, if applicable."""
++        guest = self.env.context.get('guest')
++        if isinstance(guest, self.pool['mail.guest']):
++            return guest
++        return self.env['mail.guest']
++
+     def _get_guest_from_request(self, request):
+         parts = request.httprequest.cookies.get(self._cookie_name, '').split(self._cookie_separator)
+         if len(parts) != 2:

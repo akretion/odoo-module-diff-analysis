@@ -1,0 +1,353 @@
+PR: https://github.com/odoo/odoo/pull/
+
+From: df324c885771814efde7918cfecfa7940a38591f
+From: RomainLibert
+Date: 2018-02-14 16:26:31
+
+Structural Changes: 20
+Total Changes: 153
+
+[IMP] hr_holidays: Improve leave type: limit date, visibility, usability
+
+In order to help limit leaves recording errors. We need to add some
+configuration on leave type object. For example we need to avoid people
+taking legal leaves 2016 on 2017.
+
+  * Add validity dates : start and end dates on the leave type. An empty
+    end date means forever
+  * Double validation : change the checkbox into a radio button with now
+    three choices :
+  	- Human Resource Responsible
+	- Manager
+	- Double Validation
+  * Add a sequence field, using handle widget
+  * Add a field, to specify if the employee can select the leave type in
+    his allocations, requests or in both of them
+
+================================= pseudo patch: =================================
+
+--- a/addons/hr_holidays/models/hr.py
++++ b/addons/hr_holidays/models/hr.py
+@@ -142,7 +142,7 @@ class Employee(models.Model):
+                     'number_of_days_temp': difference
+                 })
+                 leave.action_approve()
+-                if leave.double_validation:
++                if leave.validation_type == 'both':
+                     leave.action_validate()
+             elif difference < 0:
+                 raise UserError(_('You cannot reduce validated allocation requests'))
+
+--- a/addons/hr_holidays/models/hr_leave.py
++++ b/addons/hr_holidays/models/hr_leave.py
+@@ -8,7 +8,7 @@ import math
+ from datetime import timedelta
+ 
+ from odoo import api, fields, models
+-from odoo.exceptions import UserError, AccessError, ValidationError
++from odoo.exceptions import UserError, ValidationError
+ from odoo.tools import float_compare
+ from odoo.tools.translate import _
+ 
+@@ -22,9 +22,20 @@ class HolidaysRequest(models.Model):
+     _order = "date_from desc"
+     _inherit = ['mail.thread']
+ 
++    @api.model
++    def default_get(self, fields_list):
++        defaults = super(HolidaysRequest, self).default_get(fields_list)
++
++        LeaveType = self.env['hr.leave.type'].with_context(employee_id=defaults.get('employee_id'), default_date_from=defaults.get('date_from'))
++        lt = LeaveType.search([('valid', '=', True), ('employee_applicability', 'in', ['leave', 'both'])])
++
++        defaults['holiday_status_id'] = lt[0].id if len(lt) > 0 else defaults.get('holiday_status_id')
++        return defaults
++
+     def _default_employee(self):
+         return self.env.context.get('default_employee_id') or self.env['hr.employee'].search([('user_id', '=', self.env.uid)], limit=1)
+ 
++
+     name = fields.Char('Description')
+     state = fields.Selection([
+         ('draft', 'To Submit'),
+@@ -47,7 +58,8 @@ class HolidaysRequest(models.Model):
+     date_to = fields.Datetime('End Date', readonly=True, copy=False, required=True,
+         states={'draft': [('readonly', False)], 'confirm': [('readonly', False)]}, track_visibility='onchange')
+     holiday_status_id = fields.Many2one("hr.leave.type", string="Leave Type", required=True, readonly=True,
+-        states={'draft': [('readonly', False)], 'confirm': [('readonly', False)]})
++        states={'draft': [('readonly', False)], 'confirm': [('readonly', False)]},
++        domain="[('valid', '=', True), ('employee_applicability', 'in', ['leave', 'both'])]")
+     employee_id = fields.Many2one('hr.employee', string='Employee', index=True, readonly=True,
+         states={'draft': [('readonly', False)], 'confirm': [('readonly', False)]}, default=_default_employee, track_visibility='onchange')
+     manager_id = fields.Many2one('hr.employee', related='employee_id.parent_id', string='Manager', readonly=True, store=True)
+@@ -75,7 +87,7 @@ class HolidaysRequest(models.Model):
+         help='This area is automatically filled by the user who validate the leave', oldname='manager_id')
+     second_approver_id = fields.Many2one('hr.employee', string='Second Approval', readonly=True, copy=False, oldname='manager_id2',
+         help='This area is automaticly filled by the user who validate the leave with second level (If Leave type need second validation)')
+-    double_validation = fields.Boolean('Apply Double Validation', related='holiday_status_id.double_validation')
++    validation_type = fields.Selection('Validation Type', related='holiday_status_id.validation_type')
+     can_reset = fields.Boolean('Can reset', compute='_compute_can_reset')
+ 
+     _sql_constraints = [
+@@ -208,6 +220,20 @@ class HolidaysRequest(models.Model):
+         if employee.user_id:
+             self.message_subscribe_users(user_ids=employee.user_id.ids)
+ 
++    @api.multi
++    @api.constrains('holiday_status_id')
++    def _check_leave_type_validity(self):
++        for leave in self:
++            if leave.holiday_status_id.validity_start and leave.holiday_status_id.validity_stop:
++                vstart = fields.Datetime.from_string(leave.holiday_status_id.validity_start)
++                vstop  = fields.Datetime.from_string(leave.holiday_status_id.validity_stop)
++                dfrom  = fields.Datetime.from_string(leave.date_from)
++                dto    = fields.Datetime.from_string(leave.date_to)
++
++                if dfrom and dto and (dfrom < vstart or dto > vstop):
++                    raise UserError(_('You can take %s only between %s and %s') % (leave.holiday_status_id.display_name, \
++                                                                                  leave.holiday_status_id.validity_start, leave.holiday_status_id.validity_stop))
++
+     @api.model
+     def create(self, values):
+         """ Override to avoid automatic logging of creation """
+@@ -331,8 +357,8 @@ class HolidaysRequest(models.Model):
+ 
+     @api.multi
+     def action_approve(self):
+-        # if double_validation: this method is the first approval approval
+-        # if not double_validation: this method calls action_validate() below
++        # if validation_type == 'both': this method is the first approval approval
++        # if validation_type != 'both': this method calls action_validate() below
+         if not self.env.user.has_group('hr_holidays.group_hr_holidays_user'):
+             raise UserError(_('Only an HR Officer or Manager can approve leave requests.'))
+ 
+@@ -340,8 +366,17 @@ class HolidaysRequest(models.Model):
+         if any(holiday.state != 'confirm' for holiday in self):
+             raise UserError(_('Leave request must be confirmed ("To Approve") in order to approve it.'))
+ 
+-        self.filtered(lambda hol: hol.double_validation).write({'state': 'validate1', 'first_approver_id': current_employee.id})
+-        self.filtered(lambda hol: not hol.double_validation).action_validate()
++        for holiday in self:
++            validation_type = holiday.holiday_status_id.validation_type
++            manager = holiday.employee_id.parent_id or holiday.employee_id.department_id.manager_id
++            if (validation_type in ['manager', 'both']) and (manager and manager != current_employee)\
++              and not self.env.user.has_group('hr_holidays.group_hr_holidays_manager'):
++                raise UserError(_('You must be %s manager to approve this leave') % (holiday.employee_id.name))
++            elif validation_type == 'hr' and not self.env.user.has_group('hr_holidays.group_hr_holidays_manager'):
++                raise UserError(_('You must be a Human Resource Manager to approve this Leave'))
++
++        self.filtered(lambda hol: hol.validation_type == 'both').write({'state': 'validate1', 'first_approver_id': current_employee.id})
++        self.filtered(lambda hol: not hol.validation_type == 'both').action_validate()
+         return True
+ 
+     @api.multi
+@@ -357,7 +392,7 @@ class HolidaysRequest(models.Model):
+                 raise UserError(_('Only an HR Manager can apply the second approval on leave requests.'))
+ 
+             holiday.write({'state': 'validate'})
+-            if holiday.double_validation:
++            if holiday.validation_type == 'both':
+                 holiday.write({'second_approver_id': current_employee.id})
+             else:
+                 holiday.write({'first_approver_id': current_employee.id})
+@@ -371,7 +406,7 @@ class HolidaysRequest(models.Model):
+                     leaves += self.with_context(mail_notify_force_send=False).create(values)
+                 # TODO is it necessary to interleave the calls?
+                 leaves.action_approve()
+-                if leaves and leaves[0].double_validation:
++                if leaves and leaves[0].validation_type == 'both':
+                     leaves.action_validate()
+         return True
+ 
+
+--- a/addons/hr_holidays/models/hr_leave_allocation.py
++++ b/addons/hr_holidays/models/hr_leave_allocation.py
+@@ -6,7 +6,7 @@
+ import logging
+ 
+ from odoo import api, fields, models
+-from odoo.exceptions import UserError, AccessError
++from odoo.exceptions import UserError
+ from odoo.tools.translate import _
+ 
+ _logger = logging.getLogger(__name__)
+@@ -20,6 +20,11 @@ class HolidaysAllocation(models.Model):
+     def _default_employee(self):
+         return self.env.context.get('default_employee_id') or self.env['hr.employee'].search([('user_id', '=', self.env.uid)], limit=1)
+ 
++    def _default_holiday_status_id(self):
++        LeaveType = self.env['hr.leave.type'].with_context(employee_id=self._default_employee().id)
++        lt = LeaveType.search([('valid', '=', True), ('employee_applicability', 'in', ['leave', 'both']), ('limit', '=', False)])
++        return lt[:1]
++
+     name = fields.Char('Description')
+     state = fields.Selection([
+         ('draft', 'To Submit'),
+@@ -34,7 +39,8 @@ class HolidaysAllocation(models.Model):
+             "\nThe status is 'Refused', when leave request is refused by manager." +
+             "\nThe status is 'Approved', when leave request is approved by manager.")
+     holiday_status_id = fields.Many2one("hr.leave.type", string="Leave Type", required=True, readonly=True,
+-        states={'draft': [('readonly', False)], 'confirm': [('readonly', False)]})
++        states={'draft': [('readonly', False)], 'confirm': [('readonly', False)]},
++        domain="[('valid', '=', True), ('employee_applicability', 'in', ['allocation', 'both']), ('limit', '=', False)]", default=_default_holiday_status_id)
+     employee_id = fields.Many2one('hr.employee', string='Employee', index=True, readonly=True,
+         states={'draft': [('readonly', False)], 'confirm': [('readonly', False)]}, default=_default_employee, track_visibility='onchange')
+     notes = fields.Text('Reasons', readonly=True, states={'draft': [('readonly', False)], 'confirm': [('readonly', False)]})
+@@ -59,7 +65,7 @@ class HolidaysAllocation(models.Model):
+         help='This area is automatically filled by the user who validate the leave', oldname='manager_id')
+     second_approver_id = fields.Many2one('hr.employee', string='Second Approval', readonly=True, copy=False, oldname='manager_id2',
+         help='This area is automaticly filled by the user who validate the leave with second level (If Leave type need second validation)')
+-    double_validation = fields.Boolean('Apply Double Validation', related='holiday_status_id.double_validation')
++    validation_type = fields.Selection('Validation Type', related='holiday_status_id.validation_type')
+     can_reset = fields.Boolean('Can reset', compute='_compute_can_reset')
+ 
+     _sql_constraints = [
+@@ -120,6 +126,19 @@ class HolidaysAllocation(models.Model):
+         if employee.user_id:
+             self.message_subscribe_users(user_ids=employee.user_id.ids)
+ 
++    @api.multi
++    @api.constrains('holiday_status_id')
++    def _check_leave_type_validity(self):
++        for allocation in self:
++            if allocation.holiday_status_id.validity_start and allocation.holiday_status_id.validity_stop:
++                vstart = fields.Datetime.from_string(allocation.holiday_status_id.validity_start)
++                vstop = fields.Datetime.from_string(allocation.holiday_status_id.validity_stop)
++                today = fields.Datetime.from_string(fields.Datetime.now())
++
++                if vstart > today or vstop < today:
++                    raise UserError(_('You can allocate %s only between %s and %s') % (allocation.holiday_status_id.display_name,
++                                                                                  allocation.holiday_status_id.validity_start, allocation.holiday_status_id.validity_stop))
++
+     @api.model
+     def create(self, values):
+         """ Override to avoid automatic logging of creation """
+@@ -191,8 +210,8 @@ class HolidaysAllocation(models.Model):
+ 
+     @api.multi
+     def action_approve(self):
+-        # if double_validation: this method is the first approval approval
+-        # if not double_validation: this method calls action_validate() below
++        # if validation_type == 'both': this method is the first approval approval
++        # if validation_type != 'both': this method calls action_validate() below
+         if not self.env.user.has_group('hr_holidays.group_hr_holidays_user'):
+             raise UserError(_('Only an HR Officer or Manager can approve leave requests.'))
+ 
+@@ -200,8 +219,17 @@ class HolidaysAllocation(models.Model):
+         if any(holiday.state != 'confirm' for holiday in self):
+             raise UserError(_('Leave request must be confirmed ("To Approve") in order to approve it.'))
+ 
+-        self.filtered(lambda hol: hol.double_validation).write({'state': 'validate1', 'first_approver_id': current_employee.id})
+-        self.filtered(lambda hol: not hol.double_validation).action_validate()
++        for holiday in self:
++            validation_type = holiday.holiday_status_id.validation_type
++            manager = holiday.employee_id.parent_id or holiday.employee_id.department_id.manager_id
++            if (validation_type in ['manager', 'both']) and (manager and manager != current_employee)\
++              and not self.env.user.has_group('hr_holidays.group_hr_holidays_manager'):
++                raise UserError(_('You must be %s manager to approve this leave') % (holiday.employee_id.name))
++            elif validation_type == 'hr' and not self.env.user.has_group('hr_holidays.group_hr_holidays_manager'):
++                raise UserError(_('You must be a Human Resource Manager to approve this Leave'))
++
++        self.filtered(lambda hol: hol.validation_type == 'both').write({'state': 'validate1', 'first_approver_id': current_employee.id})
++        self.filtered(lambda hol: not hol.validation_type == 'both').action_validate()
+         return True
+ 
+     @api.multi
+@@ -217,7 +245,7 @@ class HolidaysAllocation(models.Model):
+                 raise UserError(_('Only an HR Manager can apply the second approval on leave requests.'))
+ 
+             holiday.write({'state': 'validate'})
+-            if holiday.double_validation:
++            if holiday.validation_type == 'both':
+                 holiday.write({'second_approver_id': current_employee.id})
+             else:
+                 holiday.write({'first_approver_id': current_employee.id})
+@@ -229,7 +257,7 @@ class HolidaysAllocation(models.Model):
+                     leaves += self.with_context(mail_notify_force_send=False).create(values)
+                 # TODO is it necessary to interleave the calls?
+                 leaves.action_approve()
+-                if leaves and leaves[0].double_validation:
++                if leaves and leaves[0].validation_type == 'both':
+                     leaves.action_validate()
+         return True
+ 
+
+--- a/addons/hr_holidays/models/hr_leave_type.py
++++ b/addons/hr_holidays/models/hr_leave_type.py
+@@ -6,6 +6,7 @@
+ import logging
+ 
+ from odoo import api, fields, models
++from odoo.exceptions import ValidationError
+ from odoo.tools.translate import _
+ 
+ _logger = logging.getLogger(__name__)
+@@ -14,8 +15,11 @@ _logger = logging.getLogger(__name__)
+ class HolidaysType(models.Model):
+     _name = "hr.leave.type"
+     _description = "Leave Type"
++    _order = "sequence, id"
+ 
+     name = fields.Char('Leave Type', required=True, translate=True)
++    sequence = fields.Integer(default=100,
++                              help='The type with the smallest sequence is the default value in leave request')
+     categ_id = fields.Many2one('calendar.event.type', string='Meeting Type',
+         help='Once a leave is validated, Odoo will create a corresponding meeting of this type in the calendar.')
+     color_name = fields.Selection([
+@@ -52,10 +56,54 @@ class HolidaysType(models.Model):
+     virtual_remaining_leaves = fields.Float(compute='_compute_leaves', string='Virtual Remaining Leaves',
+         help='Maximum Leaves Allowed - Leaves Already Taken - Leaves Waiting Approval')
+ 
+-    double_validation = fields.Boolean(string='Apply Double Validation',
+-        help="When selected, the Allocation/Leave Requests for this type require a second validation to be approved.")
+     company_id = fields.Many2one('res.company', string='Company', default=lambda self: self.env.user.company_id)
+ 
++    validation_type = fields.Selection([('hr', 'Human Resource Responsible'),
++                                      ('manager', 'Manager'),
++                                      ('both', 'Double Validation')],
++                                     default='hr',
++                                     string='Validation By')
++
++    employee_applicability = fields.Selection([('both', 'On Leave As Well As On Allocation'),
++                                            ('leave', 'Only On Leave'),
++                                            ('allocation', 'Only On Allocation')],
++                                           default='both', string='Available For Employee :',
++                                           help='This leave type will be available on Leave / Allocation request based on selected value')
++
++    validity_start = fields.Date("Start Date", default=fields.Date.today(),
++                                 help='Adding validity to types of leaves so that it cannot be selected outside'
++                                 'this time period')
++    validity_stop = fields.Date("End Date")
++
++    valid = fields.Boolean(compute='_compute_valid', search='_search_valid', help='This indicates if it is still possible to use this type of leave')
++
++    @api.multi
++    @api.constrains('validity_start', 'validity_stop')
++    def _check_validity_dates(self):
++        for htype in self:
++            if htype.validity_start and htype.validity_stop and \
++               htype.validity_start > htype.validity_stop:
++                raise ValidationError(_("End of validity period should be greater than start of validity period"))
++
++    @api.multi
++    @api.depends('validity_start', 'validity_stop', 'limit')
++    def _compute_valid(self):
++        dt = self._context.get('default_date_from', fields.Date.today())
++
++        for holiday_type in self:
++            if holiday_type.validity_start and holiday_type.validity_stop:
++                holiday_type.valid = ((dt < holiday_type.validity_stop) and (dt > holiday_type.validity_start))
++            else:
++                holiday_type.valid = not holiday_type.validity_stop
++
++    def _search_valid(self, operator, value):
++        dt = self._context.get('default_date_from', fields.Date.today())
++        signs = ['>=', '<='] if operator == '=' else ['<=', '>=']
++
++        return ['|', ('validity_stop', operator, False), '&',
++                ('validity_stop', signs[0] if value else signs[1], dt),
++                ('validity_start', signs[1] if value else signs[0], dt)]
++
+     @api.multi
+     def get_days(self, employee_id):
+         # need to use `dict` constructor to create a dict per id

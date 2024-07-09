@@ -1,0 +1,161 @@
+PR: https://github.com/odoo/odoo/pull/
+
+From: 0eadc0aa5ea53943738e43b3ec1c9bff3ef30922
+From: Victor Feyens
+Date: 2019-11-25 14:17:31
+
+Structural Changes: 1
+Total Changes: 42
+
+[IMP] mail: better prevent activity type removal and add a fallback mechanism
+
+Current activity types master data cannot be unlinked through a quite harsh
+override of unlink using xml id existence, introduced at 2602642a78dff6c15d615fadf4c55a6b6ca315df.
+Some of them are real master data, other could be unlinked if users want it.
+Finally custom activity types may cause errors when removed if used in some
+side models like server actions or automated actions.
+
+To allow more flexibility we remove the removal constraint and implement
+a fallback mechanism. It is implemented in mail.activity.mixin when calling
+activity_schedule(xmlid, ...). If the given xmlid is not found
+_default_activity_type() specifies the default activity to use. It can
+be overridden in modules if some specific behavior is wanted.
+
+e.g.
+
+def _default_activity_type(self):
+    """Define a default fallback activity type when xml id not found
+    only used in in activity_schedule() for now.
+    """
+    try:
+        return self.env.ref('mail.mail_activity_data_todo')
+    except Exception:
+        return False
+
+In this commit we also
+
+  * restrict deletion of activity type (hr.plan and ir.actions.server);
+  * fallback on default activity type if xmlid ref not found in
+    activity_schedule;
+  * correct calls to activity_schedule and replace some manual creation calls
+    by activity_schedule;
+
+Task ID 1961156
+PR #39013
+
+Related: odoo/enterprise#6238
+Signed-off-by: Thibault Delavallee (tde) <tde@openerp.com>
+Co-authored-by: Victor Feyens <vfe@odoo.com>
+Co-authored-by: Michaël Mattiello <mcm@odoo.com>
+
+================================= pseudo patch: =================================
+
+--- a/addons/mail/models/ir_actions.py
++++ b/addons/mail/models/ir_actions.py
+@@ -29,7 +29,8 @@ class ServerActions(models.Model):
+     # Next Activity
+     activity_type_id = fields.Many2one(
+         'mail.activity.type', string='Activity',
+-        domain="['|', ('res_model_id', '=', False), ('res_model_id', '=', model_id)]")
++        domain="['|', ('res_model_id', '=', False), ('res_model_id', '=', model_id)]",
++        ondelete='restrict')
+     activity_summary = fields.Char('Summary')
+     activity_note = fields.Html('Note')
+     activity_date_deadline_range = fields.Integer(string='Due Date In')
+
+--- a/addons/mail/models/mail_activity.py
++++ b/addons/mail/models/mail_activity.py
+@@ -59,7 +59,7 @@ class MailActivityType(models.Model):
+         help='Specify a model if the activity should be specific to a model'
+              ' and not available when managing activities for other models.')
+     default_next_type_id = fields.Many2one('mail.activity.type', 'Default Next Activity',
+-        domain="['|', ('res_model_id', '=', False), ('res_model_id', '=', res_model_id)]")
++        domain="['|', ('res_model_id', '=', False), ('res_model_id', '=', res_model_id)]", ondelete='restrict')
+     force_next = fields.Boolean("Trigger Next Activity", default=False)
+     next_type_ids = fields.Many2many(
+         'mail.activity.type', 'mail_activity_rel', 'activity_id', 'recommended_id',
+@@ -91,11 +91,6 @@ class MailActivityType(models.Model):
+         for activity_type in self:
+             activity_type.initial_res_model_id = activity_type.res_model_id
+ 
+-    def unlink(self):
+-        if any(self.get_external_id().values()) and not self._context.get(MODULE_UNINSTALL_FLAG):
+-            raise exceptions.ValidationError("You can not delete activity type that are used as master data.")
+-        return super(MailActivityType, self).unlink()
+-
+ 
+ class MailActivity(models.Model):
+     """ An actual activity to perform. Activities are linked to
+@@ -575,6 +570,16 @@ class MailActivityMixin(models.AbstractModel):
+     _name = 'mail.activity.mixin'
+     _description = 'Activity Mixin'
+ 
++    def _default_activity_type(self):
++        """Define a default fallback activity type when requested xml id wasn't found.
++
++        Can be overriden to specify the default activity type of a model.
++        It is only called in in activity_schedule() for now.
++        """
++        return self.env.ref('mail.mail_activity_data_todo', raise_if_not_found=False) \
++            or self.env['mail.activity.type'].search([('res_model', '=', self._name)], limit=1) \
++            or self.env['mail.activity.type'].search([('res_model_id', '=', False)], limit=1)
++
+     activity_ids = fields.One2many(
+         'mail.activity', 'res_id', 'Activities',
+         auto_join=True,
+@@ -732,15 +737,16 @@ class MailActivityMixin(models.AbstractModel):
+         if isinstance(date_deadline, datetime):
+             _logger.warning("Scheduled deadline should be a date (got %s)", date_deadline)
+         if act_type_xmlid:
+-            activity_type = self.sudo().env.ref(act_type_xmlid)
++            activity_type = self.env.ref(act_type_xmlid, raise_if_not_found=False) or self._default_activity_type()
+         else:
+-            activity_type = self.env['mail.activity.type'].sudo().browse(act_values['activity_type_id'])
++            activity_type_id = act_values.get('activity_type_id', False)
++            activity_type = activity_type_id and self.env['mail.activity.type'].sudo().browse(activity_type_id)
+ 
+         model_id = self.env['ir.model']._get(self._name).id
+         activities = self.env['mail.activity']
+         for record in self:
+             create_vals = {
+-                'activity_type_id': activity_type.id,
++                'activity_type_id': activity_type and activity_type.id,
+                 'summary': summary or activity_type.summary,
+                 'automated': True,
+                 'note': note or activity_type.default_description,
+@@ -792,7 +798,10 @@ class MailActivityMixin(models.AbstractModel):
+             return False
+ 
+         Data = self.env['ir.model.data'].sudo()
+-        activity_types_ids = [Data.xmlid_to_res_id(xmlid) for xmlid in act_type_xmlids]
++        activity_types_ids = [Data.xmlid_to_res_id(xmlid, raise_if_not_found=False) for xmlid in act_type_xmlids]
++        activity_types_ids = [act_type_id for act_type_id in activity_types_ids if act_type_id]
++        if not any(activity_types_ids):
++            return False
+         domain = [
+             '&', '&', '&',
+             ('res_model', '=', self._name),
+@@ -819,7 +828,10 @@ class MailActivityMixin(models.AbstractModel):
+             return False
+ 
+         Data = self.env['ir.model.data'].sudo()
+-        activity_types_ids = [Data.xmlid_to_res_id(xmlid) for xmlid in act_type_xmlids]
++        activity_types_ids = [Data.xmlid_to_res_id(xmlid, raise_if_not_found=False) for xmlid in act_type_xmlids]
++        activity_types_ids = [act_type_id for act_type_id in activity_types_ids if act_type_id]
++        if not any(activity_types_ids):
++            return False
+         domain = [
+             '&', '&', '&',
+             ('res_model', '=', self._name),
+@@ -841,7 +853,10 @@ class MailActivityMixin(models.AbstractModel):
+             return False
+ 
+         Data = self.env['ir.model.data'].sudo()
+-        activity_types_ids = [Data.xmlid_to_res_id(xmlid) for xmlid in act_type_xmlids]
++        activity_types_ids = [Data.xmlid_to_res_id(xmlid, raise_if_not_found=False) for xmlid in act_type_xmlids]
++        activity_types_ids = [act_type_id for act_type_id in activity_types_ids if act_type_id]
++        if not any(activity_types_ids):
++            return False
+         domain = [
+             '&', '&', '&',
+             ('res_model', '=', self._name),

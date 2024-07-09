@@ -1,0 +1,145 @@
+PR: https://github.com/odoo/odoo/pull/66181
+
+From: 3c7626fe0861854d3fb51d9cbef206683935deec
+From: Xavier BOL (xbo)
+Date: 2021-04-16 08:35:47
+
+Structural Changes: 4
+Total Changes: 67
+
+[IMP] sale_timesheet: simplify the pricing type in project settings
+
+Before this commit, the user must choose a pricing type and configure
+it.
+
+This commit changes the pricing type to a compute non-stored field and
+now the user will configure what he wants for his project and the
+pricing type changed according it.
+That is, the SO, SOL and employee mappings fields will always be visible
+in the basic project. When the user set the SO and SOL the pricing type
+becomes project rate and if he add an employee mapping, then the pricing
+type becomes employee rate.
+
+task-2442683
+
+closes odoo/odoo#66181
+
+================================= pseudo patch: =================================
+
+--- a/addons/sale_timesheet/models/product.py
++++ b/addons/sale_timesheet/models/product.py
+@@ -20,7 +20,7 @@ class ProductTemplate(models.Model):
+     ], ondelete={'timesheet': 'set default'})
+     # override domain
+     project_id = fields.Many2one(domain="[('allow_billable', '=', True), ('pricing_type', '=', 'task_rate'), ('allow_timesheets', 'in', [service_policy == 'delivered_timesheet' or '', True])]")
+-    project_template_id = fields.Many2one(domain="[('allow_billable', '=', True), ('pricing_type', 'in', ('fixed_rate', 'employee_rate')), ('allow_timesheets', 'in', [service_policy == 'delivered_timesheet' or '', True])]")
++    project_template_id = fields.Many2one(domain="[('allow_billable', '=', True), ('pricing_type', '!=', 'task_rate'), ('allow_timesheets', 'in', [service_policy == 'delivered_timesheet' or '', True])]")
+     service_upsell_warning = fields.Boolean('Upsell Warning', help="The salesperson in charge will be assigned an activity informing him of an upselling opportunity once the selected threshold is reached.")
+     service_upsell_threshold = fields.Float('Threshold', help="Percentage of time delivered compared to the prepaid amount that must be reached for the upselling opportunity activity to be triggered.")
+ 
+
+--- a/addons/sale_timesheet/models/project.py
++++ b/addons/sale_timesheet/models/project.py
+@@ -4,7 +4,8 @@
+ from collections import defaultdict
+ 
+ from odoo import api, fields, models, _
+-from odoo.exceptions import ValidationError
++from odoo.osv import expression
++from odoo.exceptions import ValidationError, UserError
+ 
+ 
+ # YTI PLEASE SPLIT ME
+@@ -29,6 +30,8 @@ class Project(models.Model):
+         ('fixed_rate', 'Project rate'),
+         ('employee_rate', 'Employee rate')
+     ], string="Pricing", default="task_rate",
++        compute='_compute_pricing_type',
++        search='_search_pricing_type',
+         help='The task rate is perfect if you would like to bill different services to different customers at different rates. The fixed rate is perfect if you bill a service at a fixed rate per hour or day worked regardless of the employee who performed it. The employee rate is preferable if your employees deliver the same service at a different rate. For instance, junior and senior consultants would deliver the same service (= consultancy), but at a different rate because of their level of seniority.')
+     sale_line_employee_ids = fields.One2many('project.sale.line.employee.map', 'project_id', "Sale line/Employee map", copy=False,
+         help="Employee/Sale Order Item Mapping:\n Defines to which sales order item an employee's timesheet entry will be linked."
+@@ -47,7 +50,62 @@ class Project(models.Model):
+         default=_default_timesheet_product_id)
+     warning_employee_rate = fields.Boolean(compute='_compute_warning_employee_rate')
+ 
+-    @api.depends('allow_billable', 'sale_order_id', 'partner_id', 'pricing_type')
++    @api.depends('sale_order_id', 'sale_line_employee_ids', 'allow_billable')
++    def _compute_pricing_type(self):
++        billable_projects = self.filtered('allow_billable')
++        for project in billable_projects:
++            if project.sale_line_employee_ids:
++                project.pricing_type = 'employee_rate'
++            elif project.sale_order_id:
++                project.pricing_type = 'fixed_rate'
++            else:
++                project.pricing_type = 'task_rate'
++        (self - billable_projects).update({'pricing_type': False})
++
++    def _search_pricing_type(self, operator, value):
++        """ Search method for pricing_type field.
++
++            This method returns a domain based on the operator and the value given in parameter:
++            - operator = '=':
++                - value = 'task_rate': [('sale_line_employee_ids', '=', False), ('sale_order_id', '=', False), ('allow_billable', '=', True)]
++                - value = 'fixed_rate': [('sale_line_employee_ids', '=', False), ('sale_order_id', '!=', False), ('allow_billable', '=', True)]
++                - value = 'employee_rate': [('sale_line_employee_ids', '!=', False), ('sale_order_id', '!=', False), ('allow_billable', '=', True)]
++                - value is False: [('allow_billable', '=', False)]
++            - operator = '!=':
++                - value = 'task_rate': ['|', ('sale_line_employee_ids', '!=', False), ('sale_order_id', '!=', False), ('allow_billable', '=', True)]
++                - value = 'fixed_rate': ['|', ('sale_line_employee_ids', '!=', False), ('sale_order_id', '=', False), ('allow_billable', '=', True)]
++                - value = 'employee_rate': [('sale_line_employee_ids', '=', False), ('sale_order_id', '=', False), ('allow_billable', '=', True)]
++                - value is False: [('allow_billable', '!=', False)]
++
++            :param operator: the supported operator is either '=' or '!='.
++            :param value: the value than the field should be is among these values into the following tuple: (False, 'task_rate', 'fixed_rate', 'employee_rate').
++
++            :returns: the domain to find the expected projects.
++        """
++        if operator not in ('=', '!='):
++            raise UserError(_('Operation not supported'))
++        if not ((isinstance(value, bool) and value is False) or (isinstance(value, str) and value in ('task_rate', 'fixed_rate', 'employee_rate'))):
++            return UserError(_('Value does not exist in the pricing type'))
++        if value is False:
++            return [('allow_billable', operator, value)]
++
++        so_cond = ('sale_order_id', '!=', False)
++        mapping_cond = ('sale_line_employee_ids', '!=', False)
++        if value == 'task_rate':
++            domain = [expression.NOT_OPERATOR, so_cond, expression.NOT_OPERATOR, mapping_cond]
++        elif value == 'fixed_rate':
++            domain = [so_cond, expression.NOT_OPERATOR, mapping_cond]
++        else:  # value == 'employee_rate'
++            domain = [so_cond, mapping_cond]
++
++        domain = expression.normalize_domain(domain)
++        if operator != '=':
++            domain.insert(0, expression.NOT_OPERATOR)
++        domain = expression.distribute_not(domain)
++        domain = expression.AND([domain, [('allow_billable', '=', True)]])
++        return domain
++
++    @api.depends('sale_order_id', 'partner_id', 'pricing_type')
+     def _compute_display_create_order(self):
+         for project in self:
+             show = True
+
+--- a/addons/sale_timesheet/models/sale_order.py
++++ b/addons/sale_timesheet/models/sale_order.py
+@@ -16,7 +16,7 @@ class SaleOrder(models.Model):
+     timesheet_count = fields.Float(string='Timesheet activities', compute='_compute_timesheet_ids', groups="hr_timesheet.group_hr_timesheet_user")
+ 
+     # override domain
+-    project_id = fields.Many2one(domain="[('pricing_type', 'in', ('fixed_rate', 'task_rate')), ('analytic_account_id', '!=', False), ('company_id', '=', company_id)]")
++    project_id = fields.Many2one(domain="[('pricing_type', '!=', 'employee_rate'), ('analytic_account_id', '!=', False), ('company_id', '=', company_id)]")
+     timesheet_encode_uom_id = fields.Many2one('uom.uom', related='company_id.timesheet_encode_uom_id')
+     timesheet_total_duration = fields.Integer("Timesheet Total Duration", compute='_compute_timesheet_total_duration', help="Total recorded duration, expressed in the encoding UoM, and rounded to the unit")
+ 
+@@ -254,7 +254,6 @@ class SaleOrderLine(models.Model):
+         """Generate project values"""
+         values = super()._timesheet_create_project_prepare_values()
+         values['allow_billable'] = True
+-        values['pricing_type'] = 'fixed_rate'
+         return values
+ 
+     def _recompute_qty_to_invoice(self, start_date, end_date):

@@ -1,0 +1,297 @@
+PR: https://github.com/odoo/odoo/pull/36555
+
+From: be8fc2296b3822baffe0bc68cb4b7efdfe53fa91
+From: Jeremy Kersten
+Date: 2019-09-30 13:58:14
+
+Structural Changes: 15
+Total Changes: 193
+
+[IMP] base, http_routing, website: allow custom routing rule
+
+After this commit, you will be able (in technical mode) to update the url for
+the python controllers.
+
+Eg.
+You can now rename /shop in /garden and /shop/product/ in /garden/vegetable/
+
+Most of urls will be replaced at fly in the renderd qweb, with the function
+url_for but all old urls will keep available. So if you access url /shop you
+will be automatically redirected to /garden (308 Permanent Redirect).
+
+As for cdn and other post-process of att, the automatically replacement in the
+rendered qweb is only done when you will be not website editor. But the new
+dispatch of URL will be applied in all cases.
+
+For developper, since it is Permanent Redirect, don't forget to clear cache or
+open chrome debug tool (with option 'Disable cache while DevTools is Open) to
+see your lasts changes.
+
+closes odoo/odoo#36555
+
+Signed-off-by: Jérémy Kersten (jke) <jke@openerp.com>
+
+================================= pseudo patch: =================================
+
+--- a/addons/website/models/__init__.py
++++ b/addons/website/models/__init__.py
+@@ -11,7 +11,7 @@ from . import mixins
+ from . import website
+ from . import website_menu
+ from . import website_page
+-from . import website_redirect
++from . import website_rewrite
+ from . import ir_rule
+ from . import ir_ui_view
+ from . import res_company
+
+--- a/addons/website/models/ir_http.py
++++ b/addons/website/models/ir_http.py
+@@ -11,6 +11,8 @@ import werkzeug
+ import werkzeug.routing
+ import werkzeug.utils
+ 
++from functools import partial
++
+ import odoo
+ from odoo import api, models, registry
+ from odoo import SUPERUSER_ID
+@@ -61,6 +63,58 @@ def get_request_website():
+ class Http(models.AbstractModel):
+     _inherit = 'ir.http'
+ 
++    @classmethod
++    def routing_map(cls, key=None):
++        key = key or (request and request.website_routing)
++        return super(Http, cls).routing_map(key=key)
++
++    @classmethod
++    def clear_caches(cls):
++        super(Http, cls)._clear_routing_map()
++        return super(Http, cls).clear_caches()
++
++    @classmethod
++    def _slug_matching(cls, adapter, endpoint, **kw):
++        for arg in kw:
++            if isinstance(kw[arg], models.BaseModel):
++                kw[arg] = kw[arg].with_user(request.uid)
++        qs = request.httprequest.query_string.decode('utf-8')
++        return adapter.build(endpoint, kw) + (qs and '?%s' % qs or '')
++
++    @classmethod
++    def _match(cls, path_info, key=None):
++        key = key or (request and request.website_routing)
++        return super(Http, cls)._match(path_info, key=key)
++
++    @classmethod
++    def _generate_routing_rules(cls, modules, converters):
++        website_id = request.website_routing
++        logger.debug("_generate_routing_rules for website: %s", website_id)
++        domain = [('redirect_type', 'in', ('rewrite', 'not_found')), '|', ('website_id', '=', False), ('website_id', '=', website_id)]
++
++        rewrites = dict([(x.url_from, x) for x in request.env['website.rewrite'].sudo().search(domain)])
++        cls._rewrite_len[website_id] = len(rewrites)
++
++        for url, endpoint, routing in super(Http, cls)._generate_routing_rules(modules, converters):
++            routing = dict(routing)
++            if url in rewrites:
++                rewrite = rewrites[url]
++                url_to = rewrite.url_to
++                if rewrite.redirect_type == 'rewrite':
++                    logger.debug('Add rule %s for %s' % (url_to, website_id))
++                    yield url_to, endpoint, routing  # yield new url
++
++                    if url != url_to:
++                        logger.debug('Redirect from %s to %s for website %s' % (url, url_to, website_id))
++                        _slug_matching = partial(cls._slug_matching, endpoint=endpoint)
++                        routing['redirect_to'] = _slug_matching
++                        yield url, endpoint, routing  # yield original redirected to new url
++                elif rewrite.redirect_type == 'not_found':
++                    logger.debug('Return 404 for %s for website %s' % (url, website_id))
++                    continue
++            else:
++                yield url, endpoint, routing
++
+     @classmethod
+     def _get_converters(cls):
+         """ Get the converters list for custom url pattern werkzeug need to
+@@ -111,7 +165,11 @@ class Http(models.AbstractModel):
+         handling the original request, in which we should create the visitor. We ignore every other rerouting requests.
+         """
+         is_rerouting = hasattr(request, 'routing_iteration')
++
++        request.website_routing = request.env['website'].get_current_website().id
++
+         response = super(Http, cls)._dispatch()
++
+         if not is_rerouting:
+             cls._register_website_track(response)
+         return response
+@@ -186,8 +244,12 @@ class Http(models.AbstractModel):
+     @classmethod
+     def _serve_redirect(cls):
+         req_page = request.httprequest.path
+-        domain = [('url_from', '=', req_page)] + request.website.website_domain()
+-        return request.env['website.redirect'].search(domain, limit=1)
++        domain = [
++            ('redirect_type', 'in', ('redirect_301', 'redirect_302')),
++            ('url_from', '=', req_page)
++        ]
++        domain += request.website.website_domain()
++        return request.env['website.rewrite'].sudo().search(domain, limit=1)
+ 
+     @classmethod
+     def _serve_fallback(cls, exception):
+
+--- a/addons/website/models/website.py
++++ b/addons/website/models/website.py
+@@ -714,6 +714,7 @@ class Website(models.Model):
+             converters = rule._converters or {}
+             if query_string and not converters and (query_string not in rule.build([{}], append_unknown=False)[1]):
+                 continue
++
+             values = [{}]
+             # converters with a domain are processed after the other ones
+             convitems = sorted(
+
+--- a/addons/website/models/website_page.py
++++ b/addons/website/models/website_page.py
+@@ -122,7 +122,7 @@ class Page(models.Model):
+ 
+         # Create redirect if needed
+         if data['create_redirect']:
+-            self.env['website.redirect'].create({
++            self.env['website.rewrite'].create({
+                 'redirect_type': data['redirect_type'],
+                 'url_from': original_url,
+                 'url_to': url,
+
+--- a/addons/website/models/website_redirect.py
++++ b/None
+@@ -1,18 +0,0 @@
+-# -*- coding: utf-8 -*-
+-# Part of Odoo. See LICENSE file for full copyright and licensing details.
+-
+-from odoo import fields, models
+-
+-
+-class WebsiteRedirect(models.Model):
+-    _name = "website.redirect"
+-    _description = "Website Redirect"
+-    _order = "sequence, id"
+-    _rec_name = 'url_from'
+-
+-    redirect_type = fields.Selection([('301', 'Moved permanently (301)'), ('302', 'Moved temporarily (302)')], string='Redirection Type', required=True, default="301")
+-    url_from = fields.Char('Redirect From', required=True)
+-    url_to = fields.Char('Redirect To', required=True)
+-    website_id = fields.Many2one('website', 'Website', ondelete='cascade')
+-    active = fields.Boolean(default=True)
+-    sequence = fields.Integer()
+
+--- a/None
++++ b/addons/website/models/website_rewrite.py
+@@ -0,0 +1,104 @@
++from odoo import models, fields, api
++from odoo.exceptions import AccessDenied
++
++import logging
++_logger = logging.getLogger(__name__)
++
++
++class WebsiteRoute(models.Model):
++    _rec_name = 'path'
++    _name = 'website.route'
++    _description = "All Website Route"
++    _order = 'path'
++
++    path = fields.Char('Route')
++
++    @api.model
++    def _name_search(self, name='', args=None, operator='ilike', limit=100, name_get_uid=None):
++        res = super(WebsiteRoute, self)._name_search(name=name, args=args, operator=operator, limit=limit, name_get_uid=name_get_uid)
++        if not len(res):
++            self._refresh()
++            return super(WebsiteRoute, self)._name_search(name=name, args=args, operator=operator, limit=limit, name_get_uid=name_get_uid)
++        return res
++
++    def _refresh(self):
++        _logger.debug("Refreshing website.route")
++        ir_http = self.env['ir.http']
++        tocreate = []
++        paths = {rec.path: rec for rec in self.search([])}
++        for url, _, routing in ir_http._generate_routing_rules(self.pool._init_modules, converters=ir_http._get_converters()):
++            if 'GET' in (routing.get('methods') or ['GET']):
++                if paths.get(url):
++                    paths.pop(url)
++                else:
++                    tocreate.append({'path': url})
++
++        if tocreate:
++            _logger.info("Add %d website.route" % len(tocreate))
++            self.create(tocreate)
++
++        if paths:
++            find = self.search([('path', 'in', list(paths.keys()))])
++            _logger.info("Delete %d website.route" % len(find))
++            find.unlink()
++
++
++class WebsiteRewrite(models.Model):
++    _name = 'website.rewrite'
++    _description = "Website rewrite"
++
++    name = fields.Char('Name', required=True)
++    website_id = fields.Many2one('website', string="Website", ondelete='cascade', index=True)
++    active = fields.Boolean(default=True)
++    url_from = fields.Char('URL from', index=True)
++    route_id = fields.Many2one('website.route')
++    url_to = fields.Char("URL to")
++    redirect_type = fields.Selection([
++        ('not_found', '404 Not Found'),
++        ('redirect_301', '301 Moved permanently'),
++        ('redirect_302', '302 Moved temporarily'),
++        ('rewrite', '308 Redirect / Rewrite'),
++    ], string='Action', default="redirect_302",
++        help='''Type of redirect/Rewrite:\n
++        301 Moved permanently: The browser will keep in cache the new url.
++        302 Moved temporarily: The browser will not keep in cache the new url and ask again the next time the new url.
++        404 Not Found: If you want remove a specific page/controller (e.g. Ecommerce is installed, but you don't want /shop on a specific website)
++        308 Redirect / Rewrite: If you want rename a controller with a new url. (Eg: /shop -> /garden - Both url will be accessible but /shop will automatically be redirected to /garden)
++    ''')
++
++    sequence = fields.Integer()
++
++    @api.onchange('route_id')
++    def _onchange_route_id(self):
++        self.url_from = self.route_id.path
++        self.url_to = self.route_id.path
++
++    def name_get(self):
++        result = []
++        for rewrite in self:
++            name = rewrite.redirect_type + ' - ' + rewrite.name
++            result.append((rewrite.id, name))
++        return result
++
++    @api.model
++    def create(self, vals):
++        res = super(WebsiteRewrite, self).create(vals)
++        self._invalidate_routing()
++        return res
++
++    def write(self, vals):
++        res = super(WebsiteRewrite, self).write(vals)
++        self._invalidate_routing()
++        return res
++
++    def unlink(self):
++        res = super(WebsiteRewrite, self).unlink()
++        self._invalidate_routing()
++        return res
++
++    def _invalidate_routing(self):
++        # call clear_caches on this worker to reload routing table
++        self.env['ir.http'].clear_caches()
++
++    def refresh_routes(self):
++        self.env['website.route']._refresh()

@@ -1,0 +1,276 @@
+PR: https://github.com/odoo/odoo/pull/
+
+From: 8248f0e153ae5fcc1449d0d05149b61df615ad4f
+From: Pierre Masereel
+Date: 2017-07-14 15:08:21
+
+Structural Changes: 2
+Total Changes: 156
+
+[IMP] purchase,stock: edit PO line quantity
+
+This commit adapt purchase to be able to edit purchase line ordered quantity
+and propagate it to the related picking after the request for quotation
+validation.
+
+These are the supported use case
+
+- When you increase the quantity on a purchase line, an extra move (and
+an extra picking if they are all done or canceled) is created with the
+difference between old and new value and the push rules are applied on
+it.
+
+- When you decrease the quantity of a purchase line, different behaviors
+can occurs:
+  * If you plan to decrese the ordered quantity under the received
+    quantity, you get a user error saying tht you have to make some
+    return before.
+  * Else the moves not done or cancelled are decreased by starting with
+    move having no procurement_id. The decrease is not propagated
+    through push or pull rules.
+  * If you decreased the quantity under the invoiced quantity, a next
+    activity is created to remind you to do a refund.
+
+================================= pseudo patch: =================================
+
+--- a/addons/purchase/models/purchase.py
++++ b/addons/purchase/models/purchase.py
+@@ -552,40 +552,21 @@ class PurchaseOrderLine(models.Model):
+     def create(self, values):
+         line = super(PurchaseOrderLine, self).create(values)
+         if line.order_id.state == 'purchase':
+-            line.order_id._create_picking()
++            line._create_or_update_picking(values)
+             msg = _("Extra line with %s ") % (line.product_id.display_name,)
+             line.order_id.message_post(body=msg)
+         return line
+ 
+     @api.multi
+     def write(self, values):
+-        orders = False
+         if 'product_qty' in values:
+-            changed_lines = self.filtered(lambda x: x.order_id.state == 'purchase')
+-            if changed_lines:
+-                orders = changed_lines.mapped('order_id')
+-                for order in orders:
+-                    order_lines = changed_lines.filtered(lambda x: x.order_id == order)
+-                    msg = ""
+-                    if any([values['product_qty'] < x.product_qty for x in order_lines]):
+-                        msg += "<b>" + _('The ordered quantity has been decreased. Do not forget to take it into account on your bills and receipts.') + '</b><br/>'
+-                    msg += "<ul>"
+-                    for line in order_lines:
+-                        msg += "<li> %s:" % (line.product_id.display_name,)
+-                        msg += "<br/>" + _("Ordered Quantity") + ": %s -> %s <br/>" % (line.product_qty, float(values['product_qty']),)
+-                        if line.product_id.type in ('product', 'consu'):
+-                            msg += _("Received Quantity") + ": %s <br/>" % (line.qty_received,)
+-                        msg += _("Billed Quantity") + ": %s <br/></li>" % (line.qty_invoiced,)
+-                    msg += "</ul>"
+-                    order.message_post(body=msg)
++            self.filtered(lambda l: l.order_id.state == 'purchase')._create_or_update_picking(values)
++        result = super(PurchaseOrderLine, self).write(values)
+         # Update expected date of corresponding moves
+         if 'date_planned' in values:
+             self.env['stock.move'].search([
+                 ('purchase_line_id', 'in', self.ids), ('state', '!=', 'done')
+             ]).write({'date_expected': values['date_planned']})
+-        result = super(PurchaseOrderLine, self).write(values)
+-        if orders:
+-            orders._create_picking()
+         return result
+ 
+     name = fields.Text(string='Description', required=True)
+@@ -619,6 +600,59 @@ class PurchaseOrderLine(models.Model):
+     date_order = fields.Datetime(related='order_id.date_order', string='Order Date', readonly=True)
+     procurement_ids = fields.One2many('procurement.order', 'purchase_line_id', string='Associated Procurements', copy=False)
+ 
++    @api.multi
++    def _create_or_update_picking(self, vals):
++        for line in self:
++            if line.product_id.type in ('product', 'consu'):
++                if float_compare(vals['product_qty'], line.qty_invoiced, line.product_uom.rounding) == -1:
++                    # If the quantity is now below the invoiced quantity, create an activity on the vendor bill
++                    # inviting the user to create a refund.
++                    activity = self.env['mail.activity'].sudo().create({
++                        'activity_type_id': self.env.ref('mail.mail_activity_data_todo').id,
++                        'note': _('The quantities on your purchase order indicate less than billed. You should ask for a refund. '),
++                        'res_id': line.invoice_lines[0].invoice_id.id,
++                        'res_model_id': self.env.ref('account.model_account_invoice').id,
++                    })
++                    activity._onchange_activity_type_id()
++                diff_purchase_uom_qty = vals['product_qty'] - line.product_qty
++                diff_qty = line.product_uom._compute_quantity(diff_purchase_uom_qty, line.product_id.uom_id)
++                if diff_purchase_uom_qty > 0 or not line.move_ids:
++                    # If the user increased quantity of existing line or created a new line
++                    pickings = line.order_id.picking_ids.filtered(lambda x: x.state not in ('done', 'cancel') and x.location_dest_id.usage in ('internal', 'transit'))
++                    picking = pickings and pickings[0] or False
++                    if not picking:
++                        res = line.order_id._prepare_picking()
++                        picking = self.env['stock.picking'].create(res)
++                    move_vals = line._get_move_template(picking)
++                    if not line.move_ids:
++                        move_vals['product_uom_qty'] = vals['product_qty']
++                    else:
++                        move_vals['product_uom_qty'] = diff_purchase_uom_qty
++                    self.env['stock.move']\
++                        .create(move_vals)\
++                        .action_confirm()\
++                        .action_assign()
++                else:
++                    # Prevent decreasing below received quantity
++                    if float_compare(vals['product_qty'], line.qty_received, line.product_uom.rounding) >= 0:
++                        open_moves = line.move_ids.filtered(lambda m: m.state not in ('done', 'cancel')).sorted(lambda m: m.procurement_id.id)
++                        # We sort by procurement id to decrease first the moves without procurement id,
++                        # the idea is to get rid of the extra moves in priority
++                        for move in open_moves:
++                            if float_compare(move.product_qty, -diff_qty, line.product_id.uom_id.rounding) > 0:
++                                qty_for_move = line.product_uom._compute_quantity(diff_purchase_uom_qty, move.product_uom)
++                                move.product_uom_qty += qty_for_move
++                                move.action_assign()
++                                break
++                            else:
++                                diff_qty += move.product_qty
++                                move.do_unreserve()
++                                move.state = 'draft'
++                                move.unlink()
++                    else:
++                        raise UserError('You cannot decrease the ordered quantity below your receipt.\n'
++                                        'Create a return first.')
++
+     @api.multi
+     def _get_stock_move_price_unit(self):
+         self.ensure_one()
+@@ -634,18 +668,8 @@ class PurchaseOrderLine(models.Model):
+         return price_unit
+ 
+     @api.multi
+-    def _prepare_stock_moves(self, picking):
+-        """ Prepare the stock moves data for one order line. This function returns a list of
+-        dictionary ready to be used in stock.move's create()
+-        """
++    def _get_move_template(self, picking):
+         self.ensure_one()
+-        res = []
+-        if self.product_id.type not in ['product', 'consu']:
+-            return res
+-        qty = 0.0
+-        price_unit = self._get_stock_move_price_unit()
+-        for move in self.move_ids.filtered(lambda x: x.state != 'cancel' and not x.location_dest_id.usage == "supplier"):
+-            qty += move.product_qty
+         template = {
+             'name': self.name or '',
+             'product_id': self.product_id.id,
+@@ -660,14 +684,30 @@ class PurchaseOrderLine(models.Model):
+             'state': 'draft',
+             'purchase_line_id': self.id,
+             'company_id': self.order_id.company_id.id,
+-            'price_unit': price_unit,
++            'price_unit': self._get_stock_move_price_unit(),
+             'picking_type_id': self.order_id.picking_type_id.id,
+             'group_id': self.order_id.group_id.id,
+             'procurement_id': False,
+             'origin': self.order_id.name,
+-            'route_ids': self.order_id.picking_type_id.warehouse_id and [(6, 0, [x.id for x in self.order_id.picking_type_id.warehouse_id.route_ids])] or [],
++            'route_ids': self.order_id.picking_type_id.warehouse_id and [
++                (6, 0, [x.id for x in self.order_id.picking_type_id.warehouse_id.route_ids])] or [],
+             'warehouse_id': self.order_id.picking_type_id.warehouse_id.id,
+         }
++        return template
++
++    @api.multi
++    def _prepare_stock_moves(self, picking):
++        """ Prepare the stock moves data for one order line. This function returns a list of
++        dictionary ready to be used in stock.move's create()
++        """
++        self.ensure_one()
++        res = []
++        if self.product_id.type not in ['product', 'consu']:
++            return res
++        qty = 0.0
++        for move in self.move_ids.filtered(lambda x: x.state != 'cancel' and not x.location_dest_id.usage == "supplier"):
++            qty += move.product_qty
++        template = self._get_move_template(picking)
+         # Fullfill all related procurements with this po line
+         diff_quantity = self.product_qty - qty
+         for procurement in self.procurement_ids.filtered(lambda p: p.state != 'cancel'):
+@@ -806,15 +846,6 @@ class PurchaseOrderLine(models.Model):
+ 
+         self.price_unit = price_unit
+ 
+-    @api.onchange('product_qty')
+-    def _onchange_product_qty(self):
+-        if (self.state == 'purchase' or self.state == 'to approve') and self.product_id.type in ['product', 'consu'] and self.product_qty < self._origin.product_qty:
+-            warning_mess = {
+-                'title': _('Ordered quantity decreased!'),
+-                'message' : _('You are decreasing the ordered quantity!\nYou must update the quantities on the reception and/or bills.'),
+-            }
+-            return {'warning': warning_mess}
+-
+     def _suggest_quantity(self):
+         '''
+         Suggest a minimal quantity based on the seller
+
+--- a/addons/purchase/models/stock.py
++++ b/addons/purchase/models/stock.py
+@@ -11,15 +11,6 @@ class StockPicking(models.Model):
+     purchase_id = fields.Many2one('purchase.order', related='move_lines.purchase_line_id.order_id',
+         string="Purchase Orders", readonly=True)
+ 
+-    @api.model
+-    def _prepare_values_extra_move(self, op, product, remaining_qty):
+-        res = super(StockPicking, self)._prepare_values_extra_move(op, product, remaining_qty)
+-        for m in op.linked_move_operation_ids:
+-            if m.move_id.purchase_line_id and m.move_id.product_id == product:
+-                res['purchase_line_id'] = m.move_id.purchase_line_id.id
+-                break
+-        return res
+-
+     @api.model
+     def _create_backorder(self, backorder_moves=[]):
+         res = super(StockPicking, self)._create_backorder(backorder_moves)
+@@ -36,7 +27,7 @@ class StockMove(models.Model):
+     _inherit = 'stock.move'
+ 
+     purchase_line_id = fields.Many2one('purchase.order.line',
+-        'Purchase Order Line', ondelete='set null', index=True, readonly=True)
++        'Purchase Order Line', ondelete='set null', index=True, readonly=True, copy=False)
+ 
+     @api.multi
+     def get_price_unit(self):
+@@ -56,17 +47,15 @@ class StockMove(models.Model):
+             return self.price_unit
+         return super(StockMove, self).get_price_unit()
+ 
+-    @api.multi
+-    def copy(self, default=None):
+-        self.ensure_one()
+-        default = default or {}
+-        # we don't want to propagate the link to the purchase order line on the move copied,
+-        # except when it's a split or a returned move
+-
+-        if not default.get('split_from') and not default.get('origin_returned_move_id'):
+-            default['purchase_line_id'] = False
+-        return super(StockMove, self).copy(default)
++    def _prepare_extra_move_vals(self, qty):
++        vals = super(StockMove, self)._prepare_extra_move_vals(qty)
++        vals['purchase_line_id'] = self.purchase_line_id.id
++        return vals
+ 
++    def _prepare_move_split_vals(self, uom_qty):
++        vals = super(StockMove, self)._prepare_move_split_vals(uom_qty)
++        vals['purchase_line_id'] = self.purchase_line_id.id
++        return vals
+ 
+ class StockWarehouse(models.Model):
+     _inherit = 'stock.warehouse'
+@@ -141,3 +130,11 @@ class StockWarehouse(models.Model):
+             if warehouse.in_type_id.default_location_dest_id != warehouse.buy_pull_id.location_id:
+                 warehouse.buy_pull_id.write({'location_id': warehouse.in_type_id.default_location_dest_id.id})
+         return res
++
++class ReturnPicking(models.TransientModel):
++    _inherit = "stock.return.picking"
++
++    def _prepare_move_default_values(self, return_line, new_picking):
++        vals = super(ReturnPicking, self)._prepare_move_default_values(return_line, new_picking)
++        vals['purchase_line_id'] = return_line.move_id.purchase_line_id.id
++        return vals

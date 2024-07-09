@@ -1,0 +1,268 @@
+PR: https://github.com/odoo/odoo/pull/115141
+
+From: 8d436c5c0a73bd47760a1814db07d2015793dab6
+From: Florian Charlier
+Date: 2024-03-12 10:59:43
+
+Structural Changes: 4
+Total Changes: 88
+
+[IMP] survey: enable custom speed rewards
+
+This commit intends to improve speed reward logic in the survey. Users
+will now have the possibility to specify a default time limit, as well
+as custom time limits on each question.
+To keep things simple, the time limit on the question is used for both
+the "real" limit and the speed-related part of the score, both in the
+live session setting only.
+
+Modifying the time limit set on the survey should update all questions
+that are not customized. Here is an example of the desired behavior:
+(See `test_survey_time_limits_config`)
+
+1. A time limit is set to 30s on a survey where no time configuration
+ was done before => All questions are now rewarded with extra point
+ after 30s.
+2. After the previous step, question `A` 's time limit is overridden to
+  60s. Only this question will have 60s. (a flag for this override is
+  also set).
+3. Question `B`'s time limit is set to 20 sec, the same as above
+  occurs.
+4. Question `C` is set to "no time limit" (also an override).
+4. At this point, the time limit at the survey level is reduced from 30
+  to 20s. This will make `B` not overridden anymore, while
+  * A is still at 60s
+  * C is still not limited (and has no time-related rewards)
+
+Technical notes:
+We cannot use `compute`s to handle the synchronization of default time
+limits because if we did,
+* all questions would immediately be marked as "overridden" after
+  step 1 above, or
+* we'd need to set up a circular update dependency between
+  `is_time_limited` and `is_time_customized` (same for time_limit).
+
+The logic implemented in `Survey.write` was also initially called within
+an `onchange` but this doesn't work in case values
+(session_speed_rating(_time_limit)) are changed multiple times in a row
+without saving, which is why we're using the existing
+`boolean_toggle` widget and adding an `integer_autosave`.
+
+The reason it doesn't work is that if non-customized questions values
+are changed after the first `session_speed_rating` onchange, they are
+passed as new record values in the second onchange call
+(reverting `session_speed_rating`), which means that as they are now
+different from the initial values of the survey record, the question
+would be marked as "time customized" even though it was the result of
+the previous onchange and we would expect to revert it as well.
+
+Also note that as
+* we want to make sure that the UI and code is clear and enforce the
+constraint that users can't set a questions as time limited and not set
+a time limit, and
+* we save the survey (+ questions) when opening a question,
+
+we add a constraint on session_speed_rating_time_limit to be more
+explicit about this restriction of the feature "leave the survey default
+at zero to only change the questions which do have a time limit".
+It would add much complexity to support that actually
+`session_speed_reward=True` with its `time_limit=0` means that the
+default value for questions `is_time_limited` should be `False`.
+
+Task-2803327
+
+Part-of: odoo/odoo#115141
+Co-authored-by: Andro Gvivradze <angv@odoo.com>
+
+================================= pseudo patch: =================================
+
+--- a/addons/survey/models/survey_question.py
++++ b/addons/survey/models/survey_question.py
+@@ -47,6 +47,17 @@ class SurveyQuestion(models.Model):
+     _rec_name = 'title'
+     _order = 'sequence,id'
+ 
++    @api.model
++    def default_get(self, fields_list):
++        res = super().default_get(fields_list)
++        if default_survey_id := self.env.context.get('default_survey_id'):
++            survey = self.env['survey.survey'].browse(default_survey_id)
++            if 'is_time_limited' in fields_list and 'is_time_limited' not in res:
++                res['is_time_limited'] = survey.session_speed_rating
++            if 'time_limit' in fields_list and 'time_limit' not in res:
++                res['time_limit'] = survey.session_speed_rating_time_limit
++        return res
++
+     # question generic data
+     title = fields.Char('Title', required=True, translate=True)
+     description = fields.Html(
+@@ -118,6 +129,7 @@ class SurveyQuestion(models.Model):
+     # -- display & timing options
+     is_time_limited = fields.Boolean("The question is limited in time",
+         help="Currently only supported for live sessions.")
++    is_time_customized = fields.Boolean("Customized speed rewards")
+     time_limit = fields.Integer("Time limit (seconds)")
+     # -- comments (simple choice, multiple choice, matrix (without count as an answer))
+     comments_allowed = fields.Boolean('Show Comments Field')
+@@ -179,6 +191,8 @@ class SurveyQuestion(models.Model):
+             'All "Is a scored question = True" and "Question Type: Date" questions need an answer'),
+         ('scale', "CHECK (question_type != 'scale' OR (scale_min >= 0 AND scale_max <= 10 AND scale_min < scale_max))",
+             'The scale must be a growing non-empty range between 0 and 10 (inclusive)'),
++        ('is_time_limited_have_time_limit', "CHECK (is_time_limited != TRUE OR time_limit IS NOT NULL AND time_limit > 0)",
++            'All time-limited questions need a positive time limit'),
+     ]
+ 
+     # -------------------------------------------------------------------------
+@@ -388,9 +402,14 @@ class SurveyQuestion(models.Model):
+                 new_question.triggering_answer_ids = old_question.triggering_answer_ids
+         return new_questions
+ 
+-    # ------------------------------------------------------------
+-    # CRUD
+-    # ------------------------------------------------------------
++    def create(self, vals_list):
++        questions = super().create(vals_list)
++        questions.filtered(
++            lambda q: q.survey_id
++            and (q.survey_id.session_speed_rating != q.is_time_limited
++                 or q.is_time_limited and q.survey_id.session_speed_rating_time_limit != q.time_limit)
++        ).is_time_customized = True
++        return questions
+ 
+     @api.ondelete(at_uninstall=False)
+     def _unlink_except_live_sessions_in_progress(self):
+@@ -520,6 +539,36 @@ class SurveyQuestion(models.Model):
+         self.ensure_one()
+         return list(self.survey_id.question_and_page_ids).index(self)
+ 
++    # ------------------------------------------------------------
++    # SPEED RATING
++    # ------------------------------------------------------------
++
++    def _update_time_limit_from_survey(self, is_time_limited=None, time_limit=None):
++        """Update the speed rating values after a change in survey's speed rating configuration.
++
++        * Questions that were not customized will take the new default values from the survey
++        * Questions that were customized will not change their values, but this method will check
++          and update the `is_time_customized` flag if necessary (to `False`) such that the user
++          won't need to "actively" do it to make the question sensitive to change in survey values.
++
++        This is not done with `_compute`s because `is_time_limited` (and `time_limit`) would depend
++        on `is_time_customized` and vice versa.
++        """
++        write_vals = {}
++        if is_time_limited is not None:
++            write_vals['is_time_limited'] = is_time_limited
++        if time_limit is not None:
++            write_vals['time_limit'] = time_limit
++        non_time_customized_questions = self.filtered(lambda s: not s.is_time_customized)
++        non_time_customized_questions.write(write_vals)
++
++        # Reset `is_time_customized` as necessary
++        customized_questions = self - non_time_customized_questions
++        back_to_default_questions = customized_questions.filtered(
++            lambda q: q.is_time_limited == q.survey_id.session_speed_rating
++            and (q.is_time_limited is False or q.time_limit == q.survey_id.session_speed_rating_time_limit))
++        back_to_default_questions.is_time_customized = False
++
+     # ------------------------------------------------------------
+     # STATISTICS / REPORTING
+     # ------------------------------------------------------------
+
+--- a/addons/survey/models/survey_survey.py
++++ b/addons/survey/models/survey_survey.py
+@@ -1,7 +1,6 @@
+ # -*- coding: utf-8 -*-
+ # Part of Odoo. See LICENSE file for full copyright and licensing details.
+ 
+-import json
+ import random
+ import uuid
+ from collections import defaultdict
+@@ -175,6 +174,8 @@ class Survey(models.Model):
+     session_show_leaderboard = fields.Boolean("Show Session Leaderboard", compute='_compute_session_show_leaderboard',
+         help="Whether or not we want to show the attendees leaderboard for this survey.")
+     session_speed_rating = fields.Boolean("Reward quick answers", help="Attendees get more points if they answer quickly")
++    session_speed_rating_time_limit = fields.Integer(
++        "Time limit (seconds)", help="Default time given to receive additional points for right answers")
+     # conditional questions management
+     has_conditional_questions = fields.Boolean("Contains conditional questions", compute="_compute_has_conditional_questions")
+ 
+@@ -190,6 +191,9 @@ class Survey(models.Model):
+         ('attempts_limit_check', "CHECK( (is_attempts_limited=False) OR (attempts_limit is not null AND attempts_limit > 0) )",
+             'The attempts limit needs to be a positive number if the survey has a limited number of attempts.'),
+         ('badge_uniq', 'unique (certification_badge_id)', "The badge for each survey should be unique!"),
++        ('session_speed_rating_has_time_limit',
++         "CHECK (session_speed_rating != TRUE OR session_speed_rating_time_limit IS NOT NULL AND session_speed_rating_time_limit > 0)",
++         'A positive default time limit is required when the session rewards quick answers.'),
+     ]
+ 
+     @api.depends('background_image', 'access_token')
+@@ -380,6 +384,13 @@ class Survey(models.Model):
+                 'scoring_type': 'scoring_with_answers',
+             })
+ 
++    @api.onchange('session_speed_rating', 'session_speed_rating_time_limit')
++    def _onchange_session_speed_rating(self):
++        """Show impact on questions in the form view (before survey is saved)."""
++        for survey in self.filtered('question_ids'):
++            survey.question_ids._update_time_limit_from_survey(
++                is_time_limited=survey.session_speed_rating, time_limit=survey.session_speed_rating_time_limit)
++
+     @api.constrains('scoring_type', 'users_can_go_back')
+     def _check_scoring_after_page_availability(self):
+         failing = self.filtered(lambda survey: survey.scoring_type == 'scoring_with_answers_after_page' and survey.users_can_go_back)
+@@ -401,9 +412,20 @@ class Survey(models.Model):
+         return surveys
+ 
+     def write(self, vals):
++        speed_rating, speed_limit = vals.get('session_speed_rating'), vals.get('session_speed_rating_time_limit')
++
++        surveys_to_update = self.filtered(lambda s: (
++            speed_rating is not None and s.session_speed_rating != speed_rating
++            or speed_limit is not None and s.session_speed_rating_time_limit != speed_limit
++        ))
++
+         result = super(Survey, self).write(vals)
+         if 'certification_give_badge' in vals:
+             return self.sudo()._handle_certification_badges(vals)
++
++        if questions_to_update := surveys_to_update.question_ids:
++            questions_to_update._update_time_limit_from_survey(is_time_limited=speed_rating, time_limit=speed_limit)
++
+         return result
+ 
+     def copy(self, default=None):
+
+--- a/addons/survey/models/survey_user_input.py
++++ b/addons/survey/models/survey_user_input.py
+@@ -50,7 +50,7 @@ class SurveyUserInput(models.Model):
+     user_input_line_ids = fields.One2many('survey.user_input.line', 'user_input_id', string='Answers', copy=True)
+     predefined_question_ids = fields.Many2many('survey.question', string='Predefined Questions', readonly=True)
+     scoring_percentage = fields.Float("Score (%)", compute="_compute_scoring_values", store=True, compute_sudo=True)  # stored for perf reasons
+-    scoring_total = fields.Float("Total Score", compute="_compute_scoring_values", store=True, compute_sudo=True)  # stored for perf reasons
++    scoring_total = fields.Float("Total Score", compute="_compute_scoring_values", store=True, compute_sudo=True, digits=(10, 2))  # stored for perf reasons
+     scoring_success = fields.Boolean('Quizz Passed', compute='_compute_scoring_success', store=True, compute_sudo=True)  # stored for perf reasons
+     survey_first_submitted = fields.Boolean(string='Survey First Submitted')
+     # live sessions
+@@ -889,7 +889,7 @@ class SurveyUserInputLine(models.Model):
+         if compute_speed_score and answer_score > 0:
+             user_input = self.env['survey.user_input'].browse(user_input_id)
+             session_speed_rating = user_input.exists() and user_input.is_session_answer and user_input.survey_id.session_speed_rating
+-            if session_speed_rating:
++            if session_speed_rating and question.is_time_limited:
+                 max_score_delay = 2
+                 time_limit = question.time_limit
+                 now = fields.Datetime.now()
+@@ -898,9 +898,8 @@ class SurveyUserInputLine(models.Model):
+                 # if answered within the max_score_delay => leave score as is
+                 if question_remaining_time < 0:  # if no time left
+                     answer_score /= 2
+-                elif seconds_to_answer > max_score_delay:
+-                    time_limit -= max_score_delay  # we remove the max_score_delay to have all possible values
+-                    score_proportion = (time_limit - seconds_to_answer) / time_limit
++                elif seconds_to_answer > max_score_delay:  # linear decrease in score after 2 sec
++                    score_proportion = (time_limit - seconds_to_answer) / (time_limit - max_score_delay)
+                     answer_score = (answer_score / 2) * (1 + score_proportion)
+ 
+         return {

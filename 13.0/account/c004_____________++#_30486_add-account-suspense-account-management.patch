@@ -1,0 +1,401 @@
+PR: https://github.com/odoo/odoo/pull/30486
+
+From: 969705fa2ae8bfd5e2d2cfce0241fcd56bebf01f
+From: wan
+Date: 2019-02-08 10:11:41
+
+Structural Changes: 4
+Total Changes: 169
+
+[ADD] account: suspense account management
+Task 1930403
+Purpose:
+A suspense account is an account in the general ledger that temporarily stores any transactions for which there is uncertainty about the account in which they should be recorded. Once the accounting staff investigates and clarifies the purpose of this type of transaction, it shifts the transaction out of the suspense account and into the correct account(s). An entry into a suspense account may be a debit or a credit.
+
+The Chosen Odoo approach (macro) for this case is
+1) from bank statement -> reconciliation widget -> reconciliation model
+2) create move that have a dedicated checkbox
+3) be able to reopen the bank statement line "like if there is no linked account move" and finally reconcile the transaction with the good invoice/bill (we can reprocess account move "to check")
+4) when we reprocess, Instead of creating an account move : Check if there is an "to check" existing linked account move and remove all the account move lines then replace  them by the good ones --> we want to keep the sequence
+
+closes odoo/odoo#30486
+
+================================= pseudo patch: =================================
+
+--- a/addons/account/models/account_bank_statement.py
++++ b/addons/account/models/account_bank_statement.py
+@@ -276,6 +276,16 @@ class AccountBankStatement(models.Model):
+                     st_number = SequenceObj.with_context(**context).next_by_code('account.bank.statement')
+                 statement.name = st_number
+             statement.state = 'open'
++            
++    @api.multi
++    def action_bank_reconcile_bank_statements(self):
++        self.ensure_one()
++        bank_stmt_lines = self.mapped('line_ids')
++        return {
++            'type': 'ir.actions.client',
++            'tag': 'bank_statement_reconciliation_view',
++            'context': {'statement_line_ids': bank_stmt_lines.ids, 'company_ids': self.mapped('company_id').ids},
++        }
+ 
+ 
+ class AccountBankStatementLine(models.Model):
+@@ -553,6 +563,7 @@ class AccountBankStatementLine(models.Model):
+         """
+         payable_account_type = self.env.ref('account.data_account_type_payable')
+         receivable_account_type = self.env.ref('account.data_account_type_receivable')
++        edition_mode = self._context.get('edition_mode')
+         counterpart_aml_dicts = counterpart_aml_dicts or []
+         payment_aml_rec = payment_aml_rec or self.env['account.move.line']
+         new_aml_dicts = new_aml_dicts or []
+@@ -569,7 +580,7 @@ class AccountBankStatementLine(models.Model):
+         if any(rec.statement_id for rec in payment_aml_rec):
+             raise UserError(_('A selected move line was already reconciled.'))
+         for aml_dict in counterpart_aml_dicts:
+-            if aml_dict['move_line'].reconciled:
++            if aml_dict['move_line'].reconciled and not edition_mode:
+                 raise UserError(_('A selected move line was already reconciled.'))
+             if isinstance(aml_dict['move_line'], int):
+                 aml_dict['move_line'] = aml_obj.browse(aml_dict['move_line'])
+@@ -583,8 +594,12 @@ class AccountBankStatementLine(models.Model):
+             user_type_id = self.env['account.account'].browse(aml_dict.get('account_id')).user_type_id
+             if user_type_id in [payable_account_type, receivable_account_type] and user_type_id not in account_types:
+                 account_types |= user_type_id
+-        if any(line.journal_entry_ids for line in self):
+-            raise UserError(_('A selected statement line was already reconciled with an account move.'))
++        if edition_mode:
++            if any(not line.journal_entry_ids for line in self):
++                raise UserError(_('Some selected statement line were not already reconciled with an account move.'))
++        else:
++            if any(line.journal_entry_ids for line in self):
++                raise UserError(_('A selected statement line was already reconciled with an account move.'))
+ 
+         # Fully reconciled moves are just linked to the bank statement
+         total = self.amount
+@@ -611,6 +626,8 @@ class AccountBankStatementLine(models.Model):
+             # Create the move
+             self.sequence = self.statement_id.line_ids.ids.index(self.id) + 1
+             move_vals = self._prepare_reconciliation_move(self.statement_id.name)
++            if edition_mode:
++                self.button_cancel_reconciliation()
+             move = self.env['account.move'].create(move_vals)
+             counterpart_moves = (counterpart_moves | move)
+ 
+
+--- a/addons/account/models/account_invoice.py
++++ b/addons/account/models/account_invoice.py
+@@ -128,6 +128,24 @@ class AccountInvoice(models.Model):
+         else:
+             self.reconciled = False
+ 
++    @api.multi
++    def _get_domain_edition_mode_available(self):
++        self.ensure_one()
++        domain = self.env['account.move.line']._get_domain_for_edition_mode()
++        domain += ['|',('move_id.partner_id', '=?', self.partner_id.id),('move_id.partner_id', '=', False)]
++        if self.type in ('out_invoice', 'in_refund'):
++            domain.append(('balance', '=', -self.residual))
++        else:
++            domain.append(('balance', '=', self.residual))
++        return domain
++
++    @api.multi
++    def _get_edition_mode_available(self):
++        for r in self:
++            domain = r._get_domain_edition_mode_available()
++            domain2 = [('state', '=', 'open'),('residual', '=', r.residual),('type', '=', r.type)]
++            r.edition_mode_available = (0 < self.env['account.move.line'].search_count(domain) < 5) and self.env['account.invoice'].search_count(domain2) < 5 and r.state == 'open'
++
+     @api.one
+     def _get_outstanding_info_JSON(self):
+         self.outstanding_credits_debits_widget = json.dumps(False)
+@@ -364,6 +382,7 @@ class AccountInvoice(models.Model):
+         related='partner_id.commercial_partner_id', store=True, readonly=True,
+         help="The commercial entity that will be used on Journal Entries for this invoice")
+ 
++    edition_mode_available = fields.Boolean(compute='_get_edition_mode_available', groups='account.group_account_invoice')
+     outstanding_credits_debits_widget = fields.Text(compute='_get_outstanding_info_JSON', groups="account.group_account_invoice")
+     payments_widget = fields.Text(compute='_get_payment_info_JSON', groups="account.group_account_invoice")
+     has_outstanding = fields.Boolean(compute='_get_outstanding_info_JSON', groups="account.group_account_invoice")
+@@ -609,6 +628,22 @@ class AccountInvoice(models.Model):
+             return self.env.ref('account.account_invoices').report_action(self)
+         else:
+             return self.env.ref('account.account_invoices_without_payment').report_action(self)
++    
++    @api.multi
++    def action_reconcile_to_check(self, params):
++        self.ensure_one()
++        domain = self._get_domain_edition_mode_available()
++        ids = self.env['account.move.line'].search(domain).mapped('statement_line_id').ids
++        action_context = {'show_mode_selector': False, 'company_ids': self.mapped('company_id').ids}
++        action_context.update({'edition_mode': True})
++        action_context.update({'statement_line_ids': ids})
++        action_context.update({'partner_id': self.partner_id.id})
++        action_context.update({'partner_name': self.partner_id.name})
++        return {
++            'type': 'ir.actions.client',
++            'tag': 'bank_statement_reconciliation_view',
++            'context': action_context,
++        }
+ 
+     @api.multi
+     def action_invoice_sent(self):
+
+--- a/addons/account/models/account_journal_dashboard.py
++++ b/addons/account/models/account_journal_dashboard.py
+@@ -145,9 +145,9 @@ class account_journal(models.Model):
+     @api.multi
+     def get_journal_dashboard_datas(self):
+         currency = self.currency_id or self.company_id.currency_id
+-        number_to_reconcile = last_balance = account_sum = 0
++        number_to_reconcile = number_to_check = last_balance = account_sum = 0
+         title = ''
+-        number_draft = number_waiting = number_late = 0
++        number_draft = number_waiting = number_late = to_check_balance = 0
+         sum_draft = sum_waiting = sum_late = 0.0
+         if self.type in ['bank', 'cash']:
+             last_bank_stmt = self.env['account.bank.statement'].search([('journal_id', 'in', self.ids)], order="date desc, id desc", limit=1)
+@@ -161,6 +161,9 @@ class account_journal(models.Model):
+                             AND not exists (select 1 from account_move_line aml where aml.statement_line_id = line.id)
+                         """, (tuple(self.ids),))
+             number_to_reconcile = self.env.cr.fetchone()[0]
++            to_check_ids = self.to_check_ids()
++            number_to_check = len(to_check_ids)
++            to_check_balance = sum([r.amount for r in to_check_ids])
+             # optimization to read sum of balance from account_move_line
+             account_ids = tuple(ac for ac in [self.default_debit_account_id.id, self.default_credit_account_id.id] if ac)
+             if account_ids:
+@@ -196,6 +199,8 @@ class account_journal(models.Model):
+ 
+         difference = currency.round(last_balance-account_sum) + 0.0
+         return {
++            'number_to_check': number_to_check,
++            'to_check_balance': formatLang(self.env, to_check_balance, currency_obj=currency),
+             'number_to_reconcile': number_to_reconcile,
+             'account_balance': formatLang(self.env, currency.round(account_sum) + 0.0, currency_obj=currency),
+             'last_balance': formatLang(self.env, currency.round(last_balance) + 0.0, currency_obj=currency),
+@@ -313,11 +318,11 @@ class account_journal(models.Model):
+     def action_open_reconcile(self):
+         if self.type in ['bank', 'cash']:
+             # Open reconciliation view for bank statements belonging to this journal
+-            bank_stmt = self.env['account.bank.statement'].search([('journal_id', 'in', self.ids)])
++            bank_stmt = self.env['account.bank.statement'].search([('journal_id', 'in', self.ids)]).mapped('line_ids')
+             return {
+                 'type': 'ir.actions.client',
+                 'tag': 'bank_statement_reconciliation_view',
+-                'context': {'statement_ids': bank_stmt.ids, 'company_ids': self.mapped('company_id').ids},
++                'context': {'statement_line_ids': bank_stmt.ids, 'company_ids': self.mapped('company_id').ids},
+             }
+         else:
+             # Open reconciliation view for customers/suppliers
+@@ -332,6 +337,26 @@ class account_journal(models.Model):
+                 'context': action_context,
+             }
+ 
++    @api.multi
++    def action_open_to_check(self):
++        self.ensure_one()
++        ids = self.to_check_ids().ids
++        action_context = {'show_mode_selector': False, 'company_ids': self.mapped('company_id').ids}
++        action_context.update({'edition_mode': True})
++        action_context.update({'statement_line_ids': ids})
++        return {
++            'type': 'ir.actions.client',
++            'tag': 'bank_statement_reconciliation_view',
++            'context': action_context,
++        }
++
++    def to_check_ids(self):
++        self.ensure_one()
++        domain = self.env['account.move.line']._get_domain_for_edition_mode()
++        domain.append(('journal_id', '=', self.id))
++        statement_line_ids = self.env['account.move.line'].search(domain).mapped('statement_line_id')
++        return statement_line_ids
++
+     @api.multi
+     def open_action(self):
+         """return action based on type for related journals"""
+
+--- a/addons/account/models/account_move.py
++++ b/addons/account/models/account_move.py
+@@ -135,6 +135,7 @@ class AccountMove(models.Model):
+     auto_reverse = fields.Boolean(string='Reverse Automatically', default=False, help='If this checkbox is ticked, this entry will be automatically reversed at the reversal date you defined.')
+     reverse_date = fields.Date(string='Reversal Date', help='Date of the reverse accounting entry.')
+     reverse_entry_id = fields.Many2one('account.move', String="Reverse entry", store=True, readonly=True)
++    to_check = fields.Boolean(string='To Check', default=False, help='If this checkbox is ticked, it means that the user was not sure of all the related informations at the time of the creation of the move and that the move needs to be checked again.')
+     tax_type_domain = fields.Char(store=False, help='Technical field used to have a dynamic taxes domain on the form view.')
+ 
+     @api.constrains('line_ids', 'journal_id', 'auto_reverse', 'reverse_date')
+@@ -336,8 +337,14 @@ class AccountMove(models.Model):
+ 
+     @api.multi
+     def button_cancel(self):
++        AccountMoveLine = self.env['account.move.line']
++        excluded_move_ids = []
++
++        if self._context.get('edition_mode'):
++            excluded_move_ids = AccountMoveLine.search(AccountMoveLine._get_domain_for_edition_mode() + [('move_id', 'in', self.ids)]).mapped('move_id').ids
++
+         for move in self:
+-            if not move.journal_id.update_posted:
++            if not move.journal_id.update_posted and move.id not in excluded_move_ids:
+                 raise UserError(_('You cannot modify a posted entry of this journal.\nFirst you should set the journal to allow cancelling entries.'))
+             # We remove all the analytics entries for this journal
+             move.mapped('line_ids.analytic_line_ids').unlink()
+@@ -1383,6 +1390,14 @@ class AccountMoveLine(models.Model):
+         action['domain'] = [('id', 'in', ids)]
+         return action
+ 
++    @api.model
++    def _get_domain_for_edition_mode(self):
++        return [
++            ('move_id.to_check', '=', True),
++            ('full_reconcile_id', '=', False),
++            ('statement_line_id', '!=', False),
++        ]
++
+ 
+ class AccountPartialReconcile(models.Model):
+     _name = "account.partial.reconcile"
+
+--- a/addons/account/models/account_reconcile_model.py
++++ b/addons/account/models/account_reconcile_model.py
+@@ -22,6 +22,7 @@ class AccountReconcileModel(models.Model):
+     ], string='Type', default='writeoff_button', required=True)
+     auto_reconcile = fields.Boolean(string='Auto-validate',
+         help='Validate the statement line automatically (reconciliation based on your rule).')
++    to_check = fields.Boolean(string='To Check', default=False, help='This matching rule is used when the user is not certain of all the informations of the counterpart.')
+ 
+     # ===== Conditions =====
+     match_journal_ids = fields.Many2many('account.journal', string='Journals',
+
+--- a/addons/account/models/chart_template.py
++++ b/addons/account/models/chart_template.py
+@@ -986,6 +986,7 @@ class AccountReconcileModelTemplate(models.Model):
+     ], string='Type', default='writeoff_button', required=True)
+     auto_reconcile = fields.Boolean(string='Auto-validate',
+         help='Validate the statement line automatically (reconciliation based on your rule).')
++    to_check = fields.Boolean(string='To Check', default=False, help='This matching rule is used when the user is not certain of all the informations of the counterpart.')
+ 
+     # ===== Conditions =====
+     match_journal_ids = fields.Many2many('account.journal', string='Journals',
+
+--- a/addons/account/models/reconciliation_widget.py
++++ b/addons/account/models/reconciliation_widget.py
+@@ -39,6 +39,7 @@ class AccountReconciliation(models.AbstractModel):
+             if datum.get('partner_id') is not None:
+                 st_line.write({'partner_id': datum['partner_id']})
+ 
++            ctx['default_to_check'] = datum.get('to_check')
+             st_line.with_context(ctx).process_reconciliation(
+                 datum.get('counterpart_aml_dicts', []),
+                 payment_aml_rec,
+@@ -106,10 +107,21 @@ class AccountReconciliation(models.AbstractModel):
+             :param excluded_ids: optional move lines ids excluded from the
+                 result
+         """
++        results = {
++            'lines': [],
++            'value_min': 0,
++            'value_max': 0,
++            'reconciled_aml_ids': [],
++        }
++        
++        if not st_line_ids:
++            return results
++
+         excluded_ids = excluded_ids or []
+ 
+         # Make a search to preserve the table's order.
+         bank_statement_lines = self.env['account.bank.statement.line'].search([('id', 'in', st_line_ids)])
++        results['value_max'] = len(bank_statement_lines)
+         reconcile_model = self.env['account.reconcile.model'].search([('rule_type', '!=', 'writeoff_button')])
+ 
+         # Search for missing partners when opening the reconciliation widget.
+@@ -117,13 +129,6 @@ class AccountReconciliation(models.AbstractModel):
+ 
+         matching_amls = reconcile_model._apply_rules(bank_statement_lines, excluded_ids=excluded_ids, partner_map=partner_map)
+ 
+-        results = {
+-            'lines': [],
+-            'value_min': 0,
+-            'value_max': len(bank_statement_lines),
+-            'reconciled_aml_ids': [],
+-        }
+-
+         # Iterate on st_lines to keep the same order in the results list.
+         bank_statements_left = self.env['account.bank.statement']
+         for line in bank_statement_lines:
+@@ -153,26 +158,41 @@ class AccountReconciliation(models.AbstractModel):
+         return results
+ 
+     @api.model
+-    def get_bank_statement_data(self, bank_statement_ids):
++    def get_bank_statement_data(self, bank_statement_line_ids, search_str=False):
+         """ Get statement lines of the specified statements or all unreconciled
+             statement lines and try to automatically reconcile them / find them
+             a partner.
+             Return ids of statement lines left to reconcile and other data for
+             the reconciliation widget.
+ 
+-            :param st_line_id: ids of the bank statement
++            :param bank_statement_line_ids: ids of the bank statement lines
+         """
+-        bank_statements = self.env['account.bank.statement'].browse(bank_statement_ids)
+-
++        if not bank_statement_line_ids:
++            return {}
++        edition_mode = self._context.get('edition_mode')
++        bank_statements = self.env['account.bank.statement.line'].browse(bank_statement_line_ids).mapped('statement_id')
++
++        search_sql = '''
++            AND (p.name ILIKE CONCAT('%%',%(search_str)s,'%%')
++            OR line.ref ILIKE CONCAT('%%',%(search_str)s,'%%')
++            OR line.name ILIKE CONCAT('%%',%(search_str)s,'%%')
++            OR CAST(line.amount AS TEXT) ILIKE CONCAT('%%',%(search_str)s,'%%'))
++        '''
+         query = '''
+              SELECT line.id
+              FROM account_bank_statement_line line
+-             WHERE account_id IS NULL
++             LEFT JOIN res_partner p on p.id = line.partner_id
++             WHERE line.account_id IS NULL
+              AND line.amount != 0.0
+-             AND line.statement_id IN %s
+-             AND NOT EXISTS (SELECT 1 from account_move_line aml WHERE aml.statement_line_id = line.id)
+-        '''
+-        self.env.cr.execute(query, [tuple(bank_statements.ids)])
++             AND line.id IN %(ids)s
++             {cond}
++             {srch}
++             GROUP BY line.id
++        '''.format(
++            cond=not edition_mode and "AND NOT EXISTS (SELECT 1 from account_move_line aml WHERE aml.statement_line_id = line.id)" or "",
++            srch=search_str and search_sql or "",
++        )
++        self.env.cr.execute(query, {'ids':tuple(bank_statement_line_ids), 'search_str':search_str})
+ 
+         bank_statement_lines = self.env['account.bank.statement.line'].browse([line.get('id') for line in self.env.cr.dictfetchall()])
+ 
+@@ -437,7 +457,7 @@ class AccountReconciliation(models.AbstractModel):
+         return str_domain
+ 
+     @api.model
+-    def _domain_move_lines_for_reconciliation(self, st_line, aml_accounts, partner_id, excluded_ids=None, search_str=False):
++    def _domain_move_lines_for_reconciliation(self, st_line, aml_accounts, partner_id, excluded_ids=[], search_str=False):
+         """ Return the domain for account.move.line records which can be used for bank statement reconciliation.
+ 
+             :param aml_accounts:
+@@ -445,6 +465,11 @@ class AccountReconciliation(models.AbstractModel):
+             :param excluded_ids:
+             :param search_str:
+         """
++        AccountMoveLine = self.env['account.move.line']
++
++        #Always exclude the journal items that have been marked as 'to be checked' in a former bank statement reconciliation
++        to_check_excluded = AccountMoveLine.search(AccountMoveLine._get_domain_for_edition_mode()).ids
++        excluded_ids.extend(to_check_excluded)
+ 
+         domain_reconciliation = [
+             '&', '&',

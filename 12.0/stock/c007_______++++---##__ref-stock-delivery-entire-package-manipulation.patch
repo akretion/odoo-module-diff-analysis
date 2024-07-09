@@ -1,0 +1,570 @@
+PR: https://github.com/odoo/odoo/pull/
+
+From: 76662a0a667fa0188468e40bdb74836bf7d35268
+From: Pierre Masereel
+Date: 2018-06-11 15:46:19
+
+Structural Changes: 30
+Total Changes: 347
+
+[REF] stock, delivery: entire package manipulation
+
+We added a model to work easily with packages, using the quant packages
+was not a good solution to move entire package and plan package moves,
+because we always had to give the picking in context, and create some
+move lines, so it was only possible when state was assigned (when move
+lines exists)
+
+So we created a model package level, linked to picking, move and move
+lines allowing to easily plan package transfer and put in pack.
+
+================================= pseudo patch: =================================
+
+--- a/addons/stock/models/__init__.py
++++ b/addons/stock/models/__init__.py
+@@ -20,3 +20,4 @@ from . import stock_warehouse
+ from . import stock_scrap
+ from . import product
+ from . import res_users
++from . import stock_package_level
+
+--- a/addons/stock/models/stock_move.py
++++ b/addons/stock/models/stock_move.py
+@@ -160,6 +160,8 @@ class StockMove(models.Model):
+     is_quantity_done_editable = fields.Boolean('Is quantity done editable', compute='_compute_is_quantity_done_editable')
+     reference = fields.Char(compute='_compute_reference', string="Reference", store=True)
+     has_move_lines = fields.Boolean(compute='_compute_has_move_lines')
++    package_level_id = fields.Many2one('stock.package_level', 'Package Level')
++    picking_type_entire_packs = fields.Boolean(related='picking_type_id.show_entire_packs', readonly=True)
+ 
+     @api.depends('picking_id.is_locked')
+     def _compute_is_locked(self):
+@@ -550,7 +552,8 @@ class StockMove(models.Model):
+     def _prepare_merge_moves_distinct_fields(self):
+         return [
+             'product_id', 'price_unit', 'product_packaging', 'procure_method',
+-            'product_uom', 'restrict_partner_id', 'scrapped', 'origin_returned_move_id'
++            'product_uom', 'restrict_partner_id', 'scrapped', 'origin_returned_move_id',
++            'package_level_id'
+         ]
+ 
+     @api.model
+@@ -558,7 +561,8 @@ class StockMove(models.Model):
+         move.ensure_one()
+         return [
+             move.product_id.id, move.price_unit, move.product_packaging.id, move.procure_method, 
+-            move.product_uom.id, move.restrict_partner_id.id, move.scrapped, move.origin_returned_move_id.id
++            move.product_uom.id, move.restrict_partner_id.id, move.scrapped, move.origin_returned_move_id.id,
++            move.package_level_id.id
+         ]
+ 
+     def _merge_moves(self, merge_into=False):
+@@ -929,10 +933,11 @@ class StockMove(models.Model):
+                         assigned_moves |= move
+                         continue
+                     # Reserve new quants and create move lines accordingly.
+-                    available_quantity = self.env['stock.quant']._get_available_quantity(move.product_id, move.location_id)
++                    forced_package_id = move.package_level_id.package_id or None
++                    available_quantity = self.env['stock.quant']._get_available_quantity(move.product_id, move.location_id, package_id=forced_package_id)
+                     if available_quantity <= 0:
+                         continue
+-                    taken_quantity = move._update_reserved_quantity(need, available_quantity, move.location_id, strict=False)
++                    taken_quantity = move._update_reserved_quantity(need, available_quantity, move.location_id, package_id=forced_package_id, strict=False)
+                     if float_is_zero(taken_quantity, precision_rounding=move.product_id.uom_id.rounding):
+                         continue
+                     if need == taken_quantity:
+@@ -1122,7 +1127,7 @@ class StockMove(models.Model):
+                 .mapped('move_line_ids.result_package_id')\
+                 .filtered(lambda p: p.quant_ids and len(p.quant_ids) > 1):
+             if len(result_package.quant_ids.mapped('location_id')) > 1:
+-                raise UserError(_('You should not put the contents of a package in different locations.'))
++                raise UserError(_('You cannot move the same package content more than once in the same transfer or split the same package inot two location.'))
+         picking = moves_todo and moves_todo[0].picking_id or False
+         moves_todo.write({'state': 'done', 'date': fields.Datetime.now()})
+         moves_todo.mapped('move_dest_ids')._action_assign()
+
+--- a/addons/stock/models/stock_move_line.py
++++ b/addons/stock/models/stock_move_line.py
+@@ -31,6 +31,7 @@ class StockMoveLine(models.Model):
+     ordered_qty = fields.Float('Ordered Quantity', digits=dp.get_precision('Product Unit of Measure'))
+     qty_done = fields.Float('Done', default=0.0, digits=dp.get_precision('Product Unit of Measure'), copy=False)
+     package_id = fields.Many2one('stock.quant.package', 'Source Package', ondelete='restrict')
++    package_level_id = fields.Many2one('stock.package_level', 'Package Level')
+     lot_id = fields.Many2one('stock.production.lot', 'Lot')
+     lot_name = fields.Char('Lot/Serial Number')
+     result_package_id = fields.Many2one(
+@@ -50,7 +51,7 @@ class StockMoveLine(models.Model):
+     consume_line_ids = fields.Many2many('stock.move.line', 'stock_move_line_consume_rel', 'consume_line_id', 'produce_line_id', help="Technical link to see who consumed what. ")
+     produce_line_ids = fields.Many2many('stock.move.line', 'stock_move_line_consume_rel', 'produce_line_id', 'consume_line_id', help="Technical link to see which line was produced with this. ")
+     reference = fields.Char(related='move_id.reference', store=True, related_sudo=False)
+-    in_entire_package = fields.Boolean(compute='_compute_in_entire_package')
++    picking_type_entire_packs = fields.Boolean(related='picking_id.picking_type_id.show_entire_packs', readonly=True)
+ 
+     def _compute_location_description(self):
+         for operation, operation_sudo in izip(self, self.sudo()):
+@@ -79,13 +80,6 @@ class StockMoveLine(models.Model):
+         detect errors. """
+         raise UserError(_('The requested operation cannot be processed because of a programming error setting the `product_qty` field instead of the `product_uom_qty`.'))
+ 
+-    def _compute_in_entire_package(self):
+-        """ This method check if the move line is in an entire pack shown in the picking."""
+-        for ml in self:
+-            picking_id = ml.picking_id
+-            ml.in_entire_package = picking_id and picking_id.picking_type_entire_packs and picking_id.state != 'done'\
+-                                   and ml.result_package_id and ml.result_package_id in picking_id.entire_package_ids
+-
+     @api.constrains('product_uom_qty')
+     def check_reserved_done_quantity(self):
+         for move_line in self:
+
+--- a/None
++++ b/addons/stock/models/stock_package_level.py
+@@ -0,0 +1,166 @@
++# -*- coding: utf-8 -*-
++# Part of Odoo. See LICENSE file for full copyright and licensing details.
++
++from odoo import api, fields, models, _
++from itertools import groupby
++from operator import itemgetter
++
++
++class StockPackageLevel(models.Model):
++    _name = 'stock.package_level'
++
++    package_id = fields.Many2one('stock.quant.package', 'Package', required=True)
++    picking_id = fields.Many2one('stock.picking', 'Picking')
++    move_ids = fields.One2many('stock.move', 'package_level_id')
++    move_line_ids = fields.One2many('stock.move.line', 'package_level_id')
++    location_id = fields.Many2one('stock.location', 'From')
++    location_dest_id = fields.Many2one('stock.location', 'To')
++    is_done = fields.Boolean('Done', compute='_compute_is_done', inverse='_set_is_done')
++    state = fields.Selection([
++        ('draft', 'Draft'),
++        ('confirmed', 'Confirmed'),
++        ('assigned', 'Reserved'),
++        ('new', 'New'),
++        ('done', 'Done'),
++        ('cancel', 'Cancelled'),
++    ],string='State', compute='_compute_state')
++    is_fresh_package = fields.Boolean(compute='_compute_fresh_pack')
++
++    picking_source_location = fields.Many2one('stock.location', related='picking_id.location_id')
++
++    @api.depends('move_line_ids', 'move_line_ids.qty_done')
++    def _compute_is_done(self):
++        for package_level in self:
++            # If it is an existing package
++            if package_level.is_fresh_package:
++                package_level.is_done = True
++            else:
++                package_level.is_done = package_level._check_move_lines_map_quant_package(package_level.package_id)
++
++
++    def _set_is_done(self):
++        for package_level in self:
++            if package_level.is_done:
++                if not package_level.is_fresh_package:
++                    for quant in package_level.package_id.quant_ids:
++                        corresponding_ml = package_level.move_line_ids.filtered(lambda ml: ml.product_id == quant.product_id and ml.lot_id == quant.lot_id)
++                        if corresponding_ml:
++                            corresponding_ml[0].qty_done = corresponding_ml[0].qty_done + quant.quantity
++                        else:
++                            corresponding_move = package_level.move_ids.filtered(lambda m: m.product_id == quant.product_id)
++                            self.env['stock.move.line'].create({
++                                'location_id': package_level.picking_id.location_id.id,
++                                'location_dest_id': package_level.picking_id.location_dest_id.id,
++                                'picking_id': package_level.picking_id.id,
++                                'product_id': quant.product_id.id,
++                                'qty_done': quant.quantity,
++                                'product_uom_id': quant.product_id.uom_id.id,
++                                'lot_id': quant.lot_id.id,
++                                'package_id': package_level.package_id.id,
++                                'result_package_id': package_level.package_id.id,
++                                'package_level_id': package_level.id,
++                                'move_id': corresponding_move.id,
++                            })
++            else:
++                package_level.move_line_ids.write({'qty_done': 0})
++
++    @api.depends('move_line_ids')
++    def _compute_fresh_pack(self):
++        for package_level in self:
++            if not package_level.move_line_ids or all(ml.package_id and ml.package_id == ml.result_package_id for ml in package_level.move_line_ids):
++                package_level.is_fresh_package = False
++            else:
++                package_level.is_fresh_package = True
++
++    @api.depends('move_ids', 'move_ids.state', 'move_line_ids', 'move_line_ids.state')
++    def _compute_state(self):
++        for package_level in self:
++            if not package_level.move_ids and not package_level.move_line_ids:
++                package_level.state = 'draft'
++            elif not package_level.move_line_ids and package_level.move_ids.filtered(lambda m: m.state not in ('done', 'cancel')):
++                package_level.state = 'confirmed'
++            elif package_level.move_line_ids and not package_level.move_line_ids.filtered(lambda ml: ml.state == 'done'):
++                if package_level.is_fresh_package:
++                    package_level.state = 'new'
++                elif package_level._check_move_lines_map_quant_package(package_level.package_id, 'product_uom_qty'):
++                    package_level.state = 'assigned'
++                else:
++                    package_level.state = 'confirmed'
++            elif package_level.move_line_ids.filtered(lambda ml: ml.state =='done'):
++                package_level.state = 'done'
++            elif package_level.move_line_ids.filtered(lambda ml: ml.state == 'cancel') or package_level.move_ids.filtered(lambda m: m.state == 'cancel'):
++                package_level.state = 'cancel'
++
++
++    @api.onchange('package_id')
++    def _onchange_package_id(self):
++        if not self.is_fresh_package:
++            self.location_id = self.package_id.location_id
++
++    def _generate_moves(self):
++        for package_level in self:
++            if package_level.package_id:
++                for quant in package_level.package_id.quant_ids:
++                    self.env['stock.move'].create({
++                        'picking_id': package_level.picking_id.id,
++                        'name': quant.product_id.display_name,
++                        'product_id': quant.product_id.id,
++                        'product_uom_qty': quant.quantity,
++                        'product_uom': quant.product_id.uom_id.id,
++                        'location_id': package_level.location_id.id,
++                        'location_dest_id': package_level.location_dest_id.id,
++                        'package_level_id': package_level.id,
++                    })
++
++    def create(self, vals):
++        result = super(StockPackageLevel, self).create(vals)
++        if vals.get('location_dest_id'):
++            result.mapped('move_line_ids').write({'location_dest_id': vals['location_dest_id']})
++            result.mapped('move_ids').write({'location_dest_id': vals['location_dest_id']})
++        if not result.is_fresh_package and vals.get('location_id'):
++            result.mapped('move_line_ids').write({'location_id': vals['location_id']})
++            result.mapped('move_ids').write({'location_id': vals['location_id']})
++        if result.picking_id.state != 'draft' and result.location_id and result.location_dest_id and not result.move_ids and not result.move_line_ids:
++            result._generate_moves()
++        return result
++
++    def write(self, vals):
++        result = super(StockPackageLevel, self).write(vals)
++        if vals.get('location_dest_id'):
++            self.mapped('move_line_ids').write({'location_dest_id': vals['location_dest_id']})
++            self.mapped('move_ids').write({'location_dest_id': vals['location_dest_id']})
++        if vals.get('location_id'):
++            fresh_packages = self.env['stock.package_level']
++            for package_level in self:
++                if package_level.is_fresh_package:
++                    fresh_packages |= package_level
++            fresh_packages.mapped('move_line_ids').write({'location_id': vals['location_id']})
++            fresh_packages.mapped('move_ids').write({'location_id': vals['location_id']})
++        return result
++
++    def unlink(self):
++        self.mapped('move_ids').unlink()
++        self.mapped('move_line_ids').write({'result_package_id': False})
++        return super(StockPackageLevel, self).unlink()
++
++    def _check_move_lines_map_quant_package(self, package, field='qty_done'):
++        """ should compare in good uom """
++        all_in = True
++        pack_move_lines = self.move_line_ids
++        keys = ['product_id', 'lot_id']
++
++        def sorted_key(object):
++            object.ensure_one()
++            return [object.product_id.id, object.lot_id.id]
++
++        grouped_quants = {}
++        for k, g in groupby(sorted(package.quant_ids, key=sorted_key), key=itemgetter(*keys)):
++            grouped_quants[k] = sum(self.env['stock.quant'].concat(*list(g)).mapped('quantity'))
++
++        grouped_ops = {}
++        for k, g in groupby(sorted(pack_move_lines, key=sorted_key), key=itemgetter(*keys)):
++            grouped_ops[k] = sum(self.env['stock.move.line'].concat(*list(g)).mapped(field))
++        if any(grouped_quants.get(key, 0) - grouped_ops.get(key, 0) != 0 for key in grouped_quants) \
++                or any(grouped_ops.get(key, 0) - grouped_quants.get(key, 0) != 0 for key in grouped_ops):
++            all_in = False
++        return all_in
+
+--- a/addons/stock/models/stock_picking.py
++++ b/addons/stock/models/stock_picking.py
+@@ -31,7 +31,7 @@ class PickingType(models.Model):
+         help="This is the default destination location when you create a picking manually with this operation type. It is possible however to change it or that the routes put another location. If it is empty, it will check for the customer location on the partner. ")
+     code = fields.Selection([('incoming', 'Vendors'), ('outgoing', 'Customers'), ('internal', 'Internal')], 'Type of Operation', required=True)
+     return_picking_type_id = fields.Many2one('stock.picking.type', 'Operation Type for Returns')
+-    show_entire_packs = fields.Boolean('Move Entire Packages', help="If checked, this shows the packs to be moved as a whole in the Operations tab all the time, even if there was no entire pack reserved.")
++    show_entire_packs = fields.Boolean('Move Entire Packages', help="If ticked, you will be able to select entire packages to move")
+     warehouse_id = fields.Many2one(
+         'stock.warehouse', 'Warehouse', ondelete='cascade',
+         default=lambda self: self.env['stock.warehouse'].search([('company_id', '=', self.env.user.company_id.id)], limit=1))
+@@ -242,6 +242,7 @@ class Picking(models.Model):
+         readonly=True, required=True,
+         states={'draft': [('readonly', False)]})
+     move_lines = fields.One2many('stock.move', 'picking_id', string="Stock Moves", copy=True)
++    move_ids_without_package = fields.One2many('stock.move', 'picking_id', string="Stock moves not in package", domain=['|',('package_level_id', '=', False), ('picking_type_entire_packs', '=', False)])
+     has_scrap_move = fields.Boolean(
+         'Has Scrap Moves', compute='_has_scrap_move')
+     picking_type_id = fields.Many2one(
+@@ -267,6 +268,7 @@ class Picking(models.Model):
+         states={'done': [('readonly', True)], 'cancel': [('readonly', True)]})
+ 
+     move_line_ids = fields.One2many('stock.move.line', 'picking_id', 'Operations')
++    move_line_ids_without_package = fields.One2many('stock.move.line', 'picking_id', 'Operations without package', domain=['|',('package_level_id', '=', False), ('picking_type_entire_packs', '=', False)])
+ 
+     move_line_exist = fields.Boolean(
+         'Has Pack Operations', compute='_compute_move_line_exist',
+@@ -276,11 +278,6 @@ class Picking(models.Model):
+         'Has Packages', compute='_compute_has_packages',
+         help='Check the existence of destination packages on move lines')
+ 
+-    entire_package_ids = fields.One2many('stock.quant.package', compute='_compute_entire_package_ids',
+-                                         help='Those are the entire packages of a picking shown in the view of operations')
+-    entire_package_detail_ids = fields.One2many('stock.quant.package', compute='_compute_entire_package_ids',
+-                                                help='Those are the entire packages of a picking shown in the view of detailed operations')
+-
+     show_check_availability = fields.Boolean(
+         compute='_compute_show_check_availability',
+         help='Technical field used to compute whether the check availability button should be shown.')
+@@ -305,6 +302,8 @@ class Picking(models.Model):
+     show_lots_text = fields.Boolean(compute='_compute_show_lots_text')
+     has_tracking = fields.Boolean(compute='_compute_has_tracking')
+     immediate_transfer = fields.Boolean(default=False)
++    package_level_ids = fields.One2many('stock.package_level', 'picking_id')
++    package_level_ids_details = fields.One2many('stock.package_level', 'picking_id')
+ 
+     _sql_constraints = [
+         ('name_uniq', 'unique(name, company_id)', 'Reference must be unique per company!'),
+@@ -408,21 +407,6 @@ class Picking(models.Model):
+     def _compute_has_packages(self):
+         self.has_packages = self.move_line_ids.filtered(lambda ml: ml.result_package_id)
+ 
+-    def _compute_entire_package_ids(self):
+-        """ This compute method populate the two one2Many containing all entire packages of the picking.
+-            An entire package is a package that is entirely reserved to be moved from a location to another one.
+-        """
+-        for picking in self:
+-            packages = self.env['stock.quant.package']
+-            packages_to_check = picking.move_line_ids\
+-                .filtered(lambda ml: ml.result_package_id and ml.package_id.id == ml.result_package_id.id)\
+-                .mapped('package_id')
+-            for package_to_check in packages_to_check:
+-                if picking.state in ('done', 'cancel') or picking._check_move_lines_map_quant_package(package_to_check):
+-                    packages |= package_to_check
+-            picking.entire_package_ids = packages
+-            picking.entire_package_detail_ids = packages
+-
+     @api.multi
+     def _compute_show_check_availability(self):
+         for picking in self:
+@@ -437,7 +421,7 @@ class Picking(models.Model):
+     @api.depends('state', 'move_lines')
+     def _compute_show_mark_as_todo(self):
+         for picking in self:
+-            if not picking.move_lines:
++            if not picking.move_lines and not picking.package_level_ids:
+                 picking.show_mark_as_todo = False
+             elif not (picking.immediate_transfer) and picking.state == 'draft':
+                 picking.show_mark_as_todo = True
+@@ -557,6 +541,7 @@ class Picking(models.Model):
+ 
+     @api.multi
+     def action_confirm(self):
++        self.mapped('package_level_ids').filtered(lambda pl: pl.state == 'draft')._generate_moves()
+         # call `_action_confirm` on every draft move
+         self.mapped('move_lines')\
+             .filtered(lambda move: move.state == 'draft')\
+@@ -662,8 +647,19 @@ class Picking(models.Model):
+             origin_packages = picking.move_line_ids.mapped("package_id")
+             for pack in origin_packages:
+                 if picking._check_move_lines_map_quant_package(pack):
+-                    picking.move_line_ids.filtered(lambda ml: ml.package_id == pack).write({'result_package_id': pack.id})
+-
++                    package_level = picking.package_level_ids.filtered(lambda pl: pl.package_id == pack)
++                    move_lines_to_pack = picking.move_line_ids.filtered(lambda ml: ml.package_id == pack)
++                    if not package_level:
++                        self.env['stock.package_level'].create({
++                            'picking_id': picking.id,
++                            'package_id': pack.id,
++                            'location_id': pack.location_id.id,
++                            'location_dest_id': picking.move_line_ids.filtered(lambda ml: ml.package_id == pack).mapped('location_dest_id')[:1].id,
++                            'move_line_ids': [(6, 0, move_lines_to_pack.ids)]
++                        })
++                        picking.move_line_ids.filtered(lambda ml: ml.package_id == pack).write({
++                            'result_package_id': pack.id,
++                        })
+     @api.multi
+     def do_unreserve(self):
+         for picking in self:
+@@ -784,7 +780,7 @@ class Picking(models.Model):
+ 
+     @api.multi
+     def _autoconfirm_picking(self):
+-        for picking in self.filtered(lambda picking: picking.immediate_transfer and picking.state not in ('done', 'cancel') and picking.move_lines):
++        for picking in self.filtered(lambda picking: picking.immediate_transfer and picking.state not in ('done', 'cancel') and (picking.move_lines or picking.package_level_ids)):
+             picking.action_confirm()
+ 
+     def _get_overprocessed_stock_moves(self):
+@@ -812,6 +808,7 @@ class Picking(models.Model):
+                     body=_('The backorder <a href=# data-oe-model=stock.picking data-oe-id=%d>%s</a> has been created.') % (
+                         backorder_picking.id, backorder_picking.name))
+                 moves_to_backorder.write({'picking_id': backorder_picking.id})
++                moves_to_backorder.mapped('package_level_id').write({'picking_id':backorder_picking.id})
+                 moves_to_backorder.mapped('move_line_ids').write({'picking_id': backorder_picking.id})
+                 backorder_picking.action_assign()
+                 backorders |= backorder_picking
+@@ -974,29 +971,42 @@ class Picking(models.Model):
+ 
+         return _explore(self.env['stock.picking'], self.env['stock.move'], moves)
+ 
++
+     def _put_in_pack(self):
+         package = False
+         for pick in self.filtered(lambda p: p.state not in ('done', 'cancel')):
+-            operations = pick.move_line_ids.filtered(lambda o: o.qty_done > 0 and not o.result_package_id)
+-            operation_ids = self.env['stock.move.line']
+-            if operations:
++            move_line_ids = pick.move_line_ids.filtered(lambda o: o.qty_done > 0 and not o.result_package_id)
++            if move_line_ids:
++                move_lines_to_pack = self.env['stock.move.line']
+                 package = self.env['stock.quant.package'].create({})
+-                for operation in operations:
+-                    if float_compare(operation.qty_done, operation.product_uom_qty, precision_rounding=operation.product_uom_id.rounding) >= 0:
+-                        operation_ids |= operation
++                if len(move_line_ids.mapped('location_dest_id')) > 1:
++                    raise UserError('You cannot put in the same pack move lines having different destination locations')
++                for ml in move_line_ids:
++                    if float_compare(ml.qty_done, ml.product_uom_qty,
++                                     precision_rounding=ml.product_uom_id.rounding) >= 0:
++                        move_lines_to_pack |= ml
+                     else:
+                         quantity_left_todo = float_round(
+-                            operation.product_uom_qty - operation.qty_done,
+-                            precision_rounding=operation.product_uom_id.rounding,
++                            ml.product_uom_qty - ml.qty_done,
++                            precision_rounding=ml.product_uom_id.rounding,
+                             rounding_method='UP')
+-                        done_to_keep = operation.qty_done
+-                        new_operation = operation.copy(
+-                            default={'product_uom_qty': 0, 'qty_done': operation.qty_done})
+-                        operation.write({'product_uom_qty': quantity_left_todo, 'qty_done': 0.0})
+-                        new_operation.write({'product_uom_qty': done_to_keep})
+-                        operation_ids |= new_operation
+-
+-                operation_ids.write({'result_package_id': package.id})
++                        done_to_keep = ml.qty_done
++                        new_move_line = ml.copy(
++                            default={'product_uom_qty': 0, 'qty_done': ml.qty_done})
++                        ml.write({'product_uom_qty': quantity_left_todo, 'qty_done': 0.0})
++                        new_move_line.write({'product_uom_qty': done_to_keep})
++                        move_lines_to_pack |= new_move_line
++
++                package_level = self.env['stock.package_level'].create({
++                    'package_id': package.id,
++                    'picking_id': pick.id,
++                    'location_id': False,
++                    'location_dest_id': move_line_ids.mapped('location_dest_id').id,
++                    'move_line_ids': [(6, 0, move_lines_to_pack.ids)]
++                })
++                move_lines_to_pack.write({
++                    'result_package_id': package.id,
++                })
+             else:
+                 raise UserError(_('You must first set the quantity you will put in the pack.'))
+         return package
+
+--- a/addons/stock/models/stock_quant.py
++++ b/addons/stock/models/stock_quant.py
+@@ -336,8 +336,7 @@ class QuantPackage(models.Model):
+         default=lambda self: self.env['ir.sequence'].next_by_code('stock.quant.package') or _('Unknown Pack'))
+     quant_ids = fields.One2many('stock.quant', 'package_id', 'Bulk Content', readonly=True)
+     packaging_id = fields.Many2one(
+-        'product.packaging', 'Package Type', index=True,
+-        help="This field should be completed only if everything inside the package share the same product, otherwise it doesn't really makes sense.")
++        'product.packaging', 'Package Type', index=True)
+     location_id = fields.Many2one(
+         'stock.location', 'Location', compute='_compute_package_info',
+         index=True, readonly=True, store=True)
+@@ -347,12 +346,6 @@ class QuantPackage(models.Model):
+     owner_id = fields.Many2one(
+         'res.partner', 'Owner', compute='_compute_package_info', search='_search_owner',
+         index=True, readonly=True)
+-    move_line_ids = fields.One2many('stock.move.line', 'result_package_id')
+-    current_picking_move_line_ids = fields.One2many('stock.move.line', compute="_compute_current_picking_info")
+-    current_picking_id = fields.Boolean(compute="_compute_current_picking_info")
+-    current_source_location_id = fields.Many2one('stock.location', compute="_compute_current_picking_info")
+-    current_destination_location_id = fields.Many2one('stock.location', compute="_compute_current_picking_info")
+-    is_processed = fields.Boolean(compute="_compute_current_picking_info")
+ 
+     @api.depends('quant_ids.package_id', 'quant_ids.location_id', 'quant_ids.company_id', 'quant_ids.owner_id')
+     def _compute_package_info(self):
+@@ -375,43 +368,6 @@ class QuantPackage(models.Model):
+             res[package.id] = name
+         return res
+ 
+-    def _compute_current_picking_info(self):
+-        """ When a package is in displayed in picking, it gets the picking id trough the context, and this function
+-        populates the different fields used when we move entire packages in pickings.
+-        """
+-        for package in self:
+-            picking_id = self.env.context.get('picking_id')
+-            if not picking_id:
+-                package.current_picking_move_line_ids = False
+-                package.current_picking_id = False
+-                package.is_processed = False
+-                package.current_source_location_id = False
+-                package.current_destination_location_id = False
+-                continue
+-            package.current_picking_move_line_ids = package.move_line_ids.filtered(lambda ml: ml.picking_id.id == picking_id)
+-            package.current_picking_id = True
+-            package.current_source_location_id = package.current_picking_move_line_ids[:1].location_id
+-            package.current_destination_location_id = package.current_picking_move_line_ids[:1].location_dest_id
+-            package.is_processed = not bool(package.current_picking_move_line_ids.filtered(lambda ml: ml.qty_done < ml.product_uom_qty))
+-
+-    def action_toggle_processed(self):
+-        """ This method set the quantity done to the reserved quantity of all move lines of a package or to 0 if the package is already processed"""
+-        picking_id = self.env.context.get('picking_id')
+-        if picking_id:
+-            self.ensure_one()
+-            move_lines = self.current_picking_move_line_ids
+-            if move_lines.filtered(lambda ml: ml.qty_done < ml.product_uom_qty):
+-                destination_location = self.env.context.get('destination_location')
+-                for ml in move_lines:
+-                    vals = {'qty_done': ml.product_uom_qty}
+-                    if destination_location:
+-                        vals['location_dest_id'] = destination_location
+-                    ml.write(vals)
+-            else:
+-                for ml in move_lines:
+-                    ml.qty_done = 0
+-
+-
+     def _search_owner(self, operator, value):
+         if value:
+             packs = self.search([('quant_ids.owner_id', operator, value)])
+@@ -422,24 +378,9 @@ class QuantPackage(models.Model):
+         else:
+             return [('id', '=', False)]
+ 
+-    def _check_location_constraint(self):
+-        '''checks that all quants in a package are stored in the same location. This function cannot be used
+-           as a constraint because it needs to be checked on pack operations (they may not call write on the
+-           package)
+-        '''
+-        for pack in self:
+-            locations = pack.get_content().filtered(lambda quant: quant.qty > 0.0).mapped('location_id')
+-            if len(locations) != 1:
+-                raise UserError(_('Every item inside a package should be in the same location.'))
+-        return True
+-
+     def unpack(self):
+         for package in self:
+-            move_lines_to_remove = package.move_line_ids.filtered(lambda move_line: move_line.state != 'done')
+-            if move_lines_to_remove:
+-                move_lines_to_remove.write({'result_package_id': False})
+-            else:
+-                package.mapped('quant_ids').write({'package_id': False})
++            package.mapped('quant_ids').write({'package_id': False})
+ 
+     def action_view_picking(self):
+         action = self.env.ref('stock.action_picking_tree_all').read()[0]

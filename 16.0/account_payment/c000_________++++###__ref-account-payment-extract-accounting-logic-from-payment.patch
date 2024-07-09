@@ -1,0 +1,805 @@
+PR: https://github.com/odoo/odoo/pull/
+
+From: 61b8c0c1a2be6e7966413bf3c60b4475ae0e9a94
+From: Victor Feyens
+Date: 2022-09-06 11:31:00
+
+Structural Changes: 23
+Total Changes: 761
+
+[REF] (account_)payment: extract accounting logic from payment
+
+================================= pseudo patch: =================================
+
+--- a/None
++++ b/addons/account_payment/models/__init__.py
+@@ -0,0 +1,9 @@
++# Part of Odoo. See LICENSE file for full copyright and licensing details.
++
++from . import account_journal
++from . import account_move
++from . import account_payment
++from . import account_payment_method
++from . import account_payment_method_line
++from . import payment_acquirer
++from . import payment_transaction
+
+--- a/None
++++ b/addons/account_payment/models/account_journal.py
+@@ -0,0 +1,73 @@
++# -*- coding: utf-8 -*-
++# Part of Odoo. See LICENSE file for full copyright and licensing details.
++
++from odoo import _, api, Command, models
++from odoo.exceptions import UserError
++
++
++class AccountJournal(models.Model):
++    _inherit = "account.journal"
++
++    @api.constrains('inbound_payment_method_line_ids')
++    def _check_inbound_payment_method_line_ids(self):
++        """
++        Check and ensure that the user do not remove a apml that is linked to an acquirer in the test or enabled state.
++        """
++        if not self.company_id:
++            return
++
++        self.env['account.payment.method'].flush_model(['code', 'payment_type'])
++        self.env['account.payment.method.line'].flush_model(['payment_method_id'])
++        self.env['payment.acquirer'].flush_model(['provider', 'state'])
++
++        self._cr.execute('''
++            SELECT acquirer.id
++            FROM payment_acquirer acquirer
++            JOIN account_payment_method apm ON apm.code = acquirer.provider
++            LEFT JOIN account_payment_method_line apml ON apm.id = apml.payment_method_id AND apml.journal_id IS NOT NULL
++            WHERE acquirer.state IN ('enabled', 'test') AND apm.payment_type = 'inbound'
++            AND apml.id IS NULL
++            AND acquirer.company_id IN %(company_ids)s
++        ''', {'company_ids': tuple(self.company_id.ids)})
++        ids = [r[0] for r in self._cr.fetchall()]
++        if ids:
++            acquirers = self.env['payment.acquirer'].sudo().browse(ids)
++            raise UserError(_("You can't delete a payment method that is linked to an acquirer in the enabled or test state.\n"
++                              "Linked acquirer(s): %s", ', '.join(a.display_name for a in acquirers)))
++
++    def _get_available_payment_method_lines(self, payment_type):
++        lines = super()._get_available_payment_method_lines(payment_type)
++
++        return lines.filtered(lambda l: l.payment_acquirer_state != 'disabled')
++
++    @api.depends('outbound_payment_method_line_ids', 'inbound_payment_method_line_ids')
++    def _compute_available_payment_method_ids(self):
++        super()._compute_available_payment_method_ids()
++
++        installed_acquirers = self.env['payment.acquirer'].sudo().search([])
++        method_information = self.env['account.payment.method']._get_payment_method_information()
++        pay_methods = self.env['account.payment.method'].search([('code', 'in', list(method_information.keys()))])
++        pay_method_by_code = {x.code + x.payment_type: x for x in pay_methods}
++
++        # On top of the basic filtering, filter to hide unavailable acquirers.
++        # This avoid allowing payment method lines linked to an acquirer that has no record.
++        for code, vals in method_information.items():
++            payment_method = pay_method_by_code.get(code + 'inbound')
++
++            if not payment_method:
++                continue
++
++            for journal in self:
++                to_remove = []
++
++                available_providers = installed_acquirers.filtered(
++                    lambda a: a.company_id == journal.company_id
++                ).mapped('provider')
++                available = payment_method.code in available_providers
++
++                if vals['mode'] == 'unique' and not available:
++                    to_remove.append(payment_method.id)
++
++                journal.write({
++                    'available_payment_method_ids': [Command.unlink(payment_method) for payment_method in to_remove]
++                })
+
+--- a/None
++++ b/addons/account_payment/models/account_move.py
+@@ -0,0 +1,77 @@
++# Part of Odoo. See LICENSE file for full copyright and licensing details.
++
++from odoo import api, fields, models
++
++from odoo.addons.payment import utils as payment_utils
++
++
++class AccountMove(models.Model):
++    _inherit = 'account.move'
++
++    transaction_ids = fields.Many2many(
++        string="Transactions", comodel_name='payment.transaction',
++        relation='account_invoice_transaction_rel', column1='invoice_id', column2='transaction_id',
++        readonly=True, copy=False)
++    authorized_transaction_ids = fields.Many2many(
++        string="Authorized Transactions", comodel_name='payment.transaction',
++        compute='_compute_authorized_transaction_ids', readonly=True, copy=False)
++    amount_paid = fields.Monetary(
++        string="Amount paid",
++        compute='_compute_amount_paid'
++    )
++
++    @api.depends('transaction_ids')
++    def _compute_authorized_transaction_ids(self):
++        for invoice in self:
++            invoice.authorized_transaction_ids = invoice.transaction_ids.filtered(
++                lambda tx: tx.state == 'authorized'
++            )
++
++    @api.depends('transaction_ids')
++    def _compute_amount_paid(self):
++        """ Sum all the transaction amount for which state is in 'authorized' or 'done'
++        """
++        for invoice in self:
++            invoice.amount_paid = sum(
++                invoice.transaction_ids.filtered(
++                    lambda tx: tx.state in ('authorized', 'done')
++                ).mapped('amount')
++            )
++
++    def get_portal_last_transaction(self):
++        self.ensure_one()
++        return self.with_context(active_test=False).transaction_ids._get_last()
++
++    def payment_action_capture(self):
++        """ Capture all transactions linked to this invoice. """
++        payment_utils.check_rights_on_recordset(self)
++        # In sudo mode because we need to be able to read on acquirer fields.
++        self.authorized_transaction_ids.sudo().action_capture()
++
++    def payment_action_void(self):
++        """ Void all transactions linked to this invoice. """
++        payment_utils.check_rights_on_recordset(self)
++        # In sudo mode because we need to be able to read on acquirer fields.
++        self.authorized_transaction_ids.sudo().action_void()
++
++    def action_view_payment_transactions(self):
++        action = self.env['ir.actions.act_window']._for_xml_id('payment.action_payment_transaction')
++
++        if len(self.transaction_ids) == 1:
++            action['view_mode'] = 'form'
++            action['res_id'] = self.transaction_ids.id
++            action['views'] = []
++        else:
++            action['domain'] = [('id', 'in', self.transaction_ids.ids)]
++
++        return action
++
++    def _get_default_payment_link_values(self):
++        self.ensure_one()
++        return {
++            'description': self.payment_reference,
++            'amount': self.amount_residual,
++            'currency_id': self.currency_id.id,
++            'partner_id': self.partner_id.id,
++            'amount_max': self.amount_residual,
++        }
+
+--- a/None
++++ b/addons/account_payment/models/account_payment.py
+@@ -0,0 +1,223 @@
++# Part of Odoo. See LICENSE file for full copyright and licensing details.
++
++from odoo import _, api, Command, fields, models
++from odoo.exceptions import ValidationError
++
++
++class AccountPayment(models.Model):
++    _inherit = 'account.payment'
++
++    # == Business fields ==
++    payment_transaction_id = fields.Many2one(
++        string="Payment Transaction",
++        comodel_name='payment.transaction',
++        readonly=True,
++        auto_join=True,  # No access rule bypass since access to payments means access to txs too
++    )
++    payment_token_id = fields.Many2one(
++        string="Saved Payment Token", comodel_name='payment.token', domain="""[
++            ('id', 'in', suitable_payment_token_ids),
++        ]""",
++        help="Note that only tokens from acquirers allowing to capture the amount are available.")
++    amount_available_for_refund = fields.Monetary(compute='_compute_amount_available_for_refund')
++
++    # == Display purpose fields ==
++    suitable_payment_token_ids = fields.Many2many(
++        comodel_name='payment.token',
++        compute='_compute_suitable_payment_token_ids',
++        compute_sudo=True,
++    )
++    # Technical field used to hide or show the payment_token_id if needed
++    use_electronic_payment_method = fields.Boolean(
++        compute='_compute_use_electronic_payment_method',
++    )
++
++    # == Fields used for traceability ==
++    source_payment_id = fields.Many2one(
++        string="Source Payment",
++        comodel_name='account.payment',
++        help="The source payment of related refund payments",
++        related='payment_transaction_id.source_transaction_id.payment_id',
++        readonly=True,
++        store=True,  # Stored for the group by in `_compute_refunds_count`
++    )
++    refunds_count = fields.Integer(string="Refunds Count", compute='_compute_refunds_count')
++
++    #=== COMPUTE METHODS ===#
++
++    def _compute_amount_available_for_refund(self):
++        for payment in self:
++            tx_sudo = payment.payment_transaction_id.sudo()
++            if tx_sudo.acquirer_id.support_refund and tx_sudo.operation != 'refund':
++                # Only consider refund transactions that are confirmed by summing the amounts of
++                # payments linked to such refund transactions. Indeed, should a refund transaction
++                # be stuck forever in a transient state (due to webhook failure, for example), the
++                # user would never be allowed to refund the source transaction again.
++                refund_payments = self.search([('source_payment_id', '=', self.id)])
++                refunded_amount = abs(sum(refund_payments.mapped('amount')))
++                payment.amount_available_for_refund = payment.amount - refunded_amount
++            else:
++                payment.amount_available_for_refund = 0
++
++    @api.depends('payment_method_line_id')
++    def _compute_suitable_payment_token_ids(self):
++        for payment in self:
++            related_partner_ids = (
++                    payment.partner_id
++                    | payment.partner_id.commercial_partner_id
++                    | payment.partner_id.commercial_partner_id.child_ids
++            )._origin
++
++            if payment.use_electronic_payment_method:
++                payment.suitable_payment_token_ids = self.env['payment.token'].sudo().search([
++                    ('company_id', '=', payment.company_id.id),
++                    ('acquirer_id.capture_manually', '=', False),
++                    ('partner_id', 'in', related_partner_ids.ids),
++                    ('acquirer_id', '=', payment.payment_method_line_id.payment_acquirer_id.id),
++                ])
++            else:
++                payment.suitable_payment_token_ids = [Command.clear()]
++
++    @api.depends('payment_method_line_id')
++    def _compute_use_electronic_payment_method(self):
++        for payment in self:
++            # Get a list of all electronic payment method codes.
++            # These codes are comprised of 'electronic' and the providers of each payment acquirer.
++            codes = [key for key in dict(self.env['payment.acquirer']._fields['provider']._description_selection(self.env))]
++            payment.use_electronic_payment_method = payment.payment_method_code in codes
++
++    def _compute_refunds_count(self):
++        rg_data = self.env['account.payment']._read_group(
++            domain=[
++                ('source_payment_id', 'in', self.ids),
++                ('payment_transaction_id.operation', '=', 'refund')
++            ],
++            fields=['source_payment_id'],
++            groupby=['source_payment_id']
++        )
++        data = {x['source_payment_id'][0]: x['source_payment_id_count'] for x in rg_data}
++        for payment in self:
++            payment.refunds_count = data.get(payment.id, 0)
++
++    #=== ONCHANGE METHODS ===#
++
++    @api.onchange('partner_id', 'payment_method_line_id', 'journal_id')
++    def _onchange_set_payment_token_id(self):
++        codes = [key for key in dict(self.env['payment.acquirer']._fields['provider']._description_selection(self.env))]
++        if not (self.payment_method_code in codes and self.partner_id and self.journal_id):
++            self.payment_token_id = False
++            return
++
++        related_partner_ids = (
++                self.partner_id
++                | self.partner_id.commercial_partner_id
++                | self.partner_id.commercial_partner_id.child_ids
++        )._origin
++
++        self.payment_token_id = self.env['payment.token'].sudo().search([
++            ('company_id', '=', self.company_id.id),
++            ('partner_id', 'in', related_partner_ids.ids),
++            ('acquirer_id.capture_manually', '=', False),
++            ('acquirer_id', '=', self.payment_method_line_id.payment_acquirer_id.id),
++         ], limit=1)
++
++    #=== ACTION METHODS ===#
++
++    def action_post(self):
++        # Post the payments "normally" if no transactions are needed.
++        # If not, let the acquirer update the state.
++
++        payments_need_tx = self.filtered(
++            lambda p: p.payment_token_id and not p.payment_transaction_id
++        )
++        # creating the transaction require to access data on payment acquirers, not always accessible to users
++        # able to create payments
++        transactions = payments_need_tx.sudo()._create_payment_transaction()
++
++        res = super(AccountPayment, self - payments_need_tx).action_post()
++
++        for tx in transactions:  # Process the transactions with a payment by token
++            tx._send_payment_request()
++
++        # Post payments for issued transactions
++        transactions._finalize_post_processing()
++        payments_tx_done = payments_need_tx.filtered(
++            lambda p: p.payment_transaction_id.state == 'done'
++        )
++        super(AccountPayment, payments_tx_done).action_post()
++        payments_tx_not_done = payments_need_tx.filtered(
++            lambda p: p.payment_transaction_id.state != 'done'
++        )
++        payments_tx_not_done.action_cancel()
++
++        return res
++
++    def action_refund_wizard(self):
++        self.ensure_one()
++        return {
++            'name': _("Refund"),
++            'type': 'ir.actions.act_window',
++            'view_mode': 'form',
++            'res_model': 'payment.refund.wizard',
++            'target': 'new',
++        }
++
++    def action_view_refunds(self):
++        self.ensure_one()
++        action = {
++            'name': _("Refund"),
++            'res_model': 'account.payment',
++            'type': 'ir.actions.act_window',
++        }
++        if self.refunds_count == 1:
++            refund_tx = self.env['account.payment'].search([
++                ('source_payment_id', '=', self.id)
++            ], limit=1)
++            action['res_id'] = refund_tx.id
++            action['view_mode'] = 'form'
++        else:
++            action['view_mode'] = 'tree,form'
++            action['domain'] = [('source_payment_id', '=', self.id)]
++        return action
++
++    #=== BUSINESS METHODS - PAYMENT FLOW ===#
++
++    def _create_payment_transaction(self, **extra_create_values):
++        for payment in self:
++            if payment.payment_transaction_id:
++                raise ValidationError(_(
++                    "A payment transaction with reference %s already exists.",
++                    payment.payment_transaction_id.reference
++                ))
++            elif not payment.payment_token_id:
++                raise ValidationError(_("A token is required to create a new payment transaction."))
++
++        transactions = self.env['payment.transaction']
++        for payment in self:
++            transaction_vals = payment._prepare_payment_transaction_vals(**extra_create_values)
++            transaction = self.env['payment.transaction'].create(transaction_vals)
++            transactions += transaction
++            payment.payment_transaction_id = transaction  # Link the transaction to the payment
++        return transactions
++
++    def _prepare_payment_transaction_vals(self, **extra_create_values):
++        self.ensure_one()
++        return {
++            'acquirer_id': self.payment_token_id.acquirer_id.id,
++            'reference': self.ref,
++            'amount': self.amount,
++            'currency_id': self.currency_id.id,
++            'partner_id': self.partner_id.id,
++            'token_id': self.payment_token_id.id,
++            'operation': 'offline',
++            'payment_id': self.id,
++            **extra_create_values,
++        }
++
++    def _get_payment_refund_wizard_values(self):
++        self.ensure_one()
++        return {
++            'transaction_id': self.payment_transaction_id.id,
++            'payment_amount': self.amount,
++            'amount_available_for_refund': self.amount_available_for_refund,
++        }
+
+--- a/None
++++ b/addons/account_payment/models/account_payment_method.py
+@@ -0,0 +1,20 @@
++# -*- coding: utf-8 -*-
++# Part of Odoo. See LICENSE file for full copyright and licensing details.
++
++from odoo import api, models
++
++
++class AccountPaymentMethod(models.Model):
++    _inherit = 'account.payment.method'
++
++    @api.model
++    def _get_payment_method_information(self):
++        res = super()._get_payment_method_information()
++        for provider, _desc in self.env['payment.acquirer']._fields['provider'].selection:
++            if provider in ('none', 'transfer'):
++                continue
++            res[provider] = {
++                'mode': 'unique',
++                'domain': [('type', '=', 'bank')],
++            }
++        return res
+
+--- a/None
++++ b/addons/account_payment/models/account_payment_method_line.py
+@@ -0,0 +1,64 @@
++# -*- coding: utf-8 -*-
++# Part of Odoo. See LICENSE file for full copyright and licensing details.
++
++from odoo import api, fields, models, _
++from odoo.osv import expression
++
++
++class AccountPaymentMethodLine(models.Model):
++    _inherit = "account.payment.method.line"
++
++    payment_acquirer_id = fields.Many2one(
++        comodel_name='payment.acquirer',
++        compute='_compute_payment_acquirer_id',
++        store=True
++    )
++    payment_acquirer_state = fields.Selection(
++        related='payment_acquirer_id.state'
++    )
++
++    @api.depends('payment_method_id')
++    def _compute_payment_acquirer_id(self):
++        acquirers = self.env['payment.acquirer'].sudo().search([
++            ('provider', 'in', self.mapped('code')),
++            ('company_id', 'in', self.journal_id.company_id.ids),
++        ])
++
++        # Make sure to pick the active acquirer, if any.
++        acquirers_map = dict()
++        for acquirer in acquirers:
++            current_value = acquirers_map.get((acquirer.provider, acquirer.company_id), False)
++            if current_value and current_value.state != 'disabled':
++                continue
++
++            acquirers_map[(acquirer.provider, acquirer.company_id)] = acquirer
++
++        for line in self:
++            code = line.payment_method_id.code
++            company = line.journal_id.company_id
++            line.payment_acquirer_id = acquirers_map.get((code, company), False)
++
++    @api.model
++    def _get_payment_method_domain(self, code):
++        # OVERRIDE
++        domain = super()._get_payment_method_domain(code)
++        information = self._get_payment_method_information().get(code)
++
++        unique = information.get('mode') == 'unique'
++        if unique:
++            company_ids = self.env['payment.acquirer'].sudo().search([('provider', '=', code)]).mapped('company_id')
++            if company_ids:
++                domain = expression.AND([domain, [('company_id', 'in', company_ids.ids)]])
++
++        return domain
++
++    def action_open_acquirer_form(self):
++        self.ensure_one()
++        return {
++            'type': 'ir.actions.act_window',
++            'name': _('Acquirer'),
++            'view_mode': 'form',
++            'res_model': 'payment.acquirer',
++            'target': 'current',
++            'res_id': self.payment_acquirer_id.id
++        }
+
+--- a/None
++++ b/addons/account_payment/models/payment_acquirer.py
+@@ -0,0 +1,90 @@
++# Part of Odoo. See LICENSE file for full copyright and licensing details.
++
++from odoo import api, fields, models
++
++
++class PaymentAcquirer(models.Model):
++    _inherit = 'payment.acquirer'
++
++    journal_id = fields.Many2one(
++        string="Payment Journal",
++        help="The journal in which the successful transactions are posted.",
++        comodel_name='account.journal',
++        compute='_compute_journal_id',
++        inverse='_inverse_journal_id',
++        domain='[("type", "=", "bank"), ("company_id", "=", company_id)]',
++    )
++
++    #=== COMPUTE METHODS ===#
++
++    @api.depends('provider')
++    def _compute_journal_id(self):
++        for acquirer in self:
++            payment_method = self.env['account.payment.method.line'].search([
++                ('journal_id.company_id', '=', acquirer.company_id.id),
++                ('code', '=', acquirer.provider)
++            ], limit=1)
++            if payment_method:
++                acquirer.journal_id = payment_method.journal_id
++            else:
++                acquirer.journal_id = False
++
++    def _inverse_journal_id(self):
++        for acquirer in self:
++            payment_method_line = self.env['account.payment.method.line'].search([
++                ('journal_id.company_id', '=', acquirer.company_id.id),
++                ('code', '=', acquirer.provider),
++            ], limit=1)
++            if acquirer.journal_id:
++                if not payment_method_line:
++                    default_payment_method_id = acquirer._get_default_payment_method_id(
++                        acquirer.provider
++                    )
++                    existing_payment_method_line = self.env['account.payment.method.line'].search([
++                        ('payment_method_id', '=', default_payment_method_id),
++                        ('journal_id', '=', acquirer.journal_id.id),
++                    ], limit=1)
++                    if not existing_payment_method_line:
++                        self.env['account.payment.method.line'].create({
++                            'payment_method_id': default_payment_method_id,
++                            'journal_id': acquirer.journal_id.id,
++                        })
++                else:
++                    payment_method_line.journal_id = acquirer.journal_id
++            elif payment_method_line:
++                payment_method_line.unlink()
++
++    @api.model
++    def _get_default_payment_method_id(self, provider):
++        provider_payment_method = self._get_provider_payment_method(provider)
++        if provider_payment_method:
++            return provider_payment_method.id
++        return self.env.ref('account.account_payment_method_manual_in').id
++
++    @api.model
++    def _get_provider_payment_method(self, provider):
++        return self.env['account.payment.method'].search([('code', '=', provider)], limit=1)
++
++    #=== BUSINESS METHODS ===#
++
++    @api.model
++    def _setup_provider(self, provider_code):
++        """ Override of `payment` to create the payment method of the provider. """
++        super()._setup_provider(provider_code)
++        self._setup_payment_method(provider_code)
++
++    @api.model
++    def _setup_payment_method(self, provider):
++        if provider not in ('none', 'transfer') and not self._get_provider_payment_method(provider):
++            providers_description = dict(self._fields['provider']._description_selection(self.env))
++            self.env['account.payment.method'].create({
++                'name': providers_description[provider],
++                'code': provider,
++                'payment_type': 'inbound',
++            })
++
++    @api.model
++    def _remove_provider(self, provider):
++        """ Override of `payment` to delete the payment method of the provider. """
++        super()._remove_provider(provider)
++        self._get_provider_payment_method(provider).unlink()
+
+--- a/None
++++ b/addons/account_payment/models/payment_transaction.py
+@@ -0,0 +1,205 @@
++# Part of Odoo. See LICENSE file for full copyright and licensing details.
++
++from odoo import api, fields, models, _
++
++
++class PaymentTransaction(models.Model):
++    _inherit = 'payment.transaction'
++
++    payment_id = fields.Many2one(
++        string="Payment", comodel_name='account.payment', readonly=True)
++
++    invoice_ids = fields.Many2many(
++        string="Invoices", comodel_name='account.move', relation='account_invoice_transaction_rel',
++        column1='transaction_id', column2='invoice_id', readonly=True, copy=False,
++        domain=[('move_type', 'in', ('out_invoice', 'out_refund', 'in_invoice', 'in_refund'))])
++    invoices_count = fields.Integer(string="Invoices Count", compute='_compute_invoices_count')
++
++    #=== COMPUTE METHODS ===#
++
++    @api.depends('invoice_ids')
++    def _compute_invoices_count(self):
++        self.env.cr.execute(
++            '''
++            SELECT transaction_id, count(invoice_id)
++            FROM account_invoice_transaction_rel
++            WHERE transaction_id IN %s
++            GROUP BY transaction_id
++            ''',
++            [tuple(self.ids)]
++        )
++        tx_data = dict(self.env.cr.fetchall())  # {id: count}
++        for tx in self:
++            tx.invoices_count = tx_data.get(tx.id, 0)
++
++    #=== ACTION METHODS ===#
++
++    def action_view_invoices(self):
++        """ Return the action for the views of the invoices linked to the transaction.
++
++        Note: self.ensure_one()
++
++        :return: The action
++        :rtype: dict
++        """
++        self.ensure_one()
++
++        action = {
++            'name': _("Invoices"),
++            'type': 'ir.actions.act_window',
++            'res_model': 'account.move',
++            'target': 'current',
++        }
++        invoice_ids = self.invoice_ids.ids
++        if len(invoice_ids) == 1:
++            invoice = invoice_ids[0]
++            action['res_id'] = invoice
++            action['view_mode'] = 'form'
++            action['views'] = [(self.env.ref('account.view_move_form').id, 'form')]
++        else:
++            action['view_mode'] = 'tree,form'
++            action['domain'] = [('id', 'in', invoice_ids)]
++        return action
++
++    #=== BUSINESS METHODS - PAYMENT FLOW ===#
++
++    @api.model
++    def _compute_reference_prefix(self, provider, separator, **values):
++        """ Compute the reference prefix from the transaction values.
++
++        If the `values` parameter has an entry with 'invoice_ids' as key and a list of (4, id, O) or
++        (6, 0, ids) X2M command as value, the prefix is computed based on the invoice name(s).
++        Otherwise, an empty string is returned.
++
++        Note: This method should be called in sudo mode to give access to documents (INV, SO, ...).
++
++        :param str provider: The provider of the acquirer handling the transaction
++        :param str separator: The custom separator used to separate data references
++        :param dict values: The transaction values used to compute the reference prefix. It should
++                            have the structure {'invoice_ids': [(X2M command), ...], ...}.
++        :return: The computed reference prefix if invoice ids are found, an empty string otherwise
++        :rtype: str
++        """
++        command_list = values.get('invoice_ids')
++        if command_list:
++            # Extract invoice id(s) from the X2M commands
++            invoice_ids = self._fields['invoice_ids'].convert_to_cache(command_list, self)
++            invoices = self.env['account.move'].browse(invoice_ids).exists()
++            if len(invoices) == len(invoice_ids):  # All ids are valid
++                return separator.join(invoices.mapped('name'))
++        return super()._compute_reference_prefix(provider, separator, **values)
++
++    def _set_canceled(self, state_message=None):
++        """ Update the transactions' state to 'cancel'.
++
++        :param str state_message: The reason for which the transaction is set in 'cancel' state
++        :return: updated transactions
++        :rtype: `payment.transaction` recordset
++        """
++        processed_txs = super()._set_canceled(state_message)
++        # Cancel the existing payments
++        processed_txs.payment_id.action_cancel()
++        return processed_txs
++
++    #=== BUSINESS METHODS - POST-PROCESSING ===#
++
++    def _reconcile_after_done(self):
++        """ Post relevant fiscal documents and create missing payments.
++
++        As there is nothing to reconcile for validation transactions, no payment is created for
++        them. This is also true for validations with a validity check (transfer of a small amount
++        with immediate refund) because validation amounts are not included in payouts.
++
++        :return: None
++        """
++        super()._reconcile_after_done()
++
++        # Validate invoices automatically once the transaction is confirmed
++        self.invoice_ids.filtered(lambda inv: inv.state == 'draft').action_post()
++
++        # Create and post missing payments for transactions requiring reconciliation
++        for tx in self.filtered(lambda t: t.operation != 'validation' and not t.payment_id):
++            tx._create_payment()
++
++    def _create_payment(self, **extra_create_values):
++        """Create an `account.payment` record for the current transaction.
++
++        If the transaction is linked to some invoices, their reconciliation is done automatically.
++
++        Note: self.ensure_one()
++
++        :param dict extra_create_values: Optional extra create values
++        :return: The created payment
++        :rtype: recordset of `account.payment`
++        """
++        self.ensure_one()
++
++        payment_method_line = self.acquirer_id.journal_id.inbound_payment_method_line_ids\
++            .filtered(lambda l: l.code == self.provider)
++        payment_values = {
++            'amount': abs(self.amount),  # A tx may have a negative amount, but a payment must >= 0
++            'payment_type': 'inbound' if self.amount > 0 else 'outbound',
++            'currency_id': self.currency_id.id,
++            'partner_id': self.partner_id.commercial_partner_id.id,
++            'partner_type': 'customer',
++            'journal_id': self.acquirer_id.journal_id.id,
++            'company_id': self.acquirer_id.company_id.id,
++            'payment_method_line_id': payment_method_line.id,
++            'payment_token_id': self.token_id.id,
++            'payment_transaction_id': self.id,
++            'ref': self.reference,
++            **extra_create_values,
++        }
++        payment = self.env['account.payment'].create(payment_values)
++        payment.action_post()
++
++        # Track the payment to make a one2one.
++        self.payment_id = payment
++
++        if self.invoice_ids:
++            self.invoice_ids.filtered(lambda inv: inv.state == 'draft').action_post()
++
++            (payment.line_ids + self.invoice_ids.line_ids).filtered(
++                lambda line: line.account_id == payment.destination_account_id
++                and not line.reconciled
++            ).reconcile()
++
++        return payment
++
++    #=== BUSINESS METHODS - LOGGING ===#
++
++    def _log_message_on_linked_documents(self, message):
++        """ Log a message on the payment and the invoices linked to the transaction.
++
++        For a module to implement payments and link documents to a transaction, it must override
++        this method and call super, then log the message on documents linked to the transaction.
++
++        Note: self.ensure_one()
++
++        :param str message: The message to be logged
++        :return: None
++        """
++        self.ensure_one()
++        if self.source_transaction_id.payment_id:
++            self.source_transaction_id.payment_id.message_post(body=message)
++            for invoice in self.source_transaction_id.invoice_ids:
++                invoice.message_post(body=message)
++        for invoice in self.invoice_ids:
++            invoice.message_post(body=message)
++
++    #=== BUSINESS METHODS - GETTERS ===#
++
++    def _get_received_message(self):
++        """ Return the message stating that the transaction has been received by the provider.
++
++        Note: self.ensure_one()
++        """
++        message = super()._get_received_message()
++
++        if self.state == 'done' and self.payment_id:
++            message += "<br />" + _(
++                "The related payment is posted: %s",
++                self.payment_id._get_html_link()
++            )
++
++        return message

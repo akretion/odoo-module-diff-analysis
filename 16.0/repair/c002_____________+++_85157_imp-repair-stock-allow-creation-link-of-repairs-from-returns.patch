@@ -1,0 +1,163 @@
+PR: https://github.com/odoo/odoo/pull/85157
+
+From: bee32f88d42d9b945ec7216e2496e0167d3904b4
+From: Tiffany Chang (tic)
+Date: 2022-03-28 16:59:57
+
+Structural Changes: 11
+Total Changes: 87
+
+[IMP] repair,stock: allow creation/link of repairs from returns
+
+This feature supports the use case of:
+- a customer receives a delivery from you.
+- there is a defective product in the delivery
+- they schedule a repair (RO) + return (picking) for the product
+
+We want to ease the creation/management of the repair order associated
+with the return, therefore the following features are added:
+
+- Create links between ROs and return pickings (smart button in return
+  of all repairs associated with it + field in RO)
+- Option (requires active setting) to create RO(s) directly from a
+  return picking
+
+Implementation notes:
+- Because return picking type doesn't have its own "Type of Operation"
+  (it is 'code'='incoming'), we default to only incoming picking types
+  that have at least 1 other picking type it is the
+  'return_picking_type_id' of.
+- Originally a Wizard for choosing which/how many products should have
+  ROs created for them was designed (i.e. to match return wizard + to
+  multi-create ROs), but this was determined to be too complicated due
+  to SN/lot selection. Instead simple approach of creating a single RO
+  each time button is pushed was implemented to match the helpdesk >
+  repair button workflow.
+- ROs are purposely allowed for 'draft' and 'cancelled' returns/moves to
+  support different types of workflows (e.g. RO is confirmed before
+  return is)
+
+closes odoo/odoo#85157
+
+Task: 2732517
+Signed-off-by: Arnold Moyaux <arm@odoo.com>
+
+================================= pseudo patch: =================================
+
+--- a/addons/repair/models/__init__.py
++++ b/addons/repair/models/__init__.py
+@@ -2,6 +2,7 @@
+ # Part of Odoo. See LICENSE file for full copyright and licensing details.
+ 
+ from . import repair
++from . import stock_picking
+ from . import stock_traceability
+ from . import stock_lot
+ from . import account_move
+
+--- a/addons/repair/models/repair.py
++++ b/addons/repair/models/repair.py
+@@ -110,7 +110,16 @@ class Repair(models.Model):
+         'res.company', 'Company',
+         readonly=True, required=True, index=True,
+         default=lambda self: self.env.company)
+-    sale_order_id = fields.Many2one('sale.order', 'Sale Order', copy=False, help="Sale Order from which the product to be repaired comes from.")
++    sale_order_id = fields.Many2one(
++        'sale.order', 'Sale Order', check_company=True,
++        copy=False, help="Sale Order from which the product to be repaired comes from.")
++    picking_id = fields.Many2one(
++        'stock.picking', 'Return', check_company=True,
++        domain="[('is_repairable', '!=', False), ('company_id', '=', company_id)]",
++        copy=False, help="Return Order from which the product to be repaired comes from.")
++    is_returned = fields.Boolean(
++        "Returned", compute='_compute_is_returned',
++        help="True if this repair is linked to a Return Order and the order is 'Done'. False otherwise.")
+     tag_ids = fields.Many2many('repair.tags', string="Tags")
+     invoiced = fields.Boolean('Invoiced', copy=False, readonly=True)
+     repaired = fields.Boolean('Repaired', copy=False, readonly=True)
+@@ -127,6 +136,12 @@ class Repair(models.Model):
+             if order.partner_id:
+                 order.default_address_id = order.partner_id.address_get(['contact'])['contact']
+ 
++    @api.depends('picking_id', 'picking_id.state')
++    def _compute_is_returned(self):
++        self.is_returned = False
++        returned = self.filtered(lambda r: r.picking_id and r.picking_id.state == 'done')
++        returned.is_returned = True
++
+     @api.depends('operations.price_subtotal', 'invoice_method', 'fees_lines.price_subtotal', 'pricelist_id.currency_id')
+     def _amount_untaxed(self):
+         for order in self:
+
+--- a/None
++++ b/addons/repair/models/stock_picking.py
+@@ -0,0 +1,69 @@
++# -*- coding: utf-8 -*-
++# Part of Odoo. See LICENSE file for full copyright and licensing details.
++
++from odoo import _, api, fields, models
++
++
++class PickingType(models.Model):
++    _inherit = 'stock.picking.type'
++
++    is_repairable = fields.Boolean(
++        'Create Repair Orders from Returns',
++        compute='_compute_is_repairable', store=True, readonly=False,
++        help="If ticked, you will be able to directly create repair orders from a return.")
++    return_type_of_ids = fields.One2many('stock.picking.type', 'return_picking_type_id')
++
++    @api.depends('return_type_of_ids', 'code')
++    def _compute_is_repairable(self):
++        for picking_type in self:
++            if not(picking_type.code == 'incoming' and picking_type.return_type_of_ids):
++                picking_type.is_repairable = False
++
++
++class Picking(models.Model):
++    _inherit = 'stock.picking'
++
++    is_repairable = fields.Boolean(related='picking_type_id.is_repairable')
++    repair_ids = fields.One2many('repair.order', 'picking_id')
++    nbr_repairs = fields.Integer('Number of repairs linked to this picking', compute='_compute_nbr_repairs')
++
++    @api.depends('repair_ids')
++    def _compute_nbr_repairs(self):
++        for picking in self:
++            picking.nbr_repairs = len(picking.repair_ids)
++
++    def action_repair_return(self):
++        self.ensure_one()
++        ctx = self.env.context.copy()
++        ctx.update({
++            'default_location_id': self.location_dest_id.id,
++            'default_picking_id': self.id,
++            'default_partner_id': self.partner_id and self.partner_id.id or False,
++        })
++        return {
++            'name': _('Create Repair'),
++            'type': 'ir.actions.act_window',
++            'view_mode': 'form',
++            'res_model': 'repair.order',
++            'view_id': self.env.ref('repair.view_repair_order_form').id,
++            'context': ctx,
++        }
++
++    def action_view_repairs(self):
++        if self.repair_ids:
++            action = {
++                'res_model': 'repair.order',
++                'type': 'ir.actions.act_window',
++            }
++            if len(self.repair_ids) == 1:
++                action.update({
++                    'view_mode': 'form',
++                    'res_id': self.repair_ids[0].id,
++                })
++            else:
++                action.update({
++                    'name': _('Repair Orders'),
++                    'view_mode': 'tree,form',
++                    'domain': [('id', 'in', self.repair_ids.ids)],
++                })
++            return action
