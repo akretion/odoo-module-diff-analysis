@@ -1,0 +1,238 @@
+PR: https://github.com/odoo/odoo/pull/
+
+From: 5849acab4379e5db0753def105d1c1aa230af4c4
+From: William Braeckman
+Date: 2021-07-09 12:51:26
+
+Structural Changes: 16
+Total Changes: 157
+
+[IMP] fleet,hr_fleet: add support for multiple fleets
+
+Add a layer above the vehicle model to separate vehicles from different
+fleets.
+
+Task ID: 2415309
+
+================================= pseudo patch: =================================
+
+--- a/addons/fleet/models/__init__.py
++++ b/addons/fleet/models/__init__.py
+@@ -2,6 +2,8 @@
+ # Part of Odoo. See LICENSE file for full copyright and licensing details.
+ 
+ from . import fleet_service_type
++from . import fleet_category
++from . import fleet_category_tag
+ from . import fleet_vehicle
+ from . import fleet_vehicle_assignation_log
+ from . import fleet_vehicle_log_contract
+
+--- a/None
++++ b/addons/fleet/models/fleet_category.py
+@@ -0,0 +1,90 @@
++# -*- coding:utf-8 -*-
++# Part of Odoo. See LICENSE file for full copyright and licensing details.
++
++from odoo import _, api, fields, models
++
++class FleetCategory(models.Model):
++    _name = 'fleet.category'
++    _description = 'Vehicle Fleet'
++
++    def _get_default_favorite_user_ids(self):
++        return [(6, 0, [self.env.uid])]
++
++    name = fields.Char()
++    active = fields.Boolean(default=True)
++    tag_ids = fields.Many2many('fleet.category.tag', string='Tags')
++    description = fields.Text()
++    manager_id = fields.Many2one(
++        'res.users', string='Fleet Manager',
++        default=lambda self: self.env.user,
++        domain=lambda self: [('groups_id', 'in', self.env.ref('fleet.fleet_group_manager').id)],
++    )
++
++    company_id = fields.Many2one(
++        'res.company', string='Company',
++        default=lambda self: self.env.company,
++    )
++    color = fields.Integer()
++
++    vehicle_ids = fields.One2many('fleet.vehicle', 'fleet_id', string='Vehicles')
++    car_count = fields.Integer(compute='_compute_vehicle_counts')
++    bike_count = fields.Integer(compute='_compute_vehicle_counts')
++
++    favorite_user_ids = fields.Many2many('res.users', default=_get_default_favorite_user_ids)
++    is_favorite = fields.Boolean(
++        compute='_compute_is_favorite', inverse='_inverse_is_favorite',
++        string='Add to favorite',
++        help='Whether this fleet is in your favorites or not.',
++    )
++
++    @api.depends('vehicle_ids')
++    def _compute_vehicle_counts(self):
++        for fleet in self:
++            car_ids = fleet.vehicle_ids.filtered(lambda v: v.model_id.vehicle_type == 'car')
++            fleet.car_count = len(car_ids)
++            bike_ids = fleet.vehicle_ids - car_ids
++            fleet.bike_count = len(bike_ids)
++
++    def _compute_is_favorite(self):
++        for fleet in self:
++            fleet.is_favorite = self.env.user in fleet.favorite_user_ids
++
++    def _inverse_is_favorite(self):
++        # We may not have write access
++        favorites = not_favorites = self.env['fleet.category'].sudo()
++        for category in self:
++            if self.env.user in category.favorite_user_ids:
++                favorites |= category
++            else:
++                not_favorites |= category
++
++        not_favorites.write({'favorite_user_ids': [(4, self.env.uid)]})
++        favorites.write({'favorite_user_ids': [(3, self.env.uid)]})
++
++    def toggle_active(self):
++        res = super().toggle_active()
++        archived = self.filtered(lambda c: not c.active)
++        for category in archived:
++            category.vehicle_ids.write({
++                'fleet_id': False,
++            })
++        return res
++
++    def action_view_vehicles(self):
++        self.ensure_one()
++        return {
++            'type': 'ir.actions.act_window',
++            'name': _('Fleet Vehicles'),
++            'res_model': 'fleet.vehicle',
++            'view_mode': 'tree,kanban,form',
++            'views': [[False, 'list'], [False, 'kanban'], [False, 'form']],
++            'domain': [('fleet_id', '=', self.id)],
++            'context': {'default_fleet_id': self.id},
++        }
++
++    def write(self, vals):
++        # directly compute is_favorite to dodge allow write access right
++        if 'is_favorite' in vals:
++            vals.pop('is_favorite')
++            self._fields['is_favorite'].determine_inverse(self)
++        return super().write(vals) if vals else True
+
+--- a/None
++++ b/addons/fleet/models/fleet_category_tag.py
+@@ -0,0 +1,15 @@
++# -*- coding: utf-8 -*-
++# Part of Odoo. See LICENSE file for full copyright and licensing details.
++
++from odoo import fields, models
++
++class FleetCategoryTag(models.Model):
++    _name = 'fleet.category.tag'
++    _description = 'Vehicle Fleet Category'
++
++    _sql_constraints = [
++        ('unique_name', 'UNIQUE(name)', 'Name must be unique.'),
++    ]
++
++    name = fields.Char()
++    color = fields.Integer()
+
+--- a/addons/fleet/models/fleet_vehicle.py
++++ b/addons/fleet/models/fleet_vehicle.py
+@@ -20,7 +20,20 @@ class FleetVehicle(models.Model):
+     name = fields.Char(compute="_compute_vehicle_name", store=True)
+     description = fields.Html("Vehicle Description")
+     active = fields.Boolean('Active', default=True, tracking=True)
+-    company_id = fields.Many2one('res.company', 'Company', default=lambda self: self.env.company)
++    fleet_id = fields.Many2one('fleet.category', string='Fleet')
++    manager_id = fields.Many2one(
++        'res.users', 'Manager',
++        compute='_compute_manager_id', store=True, readonly=False,
++        domain=lambda self: [('groups_id', 'in', self.env.ref('fleet.fleet_group_manager').id)],
++    )
++    #Company should always be the same as fleet_id, but since we do have a case where fleet_id is null
++    # and we want the vehicle to be company bound we need to store it aswell, fleet_id.company_id is not editable
++    company_id = fields.Many2one(
++        'res.company', 'Company',
++        compute='_compute_company_id',
++        default=lambda self: self.env.company,
++        store=True,
++    )
+     currency_id = fields.Many2one('res.currency', related='company_id.currency_id')
+     license_plate = fields.Char(tracking=True,
+         help='License plate number of the vehicle (i = plate number for a car)')
+@@ -30,7 +43,6 @@ class FleetVehicle(models.Model):
+     future_driver_id = fields.Many2one('res.partner', 'Future Driver', tracking=True, help='Next Driver of the vehicle', copy=False, domain="['|', ('company_id', '=', False), ('company_id', '=', company_id)]")
+     model_id = fields.Many2one('fleet.vehicle.model', 'Model',
+         tracking=True, required=True, help='Model of the vehicle')
+-    manager_id = fields.Many2one('res.users', 'Fleet Manager', domain=lambda self: [('groups_id', 'in', self.env.ref('fleet.fleet_group_manager').id)])
+ 
+     brand_id = fields.Many2one('fleet.vehicle.model.brand', 'Brand', related="model_id.brand_id", store=True, readonly=False)
+     log_drivers = fields.One2many('fleet.vehicle.assignation.log', 'vehicle_id', string='Assignment Logs')
+@@ -96,6 +108,18 @@ class FleetVehicle(models.Model):
+     electric_assistance = fields.Boolean()
+     frame_size = fields.Float()
+ 
++    @api.depends('fleet_id')
++    def _compute_manager_id(self):
++        for record in self:
++            record.manager_id = record.fleet_id.manager_id
++
++    @api.depends('fleet_id')
++    def _compute_company_id(self):
++        for record in self:
++            # Retain company when fleet is unset
++            if record.fleet_id:
++                record.company_id = record.fleet_id.company_id
++
+     @api.depends('vehicle_type')
+     def _compute_doors(self):
+         for record in self:
+@@ -223,7 +247,7 @@ class FleetVehicle(models.Model):
+         if ptc_value:
+             res.sudo().write(ptc_value)
+         if 'driver_id' in vals and vals['driver_id']:
+-            res.create_driver_history(vals['driver_id'])
++            res.create_driver_history(vals)
+         if 'future_driver_id' in vals and vals['future_driver_id']:
+             state_waiting_list = self.env.ref('fleet.fleet_vehicle_state_waiting_list', raise_if_not_found=False)
+             states = res.mapped('state_id').ids
+@@ -239,7 +263,7 @@ class FleetVehicle(models.Model):
+         if 'driver_id' in vals and vals['driver_id']:
+             driver_id = vals['driver_id']
+             for vehicle in self.filtered(lambda v: v.driver_id.id != driver_id):
+-                vehicle.create_driver_history(driver_id)
++                vehicle.create_driver_history(vals)
+                 if vehicle.driver_id:
+                     vehicle.activity_schedule(
+                         'mail.mail_activity_data_todo',
+@@ -259,13 +283,19 @@ class FleetVehicle(models.Model):
+         res = super(FleetVehicle, self).write(vals)
+         return res
+ 
+-    def create_driver_history(self, driver_id):
++    def _get_driver_history_data(self, vals):
++        self.ensure_one()
++        return {
++            'vehicle_id': self.id,
++            'driver_id': vals['driver_id'],
++            'date_start': fields.Date.today(),
++        }
++
++    def create_driver_history(self, vals):
+         for vehicle in self:
+-            self.env['fleet.vehicle.assignation.log'].create({
+-                'vehicle_id': vehicle.id,
+-                'driver_id': driver_id,
+-                'date_start': fields.Date.today(),
+-            })
++            self.env['fleet.vehicle.assignation.log'].create(
++                vehicle._get_driver_history_data(vals),
++            )
+ 
+     def action_accept_driver_change(self):
+         # Find all the vehicles for which the driver is the future_driver_id

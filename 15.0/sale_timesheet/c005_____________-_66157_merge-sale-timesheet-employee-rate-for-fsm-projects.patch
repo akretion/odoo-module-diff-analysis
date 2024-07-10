@@ -1,0 +1,293 @@
+PR: https://github.com/odoo/odoo/pull/66157
+
+From: 2133b807a87f945c07ab0893d2f397fbe8ae97c6
+From: Odoo's Mergebot
+Date: 2021-03-25 18:34:16
+
+Structural Changes: 1
+Total Changes: 143
+
+[MERGE] sale_timesheet: employee rate for fsm projects
+
+Purpose
+======
+
+Currently, the user can configure his field service project to be billed at an employee rate but it just won't work. The rates configured for each employee on the project are not taken into account when the task is marked as done. As a consequence, the only workaround to support this kind of use-case is to create 1 task per employee with a different rate (or to add service products on the task). Those solutions are far from being ideal. We should give more flexibility.
+
+## Details
+
+To reach the goal, some updates are made:
+ - Move the timesheet_product field in employee mappings into the fsm sale module, because this field is only used for fsm projects,
+ - render _timesheet_determine_sale_line no static to easily override it,
+ - fix bug when the user change project on task form view, the project for non billed timesheets is not correctly changed,
+ - let the SOL in task when the user wants to change the project of it to a project with pricing type defined as employee rate. Before when the pricing type of the destination project is employee rate, we remove the SOL of the task.
+
+task-2376382
+
+--
+I confirm I have signed the CLA and read the PR guidelines at www.odoo.com/submit-pr
+
+closes odoo/odoo#66157
+
+Signed-off-by: Yannick Tivisse (yti) <yti@odoo.com>
+
+================================= pseudo patch: =================================
+
+--- a/addons/sale_timesheet/models/account.py
++++ b/addons/sale_timesheet/models/account.py
+@@ -46,7 +46,7 @@ class AccountAnalyticLine(models.Model):
+     @api.depends('task_id.sale_line_id', 'project_id.sale_line_id', 'employee_id', 'project_id.allow_billable')
+     def _compute_so_line(self):
+         for timesheet in self.filtered(lambda t: not t.is_so_line_edited and t._is_not_billed()):  # Get only the timesheets are not yet invoiced
+-            timesheet.so_line = timesheet.project_id.allow_billable and timesheet._timesheet_determine_sale_line(timesheet.task_id, timesheet.employee_id, timesheet.project_id)
++            timesheet.so_line = timesheet.project_id.allow_billable and timesheet._timesheet_determine_sale_line()
+ 
+     def _is_not_billed(self):
+         self.ensure_one()
+@@ -76,29 +76,29 @@ class AccountAnalyticLine(models.Model):
+         values = super(AccountAnalyticLine, self)._timesheet_preprocess(values)
+         return values
+ 
+-    @api.model
+-    def _timesheet_determine_sale_line(self, task, employee, project):
++    def _timesheet_determine_sale_line(self):
+         """ Deduce the SO line associated to the timesheet line:
+             1/ timesheet on task rate: the so line will be the one from the task
+             2/ timesheet on employee rate task: find the SO line in the map of the project (even for subtask), or fallback on the SO line of the task, or fallback
+                 on the one on the project
+         """
+-        if not task:
+-            if project.pricing_type == 'employee_rate':
+-                map_entry = self.env['project.sale.line.employee.map'].search([('project_id', '=', project.id), ('employee_id', '=', employee.id)])
++        self.ensure_one()
++
++        if not self.task_id:
++            if self.project_id.pricing_type == 'employee_rate':
++                map_entry = self.env['project.sale.line.employee.map'].search([('project_id', '=', self.project_id.id), ('employee_id', '=', self.employee_id.id)])
+                 if map_entry:
+                     return map_entry.sale_line_id
+-            if project.sale_line_id:
+-                return project.sale_line_id
+-        if task.allow_billable and task.sale_line_id:
+-            if task.pricing_type in ('task_rate', 'fixed_rate'):
+-                return task.sale_line_id
++            if self.project_id.sale_line_id:
++                return self.project_id.sale_line_id
++        if self.task_id.allow_billable and self.task_id.sale_line_id:
++            if self.task_id.pricing_type in ('task_rate', 'fixed_rate'):
++                return self.task_id.sale_line_id
+             else:  # then pricing_type = 'employee_rate'
+-                map_entry = project.sale_line_employee_ids.filtered(lambda map_entry: map_entry.employee_id == employee)
++                map_entry = self.project_id.sale_line_employee_ids.filtered(lambda map_entry: map_entry.employee_id == self.employee_id)
+                 if map_entry:
+                     return map_entry.sale_line_id
+-                if task.sale_line_id or project.sale_line_id:
+-                    return task.sale_line_id or project.sale_line_id
++                return self.task_id.sale_line_id
+         return False
+ 
+     def _timesheet_get_portal_domain(self):
+
+--- a/addons/sale_timesheet/models/project.py
++++ b/addons/sale_timesheet/models/project.py
+@@ -262,15 +262,6 @@ class ProjectTask(models.Model):
+             if not self.sale_line_id:
+                 self.sale_line_id = self.project_id.sale_line_id
+ 
+-    def write(self, values):
+-        res = super(ProjectTask, self).write(values)
+-        # Done after super to avoid constraints on field recomputation
+-        if values.get('project_id'):
+-            project_dest = self.env['project.project'].browse(values['project_id'])
+-            if project_dest.pricing_type == 'employee_rate':
+-                self.write({'sale_line_id': False})
+-        return res
+-
+     def _get_last_sol_of_customer(self):
+         # Get the last SOL made for the customer in the current task where we need to compute
+         self.ensure_one()
+@@ -284,7 +275,7 @@ class ProjectTask(models.Model):
+     def _get_timesheet(self):
+         # return not invoiced timesheet and timesheet without so_line or so_line linked to task
+         timesheet_ids = super(ProjectTask, self)._get_timesheet()
+-        return timesheet_ids.filtered(lambda t: (not t.timesheet_invoice_id or t.timesheet_invoice_id.state == 'cancel') and (not t.so_line or t.so_line == t.task_id._origin.sale_line_id))
++        return timesheet_ids.filtered(lambda t: t._is_not_billed())
+ 
+     def _get_action_view_so_ids(self):
+         return list(set((self.sale_order_id + self.timesheet_ids.so_line.order_id).ids))
+
+--- a/addons/sale_timesheet/models/project_sale_line_employee_map.py
++++ b/addons/sale_timesheet/models/project_sale_line_employee_map.py
+@@ -12,13 +12,6 @@ class ProjectProductEmployeeMap(models.Model):
+     employee_id = fields.Many2one('hr.employee', "Employee", required=True)
+     sale_line_id = fields.Many2one('sale.order.line', "Sale Order Item", compute="_compute_sale_line_id", store=True, readonly=False, required=True, domain=[('is_service', '=', True)])
+     company_id = fields.Many2one('res.company', string='Company', related='project_id.company_id')
+-    timesheet_product_id = fields.Many2one(
+-        'product.product', string='Service',
+-        domain="""[
+-            ('type', '=', 'service'),
+-            ('invoice_policy', '=', 'delivery'),
+-            ('service_type', '=', 'timesheet'),
+-            '|', ('company_id', '=', False), ('company_id', '=', company_id)]""")
+     price_unit = fields.Float("Unit Price", compute='_compute_price_unit', store=True, readonly=True)
+     currency_id = fields.Many2one('res.currency', string="Currency", compute='_compute_price_unit', store=True, readonly=False)
+ 
+@@ -30,26 +23,16 @@ class ProjectProductEmployeeMap(models.Model):
+     def _compute_sale_line_id(self):
+         self.filtered(lambda map_entry: not map_entry.project_id.sale_order_id and map_entry.sale_line_id).update({'sale_line_id': None})
+ 
+-    @api.depends('sale_line_id', 'sale_line_id.price_unit', 'timesheet_product_id')
++    @api.depends('sale_line_id', 'sale_line_id.price_unit')
+     def _compute_price_unit(self):
+         for line in self:
+             if line.sale_line_id:
+                 line.price_unit = line.sale_line_id.price_unit
+                 line.currency_id = line.sale_line_id.currency_id
+-            elif line.timesheet_product_id:
+-                line.price_unit = line.timesheet_product_id.lst_price
+-                line.currency_id = line.timesheet_product_id.currency_id
+             else:
+                 line.price_unit = 0
+                 line.currency_id = False
+ 
+-    @api.onchange('timesheet_product_id')
+-    def _onchange_timesheet_product_id(self):
+-        if self.timesheet_product_id:
+-            self.price_unit = self.timesheet_product_id.lst_price
+-        else:
+-            self.price_unit = 0.0
+-
+     @api.model
+     def create(self, values):
+         res = super(ProjectProductEmployeeMap, self).create(values)
+
+--- a/addons/sale_timesheet/models/sale_order.py
++++ b/addons/sale_timesheet/models/sale_order.py
+@@ -2,10 +2,11 @@
+ # Part of Odoo. See LICENSE file for full copyright and licensing details.
+ 
+ import math
++from collections import defaultdict
+ 
+ from odoo import api, fields, models, _
+ from odoo.osv import expression
+-from odoo.tools import float_compare
++from odoo.tools import float_compare, format_amount
+ 
+ 
+ class SaleOrder(models.Model):
+@@ -134,41 +135,61 @@ class SaleOrderLine(models.Model):
+ 
+     def name_get(self):
+         res = super(SaleOrderLine, self).name_get()
+-        if self.env.context.get('with_remaining_hours'):
++        with_remaining_hours = self.env.context.get('with_remaining_hours')
++        with_price_unit = self.env.context.get('with_price_unit')
++        if with_remaining_hours or with_price_unit:
+             names = dict(res)
+             result = []
+-            uom_hour = self.env.ref('uom.product_uom_hour')
+-            uom_day = self.env.ref('uom.product_uom_day')
++            uom_hour = with_remaining_hours and self.env.ref('uom.product_uom_hour')
++            uom_day = with_remaining_hours and self.env.ref('uom.product_uom_day')
++            sols_by_so_dict = with_price_unit and defaultdict(lambda: self.env[self._name])  # key: (sale_order_id, product_id), value: sale order line
+             for line in self:
+-                name = names.get(line.id)
+-                if line.remaining_hours_available:
+-                    company = self.env.company
+-                    encoding_uom = company.timesheet_encode_uom_id
+-                    remaining_time = ''
+-                    if encoding_uom == uom_hour:
+-                        hours, minutes = divmod(abs(line.remaining_hours) * 60, 60)
+-                        round_minutes = minutes / 30
+-                        minutes = math.ceil(round_minutes) if line.remaining_hours >= 0 else math.floor(round_minutes)
+-                        if minutes > 1:
+-                            minutes = 0
+-                            hours += 1
+-                        else:
+-                            minutes = minutes * 30
+-                        remaining_time = ' ({sign}{hours:02.0f}:{minutes:02.0f})'.format(
+-                            sign='-' if line.remaining_hours < 0 else '',
+-                            hours=hours,
+-                            minutes=minutes)
+-                    elif encoding_uom == uom_day:
+-                        remaining_days = company.project_time_mode_id._compute_quantity(line.remaining_hours, encoding_uom, round=False)
+-                        remaining_time = ' ({qty:.02f} {unit})'.format(
+-                            qty=remaining_days,
+-                            unit=_('days') if abs(remaining_days) > 1 else _('day')
++                if with_remaining_hours:
++                    name = names.get(line.id)
++                    if line.remaining_hours_available:
++                        company = self.env.company
++                        encoding_uom = company.timesheet_encode_uom_id
++                        remaining_time = ''
++                        if encoding_uom == uom_hour:
++                            hours, minutes = divmod(abs(line.remaining_hours) * 60, 60)
++                            round_minutes = minutes / 30
++                            minutes = math.ceil(round_minutes) if line.remaining_hours >= 0 else math.floor(round_minutes)
++                            if minutes > 1:
++                                minutes = 0
++                                hours += 1
++                            else:
++                                minutes = minutes * 30
++                            remaining_time = ' ({sign}{hours:02.0f}:{minutes:02.0f})'.format(
++                                sign='-' if line.remaining_hours < 0 else '',
++                                hours=hours,
++                                minutes=minutes)
++                        elif encoding_uom == uom_day:
++                            remaining_days = company.project_time_mode_id._compute_quantity(line.remaining_hours, encoding_uom, round=False)
++                            remaining_time = ' ({qty:.02f} {unit})'.format(
++                                qty=remaining_days,
++                                unit=_('days') if abs(remaining_days) > 1 else _('day')
++                            )
++                        name = '{name}{remaining_time}'.format(
++                            name=name,
++                            remaining_time=remaining_time
+                         )
+-                    name = '{name}{remaining_time}'.format(
+-                        name=name,
+-                        remaining_time=remaining_time
+-                    )
+-                result.append((line.id, name))
++                        if with_price_unit:
++                            names[line.id] = name
++                    if not with_price_unit:
++                        result.append((line.id, name))
++                if with_price_unit:
++                    sols_by_so_dict[line.order_id.id, line.product_id.id] += line
++
++            if with_price_unit:
++                for sols in sols_by_so_dict.values():
++                    if len(sols) > 1:
++                        result += [(
++                            line.id,
++                            '%s - %s' % (
++                                names.get(line.id), format_amount(self.env, line.price_unit, line.currency_id))
++                        ) for line in sols]
++                    else:
++                        result.append((sols.id, names.get(sols.id)))
+             return result
+         return res
+ 
+
+--- a/addons/sale_timesheet/models/project_overview.py
++++ b/addons/sale_timesheet/models/project_overview.py
+@@ -3,6 +3,7 @@ import babel.dates
+ from dateutil.relativedelta import relativedelta
+ import itertools
+ import json
++from odoo.osv import expression
+ 
+ from odoo import fields, _, models
+ from odoo.osv import expression
+@@ -20,7 +21,9 @@ class Project(models.Model):
+ 
+     def _qweb_prepare_qcontext(self, view_id, domain):
+         values = super()._qweb_prepare_qcontext(view_id, domain)
+-
++        project_ids = self.env.context.get('active_ids')
++        if project_ids:
++            domain = expression.AND([[('id', 'in', project_ids)], domain])
+         projects = self.search(domain)
+         values.update(projects._plan_prepare_values())
+         values['actions'] = projects._plan_prepare_actions(values)

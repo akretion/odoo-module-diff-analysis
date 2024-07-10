@@ -1,0 +1,555 @@
+PR: https://github.com/odoo/odoo/pull/
+
+From: 92e577d1069a7191a84f0fbd806a4cff77fbf31a
+From: yhu-odoo
+Date: 2021-03-31 09:00:40
+
+Structural Changes: 23
+Total Changes: 342
+
+[IMP](sale_)stock,mrp: smart putaway rules
+
+We introduced new Smart Putaway Rules.
+Locations now can have a storage category, on each storage category,
+we can specify the amount of products/packages(with certian package
+type) that can be stored in the location.
+On putaway rules, we can also set a storage category. Now when apply a
+putaway rule, we will find a suitable child location of the out
+location according to quantity/weight setting on the storage category.
+
+Task 2341820
+PR #63516
+ENT PR odoo/enterprise#15363
+UPG PR odoo/upgrade#2040
+
+================================= pseudo patch: =================================
+
+--- a/addons/stock/models/__init__.py
++++ b/addons/stock/models/__init__.py
+@@ -20,3 +20,4 @@ from . import stock_scrap
+ from . import product
+ from . import stock_package_level
+ from . import stock_package_type
++from . import stock_storage_category
+
+--- a/addons/stock/models/product.py
++++ b/addons/stock/models/product.py
+@@ -96,6 +96,7 @@ class Product(models.Model):
+     reordering_max_qty = fields.Float(
+         compute='_compute_nbr_reordering_rules', compute_sudo=False)
+     putaway_rule_ids = fields.One2many('stock.putaway.rule', 'product_id', 'Putaway Rules')
++    storage_category_capacity_ids = fields.One2many('stock.storage.category.capacity', 'product_id', 'Storage Category Capacity')
+ 
+     @api.depends('stock_move_ids.product_qty', 'stock_move_ids.state')
+     @api.depends_context(
+@@ -486,6 +487,18 @@ class Product(models.Model):
+         ]
+         return self.env['product.template']._get_action_view_related_putaway_rules(domain)
+ 
++    def action_view_storage_category_capacity(self):
++        action = self.env["ir.actions.actions"]._for_xml_id("stock.action_storage_category_capacity")
++        action['context'] = {
++            'hide_package_type': True,
++        }
++        if len(self) == 1:
++            action['context'].update({
++                'default_product_id': self.id,
++            })
++        action['domain'] = [('product_id', 'in', self.ids)]
++        return action
++
+     def action_open_product_lot(self):
+         self.ensure_one()
+         action = self.env["ir.actions.actions"]._for_xml_id("stock.action_production_lot_form")
+@@ -811,6 +824,22 @@ class ProductTemplate(models.Model):
+             raise UserError(_("Available quantity should be set to zero before changing type"))
+         return super(ProductTemplate, self).write(vals)
+ 
++    def copy(self, default=None):
++        res = super().copy(default=default)
++        # Since we don't copy product variants directly, we need to match the newly
++        # created product variants with the old one, and copy the storage category
++        # capacity from them.
++        new_product_dict = {}
++        for product in res.product_variant_ids:
++            product_attribute_value = product.product_template_attribute_value_ids.product_attribute_value_id
++            new_product_dict[product_attribute_value] = product.id
++        storage_category_capacity_vals = []
++        for storage_category_capacity in self.product_variant_ids.storage_category_capacity_ids:
++            product_attribute_value = storage_category_capacity.product_id.product_template_attribute_value_ids.product_attribute_value_id
++            storage_category_capacity_vals.append(storage_category_capacity.copy_data({'product_id': new_product_dict[product_attribute_value]})[0])
++        self.env['stock.storage.category.capacity'].create(storage_category_capacity_vals)
++        return res
++
+     # Be aware that the exact same function exists in product.product
+     def action_open_quants(self):
+         return self.with_context(active_test=False).product_variant_ids.filtered(lambda p: p.active or p.qty_available != 0).action_open_quants()
+@@ -843,6 +872,10 @@ class ProductTemplate(models.Model):
+         ]
+         return self._get_action_view_related_putaway_rules(domain)
+ 
++    def action_view_storage_category_capacity(self):
++        self.ensure_one()
++        return self.product_variant_ids.action_view_storage_category_capacity()
++
+     def action_view_orderpoints(self):
+         return self.product_variant_ids.action_view_orderpoints()
+ 
+
+--- a/addons/stock/models/product_strategy.py
++++ b/addons/stock/models/product_strategy.py
+@@ -3,6 +3,7 @@
+ 
+ from odoo import _, api, fields, models
+ from odoo.exceptions import UserError
++from odoo.tools.float_utils import float_compare
+ 
+ 
+ class RemovalStrategy(models.Model):
+@@ -59,15 +60,18 @@ class StockPutawayRule(models.Model):
+     location_in_id = fields.Many2one(
+         'stock.location', 'When product arrives in', check_company=True,
+         domain="[('child_ids', '!=', False), '|', ('company_id', '=', False), ('company_id', '=', company_id)]",
+-        default=_default_location_id, required=True, ondelete='cascade')
++        default=_default_location_id, required=True, ondelete='cascade', index=True)
+     location_out_id = fields.Many2one(
+         'stock.location', 'Store to', check_company=True,
+-        domain="[('id', 'child_of', location_in_id), ('id', '!=', location_in_id), '|', ('company_id', '=', False), ('company_id', '=', company_id)]",
++        domain="[('id', 'child_of', location_in_id), '|', ('company_id', '=', False), ('company_id', '=', company_id)]",
+         required=True, ondelete='cascade')
+     sequence = fields.Integer('Priority', help="Give to the more specialized category, a higher priority to have them in top of the list.")
+     company_id = fields.Many2one(
+         'res.company', 'Company', required=True,
+         default=lambda s: s.env.company.id, index=True)
++    package_type_ids = fields.Many2many('stock.package.type', string='Package Type', check_company=True)
++    storage_category_id = fields.Many2one('stock.storage.category', 'Storage Category', ondelete='cascade', check_company=True)
++    active = fields.Boolean('Active', default=True)
+ 
+     @api.onchange('location_in_id')
+     def _onchange_location_in(self):
+@@ -86,3 +90,44 @@ class StockPutawayRule(models.Model):
+                 if rule.company_id.id != vals['company_id']:
+                     raise UserError(_("Changing the company of this record is forbidden at this point, you should rather archive it and create a new one."))
+         return super(StockPutawayRule, self).write(vals)
++
++    def _get_putaway_location(self, product, quantity=0, package=None, qty_by_location=None):
++        package_type = package and package.package_type_id or None
++
++        checked_locations = set()
++        for putaway_rule in self:
++            location_out = putaway_rule.location_out_id
++
++            if not putaway_rule.storage_category_id:
++                if location_out in checked_locations:
++                    continue
++                if location_out._check_can_be_used(product, quantity, package, qty_by_location[location_out.id]):
++                    return location_out
++                continue
++
++            child_locations = self.env['stock.location'].search([('id', 'child_of', location_out.id), ('usage', '=', 'internal')])
++            # check if already have the product/package type stored
++            for location in child_locations:
++                if location in checked_locations:
++                    continue
++                if package_type:
++                    if location.quant_ids.filtered(lambda q: q.product_id == product and q.package_id and q.package_id.package_type_id == package_type):
++                        if location._check_can_be_used(product, package=package, location_qty=qty_by_location[location.id]):
++                            return location
++                        else:
++                            checked_locations.add(location)
++                elif float_compare(qty_by_location[location.id], 0, precision_rounding=product.uom_id.rounding) > 0:
++                    if location._check_can_be_used(product, quantity, location_qty=qty_by_location[location.id]):
++                        return location
++                    else:
++                        checked_locations.add(location)
++
++            # check locations with matched storage category
++            for location in child_locations.filtered(lambda l: l.storage_category_id == putaway_rule.storage_category_id):
++                if location in checked_locations:
++                    continue
++                if location._check_can_be_used(product, quantity, package, qty_by_location[location.id]):
++                    return location
++                checked_locations.add(location)
++
++        return None
+
+--- a/addons/stock/models/res_config_settings.py
++++ b/addons/stock/models/res_config_settings.py
+@@ -39,11 +39,13 @@ class ResConfigSettings(models.TransientModel):
+     module_quality_control_worksheet = fields.Boolean("Quality Worksheet")
+     group_stock_multi_locations = fields.Boolean('Storage Locations', implied_group='stock.group_stock_multi_locations',
+         help="Store products in specific locations of your warehouse (e.g. bins, racks) and to track inventory accordingly.")
++    group_stock_storage_categories = fields.Boolean('Storage Categories', implied_group='stock.group_stock_storage_categories')
+ 
+     @api.onchange('group_stock_multi_locations')
+     def _onchange_group_stock_multi_locations(self):
+         if not self.group_stock_multi_locations:
+             self.group_stock_adv_location = False
++            self.group_stock_storage_categories = False
+ 
+     @api.onchange('group_stock_production_lot')
+     def _onchange_group_stock_production_lot(self):
+@@ -62,6 +64,20 @@ class ResConfigSettings(models.TransientModel):
+         if not self.group_stock_multi_locations and location_grp in base_user.implied_ids and warehouse_grp in base_user.implied_ids:
+             raise UserError(_("You can't desactivate the multi-location if you have more than once warehouse by company"))
+ 
++        # Deactivate putaway rules with storage category when not in storage category
++        # group. Otherwise, active them.
++        storage_cate_grp = self.env.ref('stock.group_stock_storage_categories')
++        PutawayRule = self.env['stock.putaway.rule']
++        if self.group_stock_storage_categories and storage_cate_grp not in base_user.implied_ids:
++            putaway_rules = PutawayRule.search([
++                ('active', '=', False),
++                ('storage_category_id', '!=', False)
++            ])
++            putaway_rules.write({'active': True})
++        elif not self.group_stock_storage_categories and storage_cate_grp in base_user.implied_ids:
++            putaway_rules = PutawayRule.search([('storage_category_id', '!=', False)])
++            putaway_rules.write({'active': False})
++
+         res = super(ResConfigSettings, self).set_values()
+ 
+         if not self.user_has_groups('stock.group_stock_manager'):
+@@ -89,4 +105,5 @@ class ResConfigSettings(models.TransientModel):
+                 ('show_operations', '=', False)
+             ])
+             picking_types.sudo().write({'show_operations': True})
++
+         return res
+
+--- a/addons/stock/models/stock_location.py
++++ b/addons/stock/models/stock_location.py
+@@ -1,12 +1,12 @@
+ # -*- coding: utf-8 -*-
+ # Part of Odoo. See LICENSE file for full copyright and licensing details.
+-
++from collections import defaultdict, OrderedDict
+ from datetime import timedelta
+ 
+ from odoo import _, api, fields, models
+ from odoo.exceptions import UserError
+ from odoo.osv import expression
+-from collections import OrderedDict
++from odoo.tools.float_utils import float_compare
+ 
+ 
+ class Location(models.Model):
+@@ -68,10 +68,33 @@ class Location(models.Model):
+     next_inventory_date = fields.Date("Next Expected Inventory", compute="_compute_next_inventory_date", store=True, help="Date for next planned inventory based on cyclic schedule.")
+     warehouse_view_ids = fields.One2many('stock.warehouse', 'view_location_id', readonly=True)
+     warehouse_id = fields.Many2one('stock.warehouse', compute='_compute_warehouse_id')
++    storage_category_id = fields.Many2one('stock.storage.category', string='Storage Category')
++    outgoing_move_line_ids = fields.One2many('stock.move.line', 'location_id', help='Technical: used to compute weight.')
++    incoming_move_line_ids = fields.One2many('stock.move.line', 'location_dest_id', help='Technical: used to compute weight.')
++    net_weight = fields.Float('Net Weight', compute="_compute_weight")
++    forecast_weight = fields.Float('Forecasted Weight', compute="_compute_weight")
+ 
+     _sql_constraints = [('barcode_company_uniq', 'unique (barcode,company_id)', 'The barcode for a location must be unique per company !'),
+                         ('inventory_freq_nonneg', 'check(cyclic_inventory_frequency >= 0)', 'The inventory frequency (days) for a location must be non-negative')]
+ 
++    @api.depends('outgoing_move_line_ids.product_qty', 'incoming_move_line_ids.product_qty',
++                 'outgoing_move_line_ids.state', 'incoming_move_line_ids.state',
++                 'outgoing_move_line_ids.product_id.weight', 'outgoing_move_line_ids.product_id.weight',
++                 'quant_ids.quantity', 'quant_ids.product_id.weight')
++    def _compute_weight(self):
++        for location in self:
++            location.net_weight = 0
++            quants = location.quant_ids.filtered(lambda q: q.product_id.type != 'service')
++            incoming_move_lines = location.incoming_move_line_ids.filtered(lambda ml: ml.product_id.type != 'service' and ml.state not in ['draft', 'done', 'cancel'])
++            outgoing_move_lines = location.outgoing_move_line_ids.filtered(lambda ml: ml.product_id.type != 'service' and ml.state not in ['draft', 'done', 'cancel'])
++            for quant in quants:
++                location.net_weight += quant.product_id.weight * quant.quantity
++            location.forecast_weight = location.net_weight
++            for line in incoming_move_lines:
++                location.forecast_weight += line.product_id.weight * line.product_qty
++            for line in outgoing_move_lines:
++                location.forecast_weight -= line.product_id.weight * line.product_qty
++
+     @api.depends('name', 'location_id.complete_name')
+     def _compute_complete_name(self):
+         for location in self:
+@@ -171,28 +194,98 @@ class Location(models.Model):
+             domain = ['|', ('barcode', operator, name), ('complete_name', operator, name)]
+         return self._search(expression.AND([domain, args]), limit=limit, access_rights_uid=name_get_uid)
+ 
+-    def _get_putaway_strategy(self, product):
+-        ''' Returns the location where the product has to be put, if any compliant putaway strategy is found. Otherwise returns None.'''
+-        putaway_location = self.env['stock.location']
+-        # Looking for a putaway about the product.
+-        putaway_rules = self.putaway_rule_ids.filtered(lambda x: x.product_id == product)
+-        if putaway_rules:
+-            putaway_location = putaway_rules[0].location_out_id
+-        # If not product putaway found, we're looking with category so.
+-        else:
+-            categ = product.categ_id
+-            while categ:
+-                putaway_rules = self.putaway_rule_ids.filtered(lambda x: x.category_id == categ)
+-                if putaway_rules:
+-                    putaway_location = putaway_rules[0].location_out_id
+-                    break
+-                categ = categ.parent_id
+-        return putaway_location
++    def _get_putaway_strategy(self, product, quantity=0, package=None):
++        """Returns the location where the product has to be put, if any compliant
++        putaway strategy is found. Otherwise returns self.
++        The quantity should be in the default UOM of the product, it is used when
++        no package is specified.
++        """
++        package_type = package and package.package_type_id or self.env['stock.package.type']
++
++        putaway_rules = self.env['stock.putaway.rule']
++        putaway_rules |= self.putaway_rule_ids.filtered(lambda x: x.product_id == product and (package_type in x.package_type_ids or package_type == x.package_type_ids))
++        categ = product.categ_id
++        while categ:
++            putaway_rules |= self.putaway_rule_ids.filtered(lambda x: x.category_id == categ and (package_type in x.package_type_ids or package_type == x.package_type_ids))
++            categ = categ.parent_id
++        if package_type:
++            putaway_rules |= self.putaway_rule_ids.filtered(lambda x: not x.product_id and (package_type in x.package_type_ids or package_type == x.package_type_ids))
++
++        # get current product qty (qty in current quants and future qty on assigned ml) of all child locations
++        qty_by_location = defaultdict(lambda: 0)
++        locations = self.env['stock.location'].search([('id', 'child_of', self.id), ('usage', '=', 'internal')])
++        if locations.storage_category_id:
++            move_line_data = self.env['stock.move.line'].read_group([
++                ('product_id', '=', product.id),
++                ('location_dest_id', 'in', locations.ids),
++                ('state', 'not in', ['draft', 'done', 'cancel'])
++            ], ['location_dest_id', 'product_id', 'product_qty:sum'], ['location_dest_id'])
++            quant_data = self.env['stock.quant'].read_group([
++                ('product_id', '=', product.id),
++                ('location_id', 'in', locations.ids),
++            ], ['location_id', 'product_id', 'quantity:sum'], ['location_id'])
++
++            for values in move_line_data:
++                qty_by_location[values['location_dest_id'][0]] = values['product_qty']
++            for values in quant_data:
++                qty_by_location[values['location_id'][0]] += values['quantity']
++
++        return putaway_rules._get_putaway_location(product, quantity, package, qty_by_location) or self
+ 
+     def should_bypass_reservation(self):
+         self.ensure_one()
+         return self.usage in ('supplier', 'customer', 'inventory', 'production') or self.scrap_location or (self.usage == 'transit' and not self.company_id)
+ 
++    def _check_can_be_used(self, product, quantity=0, package=None, location_qty=0):
++        """Check if product/package can be stored in the location. Quantity
++        should in the default uom of product, it's only used when no package is
++        specified."""
++        self.ensure_one()
++        if package and package.package_type_id:
++            return self._check_package_storage(product, package)
++        return self._check_product_storage(product, quantity, location_qty)
++
++    def _check_product_storage(self, product, quantity, location_qty):
++        """Check if a number of product can be stored in the location. Quantity
++        should in the default uom of product."""
++        self.ensure_one()
++        if self.storage_category_id:
++            # check weight
++            if self.storage_category_id.max_weight < self.forecast_weight + product.weight * quantity:
++                return False
++            # check if only allow new product when empty
++            if self.storage_category_id.allow_new_product == "empty" and any(float_compare(q.quantity, 0, precision_rounding=q.product_id.uom_id.rounding) > 0 for q in self.quant_ids):
++                return False
++            # check if only allow same product
++            if self.storage_category_id.allow_new_product == "same" and self.quant_ids and self.quant_ids.product_id != product:
++                return False
++            # check if enough space
++            product_capacity = self.storage_category_id.product_capacity_ids.filtered(lambda pc: pc.product_id == product)
++            if product_capacity and quantity + location_qty > product_capacity.quantity:
++                return False
++        return True
++
++    def _check_package_storage(self, product, package):
++        """Check if the given package can be stored in the location."""
++        self.ensure_one()
++        if self.storage_category_id:
++            # check weight
++            if self.storage_category_id.max_weight < self.forecast_weight + package.package_type_id.max_weight:
++                return False
++            # check if only allow new product when empty
++            if self.storage_category_id.allow_new_product == "empty" and any(float_compare(q.quantity, 0, precision_rounding=q.product_id.uom_id.rounding) > 0 for q in self.quant_ids):
++                return False
++            # check if only allow same product
++            if self.storage_category_id.allow_new_product == "same" and self.quant_ids and self.quant_ids.product_id != product:
++                return False
++            # check if enough space
++            package_capacity = self.storage_category_id.package_capacity_ids.filtered(lambda pc: pc.package_type_id == package.package_type_id)
++            if package_capacity:
++                package_number = len(self.quant_ids.package_id.filtered(lambda q: q.package_type_id == package.package_type_id))
++                if package_number >= package_capacity.quantity:
++                    return False
++        return True
++
+ 
+ class Route(models.Model):
+     _name = 'stock.location.route'
+
+--- a/addons/stock/models/stock_move.py
++++ b/addons/stock/models/stock_move.py
+@@ -1045,10 +1045,10 @@ class StockMove(models.Model):
+         if origin_move_line:
+             location_dest = origin_move_line.location_dest_id
+         else:
+-            location_dest = self.location_dest_id._get_putaway_strategy(self.product_id)
++            location_dest = self.location_dest_id._get_putaway_strategy(self.product_id, quantity=1)
+         move_line_vals = {
+             'picking_id': self.picking_id.id,
+-            'location_dest_id': location_dest.id or self.location_dest_id.id,
++            'location_dest_id': location_dest.id,
+             'location_id': self.location_id.id,
+             'product_id': self.product_id.id,
+             'product_uom_id': self.product_id.uom_id.id,
+@@ -1201,7 +1201,7 @@ class StockMove(models.Model):
+     def _prepare_move_line_vals(self, quantity=None, reserved_quant=None):
+         self.ensure_one()
+         # apply putaway
+-        location_dest_id = self.location_dest_id._get_putaway_strategy(self.product_id).id or self.location_dest_id.id
++        location_dest_id = self.location_dest_id._get_putaway_strategy(self.product_id, quantity=quantity or 0).id
+         vals = {
+             'move_id': self.id,
+             'product_id': self.product_id.id,
+
+--- a/addons/stock/models/stock_move_line.py
++++ b/addons/stock/models/stock_move_line.py
+@@ -112,11 +112,18 @@ class StockMoveLine(models.Model):
+         if any(ml.qty_done < 0 for ml in self):
+             raise ValidationError(_('You can not enter negative quantities.'))
+ 
++    @api.onchange('result_package_id')
++    def _onchange_result_package_id(self):
++        if self.result_package_id:
++            if not self.id and self.user_has_groups('stock.group_stock_multi_locations'):
++                self.location_dest_id = self.location_dest_id._get_putaway_strategy(self.product_id, package=self.result_package_id)
++
+     @api.onchange('product_id', 'product_uom_id')
+     def _onchange_product_id(self):
+         if self.product_id:
+-            if not self.id and self.user_has_groups('stock.group_stock_multi_locations'):
+-                self.location_dest_id = self.location_dest_id._get_putaway_strategy(self.product_id) or self.location_dest_id
++            if not self.id and self.user_has_groups('stock.group_stock_multi_locations') and not self.result_package_id:
++                qty_done = self.product_uom_id._compute_quantity(self.qty_done, self.product_id.uom_id)
++                self.location_dest_id = self.location_dest_id._get_putaway_strategy(self.product_id, qty_done)
+             if self.picking_id:
+                 product = self.product_id.with_context(lang=self.picking_id.partner_id.lang or self.env.user.lang)
+                 self.description_picking = product._get_description(self.picking_id.picking_type_id)
+@@ -177,11 +184,15 @@ class StockMoveLine(models.Model):
+         help him. This onchange will warn him if he set `qty_done` to a non-supported value.
+         """
+         res = {}
+-        if self.qty_done and self.product_id.tracking == 'serial':
++        if self.qty_done:
+             qty_done = self.product_uom_id._compute_quantity(self.qty_done, self.product_id.uom_id)
+-            if float_compare(qty_done, 1.0, precision_rounding=self.product_id.uom_id.rounding) != 0:
+-                message = _('You can only process 1.0 %s of products with unique serial number.', self.product_id.uom_id.name)
+-                res['warning'] = {'title': _('Warning'), 'message': message}
++            if not self.id and self.user_has_groups('stock.group_stock_multi_locations') and not self.result_package_id:
++                self.location_dest_id = self.location_dest_id._get_putaway_strategy(self.product_id, qty_done)
++            if self.product_id.tracking == 'serial':
++                qty_done = self.product_uom_id._compute_quantity(self.qty_done, self.product_id.uom_id)
++                if float_compare(qty_done, 1.0, precision_rounding=self.product_id.uom_id.rounding) != 0:
++                    message = _('You can only process 1.0 %s of products with unique serial number.', self.product_id.uom_id.name)
++                    res['warning'] = {'title': _('Warning'), 'message': message}
+         return res
+ 
+     def init(self):
+
+--- a/addons/stock/models/stock_package_type.py
++++ b/addons/stock/models/stock_package_type.py
+@@ -24,6 +24,7 @@ class PackageType(models.Model):
+     weight_uom_name = fields.Char(string='Weight unit of measure label', compute='_compute_weight_uom_name', default=_get_default_weight_uom)
+     length_uom_name = fields.Char(string='Length unit of measure label', compute='_compute_length_uom_name', default=_get_default_length_uom)
+     company_id = fields.Many2one('res.company', 'Company', index=True)
++    storage_category_capacity_ids = fields.One2many('stock.storage.category.capacity', 'package_type_id', 'Storage Category Capacity', copy=True)
+ 
+     _sql_constraints = [
+         ('positive_height', 'CHECK(height>=0)', 'Height must be positive'),
+@@ -37,5 +38,10 @@ class PackageType(models.Model):
+             package_type.length_uom_name = self.env['product.template']._get_length_uom_name_from_ir_config_parameter()
+ 
+     def _compute_weight_uom_name(self):
+-        for packaging in self:
+-            packaging.weight_uom_name = self.env['product.template']._get_weight_uom_name_from_ir_config_parameter()
++        for package_type in self:
++            package_type.weight_uom_name = self.env['product.template']._get_weight_uom_name_from_ir_config_parameter()
++
++    def copy(self, default=None):
++        default = dict(default or {})
++        default.update(name=_("%s (copy)") % self.name)
++        return super().copy(default)
+
+--- a/None
++++ b/addons/stock/models/stock_storage_category.py
+@@ -0,0 +1,72 @@
++# -*- coding: utf-8 -*-
++# Part of Odoo. See LICENSE file for full copyright and licensing details.
++
++from odoo import _, api, fields, models
++
++
++class StorageCategory(models.Model):
++    _name = 'stock.storage.category'
++    _description = "Storage Category"
++    _order = "name"
++
++    name = fields.Char('Storage Category', required=True)
++    max_weight = fields.Float('Max Weight', digits='Stock Weight')
++    capacity_ids = fields.One2many('stock.storage.category.capacity', 'storage_category_id', copy=True)
++    product_capacity_ids = fields.One2many('stock.storage.category.capacity', compute="_compute_storage_capacity_ids", inverse="_set_storage_capacity_ids")
++    package_capacity_ids = fields.One2many('stock.storage.category.capacity', compute="_compute_storage_capacity_ids", inverse="_set_storage_capacity_ids")
++    allow_new_product = fields.Selection([
++        ('empty', 'If the location is empty'),
++        ('same', 'If all products are same'),
++        ('mixed', 'Allow mixed products')], default='mixed', required=True)
++    location_ids = fields.One2many('stock.location', 'storage_category_id')
++    company_id = fields.Many2one('res.company', 'Company')
++
++    _sql_constraints = [
++        ('positive_max_weight', 'CHECK(max_weight >= 0)', 'Max weight should be a positive number.'),
++    ]
++
++    @api.depends('capacity_ids')
++    def _compute_storage_capacity_ids(self):
++        for storage_category in self:
++            storage_category.product_capacity_ids = storage_category.capacity_ids.filtered(lambda c: c.product_id)
++            storage_category.package_capacity_ids = storage_category.capacity_ids.filtered(lambda c: c.package_type_id)
++
++    def _set_storage_capacity_ids(self):
++        for storage_category in self:
++            storage_category.capacity_ids = storage_category.product_capacity_ids | storage_category.package_capacity_ids
++
++    def copy(self, default=None):
++        default = dict(default or {})
++        default.update(name=_("%s (copy)") % self.name)
++        return super().copy(default)
++
++
++class StorageCategoryProductCapacity(models.Model):
++    _name = 'stock.storage.category.capacity'
++    _description = "Storage Category Capacity"
++    _check_company_auto = True
++    _order = "storage_category_id"
++
++    @api.model
++    def _domain_product_id(self):
++        domain = "('type', '=', 'product')"
++        if self.env.context.get('active_model') == 'product.template':
++            product_template_id = self.env.context.get('active_id', False)
++            domain = f"('product_tmpl_id', '=', {product_template_id})"
++        elif self.env.context.get('default_product_id', False):
++            product_id = self.env.context.get('default_product_id', False)
++            domain = f"('id', '=', {product_id})"
++        return f"[{domain}, '|', ('company_id', '=', False), ('company_id', '=', company_id)]"
++
++    storage_category_id = fields.Many2one('stock.storage.category', ondelete='cascade', required=True, index=True)
++    product_id = fields.Many2one('product.product', 'Product', domain=lambda self: self._domain_product_id(), ondelete='cascade', check_company=True)
++    package_type_id = fields.Many2one('stock.package.type', 'Package Type', ondelete='cascade', check_company=True)
++    quantity = fields.Float('Quantity', required=True)
++    product_uom_id = fields.Many2one(related='product_id.uom_id')
++    company_id = fields.Many2one('res.company', 'Company', related="storage_category_id.company_id")
++
++    _sql_constraints = [
++        ('positive_quantity', 'CHECK(quantity > 0)', 'Quantity should be a positive number.'),
++        ('unique_product', 'UNIQUE(product_id, storage_category_id)', 'Multiple capacity rules for one product.'),
++        ('unique_package_type', 'UNIQUE(package_type_id, storage_category_id)', 'Multiple capacity rules for one package type.'),
++    ]

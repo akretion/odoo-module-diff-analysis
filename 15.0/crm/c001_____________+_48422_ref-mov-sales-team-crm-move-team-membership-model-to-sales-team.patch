@@ -1,0 +1,141 @@
+PR: https://github.com/odoo/odoo/pull/48422
+
+From: 9790d7dcfbf1e22377f5555b275bf328216ae2ec
+From: Thibault Delavallée
+Date: 2021-01-21 10:56:19
+
+Structural Changes: 3
+Total Changes: 54
+
+[REF][MOV] sales_team, crm: move team membership model to sales_team
+
+GLOBAL PURPOSE
+
+Ability to have salesmen belonging to several sales team is a core requirement
+of CRM. It is therefore moved from website_crm_score to crm along with cleaning
+and behavior improvement. Automatic lead assignment is also moved and cleaned.
+
+SPECIFICIATIONS
+
+Move sales team membership model from website_crm_score (enterprise) directly
+into sales_team. It allows to have the base requirements to correctly handle
+mono and multi sales team for salesperson.
+
+Membership is modeled using a decorated many2many relationship. Members of
+a sales team are res.users. Subscriptions are crm.team.member linking a team
+and an user. It is a rename of team.user model coming from website_crm_score
+as well as some other relational fields renaming.
+
+Part of old team.user model is moved directly to sales team, part of it to
+crm module (notably assignment limits). Its support will be improved in the
+upcoming commits. Assignment related fields will be cleaned and used when
+moving assignment directly into CRM.
+
+LINKS
+
+Task ID-2086889 (main task)
+Task ID-2357969 (scoring migration task)
+Community PR odoo/odoo#48422
+Enterprise PR odoo/enterprise#499
+Upgrade PR odoo/upgrade#996996
+
+================================= pseudo patch: =================================
+
+--- a/addons/crm/models/__init__.py
++++ b/addons/crm/models/__init__.py
+@@ -7,6 +7,7 @@ from . import crm_lead
+ from . import crm_lost_reason
+ from . import crm_stage
+ from . import crm_team
++from . import crm_team_member
+ from . import ir_config_parameter
+ from . import res_config_settings
+ from . import res_partner
+
+--- a/addons/crm/models/crm_lead.py
++++ b/addons/crm/models/crm_lead.py
+@@ -3,16 +3,16 @@
+ 
+ import logging
+ import threading
++from collections import OrderedDict, defaultdict
+ from datetime import date, datetime, timedelta
+ from psycopg2 import sql
+ 
+ from odoo import api, fields, models, tools, SUPERUSER_ID
+ from odoo.addons.phone_validation.tools import phone_validation
++from odoo.exceptions import UserError, AccessError
+ from odoo.osv import expression
+ from odoo.tools.translate import _
+-from odoo.tools import email_re, email_split
+-from odoo.exceptions import UserError, AccessError
+-from collections import OrderedDict, defaultdict
++from odoo.tools import email_re, email_split, safe_eval
+ 
+ from . import crm_stage
+ 
+@@ -71,6 +71,12 @@ PARTNER_ADDRESS_FIELDS_TO_SYNC = [
+ PLS_COMPUTE_BATCH_STEP = 50000  # odoo.models.PREFETCH_MAX = 1000 but larger cluster can speed up global computation
+ PLS_UPDATE_BATCH_STEP = 5000
+ 
++# Evaluation context for all domain-based lead auto assignment
++LEAD_ASSIGN_EVAL_CONTEXT = {
++    'datetime': safe_eval.datetime,
++    'context_today': datetime.now,
++}
++
+ 
+ class Lead(models.Model):
+     _name = "crm.lead"
+@@ -249,7 +255,7 @@ class Lead(models.Model):
+             if not lead.user_id:
+                 continue
+             user = lead.user_id
+-            if lead.team_id and user in lead.team_id.member_ids | lead.team_id.user_id:
++            if lead.team_id and user in (lead.team_id.member_ids | lead.team_id.user_id):
+                 continue
+             team_domain = [('use_leads', '=', True)] if lead.type == 'lead' else [('use_opportunities', '=', True)]
+             team = self.env['crm.team']._get_default_team_id(user_id=user.id, domain=team_domain)
+
+--- a/None
++++ b/addons/crm/models/crm_team_member.py
+@@ -0,0 +1,39 @@
++# -*- coding: utf-8 -*-
++# Part of Odoo. See LICENSE file for full copyright and licensing details.
++
++import datetime
++
++from odoo import api, exceptions, fields, models, _
++from odoo.addons.crm.models.crm_lead import LEAD_ASSIGN_EVAL_CONTEXT
++from odoo.tools import safe_eval
++
++
++class Team(models.Model):
++    _inherit = 'crm.team.member'
++
++    # assignment
++    team_user_domain = fields.Char('Domain', tracking=True)
++    maximum_user_leads = fields.Integer('Leads Per Month')
++    lead_month_count = fields.Integer(
++        'Assigned Leads', compute='_compute_lead_month_count',
++        help='Lead assigned to this member those last 30 days')
++
++    def _compute_lead_month_count(self):
++        for member in self:
++            if member.id:
++                limit_date = fields.Datetime.now() - datetime.timedelta(days=30)
++                domain = [('user_id', '=', member.user_id.id),
++                          ('team_id', '=', member.crm_team_id.id),
++                          ('date_open', '>=', limit_date)]
++                member.lead_month_count = self.env['crm.lead'].search_count(domain)
++            else:
++                member.lead_month_count = 0
++
++    @api.constrains('team_user_domain')
++    def _constrains_team_user_domain(self):
++        for member in self:
++            try:
++                domain = safe_eval.safe_eval(member.team_user_domain or '[]', LEAD_ASSIGN_EVAL_CONTEXT)
++                self.env['crm.lead'].search(domain, limit=1)
++            except Exception:
++                raise exceptions.UserError(_('Team membership assign domain is incorrectly formatted'))

@@ -1,0 +1,653 @@
+PR: https://github.com/odoo/odoo/pull/66611
+
+From: ac99b09cdc1da0ce191124603dee71c6a2c1c4bd
+From: Thanh Dodeur
+Date: 2021-09-04 06:23:56
+
+Structural Changes: 14
+Total Changes: 471
+
+[IMP] mail*: add audio and video conference with webRTC
+
+*test_discuss_full,test_lint
+
+This commit adds the audio and video conference feature to mail channels
+and integrate it with the groupDM/guest features.
+
+Adds new mp3 and ogg files (from task-2554674) for sound effects.
+
+- Adds three new tables:
+    * `mail.channel.rtc.session` to manage the peerToPeer interactions
+      during rtc calls.
+    * `mail.ice.server` to provide ICE servers necessary to establish
+      peerToPeer connections with webRtc.
+    * `res.users.settings.volumes` to hold the partner-to-partner volume
+      settings, each partner can create one new setting per other
+      partner to configure the volume coming from those partners during
+      calls.
+
+- changes res.config.settings:
+    * Adds new fields for the Twilio credentials to use their STUN/TURN
+      service.
+
+- changes res.user.settings:
+    * Adds 4 fields for the push to talk and voice activation.
+
+- changes mail.channel:
+    * Adds a new field `rtc_session_ids` that represents the active
+      participants in a rtc call on that channel.
+
+- changes mail.channel.partner:
+    * Adds a new field `rtc_inviting_session_id` that represents the
+      rtcSession of the user that is inviting that channelPartner to a
+      call.
+
+task-2366708
+
+closes odoo/odoo#66611
+
+Signed-off-by: Sébastien Theys (seb) <seb@odoo.com>
+
+================================= pseudo patch: =================================
+
+--- a/addons/mail/models/__init__.py
++++ b/addons/mail/models/__init__.py
+@@ -28,10 +28,13 @@ from . import mail_template
+ 
+ # discuss
+ from . import mail_channel_partner
++from . import mail_channel_rtc_session
+ from . import mail_channel
+ from . import mail_guest
++from . import mail_ice_server
+ from . import mail_shortcode
+ from . import res_users_settings
++from . import res_users_settings_volumes
+ 
+ # odoo models
+ from . import ir_action_act_window
+
+--- a/addons/mail/models/mail_channel.py
++++ b/addons/mail/models/mail_channel.py
+@@ -69,6 +69,7 @@ class Channel(models.Model):
+     channel_last_seen_partner_ids = fields.One2many(
+         'mail.channel.partner', 'channel_id', string='Last Seen',
+         groups='base.group_user')
++    rtc_session_ids = fields.One2many('mail.channel.rtc.session', 'channel_id', groups="base.group_system")
+     is_member = fields.Boolean('Is Member', compute='_compute_is_member', compute_sudo=True)
+     member_count = fields.Integer(string="Member Count", compute='_compute_member_count', help="Excluding guests from count.")
+     group_ids = fields.Many2many(
+@@ -288,7 +289,7 @@ class Channel(models.Model):
+         })
+         return result
+ 
+-    def add_members(self, partner_ids=None, guest_ids=None):
++    def add_members(self, partner_ids=None, guest_ids=None, invite_to_rtc_call=False):
+         """ Adds the given partner_ids and guest_ids as member of self channels. """
+         self.check_access_rights('write')
+         self.check_access_rule('write')
+@@ -316,6 +317,8 @@ class Channel(models.Model):
+                 'channel_id': channel.id,
+             } for partner in guests - existing_guests]
+         new_members = self.env['mail.channel.partner'].sudo().create(members_to_create)
++        if invite_to_rtc_call:
++            self._invite_members_to_rtc(partner_ids=partner_ids, guest_ids=guest_ids)
+         for channel_partner in new_members.filtered(lambda channel_partner: channel_partner.partner_id):
+             user = channel_partner.partner_id.user_ids[0] if channel_partner.partner_id.user_ids else self.env['res.users']
+             # notify invited members through the bus
+@@ -337,16 +340,18 @@ class Channel(models.Model):
+                     new_partner_name=channel_partner.partner_id.name,
+                 )
+             channel_partner.channel_id.message_post(body=notification, message_type="notification", subtype_xmlid="mail.mt_comment", notify_by_email=False)
++            new_partner_data = {
++                'id': channel_partner.partner_id.id,
++                'im_status': channel_partner.partner_id.im_status,
++                'name': channel_partner.partner_id.name,
++            }
+             self.env['bus.bus'].sendone((self._cr.dbname, 'mail.channel', channel_partner.channel_id.id), {
+                 'type': 'mail.channel_update',
+                 'payload': {
+                     'id': channel_partner.channel_id.id,
+                     'memberCount': channel_partner.channel_id.member_count,
+-                    'members': [('insert', {
+-                        'id': channel_partner.partner_id.id,
+-                        'im_status': channel_partner.partner_id.im_status,
+-                        'name': channel_partner.partner_id.name,
+-                    })],
++                    'members': [('insert', new_partner_data)],
++                    'invitedPartners': [('insert', [{'id': new_partner_data['id']}] if invite_to_rtc_call else [])]
+                 },
+             })
+ 
+@@ -379,6 +384,167 @@ class Channel(models.Model):
+                     return False
+         return True
+ 
++    # ------------------------------------------------------------
++    # RTC
++    # ------------------------------------------------------------
++
++    def _cancel_rtc_invitations(self, partner_ids=None, guest_ids=None, inviting_member=None):
++        """ Cancels the invitations of the RTC call from all invited members (or the specified partner_ids).
++            :param list partner_ids: list of the partner ids from which the invitation has to be removed
++            :param list guest_ids: list of the guest ids from which the invitation has to be removed
++            if either partner_ids or guest_ids is set, only the specified ids will be invited.
++            :param inviting_member: if specified, only removes invitations if they are coming
++                from this channel member
++        """
++        self.ensure_one()
++        notifications = []
++        domain = ['&', ('rtc_inviting_session_id', '!=', False), ('channel_id', '=', self.id)]
++        if inviting_member:
++            domain = expression.AND([domain, [('rtc_inviting_session_id.channel_partner_id', '=', inviting_member.id)]])
++        if partner_ids or guest_ids:
++            domain = expression.AND([domain, ['|', ('partner_id', 'in', partner_ids or []), ('guest_id', 'in', guest_ids or [])]])
++        channel_partners = self.env['mail.channel.partner'].search(domain)
++        for member in channel_partners:
++            member.write({'rtc_inviting_session_id': False})
++            model, record_id = ('mail.guest', member.guest_id.id) if member.guest_id else ('res.partner', member.partner_id.id)
++            notifications.append([
++                (self._cr.dbname, model, record_id),
++                {
++                    'type': 'rtc_incoming_invitation_update',
++                    'payload': {
++                        'channelId': self.id,
++                    },
++                },
++            ])
++        self.env['bus.bus'].sendmany(notifications)
++
++    def _invite_members_to_rtc(self, partner_ids=None, guest_ids=None):
++        """ Sends invitations to join the RTC call to all connected members of the thread who are not already invited.
++            :param list partner_ids: list of the partner ids to invite
++            :param list guest_ids: list of the guest ids to invite
++
++            if either partner_ids or guest_ids is set, only the specified ids will be invited.
++        """
++        self.ensure_one()
++
++        guest = self.env.context.get('guest')
++        partner = None if guest else self.env.user.partner_id
++
++        def is_current_user(r):
++            return (guest and r.guest_id == guest) or r.partner_id == partner
++
++        current_rtc_session = self.rtc_session_ids.filtered(is_current_user)
++        if not current_rtc_session:
++            return
++
++        current_sessions_channel_partners = self.rtc_session_ids.channel_partner_id
++        notifications = []
++        invited_partners = []
++        invited_guests = []
++        domain = ['&', '&', ('rtc_inviting_session_id', '=', False), ('channel_id', '=', self.id), ('id', 'not in', current_sessions_channel_partners.ids)]
++        if partner:
++            domain = expression.AND([domain, [('partner_id', '!=', partner.id)]])
++        if guest:
++            domain = expression.AND([domain, [('guest_id', '!=', guest.id)]])
++        if partner_ids or guest_ids:
++            domain = expression.AND([domain, ['|', ('partner_id', 'in', partner_ids or []), ('guest_id', 'in', guest_ids or [])]])
++        channel_partners = self.env['mail.channel.partner'].search(domain)
++        for member in channel_partners:
++            member.rtc_inviting_session_id = current_rtc_session.id
++            if member.partner_id:
++                invited_partners.append({
++                    'id': member.partner_id.id,
++                    'name': member.partner_id.name,
++                })
++            elif member.guest_id:
++                invited_guests.append({
++                    'id': member.guest_id.id,
++                    'name': member.guest_id.name,
++                })
++            model, record_id = ('mail.guest', member.guest_id.id) if member.guest_id else ('res.partner', member.partner_id.id)
++            notifications.append([
++                (self._cr.dbname, model, record_id),
++                {
++                    'type': 'rtc_incoming_invitation_update',
++                    'payload': {
++                        'channelId': self.id,
++                        'rtcSession': current_rtc_session._mail_rtc_session_format(),
++                    },
++                },
++            ])
++        notification = _('%s started a live conference', partner.name)
++        self.message_post(body=notification, message_type="notification")
++        self.env['bus.bus'].sendmany(notifications)
++        return invited_partners, invited_guests
++
++    def _join_call(self):
++        self.ensure_one()
++        session_data, session_id = self._update_call_participation(joining=True)
++        if not session_id:
++            return
++        ice_servers = self.env['mail.ice.server']._get_ice_servers()
++        invited_partners = []
++        invited_guests = []
++        if len(self.rtc_session_ids) == 1 and self.channel_type in {'chat', 'group'}:
++            invited_partners, invited_guests = self._invite_members_to_rtc()
++        return {
++            'rtcSessions': session_data,
++            'iceServers': ice_servers or False,
++            'invitedGuests': invited_guests,
++            'invitedPartners': invited_partners,
++            'sessionId': session_id,
++        }
++
++    def _leave_call(self):
++        self.ensure_one()
++        self._update_call_participation(joining=False)
++
++    def _update_call_participation(self, joining=True):
++        """ Updates the call participation of the current partner and notifies members of
++            the channel if necessary.
++            :param bool joining : true if joining the call, false if leaving.
++        """
++        guest = self.env.context.get('guest')
++        partner = None if guest else self.env.user.partner_id
++        new_session_id = None
++        if partner:
++            domain = [('partner_id', '=', partner.id)]
++        else:
++            domain = [('guest_id', '=', guest.id)]
++        current_channel_partner = self.env['mail.channel.partner'].search(domain, limit=1)
++
++        if not current_channel_partner:
++            return
++        current_channel_partner._remove_rtc_invitation()
++        old_sessions = self.rtc_session_ids.filtered(lambda s: s.channel_partner_id == current_channel_partner)
++        old_sessions._disconnect()
++        if joining:
++            new_session = self.env['mail.channel.rtc.session'].create({'channel_partner_id': current_channel_partner.id})
++            new_session_id = new_session.id
++        elif not old_sessions:
++            return
++
++        session_data_by_channel = self._notify_rtc_sessions_change()
++        return session_data_by_channel.get(self.id, []), new_session_id
++
++    def _notify_rtc_sessions_change(self):
++        session_data_by_channel = self.rtc_session_ids._mail_rtc_session_format_by_channel()
++        notifications = []
++        for record in self:
++            sessions_data = session_data_by_channel.get(record.id, [])
++            if not sessions_data:
++                # if there is no member left in the rtc call, all invitations are reset
++                record._cancel_rtc_invitations()
++            notifications.append([(self._cr.dbname, 'mail.channel', record.id), {
++                'type': 'rtc_sessions_update',
++                'payload': {
++                    'channelId': record.id,
++                    'rtcSessions': sessions_data,
++                },
++            }])
++        self.env['bus.bus'].sendmany(notifications)
++        return session_data_by_channel
++
+     # ------------------------------------------------------------
+     # MAILING
+     # ------------------------------------------------------------
+@@ -615,6 +781,7 @@ class Channel(models.Model):
+         if not self:
+             return []
+         channel_infos = []
++        rtc_sessions_by_channel = self.sudo().rtc_session_ids._mail_rtc_session_format_by_channel()
+         channel_last_message_ids = dict((r['id'], r['message_id']) for r in self._channel_last_message_ids())
+         for channel in self:
+             info = {
+@@ -650,6 +817,8 @@ class Channel(models.Model):
+                     info['custom_channel_name'] = partner_channel.custom_channel_name
+                     info['is_pinned'] = partner_channel.is_pinned
+                     info['last_interest_dt'] = partner_channel.last_interest_dt.strftime(DEFAULT_SERVER_DATETIME_FORMAT)
++                    if partner_channel.rtc_inviting_session_id:
++                        info['rtc_inviting_session'] = {'id': partner_channel.rtc_inviting_session_id.id}
+             # add members infos
+             if channel.channel_type != 'channel':
+                 # avoid sending potentially a lot of members for big channels
+@@ -663,6 +832,10 @@ class Channel(models.Model):
+                     'seen_message_id': cp.seen_message_id.id,
+                 } for cp in channel_partners], key=lambda p: p['partner_id'])
+ 
++            # add rtc sessions infos
++            if rtc_sessions_by_channel.get(channel.id):
++                info['rtc_sessions'] = rtc_sessions_by_channel[channel.id]
++
+             channel_infos.append(info)
+         return channel_infos
+ 
+
+--- a/addons/mail/models/mail_channel_partner.py
++++ b/addons/mail/models/mail_channel_partner.py
+@@ -27,6 +27,30 @@ class ChannelPartner(models.Model):
+     is_minimized = fields.Boolean("Conversation is minimized")
+     is_pinned = fields.Boolean("Is pinned on the interface", default=True)
+     last_interest_dt = fields.Datetime("Last Interest", default=fields.Datetime.now, help="Contains the date and time of the last interesting event that happened in this channel for this partner. This includes: creating, joining, pinning, and new message posted.")
++    rtc_inviting_session_id = fields.Many2one('mail.channel.rtc.session', string='Ringing session')
++
++    def _remove_rtc_invitation(self):
++        """ Removes the invitation to the rtc call and notifies the inviting partner if removed. """
++        notifications = []
++        for record in self:
++            if not record.rtc_inviting_session_id:
++                continue
++            model, record_id = ('mail.guest', record.rtc_inviting_session_id.guest_id.id) if record.rtc_inviting_session_id.guest_id else (
++                'res.partner', record.rtc_inviting_session_id.partner_id.id)
++            payload = {'channelId': record.channel_id.id}
++            if record.partner_id:
++                payload['partnerId'] = record.partner_id.id
++            else:
++                payload['guestId'] = record.guest_id.id
++            notifications.append([
++                (self._cr.dbname, model, record_id),
++                {
++                    'type': 'rtc_outgoing_invitation_ended',
++                    'payload': payload,
++                },
++            ])
++        self.write({'rtc_inviting_session_id': False})
++        self.env['bus.bus'].sendmany(notifications)
+ 
+     def init(self):
+         self.env.cr.execute("CREATE UNIQUE INDEX IF NOT EXISTS mail_channel_partner_partner_unique ON %s (channel_id, partner_id) WHERE partner_id IS NOT NULL" % self._table)
+
+--- a/None
++++ b/addons/mail/models/mail_channel_rtc_session.py
+@@ -0,0 +1,131 @@
++# -*- coding: utf-8 -*-
++# Part of Odoo. See LICENSE file for full copyright and licensing details.
++
++from dateutil.relativedelta import relativedelta
++
++from odoo import api, fields, models
++
++
++class MailRtcSession(models.Model):
++    _name = 'mail.channel.rtc.session'
++    _description = 'Mail RTC session'
++
++    channel_partner_id = fields.Many2one('mail.channel.partner', index=True, required=True, ondelete='cascade')
++    channel_id = fields.Many2one('mail.channel', related='channel_partner_id.channel_id', store=True, readonly=True)
++    partner_id = fields.Many2one('res.partner', related='channel_partner_id.partner_id', string="Partner")
++    guest_id = fields.Many2one('mail.guest', related='channel_partner_id.guest_id')
++
++    write_date = fields.Datetime("Last Updated On", index=True)
++
++    is_screen_sharing_on = fields.Boolean(string="Is sharing the screen")
++    is_camera_on = fields.Boolean(string="Is sending user video")
++    is_muted = fields.Boolean(string="Is microphone muted")
++    is_deaf = fields.Boolean(string="Has disabled incoming sound")
++
++    _sql_constraints = [
++        ('channel_partner_unique', 'UNIQUE(channel_partner_id)',
++         'There can only be one rtc session per channel partner')
++    ]
++
++    def _update_and_broadcast(self, values):
++        """ Updates the session and notifies all members of the channel
++            of the change.
++        """
++        valid_values = {'is_screen_sharing_on', 'is_camera_on', 'is_muted', 'is_deaf'}
++        self.write({key: values[key] for key in valid_values if key in valid_values})
++        session_data = self._mail_rtc_session_format()
++        self.env['bus.bus'].sendone((self._cr.dbname, 'mail.channel', self.channel_id.id), {
++            'type': 'rtc_session_data_update',
++            'payload': {
++                'rtcSession': session_data,
++            },
++        })
++
++    @api.autovacuum
++    def _gc_inactive_sessions(self):
++        """ Garbage collect sessions that aren't active anymore,
++            this can happen when the server or the user's browser crash
++            or when the user's odoo session ends.
++        """
++        sessions = self.search([
++            ('write_date', '<', fields.Datetime.now() - relativedelta(days=1))
++        ])
++        if not sessions:
++            return
++        channel_ids = sessions.channel_id
++        sessions.unlink()
++        channel_ids._notify_rtc_sessions_change()
++
++    def action_disconnect(self):
++        channels = self.channel_id
++        self._disconnect()
++        if channels:
++            channels._notify_rtc_sessions_change()
++
++    def _disconnect(self):
++        """ Unlinks the sessions and notifies the associated partners/guests that
++            their session ended.
++        """
++        notifications = []
++        for record in self:
++            model, record_id = ('mail.guest', record.guest_id.id) if record.guest_id else ('res.partner', record.partner_id.id)
++            notifications.append([
++                (self._cr.dbname, model, record_id),
++                {
++                    'type': 'rtc_session_ended',
++                    'payload': {
++                        'sessionId': record.id,
++                    },
++                },
++            ])
++        self.unlink()
++        self.env['bus.bus'].sendmany(notifications)
++
++    def _notify_peers(self, target_session_ids, content):
++        """ Used for peer-to-peer communication,
++            guarantees that the sender is the current guest or partner.
++
++            :param target_session_ids: a list of mail.channel.rtc.session ids
++            :param content: a dict with the content to be sent to the targets
++        """
++        notifications = []
++        target_sessions = self.search([('id', 'in', [int(target) for target in target_session_ids]), ('channel_id', '=', self.channel_id.id)])
++        for session in target_sessions:
++            model, record_id = ('mail.guest', session.guest_id.id) if session.guest_id else ('res.partner', session.partner_id.id)
++            notifications.append([
++                (self._cr.dbname, model, record_id),
++                {
++                    'type': 'rtc_peer_notification',
++                    'payload': {
++                        'sender': self.id,
++                        'content': content,
++                    },
++                },
++            ])
++        return self.env['bus.bus'].sendmany(notifications)
++
++    def _mail_rtc_session_format(self):
++        vals = {
++            'id': self.id,
++            'is_screen_sharing_on': self.is_screen_sharing_on,
++            'is_muted': self.is_muted,
++            'is_deaf': self.is_deaf,
++            'is_camera_on': self.is_camera_on,
++        }
++        if self.guest_id:
++            vals['guest'] = {
++                'id': self.guest_id.id,
++                'name': self.guest_id.name,
++            }
++        else:
++            vals['partner'] = {
++                'id': self.partner_id.id,
++                'name': self.partner_id.name,
++            }
++        return vals
++
++    def _mail_rtc_session_format_by_channel(self):
++        data = {}
++        for record in self:
++            data.setdefault(record.channel_id.id, []).append(record._mail_rtc_session_format())
++        return data
+
+--- a/None
++++ b/addons/mail/models/mail_ice_server.py
+@@ -0,0 +1,57 @@
++# -*- coding: utf-8 -*-
++# Part of Odoo. See LICENSE file for full copyright and licensing details.
++
++from odoo import fields, models
++import requests
++
++
++class MailIceServer(models.Model):
++    _name = 'mail.ice.server'
++    _description = 'ICE server'
++
++    server_type = fields.Selection([('stun', 'stun:'), ('turn', 'turn:')], string='Type', required=True, default='stun')
++    uri = fields.Char('URI', required=True)
++    username = fields.Char()
++    credential = fields.Char()
++
++    def _get_local_ice_servers(self):
++        """
++        :return: List of up to 5 dict, each of which representing a stun or turn server
++        """
++        # firefox has a hard cap of 5 ice servers
++        ice_servers = self.sudo().search([], limit=5)
++        formatted_ice_servers = []
++        for ice_server in ice_servers:
++            formatted_ice_server = {
++                'urls': '%s:%s' % (ice_server.server_type, ice_server.uri),
++            }
++            if ice_server.username:
++                formatted_ice_server['username'] = ice_server.username
++            if ice_server.credential:
++                formatted_ice_server['credential'] = ice_server.credential
++            formatted_ice_servers.append(formatted_ice_server)
++        return formatted_ice_servers
++
++    def _get_twilio_credentials(self):
++        """ To be overridable if we need to obtain credentials from another source.
++        :return: tuple
++        """
++        account_sid = self.env['ir.config_parameter'].get_param('mail.twilio_account_sid')
++        auth_token = self.env['ir.config_parameter'].get_param('mail.twilio_account_token')
++        return account_sid, auth_token
++
++    def _get_ice_servers(self):
++        """
++        :return: List of dict, each of which representing a stun or turn server,
++                formatted as expected by the specifications of RTCConfiguration.iceServers
++        """
++        if self.env['ir.config_parameter'].get_param('mail.use_twilio_rtc_servers'):
++            (account_sid, auth_token) = self._get_twilio_credentials()
++            if account_sid and auth_token:
++                url = f'https://api.twilio.com/2010-04-01/Accounts/{account_sid}/Tokens.json'
++                response = requests.post(url, auth=(account_sid, auth_token), timeout=60)
++                if response.ok:
++                    response_content = response.json()
++                    if response_content:
++                        return response_content['ice_servers']
++        return self._get_local_ice_servers()
+
+--- a/addons/mail/models/res_config_settings.py
++++ b/addons/mail/models/res_config_settings.py
+@@ -19,6 +19,19 @@ class ResConfigSettings(models.TransientModel):
+         config_parameter='mail.restrict.template.rendering',
+         help='Users will still be able to render templates.\n'
+         'However only Mail Template Editors will be able to create new dynamic templates or modify existing ones.')
++    use_twilio_rtc_servers = fields.Boolean(
++        'Use Twilio ICE servers',
++        help="If you want to use twilio as TURN/STUN server provider",
++        config_parameter='mail.use_twilio_rtc_servers',
++    )
++    twilio_account_sid = fields.Char(
++        'Twilio Account SID',
++        config_parameter='mail.twilio_account_sid',
++    )
++    twilio_account_token = fields.Char(
++        'Twilio Account Auth Token',
++        config_parameter='mail.twilio_account_token',
++    )
+ 
+     @api.model
+     def get_values(self):
+
+--- a/addons/mail/models/res_users_settings.py
++++ b/addons/mail/models/res_users_settings.py
+@@ -12,6 +12,12 @@ class ResUsersSettings(models.Model):
+     is_discuss_sidebar_category_channel_open = fields.Boolean(string="Is discuss sidebar category channel open?", default=True)
+     is_discuss_sidebar_category_chat_open = fields.Boolean(string="Is discuss sidebar category chat open?", default=True)
+ 
++    # RTC
++    push_to_talk_key = fields.Char(string="Push-To-Talk shortcut", help="String formatted to represent a key with modifiers following this pattern: shift.ctrl.alt.key, e.g: truthy.1.true.b")
++    use_push_to_talk = fields.Boolean(string="Use the push to talk feature", default=False)
++    voice_active_duration = fields.Integer(string="Duration of voice activity in ms", help="How long the audio broadcast will remain active after passing the volume threshold")
++    volume_settings_ids = fields.One2many('res.users.settings.volumes', 'user_setting_id', string="Volumes of other partners")
++
+     _sql_constraints = [
+         ('unique_user_id', 'UNIQUE(user_id)', 'One user should only have one mail user settings.')
+     ]
+@@ -25,7 +31,12 @@ class ResUsersSettings(models.Model):
+ 
+     def _res_users_settings_format(self):
+         self.ensure_one()
+-        return self._read_format(fnames=[name for name, field in self._fields.items() if name == 'id' or not field.automatic])[0]
++        res = self._read_format(fnames=[name for name, field in self._fields.items() if name == 'id' or not field.automatic])[0]
++        res.pop('volume_settings_ids')
++        res.update({
++            'volume_settings': self.volume_settings_ids._read_format(['id', 'user_setting_id', 'partner_id', 'volume']),
++        })
++        return res
+ 
+     def set_res_users_settings(self, new_settings):
+         self.ensure_one()
+@@ -38,3 +49,25 @@ class ResUsersSettings(models.Model):
+             'type': 'res.users_settings_changed',
+             'payload': changed_settings,
+         })
++
++    def set_volume_setting(self, partner_id, volume):
++        self.ensure_one()
++        volume_setting = self.env['res.users.settings.volumes'].search([('user_setting_id', '=', self.id), ('partner_id', '=', partner_id)])
++        if volume_setting:
++            volume_setting.volume = volume
++        else:
++            volume_setting = self.env['res.users.settings.volumes'].create([{
++                'user_setting_id': self.id,
++                'partner_id': partner_id,
++                'volume': volume,
++            }])
++        notification = {
++            'type': 'res_users_settings_volumes_update',
++            'payload': {
++                'volumeSettings': [('insert', {
++                    'id': volume_setting.id,
++                    'volume': volume_setting.volume,
++                })],
++            }
++        }
++        self.env['bus.bus'].sendone((self._cr.dbname, 'res.partner', self.user_id.partner_id.id), notification)
+
+--- a/None
++++ b/addons/mail/models/res_users_settings_volumes.py
+@@ -0,0 +1,23 @@
++# -*- coding: utf-8 -*-
++# Part of Odoo. See LICENSE file for full copyright and licensing details.
++
++from odoo import fields, models
++
++
++class ResUsersSettingsVolumes(models.Model):
++    """ Represents the volume of the sound that the user of user_setting_id will receive from partner_id. """
++    _name = 'res.users.settings.volumes'
++    _description = 'User Settings Volumes'
++
++    user_setting_id = fields.Many2one('res.users.settings', required=True, ondelete='cascade', index=True)
++    partner_id = fields.Many2one('res.partner', ondelete='cascade', index=True)
++    guest_id = fields.Many2one('res.partner', ondelete='cascade', index=True)
++    volume = fields.Float(default=0.5, help="Ranges between 0.0 and 1.0, scale depends on the browser implementation")
++
++    def init(self):
++        self.env.cr.execute("CREATE UNIQUE INDEX IF NOT EXISTS res_users_settings_volumes_partner_unique ON %s (user_setting_id, partner_id) WHERE partner_id IS NOT NULL" % self._table)
++        self.env.cr.execute("CREATE UNIQUE INDEX IF NOT EXISTS res_users_settings_volumes_guest_unique ON %s (user_setting_id, guest_id) WHERE guest_id IS NOT NULL" % self._table)
++
++    _sql_constraints = [
++        ("partner_or_guest_exists", "CHECK((partner_id IS NOT NULL AND guest_id IS NULL) OR (partner_id IS NULL AND guest_id IS NOT NULL))", "A volume setting must have a partner or a guest."),
++    ]

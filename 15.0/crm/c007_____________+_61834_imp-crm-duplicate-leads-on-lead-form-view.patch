@@ -1,0 +1,156 @@
+PR: https://github.com/odoo/odoo/pull/61834
+
+From: e86f892a7b277cc35fe32d365cfe50b7509a93a5
+From: Julien Banken
+Date: 2021-03-10 14:29:50
+
+Structural Changes: 3
+Total Changes: 83
+
+[IMP] crm: Duplicate leads on lead form view
+
+PURPOSE
+
+Duplicate lead records are an issue for CRM users
+To prevent sales representatives from contacting a prospect that:
+
+- Already refused an offer from another sales
+- Already accepted an offer from another sales
+- Is already discussing with another sales
+
+The purpose of this task is to inform the CRM user that there are
+some possible duplicates for one lead and let the user decide how
+to handle the case.
+
+SPECIFICATION
+
+- Add a computed field to count the number of potential duplicates.
+- Add a stat button on the form view of a lead to display the number
+of potential duplicates. When the user clicks on it, the leads
+considered as duplicate will be displayed in a kanban view.
+- Add a lost ribbon on the kanban view to quickly visualize the lead
+state since the duplicates can be lost leads.
+
+LINKS
+
+Task ID : 2151017
+
+closes odoo/odoo#61834
+
+Signed-off-by: Thibault Delavallee (tde) <tde@openerp.com>
+
+================================= pseudo patch: =================================
+
+--- a/addons/crm/models/crm_lead.py
++++ b/addons/crm/models/crm_lead.py
+@@ -8,6 +8,7 @@ from datetime import date, datetime, timedelta
+ from psycopg2 import sql
+ 
+ from odoo import api, fields, models, tools, SUPERUSER_ID
++from odoo.addons.iap.tools import iap_tools
+ from odoo.addons.mail.tools import mail_validation
+ from odoo.addons.phone_validation.tools import phone_validation
+ from odoo.exceptions import UserError, AccessError
+@@ -224,6 +225,8 @@ class Lead(models.Model):
+         index=True, ondelete='restrict', tracking=True)
+     # Statistics
+     meeting_count = fields.Integer('# Meetings', compute='_compute_meeting_count')
++    duplicate_lead_ids = fields.Many2many("crm.lead", compute="_compute_potential_lead_duplicates", string="Potential Duplicate Lead", context={"active_test": False})
++    duplicate_lead_count = fields.Integer(compute="_compute_potential_lead_duplicates", string="Potential Duplicate Lead Count")
+     # UX
+     ribbon_message = fields.Char('Ribbon message', compute='_compute_ribbon_message')
+ 
+@@ -502,6 +505,73 @@ class Lead(models.Model):
+         for lead in self:
+             lead.meeting_count = mapped_data.get(lead.id, 0)
+ 
++    @api.depends('email_from', 'partner_id', 'contact_name', 'partner_name')
++    def _compute_potential_lead_duplicates(self):
++        MIN_EMAIL_LENGTH = 7
++        MIN_NAME_LENGTH = 6
++        SEARCH_RESULT_LIMIT = 21
++
++        def return_if_relevant(model_name, domain):
++            """ Returns the recordset obtained by performing a search on the provided
++            model with the provided domain if the cardinality of that recordset is
++            below a given threshold (i.e: `SEARCH_RESULT_LIMIT`). Otherwise, returns
++            an empty recordset of the provided model as it indicates search term
++            was not relevant.
++
++            Note: The function will use the administrator privileges to guarantee
++            that a maximum amount of leads will be included in the search results
++            and transcend multi-company record rules. It also includes archived records.
++            Idea is that counter indicates duplicates are present and that lead
++            could be escalated to managers.
++            """
++            # Includes archived records and transcend multi-company record rules
++            model = self.env[model_name].sudo().with_context(active_test=False)
++            res = model.search(domain, limit=SEARCH_RESULT_LIMIT)
++            return res if len(res) < SEARCH_RESULT_LIMIT else model
++
++        def get_email_to_search(email):
++            """ Returns the full email address if the domain of the email address
++            is common (i.e: in the mail domain blacklist). Otherwise, returns
++            the domain of the email address. A minimal length is required to avoid
++            returning false positives records. """
++            if not email or len(email) < MIN_EMAIL_LENGTH:
++                return False
++            parts = email.rsplit('@', maxsplit=1)
++            if len(parts) > 1:
++                email_domain = parts[1]
++                if email_domain not in iap_tools._MAIL_DOMAIN_BLACKLIST:
++                    return '@' + email_domain
++            return email
++
++        for lead in self:
++            lead_id = lead._origin.id if isinstance(lead.id, models.NewId) else lead.id
++            common_lead_domain = [
++                ('id', '!=', lead_id)
++            ]
++
++            duplicate_lead_ids = self.env['crm.lead']
++            email_search = get_email_to_search(lead.email_from)
++
++            if email_search:
++                duplicate_lead_ids |= return_if_relevant('crm.lead', common_lead_domain + [
++                    ('email_from', 'ilike', email_search)
++                ])
++            if lead.partner_name and len(lead.partner_name) >= MIN_NAME_LENGTH:
++                duplicate_lead_ids |= return_if_relevant('crm.lead', common_lead_domain + [
++                    ('partner_name', 'ilike', lead.partner_name)
++                ])
++            if lead.contact_name and len(lead.contact_name) >= MIN_NAME_LENGTH:
++                duplicate_lead_ids |= return_if_relevant('crm.lead', common_lead_domain + [
++                    ('contact_name', 'ilike', lead.contact_name)
++                ])
++            if lead.partner_id and lead.partner_id.commercial_partner_id:
++                duplicate_lead_ids |= lead.with_context(active_test=False).search(common_lead_domain + [
++                    ("partner_id", "child_of", lead.partner_id.commercial_partner_id.id)
++                ])
++
++            lead.duplicate_lead_ids = duplicate_lead_ids + lead
++            lead.duplicate_lead_count = len(duplicate_lead_ids)
++
+     @api.depends('email_from', 'phone', 'partner_id')
+     def _compute_ribbon_message(self):
+         for lead in self:
+@@ -967,6 +1037,19 @@ class Lead(models.Model):
+             action['context']['initial_date'] = next_activity.calendar_event_id.start
+         return action
+ 
++    def action_show_potential_duplicates(self):
++        """ Open kanban view to display duplicate leads or opportunity.
++            :return dict: dictionary value for created kanban view
++        """
++        self.ensure_one()
++        action = self.env["ir.actions.actions"]._for_xml_id("crm.crm_lead_action_duplicates")
++        action['domain'] = [('id', 'in', self.duplicate_lead_ids.ids)]
++        action['context'] = {
++            'active_test': False,
++            'create': False
++        }
++        return action
++
+     def action_snooze(self):
+         self.ensure_one()
+         today = date.today()

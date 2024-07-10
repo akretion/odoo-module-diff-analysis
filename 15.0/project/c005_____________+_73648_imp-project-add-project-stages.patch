@@ -1,0 +1,187 @@
+PR: https://github.com/odoo/odoo/pull/73648
+
+From: 25f85544260201903495160634f30526b9a984d0
+From: William Braeckman
+Date: 2021-08-23 07:45:56
+
+Structural Changes: 5
+Total Changes: 78
+
+[IMP] project: add project stages
+
+Adds new optional stages for the project.project model.
+
+Previously projects would stay dormant when they were finished, we can
+now define stages for those projects to determine where a stage is in
+it's lifecycle.
+
+Also adds some small changes to the project itself, such as adding tags.
+
+Closes odoo/odoo#73648
+
+Task ID: 2581575
+
+Related: odoo/upgrade#2646
+Signed-off-by: LTU-Odoo <IT-Ideas@users.noreply.github.com>
+
+================================= pseudo patch: =================================
+
+--- a/addons/project/models/__init__.py
++++ b/addons/project/models/__init__.py
+@@ -3,9 +3,11 @@
+ 
+ from . import analytic_account
+ from . import project_milestone
++from . import project_project_stage
+ from . import project_task_recurrence
+ from . import project
+ from . import project_update
+ from . import res_config_settings
+ from . import res_partner
+ from . import digest
++from . import ir_ui_menu
+
+--- a/None
++++ b/addons/project/models/ir_ui_menu.py
+@@ -0,0 +1,14 @@
++# -*- coding: utf-8 -*-
++# Part of Odoo. See LICENSE file for full copyright and licensing details.
++
++from odoo import models
++
++
++class IrUiMenu(models.Model):
++    _inherit = 'ir.ui.menu'
++
++    def _load_menus_blacklist(self):
++        res = super()._load_menus_blacklist()
++        if self.env.user.has_group('project.group_project_stages'):
++            res.append(self.env.ref('project.menu_projects').id)
++        return res
+
+--- a/addons/project/models/project.py
++++ b/addons/project/models/project.py
+@@ -148,6 +148,10 @@ class Project(models.Model):
+         action['context'] = "{'default_res_model': '%s','default_res_id': %d}" % (self._name, self.id)
+         return action
+ 
++    def _default_stage_id(self):
++        # Since project stages are order by sequence first, this should fetch the one with the lowest sequence number.
++        return self.env['project.project.stage'].search([], limit=1)
++
+     def _compute_is_favorite(self):
+         for project in self:
+             project.is_favorite = self.env.user in project.favorite_user_ids
+@@ -167,6 +171,10 @@ class Project(models.Model):
+     def _get_default_favorite_user_ids(self):
+         return [(6, 0, [self.env.uid])]
+ 
++    @api.model
++    def _read_group_stage_ids(self, stages, domain, order):
++        return self.env['project.project.stage'].search([], order=order)
++
+     name = fields.Char("Name", index=True, required=True, tracking=True, translate=True)
+     description = fields.Html()
+     active = fields.Boolean(default=True,
+@@ -230,6 +238,7 @@ class Project(models.Model):
+     allow_subtasks = fields.Boolean('Sub-tasks', default=lambda self: self.env.user.has_group('project.group_subtask_project'))
+     allow_recurring_tasks = fields.Boolean('Recurring Tasks', default=lambda self: self.env.user.has_group('project.group_project_recurring_tasks'))
+     allow_task_dependencies = fields.Boolean('Task Dependencies', default=lambda self: self.env.user.has_group('project.group_project_task_dependencies'))
++    tag_ids = fields.Many2many('project.tags', relation='project_project_project_tags_rel', string='Tags')
+ 
+     # rating fields
+     rating_request_deadline = fields.Datetime(compute='_compute_rating_request_deadline', store=True)
+@@ -250,6 +259,10 @@ class Project(models.Model):
+         ('quarterly', 'Quarterly'),
+         ('yearly', 'Yearly')], 'Rating Frequency', required=True, default='monthly')
+ 
++    # Not `required` since this is an option to enable in project settings.
++    stage_id = fields.Many2one('project.project.stage', string='Stage', ondelete='restrict', groups="project.group_project_stages",
++        tracking=True, index=True, copy=False, default=_default_stage_id, group_expand='_read_group_stage_ids')
++
+     update_ids = fields.One2many('project.update', 'project_id')
+     last_update_id = fields.Many2one('project.update', string='Last Update')
+     last_update_status = fields.Selection(selection=[
+@@ -467,6 +480,27 @@ class Project(models.Model):
+             defaults['project_id'] = self.id
+         return values
+ 
++    # ---------------------------------------------------
++    # Mail gateway
++    # ---------------------------------------------------
++
++    def _track_template(self, changes):
++        res = super()._track_template(changes)
++        project = self[0]
++        if self.user_has_groups('project.group_project_stages') and 'stage_id' in changes and project.stage_id.mail_template_id:
++            res['stage_id'] = (project.stage_id.mail_template_id, {
++                'auto_delete_message': True,
++                'subtype_id': self.env['ir.model.data'].xmlid_to_res_id('mail.mt_note'),
++                'email_layout_xmlid': 'mail.mail_notification_light',
++            })
++        return res
++
++    def _track_subtype(self, init_values):
++        self.ensure_one()
++        if 'stage_id' in init_values:
++            return self.env.ref('project.mt_project_stage_change')
++        return super()._track_subtype(init_values)
++
+     # ---------------------------------------------------
+     #  Actions
+     # ---------------------------------------------------
+@@ -507,6 +541,13 @@ class Project(models.Model):
+         action_context['search_default_project_id'] = self.id
+         return dict(action, context=action_context)
+ 
++    @api.model
++    def _action_open_all_projects(self):
++        action = self.env['ir.actions.act_window']._for_xml_id(
++            'project.open_view_project_all' if not self.user_has_groups('project.group_project_stages') else
++            'project.open_view_project_all_group_stage')
++        return action
++
+     # ---------------------------------------------
+     #  PROJECT UPDATES
+     # ---------------------------------------------
+
+--- a/None
++++ b/addons/project/models/project_project_stage.py
+@@ -0,0 +1,16 @@
++# -*- coding: utf-8 -*-
++# Part of Odoo. See LICENSE file for full copyright and licensing details.
++
++from odoo import fields, models
++
++class ProjectProjectStage(models.Model):
++    _name = 'project.project.stage'
++    _description = 'Project Stage'
++    _order = 'sequence, id'
++
++    active = fields.Boolean(default=True)
++    sequence = fields.Integer(default=50)
++    name = fields.Char(required=True, translate=True)
++    mail_template_id = fields.Many2one('mail.template', string='Email Template', domain=[('model', '=', 'project.project')],
++        help="If set, an email will be sent to the customer when the project reaches this step.")
++    fold = fields.Boolean('Folded in Kanban', help="This stage is folded in the kanban view.")
+
+--- a/addons/project/models/res_config_settings.py
++++ b/addons/project/models/res_config_settings.py
+@@ -11,6 +11,7 @@ class ResConfigSettings(models.TransientModel):
+     module_hr_timesheet = fields.Boolean(string="Task Logs")
+     group_subtask_project = fields.Boolean("Sub-tasks", implied_group="project.group_subtask_project")
+     group_project_rating = fields.Boolean("Customer Ratings", implied_group='project.group_project_rating')
++    group_project_stages = fields.Boolean("Project Stages", implied_group="project.group_project_stages")
+     group_project_recurring_tasks = fields.Boolean("Recurring Tasks", implied_group="project.group_project_recurring_tasks")
+     group_project_task_dependencies = fields.Boolean("Task Dependencies", implied_group="project.group_project_task_dependencies")
+ 
+@@ -50,5 +51,9 @@ class ResConfigSettings(models.TransientModel):
+         if task_dep_change_subtype_id.hidden != (not self['group_project_task_dependencies']):
+             task_dep_change_subtype_id.hidden = not self['group_project_task_dependencies']
+             project_task_dep_change_subtype_id.hidden = not self['group_project_task_dependencies']
++        # Hide Project Stage Changed mail subtype according to the settings
++        project_stage_change_mail_type = self.env.ref('project.mt_project_stage_change')
++        if project_stage_change_mail_type.hidden == self['group_project_stages']:
++            project_stage_change_mail_type.hidden = not self['group_project_stages']
+ 
+         super(ResConfigSettings, self).set_values()

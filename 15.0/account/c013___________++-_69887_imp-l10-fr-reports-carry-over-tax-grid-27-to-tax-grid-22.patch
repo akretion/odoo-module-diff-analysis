@@ -1,0 +1,191 @@
+PR: https://github.com/odoo/odoo/pull/69887
+
+From: 2bac8ffceaf9328af2d3d1fe81a22106234b22aa
+From: Nicolas (vin)
+Date: 2021-08-02 06:51:33
+
+Structural Changes: 11
+Total Changes: 92
+
+[IMP] l10_fr_reports: carry over tax grid 27 to tax grid 22
+
+Using the new carryover feature, improve the french tax report to properly carryover the values from the tax grid 27 to the tax grid 22 of the next period.
+
+Also slightly improve the carryover itself
+to support total lines, and disallow to
+carry over to lines from another report.
+
+Task id #2452451
+
+closes odoo/odoo#69887
+
+Related: odoo/upgrade#2708
+Related: odoo/enterprise#17953
+Signed-off-by: Laurent Smet <smetl@users.noreply.github.com>
+
+================================= pseudo patch: =================================
+
+--- a/addons/account/models/account_tax_carryover_line.py
++++ b/addons/account/models/account_tax_carryover_line.py
+@@ -2,6 +2,7 @@ from odoo import api, fields, models, _
+ 
+ from odoo.exceptions import ValidationError
+ 
++
+ class AccountTaxCarryoverLine(models.Model):
+     _name = 'account.tax.carryover.line'
+     _description = 'Tax carryover line'
+@@ -9,17 +10,26 @@ class AccountTaxCarryoverLine(models.Model):
+     name = fields.Char(required=True)
+     amount = fields.Float(required=True, default=0.0)
+     date = fields.Date(required=True, default=fields.Date.context_today, readonly=True)
+-    tax_report_line_id = fields.Many2one(comodel_name='account.tax.report.line', string="Tax report line")
+-    tax_report_country_id = fields.Many2one(related='tax_report_line_id.report_id.country_id')
+-    company_id = fields.Many2one(comodel_name='res.company', string='Company',
+-                                 required=True,
+-                                 default=lambda self: self.env.company)
+-    foreign_vat_fiscal_position_id = fields.Many2one(comodel_name='account.fiscal.position',
+-                                                     string='Fiscal position',
+-                                                     help="The foreign fiscal position for which this carryover is made.",
+-                                                     domain="[('company_id', '=', company_id), "
+-                                                            "('country_id', '=', tax_report_country_id), "
+-                                                            "('foreign_vat', '!=', False)]")
++    tax_report_line_id = fields.Many2one(
++        comodel_name='account.tax.report.line',
++        string="Tax report line",
++        domain="[('report_id', '=', tax_report_id)]",
++    )
++    tax_report_id = fields.Many2one(related='tax_report_line_id.report_id')
++    tax_report_country_id = fields.Many2one(related='tax_report_id.country_id')
++    company_id = fields.Many2one(
++        comodel_name='res.company', string='Company',
++        required=True,
++        default=lambda self: self.env.company,
++    )
++    foreign_vat_fiscal_position_id = fields.Many2one(
++        comodel_name='account.fiscal.position',
++        string="Fiscal position",
++        help="The foreign fiscal position for which this carryover is made.",
++        domain="[('company_id', '=', company_id), "
++               "('country_id', '=', tax_report_country_id), "
++               "('foreign_vat', '!=', False)]",
++    )
+ 
+     @api.constrains('foreign_vat_fiscal_position_id')
+     def _check_fiscal_position(self):
+
+--- a/addons/account/models/account_tax_report.py
++++ b/addons/account/models/account_tax_report.py
+@@ -1,6 +1,7 @@
+ # -*- coding: utf-8 -*-
+ from odoo import api, fields, models, _
+ from odoo.exceptions import ValidationError
++from odoo.osv import expression
+ 
+ 
+ class AccountTaxReport(models.Model):
+@@ -118,14 +119,17 @@ class AccountTaxReportLine(models.Model):
+ 
+     # The selection should be filled in localizations using the system
+     carry_over_condition_method = fields.Selection(
+-        selection=[('no_negative_amount_carry_over_condition', 'No negative amount')],
+-        string="Carryover method",
++        selection=[
++            ('no_negative_amount_carry_over_condition', 'No negative amount'),
++            ('always_carry_over_and_set_to_0', 'Always carry over and set to 0'),
++        ],
++        string="Method",
+         help="The method used to determine if this line should be carried over."
+     )
+     carry_over_destination_line_id = fields.Many2one(
+-        string="Carryover to",
++        string="Destination",
+         comodel_name="account.tax.report.line",
+-        domain=[('tag_name', '!=', False)],
++        domain="[('report_id', '=', report_id)]",
+         help="The line to which the value of this line will be carried over to if needed."
+              " If left empty the line will carry over to itself."
+     )
+@@ -134,6 +138,17 @@ class AccountTaxReportLine(models.Model):
+         comodel_name='account.tax.carryover.line',
+         inverse_name='tax_report_line_id',
+     )
++    is_carryover_persistent = fields.Boolean(
++        string="Persistent",
++        help="If set, each new carryover amount is added to the previous ones. And the amounts are carried over from period to period.\n"
++             "If not set, each new carryover amount overrides the former one.",
++        default=True,
++    )
++    is_carryover_used_in_balance = fields.Boolean(
++        string="Used in line balance",
++        help="If set, the carryover amount for this line will be used when calculating its balance in the report."
++             "This means that the carryover could affect other lines if they are using this one in their computation."
++    )
+ 
+     @api.model
+     def create(self, vals):
+@@ -298,21 +313,28 @@ class AccountTaxReportLine(models.Model):
+             if neg_tags.name != '-'+record.tag_name or pos_tags.name != '+'+record.tag_name:
+                 raise ValidationError(_("The tags linked to a tax report line should always match its tag name."))
+ 
+-    def action_view_carryover_lines(self):
++    def action_view_carryover_lines(self, options):
+         ''' Action when clicking on the "View carryover lines" in the carryover info popup.
++        Takes into account the report options, to get the correct lines depending on the current
++        company/companies.
+ 
+         :return:    An action showing the account.tax.carryover.lines for the current tax report line.
+         '''
+         self.ensure_one()
++
++        target = self.carry_over_destination_line_id or self
++        domain = target._get_carryover_lines_domain(options)
++        carryover_lines = self.env['account.tax.carryover.line'].search(domain)
++
+         return {
+             'type': 'ir.actions.act_window',
+-            'name': _('Carryover Lines For %s', self.name),
++            'name': _('Carryover Lines For %s', target.name),
+             'res_model': 'account.tax.carryover.line',
+             'view_type': 'list',
+             'view_mode': 'list',
+             'views': [[self.env.ref('account.account_tax_carryover_line_tree').id, 'list'],
+                       [False, 'form']],
+-            'domain': [('id', 'in', self.carryover_line_ids.ids)],
++            'domain': [('id', 'in', carryover_lines.ids)],
+         }
+ 
+     def _get_carryover_bounds(self, options, line_amount, carried_over_amount):
+@@ -338,8 +360,32 @@ class AccountTaxReportLine(models.Model):
+ 
+         return None
+ 
++    def _get_carryover_lines_domain(self, options):
++        """
++        :param options: The report options
++        :return: The domain that can be used to search for carryover lines for this tax report line.
++        Using this domain instead of directly accessing the lines ensure that we only pick the ones related to the
++        companies affecting the tax report.
++        """
++        self.ensure_one()
++        domain = [('tax_report_line_id', '=', self.id)]
++
++        if options.get('multi_company'):
++            company_ids = [company['id'] for company in options['multi_company']]
++            domain = expression.AND([domain, [('company_id', 'in', company_ids)]])
++        else:
++            domain = expression.AND([domain, [('company_id', '=', self.env.company.id)]])
++
++        return domain
++
+     def no_negative_amount_carry_over_condition(self, options, line_amount, carried_over_amount):
+         # The bounds are (0, None).
+         # Lines below 0 will be set to 0 and reduce the balance of the carryover.
+         # Lines above 0 will never be carried over
+         return (0, None)
++
++    def always_carry_over_and_set_to_0(self, options, line_amount, carried_over_amount):
++        # The bounds are (0, 0).
++        # Lines below 0 will be set to 0 and reduce the balance of the carryover.
++        # Lines above 0 will be set to 0 and increase the balance of the carryover.
++        return (0, 0)
