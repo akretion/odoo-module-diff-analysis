@@ -1,0 +1,493 @@
+PR: https://github.com/odoo/odoo/pull/90899
+
+From: f7b8f07501315233c8208e99b311935815039a3a
+From: Horacio Tellez
+Date: 2022-09-09 11:38:08
+
+Structural Changes: 5.9
+Total Changes: 306
+
+[IMP] payment: rename of acquirer to provider
+
+Changing the name of model payment.acquirer to payment.provider
+and everything that it touches. It is technically incorrect to
+use the term "acquirer" for systems that only provide a service
+of payment.
+After this commit the model payment.acquirer and all related to
+it will be renamed to payment.provider.
+
+Task - 2842088
+
+closes odoo/odoo#90899
+
+Related: odoo/upgrade#3542
+Related: odoo/documentation#1981
+Related: odoo/enterprise#27131
+Signed-off-by: Victor Feyens (vfe) <vfe@odoo.com>
+
+================================= pseudo patch: =================================
+
+--- a/addons/account_payment/models/__init__.py
++++ b/addons/account_payment/models/__init__.py
+@@ -5,5 +5,5 @@ from . import account_move
+ from . import account_payment
+ from . import account_payment_method
+ from . import account_payment_method_line
+-from . import payment_acquirer
++from . import payment_provider
+ from . import payment_transaction
+
+--- a/addons/account_payment/models/account_journal.py
++++ b/addons/account_payment/models/account_journal.py
+@@ -11,50 +11,52 @@ class AccountJournal(models.Model):
+     @api.constrains('inbound_payment_method_line_ids')
+     def _check_inbound_payment_method_line_ids(self):
+         """
+-        Check and ensure that the user do not remove a apml that is linked to an acquirer in the test or enabled state.
++        Check and ensure that the user do not remove a apml that is linked to a provider in the test or enabled state.
+         """
+         if not self.company_id:
+             return
+ 
+         self.env['account.payment.method'].flush_model(['code', 'payment_type'])
+         self.env['account.payment.method.line'].flush_model(['payment_method_id'])
+-        self.env['payment.acquirer'].flush_model(['provider', 'state'])
++        self.env['payment.provider'].flush_model(['code', 'state'])
+ 
+         self._cr.execute('''
+-            SELECT acquirer.id
+-              FROM payment_acquirer acquirer
++            SELECT provider.id
++              FROM payment_provider provider
+               JOIN account_payment_method apm
+-                ON apm.code = acquirer.provider
++                ON apm.code = provider.code
+          LEFT JOIN account_payment_method_line apml
+                 ON apm.id = apml.payment_method_id AND apml.journal_id IS NOT NULL
+-             WHERE acquirer.state IN ('enabled', 'test')
+-               AND acquirer.provider != 'custom'
++             WHERE provider.state IN ('enabled', 'test')
++               AND provider.code != 'custom'
+                AND apm.payment_type = 'inbound'
+                AND apml.id IS NULL
+-               AND acquirer.company_id IN %(company_ids)s
++               AND provider.company_id IN %(company_ids)s
+         ''', {'company_ids': tuple(self.company_id.ids)})
+         ids = [r[0] for r in self._cr.fetchall()]
+         if ids:
+-            acquirers = self.env['payment.acquirer'].sudo().browse(ids)
+-            raise UserError(_("You can't delete a payment method that is linked to an acquirer in the enabled or test state.\n"
+-                              "Linked acquirer(s): %s", ', '.join(a.display_name for a in acquirers)))
++            providers = self.env['payment.provider'].sudo().browse(ids)
++            raise UserError(
++                _("You can't delete a payment method that is linked to a provider in the enabled or test state.\n"
++                  "Linked provider(s): %s", ', '.join(p.display_name for p in providers))
++            )
+ 
+     def _get_available_payment_method_lines(self, payment_type):
+         lines = super()._get_available_payment_method_lines(payment_type)
+ 
+-        return lines.filtered(lambda l: l.payment_acquirer_state != 'disabled')
++        return lines.filtered(lambda l: l.payment_provider_state != 'disabled')
+ 
+     @api.depends('outbound_payment_method_line_ids', 'inbound_payment_method_line_ids')
+     def _compute_available_payment_method_ids(self):
+         super()._compute_available_payment_method_ids()
+ 
+-        installed_acquirers = self.env['payment.acquirer'].sudo().search([])
++        installed_providers = self.env['payment.provider'].sudo().search([])
+         method_information = self.env['account.payment.method']._get_payment_method_information()
+         pay_methods = self.env['account.payment.method'].search([('code', 'in', list(method_information.keys()))])
+         pay_method_by_code = {x.code + x.payment_type: x for x in pay_methods}
+ 
+-        # On top of the basic filtering, filter to hide unavailable acquirers.
+-        # This avoid allowing payment method lines linked to an acquirer that has no record.
++        # On top of the basic filtering, filter to hide unavailable providers.
++        # This avoid allowing payment method lines linked to a provider that has no record.
+         for code, vals in method_information.items():
+             payment_method = pay_method_by_code.get(code + 'inbound')
+ 
+@@ -64,9 +66,9 @@ class AccountJournal(models.Model):
+             for journal in self:
+                 to_remove = []
+ 
+-                available_providers = installed_acquirers.filtered(
+-                    lambda a: a.company_id == journal.company_id
+-                ).mapped('provider')
++                available_providers = installed_providers.filtered(
++                    lambda p: p.company_id == journal.company_id
++                ).mapped('code')
+                 available = payment_method.code in available_providers
+ 
+                 if vals['mode'] == 'unique' and not available:
+
+--- a/addons/account_payment/models/account_move.py
++++ b/addons/account_payment/models/account_move.py
+@@ -45,13 +45,13 @@ class AccountMove(models.Model):
+     def payment_action_capture(self):
+         """ Capture all transactions linked to this invoice. """
+         payment_utils.check_rights_on_recordset(self)
+-        # In sudo mode because we need to be able to read on acquirer fields.
++        # In sudo mode because we need to be able to read on provider fields.
+         self.authorized_transaction_ids.sudo().action_capture()
+ 
+     def payment_action_void(self):
+         """ Void all transactions linked to this invoice. """
+         payment_utils.check_rights_on_recordset(self)
+-        # In sudo mode because we need to be able to read on acquirer fields.
++        # In sudo mode because we need to be able to read on provider fields.
+         self.authorized_transaction_ids.sudo().action_void()
+ 
+     def action_view_payment_transactions(self):
+
+--- a/addons/account_payment/models/account_payment.py
++++ b/addons/account_payment/models/account_payment.py
+@@ -18,7 +18,7 @@ class AccountPayment(models.Model):
+         string="Saved Payment Token", comodel_name='payment.token', domain="""[
+             ('id', 'in', suitable_payment_token_ids),
+         ]""",
+-        help="Note that only tokens from acquirers allowing to capture the amount are available.")
++        help="Note that only tokens from providers allowing to capture the amount are available.")
+     amount_available_for_refund = fields.Monetary(compute='_compute_amount_available_for_refund')
+ 
+     # == Display purpose fields ==
+@@ -48,7 +48,7 @@ class AccountPayment(models.Model):
+     def _compute_amount_available_for_refund(self):
+         for payment in self:
+             tx_sudo = payment.payment_transaction_id.sudo()
+-            if tx_sudo.acquirer_id.support_refund and tx_sudo.operation != 'refund':
++            if tx_sudo.provider_id.support_refund and tx_sudo.operation != 'refund':
+                 # Only consider refund transactions that are confirmed by summing the amounts of
+                 # payments linked to such refund transactions. Indeed, should a refund transaction
+                 # be stuck forever in a transient state (due to webhook failure, for example), the
+@@ -71,9 +71,9 @@ class AccountPayment(models.Model):
+             if payment.use_electronic_payment_method:
+                 payment.suitable_payment_token_ids = self.env['payment.token'].sudo().search([
+                     ('company_id', '=', payment.company_id.id),
+-                    ('acquirer_id.capture_manually', '=', False),
++                    ('provider_id.capture_manually', '=', False),
+                     ('partner_id', 'in', related_partner_ids.ids),
+-                    ('acquirer_id', '=', payment.payment_method_line_id.payment_acquirer_id.id),
++                    ('provider_id', '=', payment.payment_method_line_id.payment_provider_id.id),
+                 ])
+             else:
+                 payment.suitable_payment_token_ids = [Command.clear()]
+@@ -82,8 +82,8 @@ class AccountPayment(models.Model):
+     def _compute_use_electronic_payment_method(self):
+         for payment in self:
+             # Get a list of all electronic payment method codes.
+-            # These codes are comprised of 'electronic' and the providers of each payment acquirer.
+-            codes = [key for key in dict(self.env['payment.acquirer']._fields['provider']._description_selection(self.env))]
++            # These codes are comprised of 'electronic' and the providers of each payment provider.
++            codes = [key for key in dict(self.env['payment.provider']._fields['code']._description_selection(self.env))]
+             payment.use_electronic_payment_method = payment.payment_method_code in codes
+ 
+     def _compute_refunds_count(self):
+@@ -103,7 +103,7 @@ class AccountPayment(models.Model):
+ 
+     @api.onchange('partner_id', 'payment_method_line_id', 'journal_id')
+     def _onchange_set_payment_token_id(self):
+-        codes = [key for key in dict(self.env['payment.acquirer']._fields['provider']._description_selection(self.env))]
++        codes = [key for key in dict(self.env['payment.provider']._fields['code']._description_selection(self.env))]
+         if not (self.payment_method_code in codes and self.partner_id and self.journal_id):
+             self.payment_token_id = False
+             return
+@@ -117,20 +117,20 @@ class AccountPayment(models.Model):
+         self.payment_token_id = self.env['payment.token'].sudo().search([
+             ('company_id', '=', self.company_id.id),
+             ('partner_id', 'in', related_partner_ids.ids),
+-            ('acquirer_id.capture_manually', '=', False),
+-            ('acquirer_id', '=', self.payment_method_line_id.payment_acquirer_id.id),
++            ('provider_id.capture_manually', '=', False),
++            ('provider_id', '=', self.payment_method_line_id.payment_provider_id.id),
+          ], limit=1)
+ 
+     #=== ACTION METHODS ===#
+ 
+     def action_post(self):
+         # Post the payments "normally" if no transactions are needed.
+-        # If not, let the acquirer update the state.
++        # If not, let the provider update the state.
+ 
+         payments_need_tx = self.filtered(
+             lambda p: p.payment_token_id and not p.payment_transaction_id
+         )
+-        # creating the transaction require to access data on payment acquirers, not always accessible to users
++        # creating the transaction require to access data on payment providers, not always accessible to users
+         # able to create payments
+         transactions = payments_need_tx.sudo()._create_payment_transaction()
+ 
+@@ -203,7 +203,7 @@ class AccountPayment(models.Model):
+     def _prepare_payment_transaction_vals(self, **extra_create_values):
+         self.ensure_one()
+         return {
+-            'acquirer_id': self.payment_token_id.acquirer_id.id,
++            'provider_id': self.payment_token_id.provider_id.id,
+             'reference': self.ref,
+             'amount': self.amount,
+             'currency_id': self.currency_id.id,
+
+--- a/addons/account_payment/models/account_payment_method.py
++++ b/addons/account_payment/models/account_payment_method.py
+@@ -10,10 +10,10 @@ class AccountPaymentMethod(models.Model):
+     @api.model
+     def _get_payment_method_information(self):
+         res = super()._get_payment_method_information()
+-        for provider, _desc in self.env['payment.acquirer']._fields['provider'].selection:
+-            if provider in ('none', 'transfer'):
++        for code, _desc in self.env['payment.provider']._fields['code'].selection:
++            if code in ('none', 'transfer'):
+                 continue
+-            res[provider] = {
++            res[code] = {
+                 'mode': 'unique',
+                 'domain': [('type', '=', 'bank')],
+             }
+
+--- a/addons/account_payment/models/account_payment_method_line.py
++++ b/addons/account_payment/models/account_payment_method_line.py
+@@ -8,35 +8,35 @@ from odoo.osv import expression
+ class AccountPaymentMethodLine(models.Model):
+     _inherit = "account.payment.method.line"
+ 
+-    payment_acquirer_id = fields.Many2one(
+-        comodel_name='payment.acquirer',
+-        compute='_compute_payment_acquirer_id',
++    payment_provider_id = fields.Many2one(
++        comodel_name='payment.provider',
++        compute='_compute_payment_provider_id',
+         store=True
+     )
+-    payment_acquirer_state = fields.Selection(
+-        related='payment_acquirer_id.state'
++    payment_provider_state = fields.Selection(
++        related='payment_provider_id.state'
+     )
+ 
+     @api.depends('payment_method_id')
+-    def _compute_payment_acquirer_id(self):
+-        acquirers = self.env['payment.acquirer'].sudo().search([
+-            ('provider', 'in', self.mapped('code')),
++    def _compute_payment_provider_id(self):
++        providers = self.env['payment.provider'].sudo().search([
++            ('code', 'in', self.mapped('code')),
+             ('company_id', 'in', self.journal_id.company_id.ids),
+         ])
+ 
+-        # Make sure to pick the active acquirer, if any.
+-        acquirers_map = dict()
+-        for acquirer in acquirers:
+-            current_value = acquirers_map.get((acquirer.provider, acquirer.company_id), False)
++        # Make sure to pick the active provider, if any.
++        providers_map = dict()
++        for provider in providers:
++            current_value = providers_map.get((provider.code, provider.company_id), False)
+             if current_value and current_value.state != 'disabled':
+                 continue
+ 
+-            acquirers_map[(acquirer.provider, acquirer.company_id)] = acquirer
++            providers_map[(provider.code, provider.company_id)] = provider
+ 
+         for line in self:
+             code = line.payment_method_id.code
+             company = line.journal_id.company_id
+-            line.payment_acquirer_id = acquirers_map.get((code, company), False)
++            line.payment_provider_id = providers_map.get((code, company), False)
+ 
+     @api.model
+     def _get_payment_method_domain(self, code):
+@@ -46,19 +46,19 @@ class AccountPaymentMethodLine(models.Model):
+ 
+         unique = information.get('mode') == 'unique'
+         if unique:
+-            company_ids = self.env['payment.acquirer'].sudo().search([('provider', '=', code)]).mapped('company_id')
++            company_ids = self.env['payment.provider'].sudo().search([('code', '=', code)]).mapped('company_id')
+             if company_ids:
+                 domain = expression.AND([domain, [('company_id', 'in', company_ids.ids)]])
+ 
+         return domain
+ 
+-    def action_open_acquirer_form(self):
++    def action_open_provider_form(self):
+         self.ensure_one()
+         return {
+             'type': 'ir.actions.act_window',
+-            'name': _('Acquirer'),
++            'name': _('Provider'),
+             'view_mode': 'form',
+-            'res_model': 'payment.acquirer',
++            'res_model': 'payment.provider',
+             'target': 'current',
+-            'res_id': self.payment_acquirer_id.id
++            'res_id': self.payment_provider_id.id
+         }
+
+--- a/addons/account_payment/models/payment_acquirer.py
++++ b/addons/account_payment/models/payment_provider.py
+@@ -3,8 +3,8 @@
+ from odoo import api, fields, models
+ 
+ 
+-class PaymentAcquirer(models.Model):
+-    _inherit = 'payment.acquirer'
++class Paymentprovider(models.Model):
++    _inherit = 'payment.provider'
+ 
+     journal_id = fields.Many2one(
+         string="Payment Journal",
+@@ -17,74 +17,74 @@ class PaymentAcquirer(models.Model):
+ 
+     #=== COMPUTE METHODS ===#
+ 
+-    @api.depends('provider')
++    @api.depends('code')
+     def _compute_journal_id(self):
+-        for acquirer in self:
++        for provider in self:
+             payment_method = self.env['account.payment.method.line'].search([
+-                ('journal_id.company_id', '=', acquirer.company_id.id),
+-                ('code', '=', acquirer.provider)
++                ('journal_id.company_id', '=', provider.company_id.id),
++                ('code', '=', provider.code)
+             ], limit=1)
+             if payment_method:
+-                acquirer.journal_id = payment_method.journal_id
++                provider.journal_id = payment_method.journal_id
+             else:
+-                acquirer.journal_id = False
++                provider.journal_id = False
+ 
+     def _inverse_journal_id(self):
+-        for acquirer in self:
++        for provider in self:
+             payment_method_line = self.env['account.payment.method.line'].search([
+-                ('journal_id.company_id', '=', acquirer.company_id.id),
+-                ('code', '=', acquirer.provider),
++                ('journal_id.company_id', '=', provider.company_id.id),
++                ('code', '=', provider.code),
+             ], limit=1)
+-            if acquirer.journal_id:
++            if provider.journal_id:
+                 if not payment_method_line:
+-                    default_payment_method_id = acquirer._get_default_payment_method_id(
+-                        acquirer.provider
++                    default_payment_method_id = provider._get_default_payment_method_id(
++                        provider.code
+                     )
+                     existing_payment_method_line = self.env['account.payment.method.line'].search([
+                         ('payment_method_id', '=', default_payment_method_id),
+-                        ('journal_id', '=', acquirer.journal_id.id),
++                        ('journal_id', '=', provider.journal_id.id),
+                     ], limit=1)
+                     if not existing_payment_method_line:
+                         self.env['account.payment.method.line'].create({
+                             'payment_method_id': default_payment_method_id,
+-                            'journal_id': acquirer.journal_id.id,
++                            'journal_id': provider.journal_id.id,
+                         })
+                 else:
+-                    payment_method_line.journal_id = acquirer.journal_id
++                    payment_method_line.journal_id = provider.journal_id
+             elif payment_method_line:
+                 payment_method_line.unlink()
+ 
+     @api.model
+-    def _get_default_payment_method_id(self, provider):
+-        provider_payment_method = self._get_provider_payment_method(provider)
++    def _get_default_payment_method_id(self, code):
++        provider_payment_method = self._get_provider_payment_method(code)
+         if provider_payment_method:
+             return provider_payment_method.id
+         return self.env.ref('account.account_payment_method_manual_in').id
+ 
+     @api.model
+-    def _get_provider_payment_method(self, provider):
+-        return self.env['account.payment.method'].search([('code', '=', provider)], limit=1)
++    def _get_provider_payment_method(self, code):
++        return self.env['account.payment.method'].search([('code', '=', code)], limit=1)
+ 
+     #=== BUSINESS METHODS ===#
+ 
+     @api.model
+-    def _setup_provider(self, provider_code):
++    def _setup_provider(self, code):
+         """ Override of `payment` to create the payment method of the provider. """
+-        super()._setup_provider(provider_code)
+-        self._setup_payment_method(provider_code)
++        super()._setup_provider(code)
++        self._setup_payment_method(code)
+ 
+     @api.model
+-    def _setup_payment_method(self, provider):
+-        if provider not in ('none', 'transfer') and not self._get_provider_payment_method(provider):
+-            providers_description = dict(self._fields['provider']._description_selection(self.env))
++    def _setup_payment_method(self, code):
++        if code not in ('none', 'transfer') and not self._get_provider_payment_method(code):
++            providers_description = dict(self._fields['code']._description_selection(self.env))
+             self.env['account.payment.method'].create({
+-                'name': providers_description[provider],
+-                'code': provider,
++                'name': providers_description[code],
++                'code': code,
+                 'payment_type': 'inbound',
+             })
+ 
+     @api.model
+-    def _remove_provider(self, provider):
++    def _remove_provider(self, code):
+         """ Override of `payment` to delete the payment method of the provider. """
+-        super()._remove_provider(provider)
+-        self._get_provider_payment_method(provider).unlink()
++        super()._remove_provider(code)
++        self._get_provider_payment_method(code).unlink()
+
+--- a/addons/account_payment/models/payment_transaction.py
++++ b/addons/account_payment/models/payment_transaction.py
+@@ -64,7 +64,7 @@ class PaymentTransaction(models.Model):
+     #=== BUSINESS METHODS - PAYMENT FLOW ===#
+ 
+     @api.model
+-    def _compute_reference_prefix(self, provider, separator, **values):
++    def _compute_reference_prefix(self, provider_code, separator, **values):
+         """ Compute the reference prefix from the transaction values.
+ 
+         If the `values` parameter has an entry with 'invoice_ids' as key and a list of (4, id, O) or
+@@ -73,7 +73,7 @@ class PaymentTransaction(models.Model):
+ 
+         Note: This method should be called in sudo mode to give access to documents (INV, SO, ...).
+ 
+-        :param str provider: The provider of the acquirer handling the transaction
++        :param str provider_code: The code of the provider handling the transaction
+         :param str separator: The custom separator used to separate data references
+         :param dict values: The transaction values used to compute the reference prefix. It should
+                             have the structure {'invoice_ids': [(X2M command), ...], ...}.
+@@ -87,7 +87,7 @@ class PaymentTransaction(models.Model):
+             invoices = self.env['account.move'].browse(invoice_ids).exists()
+             if len(invoices) == len(invoice_ids):  # All ids are valid
+                 return separator.join(invoices.mapped('name'))
+-        return super()._compute_reference_prefix(provider, separator, **values)
++        return super()._compute_reference_prefix(provider_code, separator, **values)
+ 
+     def _set_canceled(self, state_message=None):
+         """ Update the transactions' state to 'cancel'.
+@@ -134,16 +134,16 @@ class PaymentTransaction(models.Model):
+         """
+         self.ensure_one()
+ 
+-        payment_method_line = self.acquirer_id.journal_id.inbound_payment_method_line_ids\
+-            .filtered(lambda l: l.code == self.provider)
++        payment_method_line = self.provider_id.journal_id.inbound_payment_method_line_ids\
++            .filtered(lambda l: l.code == self.provider_code)
+         payment_values = {
+             'amount': abs(self.amount),  # A tx may have a negative amount, but a payment must >= 0
+             'payment_type': 'inbound' if self.amount > 0 else 'outbound',
+             'currency_id': self.currency_id.id,
+             'partner_id': self.partner_id.commercial_partner_id.id,
+             'partner_type': 'customer',
+-            'journal_id': self.acquirer_id.journal_id.id,
+-            'company_id': self.acquirer_id.company_id.id,
++            'journal_id': self.provider_id.journal_id.id,
++            'company_id': self.provider_id.company_id.id,
+             'payment_method_line_id': payment_method_line.id,
+             'payment_token_id': self.token_id.id,
+             'payment_transaction_id': self.id,

@@ -1,0 +1,199 @@
+PR: https://github.com/odoo/odoo/pull/
+
+From: ef00294e7189359c47638c4a71626f1937395edb
+From: Chong Wang (cwg)
+Date: 2022-09-15 20:37:50
+
+Structural Changes: 1
+Total Changes: 67
+
+[IMP] core: store translated fields as JSONB columns
+
+Translated fields no longer use the model ir.translation.  Instead they store
+all their values as JSON, and store them into JSONB columns in the model's
+table.  The field's column value is either NULL or a JSON dict mapping language
+codes to text (the field's value in the corresponding language), and must
+contain an entry for key 'en_US' (as it is used as a fallback for all other
+languages).  Empty text is allowed in translation values, but not NULL.
+
+Here are examples for a field with translate=True:
+
+    NULL
+    {"en_US": "Foo"}
+    {"en_US": "Foo", "fr_FR": "Bar", "nl_NL": "Baz"}
+    {"en_US": "Foo", "fr_FR": "", "nl_NL": "Baz"}
+
+Like before, writing False to the field makes it NULL, i.e., False in all
+languages.  However, writing "" to the field makes its value empty in the
+current language, but does not discard the values in the other languages.
+
+Here are examples for a field with translate=xml_translate:
+
+    NULL
+    {"en_US": "<div>Foo<p>Bar</p></div>", "fr_FR": "<div>Fou<p>Barre</p></div>"}
+
+Change for callable(translate) fields: one can now write any value in any
+language on such a field.  The new value will be adapted in all languages, based
+on the mapping of terms between languages in the old values.  Basically the
+structure of the value must remain the same in all languages, like before.
+
+Reading a translated field is now both simpler and faster than the former
+implementation.  We fetch the value of the field in the current language by
+coalescing its value with the 'en_US' value of the field:
+
+    SELECT id, COALESCE(name->>'fr_FR', name->>'en_US') AS name ...
+
+The raw cache of the field contains either None or a dict which is conceptually
+a subset of the JSON value in database (except for missing languages).  For the
+sake of simplicity, most cache operations deal with the dict and return the text
+value in the current language.
+
+Trigram indexes have been adapted to the new storing strategy, and should enable
+to search in any language.  Before this change, only the source value of the
+field ('en_US') could be indexed.
+
+Computed stored translated fields are not supported by the framework, because of
+the complexity of the computation itself: the field would need to be computed in
+all active languages.  We chose to not provide any hook to compute a field in
+all languages at once, and the framework always invokes a compute method once to
+recompute it.
+
+Code translations are no longer stored into the database.  They become static,
+and are extracted from the PO files when needed.  The worker simply uses a cache
+with extracted code translations for performance.  This is reasonable, since
+fr_FR code translations for all modules takes around 2MB of memory, and the
+cache can be shared among all registries in the worker.  Changing code
+translations requires to update the corresponding PO file and reloading the
+worker(s).
+
+Performance summary:
+ (+) reading 'model' translated fields is faster
+ (+) reading 'model_terms' translated fields is much faster (no need to inject
+     translations into the source value)
+ (+) searching translated fields with operator 'ilike' is much faster when the
+     field is indexed with 'trigram'
+ (+) updating translated fields requires less ORM flushing
+ (-) importing translations from PO files is 2x slower
+
+Some extra fixes:
+ - make field 'name' of ir.actions.actions translated; because of the PG
+   inheritance, this is necessary to make the column definition consistent in
+   all models that inherit from ir.actions.actions.
+ - add some backend API for the web/website client for editing translations
+ - move methods get_field_string() to model ir.model.fields
+ - move _load_module_terms to model ir.module.module
+ - adapt tests in test_impex, test_new_api
+ - because env.lang is injected into SQL queries, its returned value is
+   now guaranteed to correspond to a valid active language or None
+ - remove wizard to insert missing translations (no longer makes sense)
+
+task-id: 2081307
+
+Co-authored-by: Fabien Pinckaers <fp@openerp.com>
+Co-authored-by: Raphael Collet <rco@odoo.com>
+
+================================= pseudo patch: =================================
+
+--- a/addons/web_editor/models/__init__.py
++++ b/addons/web_editor/models/__init__.py
+@@ -5,7 +5,6 @@ from . import ir_attachment
+ from . import ir_qweb_fields
+ from . import ir_ui_view
+ from . import ir_http
+-from . import ir_translation
+ from . import ir_websocket
+ from . import models
+ 
+
+--- a/addons/web_editor/models/ir_qweb_fields.py
++++ b/addons/web_editor/models/ir_qweb_fields.py
+@@ -155,10 +155,13 @@ class Field(models.AbstractModel):
+             attrs['placeholder'] = placeholder
+ 
+         if options['translate'] and field.type in ('char', 'text'):
+-            name = "%s,%s" % (record._name, field_name)
+-            domain = [('name', '=', name), ('res_id', '=', record.id), ('type', '=', 'model'), ('lang', '=', options.get('lang'))]
+-            translation = record.env['ir.translation'].search(domain, limit=1)
+-            attrs['data-oe-translation-state'] = translation and translation.state or 'to_translate'
++            lang = record.env.lang or 'en_US'
++            if lang == 'en_US':
++                attrs['data-oe-translation-state'] = 'translated'
++            else:
++                value_en = record.with_context(lang='en_US')[field_name]
++                value_lang = record.with_context(lang=lang)[field_name]
++                attrs['data-oe-translation-state'] = 'translated' if value_en != value_lang else 'to_translate'
+ 
+         return attrs
+ 
+
+--- a/addons/web_editor/models/ir_translation.py
++++ b/None
+@@ -1,46 +0,0 @@
+-# -*- coding: utf-8 -*-
+-# Part of Odoo. See LICENSE file for full copyright and licensing details.
+-
+-from lxml import etree
+-
+-from odoo import models, api
+-from odoo.tools.translate import encode, xml_translate, html_translate
+-
+-
+-def edit_translation_mapping(data):
+-    data = dict(data, model=data['name'].partition(',')[0], value=data['value'] or data['src'])
+-    return '<span data-oe-model="%(model)s" data-oe-translation-id="%(id)s" data-oe-translation-state="%(state)s">%(value)s</span>' % data
+-
+-
+-class IrTranslation(models.Model):
+-    _inherit = 'ir.translation'
+-
+-    @api.model
+-    def _get_terms_mapping(self, field, records):
+-        if self._context.get('edit_translations'):
+-            self.insert_missing(field, records)
+-            return edit_translation_mapping
+-        return super(IrTranslation, self)._get_terms_mapping(field, records)
+-
+-    def save_html(self, value):
+-        """ Convert the HTML fragment ``value`` to XML if necessary, and write
+-        it as the value of translation ``self``.
+-        """
+-        assert len(self) == 1 and self.type == 'model_terms'
+-        mname, fname = self.name.split(',')
+-        field = self.env[mname]._fields[fname]
+-        if field.translate == xml_translate:
+-            # wrap value inside a div and parse it as HTML
+-            div = "<div>%s</div>" % encode(value)
+-            root = etree.fromstring(div, etree.HTMLParser(encoding='utf-8'))
+-            # root is html > body > div
+-            # serialize div as XML and discard surrounding tags
+-            value = etree.tostring(root[0][0], encoding='utf-8')[5:-6]
+-        elif field.translate == html_translate:
+-            # wrap value inside a div and parse it as HTML
+-            div = "<div>%s</div>" % encode(value)
+-            root = etree.fromstring(div, etree.HTMLParser(encoding='utf-8'))
+-            # root is html > body > div
+-            # serialize div as HTML and discard surrounding tags
+-            value = etree.tostring(root[0][0], encoding='utf-8', method='html')[5:-6]
+-        return self.write({'value': value})
+
+--- a/addons/web_editor/models/models.py
++++ b/addons/web_editor/models/models.py
+@@ -1,5 +1,7 @@
+ # -*- coding: utf-8 -*-
+ # Part of Odoo. See LICENSE file for full copyright and licensing details.
++from hashlib import sha256
++
+ from odoo import api, models
+ 
+ 
+@@ -12,3 +14,10 @@ class Base(models.AbstractModel):
+         keys.append('sanitize')
+         keys.append('sanitize_tags')
+         return keys
++
++
++class BaseModel(models.AbstractModel):
++    _inherit = 'base'
++
++    def update_field_translations_sha(self, fname, translations):
++        return self._update_field_translations(fname, translations, lambda old_term: sha256(old_term.encode()).hexdigest())
