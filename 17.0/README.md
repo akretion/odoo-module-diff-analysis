@@ -1,6 +1,6 @@
 # Dude, what did they do to my Odoo at version 17.0?
 
-You can see below the Odoo addons that changes that got the largest data model changes between versions 16.0 and 17.0:
+You can see below the Odoo addons that got the largest data model changes between versions 16.0 and 17.0:
 (this is just summing the size of the data model impacting commits addon per addon)
 You can browse each directory to dig into the detail of these changes.
 
