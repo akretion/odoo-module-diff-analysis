@@ -1,0 +1,396 @@
+PR: https://github.com/odoo/odoo/pull/76430
+
+From: 0ffa2d64baac6569caeb5054448d8651975e86bb
+From: Thomas Josse
+Date: 2023-03-06 16:47:09
+
+Structural Changes: 10
+Total Changes: 282
+
+[IMP] gamification, website_forum, website_slides: karma tracking improvement
+
+Purpose
+=======
+Some users found a way to farm karma points, so we want to be able to
+track the source of the karma gain / loss.
+
+Specifications
+==============
+Now, we added a reference field `origin_ref` which store the record
+responsible for the karma gain / loss (e.g. a slide we just completed).
+
+In addition to this origin, we also have a new field to store the
+reason (e.g. "Slide completed") so we know exactly what happened and
+how the user gains his karma.
+
+Before, the `old_value` of the karma tracking has to be set manually,
+but now it's done automatically based on the value of the previous
+tracking of the same user. That way, it will simplify other part of
+the code.
+
+Add the karma reason in the website modules. Adapt those modules due
+to the changes in gamification.
+
+Task-2234179
+
+closes odoo/odoo#76430
+
+Related: odoo/enterprise#23702
+Related: odoo/upgrade#3299
+Signed-off-by: Warnon Aurélien (awa) <awa@odoo.com>
+Co-authored-by: std-odoo <std@odoo.com>
+
+================================= pseudo patch: =================================
+
+--- a/addons/gamification/models/gamification_karma_tracking.py
++++ b/addons/gamification/models/gamification_karma_tracking.py
+@@ -1,69 +1,135 @@
+ # -*- coding: utf-8 -*-
+ # Part of Odoo. See LICENSE file for full copyright and licensing details.
+ 
+-import calendar
+-
+ from dateutil.relativedelta import relativedelta
+ 
+-from odoo import api, fields, models
++from odoo import _, api, fields, models
++from odoo.tools import date_utils
+ 
+ 
+ class KarmaTracking(models.Model):
+     _name = 'gamification.karma.tracking'
+     _description = 'Track Karma Changes'
+     _rec_name = 'user_id'
+-    _order = 'tracking_date DESC'
++    _order = 'tracking_date desc, id desc'
++
++    def _get_origin_selection_values(self):
++        return [('res.users', _('User'))]
+ 
+-    user_id = fields.Many2one('res.users', 'User', index=True, readonly=True, required=True, ondelete='cascade')
+-    old_value = fields.Integer('Old Karma Value', required=True, readonly=True)
+-    new_value = fields.Integer('New Karma Value', required=True, readonly=True)
++    user_id = fields.Many2one('res.users', 'User', index=True, required=True, ondelete='cascade')
++    old_value = fields.Integer('Old Karma Value', readonly=True)
++    new_value = fields.Integer('New Karma Value', required=True)
++    gain = fields.Integer('Gain', compute='_compute_gain', readonly=False)
+     consolidated = fields.Boolean('Consolidated')
+-    tracking_date = fields.Date(default=fields.Date.context_today)
++
++    tracking_date = fields.Datetime(default=fields.Datetime.now, readonly=True, index=True)
++    reason = fields.Text(default=lambda self: _('Add Manually'), string='Description')
++    origin_ref = fields.Reference(
++        string='Source',
++        selection=lambda self: self._get_origin_selection_values(),
++        default=lambda self: f'res.users,{self.env.user.id}',
++    )
++    origin_ref_model_name = fields.Selection(
++        string='Source Type', selection=lambda self: self._get_origin_selection_values(),
++        compute='_compute_origin_ref_model_name', store=True)
++
++    @api.depends('old_value', 'new_value')
++    def _compute_gain(self):
++        for karma in self:
++            karma.gain = karma.new_value - (karma.old_value or 0)
++
++    @api.depends('origin_ref')
++    def _compute_origin_ref_model_name(self):
++        for karma in self:
++            if not karma.origin_ref:
++                karma.origin_ref_model_name = False
++                continue
++
++            karma.origin_ref_model_name = karma.origin_ref._name
++
++    @api.model_create_multi
++    def create(self, values_list):
++        # fill missing old value with current user karma
++        users = self.env['res.users'].browse([
++            values['user_id']
++            for values in values_list
++            if 'old_value' not in values and values.get('user_id')
++        ])
++        karma_per_users = {user.id: user.karma for user in users}
++
++        for values in values_list:
++            if 'old_value' not in values and values.get('user_id'):
++                values['old_value'] = karma_per_users[values['user_id']]
++
++            if 'gain' in values and 'old_value' in values:
++                values['new_value'] = values['old_value'] + values['gain']
++                del values['gain']
++
++        return super().create(values_list)
+ 
+     @api.model
+-    def _consolidate_last_month(self):
+-        """ Consolidate last month. Used by a cron to cleanup tracking records. """
+-        previous_month_start = fields.Date.today() + relativedelta(months=-1, day=1)
+-        return self._process_consolidate(previous_month_start)
+-
+-    def _process_consolidate(self, from_date):
+-        """ Consolidate trackings into a single record for a given month, starting
+-        at a from_date (included). End date is set to last day of current month
+-        using a smart calendar.monthrange construction. """
+-        end_date = from_date + relativedelta(day=calendar.monthrange(from_date.year, from_date.month)[1])
++    def _consolidate_cron(self):
++        """Consolidate the trackings 2 months ago. Used by a cron to cleanup tracking records."""
++        from_date = date_utils.start_of(fields.Datetime.today(), 'month') - relativedelta(months=2)
++        return self._process_consolidate(from_date)
++
++    def _process_consolidate(self, from_date, end_date=None):
++        """Consolidate the karma trackings.
++
++        The consolidation keeps, for each user, the oldest "old_value" and the most recent
++        "new_value", creates a new karma tracking with those values and removes all karma
++        trackings between those dates. The origin / reason is changed on the consolidated
++        records, so this information is lost in the process.
++        """
++        self.env['gamification.karma.tracking'].flush_model()
++
++        if not end_date:
++            end_date = date_utils.end_of(date_utils.end_of(from_date, 'month'), 'day')
++
+         select_query = """
+-SELECT user_id,
+-(
+-    SELECT old_value from gamification_karma_tracking old_tracking
+-    WHERE old_tracking.user_id = gamification_karma_tracking.user_id
+-        AND tracking_date::timestamp BETWEEN %(from_date)s AND %(to_date)s
+-        AND consolidated IS NOT TRUE
+-        ORDER BY tracking_date ASC LIMIT 1
+-), (
+-    SELECT new_value from gamification_karma_tracking new_tracking
+-    WHERE new_tracking.user_id = gamification_karma_tracking.user_id
+-        AND tracking_date::timestamp BETWEEN %(from_date)s AND %(to_date)s
+-        AND consolidated IS NOT TRUE
+-        ORDER BY tracking_date DESC LIMIT 1
+-)
+-FROM gamification_karma_tracking
+-WHERE tracking_date::timestamp BETWEEN %(from_date)s AND %(to_date)s
+-AND consolidated IS NOT TRUE
+-GROUP BY user_id """
++        WITH old_tracking AS (
++            SELECT DISTINCT ON (user_id) user_id, old_value, tracking_date
++              FROM gamification_karma_tracking
++             WHERE tracking_date BETWEEN %(from_date)s
++               AND %(end_date)s
++               AND consolidated IS NOT TRUE
++          ORDER BY user_id, tracking_date ASC, id ASC
++        )
++            INSERT INTO gamification_karma_tracking (
++                            user_id,
++                            old_value,
++                            new_value,
++                            tracking_date,
++                            origin_ref,
++                            consolidated,
++                            reason)
++            SELECT DISTINCT ON (nt.user_id)
++                            nt.user_id,
++                            ot.old_value AS old_value,
++                            nt.new_value AS new_value,
++                            ot.tracking_date AS from_tracking_date,
++                            %(origin_ref)s AS origin_ref,
++                            TRUE,
++                            %(reason)s
++              FROM gamification_karma_tracking AS nt
++              JOIN old_tracking AS ot
++                   ON ot.user_id = nt.user_id
++             WHERE nt.tracking_date BETWEEN %(from_date)s
++               AND %(end_date)s
++               AND nt.consolidated IS NOT TRUE
++          ORDER BY nt.user_id, nt.tracking_date DESC, id DESC
++        """
++
+         self.env.cr.execute(select_query, {
+             'from_date': from_date,
+-            'to_date': end_date,
++            'end_date': end_date,
++            'origin_ref': f'res.users,{self.env.user.id}',
++            'reason': _('Consolidation from %s to %s', from_date.date(), end_date.date()),
+         })
+-        results = self.env.cr.dictfetchall()
+-        if results:
+-            for result in results:
+-                result['consolidated'] = True
+-                result['tracking_date'] = fields.Date.to_string(from_date)
+-            self.create(results)
+-
+-            self.search([
+-                ('tracking_date', '>=', from_date),
+-                ('tracking_date', '<=', end_date),
+-                ('consolidated', '!=', True)]
+-            ).unlink()
++
++        self.search([
++            ('tracking_date', '>=', from_date),
++            ('tracking_date', '<=', end_date),
++            ('consolidated', '!=', True)]
++        ).with_context(skip_karma_computation=True).unlink()
+         return True
+
+--- a/addons/gamification/models/res_users.py
++++ b/addons/gamification/models/res_users.py
+@@ -1,13 +1,13 @@
+ # -*- coding: utf-8 -*-
+ # Part of Odoo. See LICENSE file for full copyright and licensing details.
+ 
+-from odoo import api, fields, models
++from odoo import _, api, fields, models
+ 
+ 
+ class Users(models.Model):
+     _inherit = 'res.users'
+ 
+-    karma = fields.Integer('Karma', default=0)
++    karma = fields.Integer('Karma', compute='_compute_karma', store=True, readonly=False)
+     karma_tracking_ids = fields.One2many('gamification.karma.tracking', 'user_id', string='Karma Changes', groups="base.group_system")
+     badge_ids = fields.One2many('gamification.badge.user', 'user_id', string='Badges', copy=False)
+     gold_badge = fields.Integer('Gold badges count', compute="_get_user_badge_level")
+@@ -16,6 +16,33 @@ class Users(models.Model):
+     rank_id = fields.Many2one('gamification.karma.rank', 'Rank')
+     next_rank_id = fields.Many2one('gamification.karma.rank', 'Next Rank')
+ 
++    @api.depends('karma_tracking_ids.new_value')
++    def _compute_karma(self):
++        if self.env.context.get('skip_karma_computation'):
++            # do not need to update the user karma
++            # e.g. during the tracking consolidation
++            return
++
++        self.env['gamification.karma.tracking'].flush_model()
++
++        select_query = """
++            SELECT DISTINCT ON (user_id) user_id, new_value
++              FROM gamification_karma_tracking
++             WHERE user_id = ANY(%(user_ids)s)
++          ORDER BY user_id, tracking_date DESC, id DESC
++        """
++        self.env.cr.execute(select_query, {'user_ids': self.ids})
++
++        user_karma_map = {
++            values['user_id']: values['new_value']
++            for values in self.env.cr.dictfetchall()
++        }
++
++        for user in self:
++            user.karma = user_karma_map.get(user.id, 0)
++
++        self.sudo()._recompute_rank()
++
+     @api.depends('badge_ids')
+     def _get_user_badge_level(self):
+         """ Return total badge per level of users
+@@ -43,34 +70,56 @@ class Users(models.Model):
+     def create(self, values_list):
+         res = super(Users, self).create(values_list)
+ 
+-        karma_trackings = []
+-        for user in res:
+-            if user.karma:
+-                karma_trackings.append({'user_id': user.id, 'old_value': 0, 'new_value': user.karma})
+-        if karma_trackings:
+-            self.env['gamification.karma.tracking'].sudo().create(karma_trackings)
++        self._add_karma_batch({
++            user: {
++                'gain': int(vals['karma']),
++                'old_value': 0,
++                'origin_ref': f'res.users,{self.env.uid}',
++                'reason': _('User Creation'),
++            }
++            for user, vals in zip(res, values_list)
++            if vals.get('karma')
++        })
+ 
+-        res._recompute_rank()
+         return res
+ 
+-    def write(self, vals):
+-        karma_trackings = []
+-        if 'karma' in vals:
+-            for user in self:
+-                if user.karma != vals['karma']:
+-                    karma_trackings.append({'user_id': user.id, 'old_value': user.karma, 'new_value': vals['karma']})
+-
+-        result = super(Users, self).write(vals)
++    def write(self, values):
++        if 'karma' in values:
++            self._add_karma_batch({
++                user: {
++                    'gain': int(values['karma']) - user.karma,
++                    'origin_ref': f'res.users,{self.env.uid}',
++                }
++                for user in self
++                if int(values['karma']) != user.karma
++            })
++        return super().write(values)
++
++    def _add_karma(self, gain, source=None, reason=None):
++        self.ensure_one()
++        values = {'gain': gain, 'source': source, 'reason': reason}
++        return self._add_karma_batch({self: values})
+ 
+-        if karma_trackings:
+-            self.env['gamification.karma.tracking'].sudo().create(karma_trackings)
+-        if 'karma' in vals:
+-            self._recompute_rank()
+-        return result
++    def _add_karma_batch(self, values_per_user):
++        if not values_per_user:
++            return
+ 
+-    def add_karma(self, karma):
+-        for user in self:
+-            user.karma += karma
++        create_values = []
++        for user, values in values_per_user.items():
++            origin = values.get('source') or self.env.user
++            reason = values.get('reason') or _('Add Manually')
++            origin_description = f'{origin.display_name} #{origin.id}'
++            old_value = values.get('old_value', user.karma)
++
++            create_values.append({
++                'new_value': old_value + values['gain'],
++                'old_value': old_value,
++                'origin_ref': f'{origin._name},{origin.id}',
++                'reason': f'{reason} ({origin_description})',
++                'user_id': user.id,
++            })
++
++        self.env['gamification.karma.tracking'].sudo().create(create_values)
+         return True
+ 
+     def _get_tracking_karma_gain_position(self, user_domain, from_date=None, to_date=None):
+@@ -104,10 +153,10 @@ class Users(models.Model):
+ 
+         params = []
+         if from_date:
+-            date_from_condition = 'AND tracking.tracking_date::timestamp >= timestamp %s'
++            date_from_condition = 'AND tracking.tracking_date::DATE >= %s::DATE'
+             params.append(from_date)
+         if to_date:
+-            date_to_condition = 'AND tracking.tracking_date::timestamp <= timestamp %s'
++            date_to_condition = 'AND tracking.tracking_date::DATE <= %s::DATE'
+             params.append(to_date)
+         params.append(tuple(self.ids))
+ 
+@@ -303,3 +352,18 @@ WHERE sub.user_id IN %%s""" % {
+         """
+         self.ensure_one()
+         return []
++
++    def action_karma_report(self):
++        self.ensure_one()
++
++        return {
++            'name': _('Karma Updates'),
++            'res_model': 'gamification.karma.tracking',
++            'target': 'current',
++            'type': 'ir.actions.act_window',
++            'view_mode': 'tree',
++            'context': {
++                'default_user_id': self.id,
++                'search_default_user_id': self.id,
++            },
++        }
