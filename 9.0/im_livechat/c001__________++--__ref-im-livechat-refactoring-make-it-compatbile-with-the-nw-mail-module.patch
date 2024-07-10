@@ -1,0 +1,294 @@
+PR: https://github.com/odoo/odoo/pull/
+
+From: 95b97d1010e2596c8dbe719382c77c6009819afa
+From: Jérome Maes
+Date: 2015-09-01 18:16:09
+
+Structural Changes: 10
+Total Changes: 165
+
+[REF] im_livechat : refactoring, make it compatbile with the nw mail module, change reporting sql view (split them in 2), adapt view, ...
+
+================================= pseudo patch: =================================
+
+--- a/addons/im_livechat/models/im_livechat_channel.py
++++ b/addons/im_livechat/models/im_livechat_channel.py
+@@ -24,13 +24,12 @@ class ImLivechatChannel(models.Model):
+     def _default_user_ids(self):
+         return [(6, 0, [self._uid])]
+ 
+-
+     # attribute fields
+     name = fields.Char('Name', required=True, help="The name of the channel")
+     button_text = fields.Char('Text of the Button', default='Have a Question? Chat with us.',
+         help="Default text displayed on the Livechat Support Button")
+     default_message = fields.Char('Welcome Message', default='How may I help you?',
+-        help="This is an automated 'welcome' message that your visitor will see when they initiate a new chat session.")
++        help="This is an automated 'welcome' message that your visitor will see when they initiate a new conversation.")
+     input_placeholder = fields.Char('Chat Input Placeholder')
+ 
+     # computed fields
+@@ -39,7 +38,7 @@ class ImLivechatChannel(models.Model):
+     are_you_inside = fields.Boolean(string='Are you inside the matrix?',
+         compute='_are_you_inside', store=False, readonly=True)
+     script_external = fields.Text('Script (external)', compute='_compute_script_external', store=False, readonly=True)
+-    nbr_session = fields.Integer('Number of session', compute='_compute_nbr_session', store=False, readonly=True)
++    nbr_channel = fields.Integer('Number of conversation', compute='_compute_nbr_channel', store=False, readonly=True)
+     rating_percentage_satisfaction = fields.Integer('% Happy', compute='_compute_percentage_satisfaction', store=False, default=-1)
+ 
+     # images fields
+@@ -56,7 +55,7 @@ class ImLivechatChannel(models.Model):
+ 
+     # relationnal fields
+     user_ids = fields.Many2many('res.users', 'im_livechat_channel_im_user', 'channel_id', 'user_id', string='Operators', default=_default_user_ids)
+-    session_ids = fields.One2many('im_chat.session', 'channel_id', 'Sessions')
++    channel_ids = fields.One2many('mail.channel', 'livechat_channel_id', 'Sessions')
+     rule_ids = fields.One2many('im_livechat.channel.rule', 'channel_id', 'Rules')
+ 
+ 
+@@ -92,16 +91,16 @@ class ImLivechatChannel(models.Model):
+             record.web_page = "%s/im_livechat/support/%s/%i" % (base_url, self._cr.dbname, record.id)
+ 
+     @api.multi
+-    @api.depends('session_ids')
+-    def _compute_nbr_session(self):
++    @api.depends('channel_ids')
++    def _compute_nbr_channel(self):
+         for record in self:
+-            record.nbr_session = len(record.session_ids)
++            record.nbr_channel = len(record.channel_ids)
+ 
+     @api.multi
+-    @api.depends('session_ids.rating_ids')
++    @api.depends('channel_ids.rating_ids')
+     def _compute_percentage_satisfaction(self):
+         for record in self:
+-            repartition = record.session_ids.rating_get_grades()
++            repartition = record.channel_ids.rating_get_grades()
+             total = sum(repartition.values())
+             if total > 0:
+                 happy = repartition['great']
+@@ -109,7 +108,6 @@ class ImLivechatChannel(models.Model):
+             else:
+                 record.rating_percentage_satisfaction = -1
+ 
+-
+     # --------------------------
+     # Action Methods
+     # --------------------------
+@@ -131,7 +129,7 @@ class ImLivechatChannel(models.Model):
+         """
+         self.ensure_one()
+         action = self.env['ir.actions.act_window'].for_xml_id('rating', 'action_view_rating')
+-        action['domain'] = [('res_id', 'in', [s.id for s in self.session_ids]), ('res_model', '=', 'im_chat.session')]
++        action['domain'] = [('res_id', 'in', [s.id for s in self.channel_ids]), ('res_model', '=', 'mail.channel')]
+         return action
+ 
+     # --------------------------
+@@ -146,20 +144,36 @@ class ImLivechatChannel(models.Model):
+         return self.sudo().user_ids.filtered(lambda user: user.im_status == 'online')
+ 
+     @api.model
+-    def get_channel_session(self, channel_id, anonymous_name):
+-        """ return a session given a channel : create on with a registered user, or return false otherwise """
++    def get_mail_channel(self, livechat_channel_id, anonymous_name):
++        """ Return a mail.channel given a livechat channel. It creates one with a connected operator, or return false otherwise
++            :param livechat_channel_id : the identifier if the im_livechat.channel
++            :param anonymous_name : the name of the anonymous person of the channel
++            :type livechat_channel_id : int
++            :type anonymous_name : str
++            :return : channel header
++            :rtype : dict
++        """
+         # get the avalable user of the channel
+-        users = self.sudo().browse(channel_id).get_available_users()
++        users = self.sudo().browse(livechat_channel_id).get_available_users()
+         if len(users) == 0:
+             return False
+-        user_id = random.choice(users).id
+-        # user to add to the session
+-        user_to_add = [(4, user_id)]
+-        if self.env.uid:
+-            user_to_add.append((4, self.env.uid))
++        # choose the res.users operator and get its partner id
++        user = random.choice(users)
++        operator_partner_id = user.partner_id.id
++        # partner to add to the mail.channel
++        channel_partner_to_add = [(4, operator_partner_id)]
++        if self.env.uid:  # if the user if logged (portal user), he can be identify
++            channel_partner_to_add.append((4, self.env.user.partner_id.id))
+         # create the session, and add the link with the given channel
+-        session = self.env["im_chat.session"].sudo().create({'user_ids': user_to_add, 'channel_id': channel_id, 'anonymous_name': anonymous_name})
+-        return session.sudo().with_context(im_livechat_operator_id=user_id).session_info()
++        mail_channel = self.env["mail.channel"].with_context(mail_create_nosubscribe=False).sudo().create({
++            'channel_partner_ids': channel_partner_to_add,
++            'livechat_channel_id': livechat_channel_id,
++            'anonymous_name': anonymous_name,
++            'channel_type': 'livechat',
++            'name': ', '.join([anonymous_name, user.name]),
++            'public': 'public',
++        })
++        return mail_channel.sudo().with_context(im_livechat_operator_partner_id=operator_partner_id).channel_info()[0]
+ 
+     @api.model
+     def get_channel_infos(self, channel_id):
+@@ -174,7 +188,6 @@ class ImLivechatChannel(models.Model):
+         }
+ 
+ 
+-
+ class ImLivechatChannelRule(models.Model):
+     """ Channel Rules
+         Rules defining access to the channel (countries, and url matching). It also provide the 'auto pop'
+@@ -202,7 +215,6 @@ class ImLivechatChannelRule(models.Model):
+     sequence = fields.Integer('Matching order', default=10,
+         help="Given the order to find a matching rule. If 2 rules are matching for the given url/country, the one with the lowest sequence will be chosen.")
+ 
+-
+     def match_rule(self, channel_id, url, country_id=False):
+         """ determine if a rule of the given channel match with the given url
+             :param channel_id : the identifier of the channel_id
+
+--- a/addons/im_livechat/models/mail_channel.py
++++ b/addons/im_livechat/models/mail_channel.py
+@@ -3,79 +3,69 @@ from openerp import api, fields, models
+ from openerp import SUPERUSER_ID
+ 
+ 
+-class ImChatSession(models.Model):
++class MailChannel(models.Model):
+     """ Chat Session
+         Reprensenting a conversation between users.
+         It extends the base method for anonymous usage.
+     """
+ 
+-    _name = 'im_chat.session'
+-    _inherit = ['im_chat.session', 'rating.mixin']
+-
++    _name = 'mail.channel'
++    _inherit = ['mail.channel', 'rating.mixin']
+ 
+     anonymous_name = fields.Char('Anonymous Name')
+     create_date = fields.Datetime('Create Date', required=True)
+-    channel_id = fields.Many2one('im_livechat.channel', 'Channel')
+-    fullname = fields.Char('Complete Name', compute='_compute_fullname')
+-
+-    @api.multi
+-    @api.depends('anonymous_name', 'user_ids')
+-    def _compute_fullname(self):
+-        """ built the complete name of the session """
+-        for session in self:
+-            names = []
+-            for user in session.user_ids:
+-                names.append(user.name)
+-            if session.anonymous_name:
+-                names.append(session.anonymous_name)
+-            session.fullname = ', '.join(names)
++    channel_type = fields.Selection(selection_add=[('livechat', 'Livechat Conversation')])
++    livechat_channel_id = fields.Many2one('im_livechat.channel', 'Channel')
+ 
+     @api.multi
+-    def is_in_session(self):
+-        """ Return True if the current user is in the user_ids of the session. False otherwise.
+-            If this is executed as sudo, this might be the anonymous user.
++    def _channel_message_notifications(self, message):
++        """ When a anonymous user create a mail.channel, the operator is not notify (to avoid massive polling when
++            clicking on livechat button). So when the anonymous person is sending its FIRST message, the channel header
++            should be added to the notification, since the user cannot be listining to the channel.
+         """
+-        self.ensure_one()
+-        if self.anonymous_name and self._uid == SUPERUSER_ID:
+-            return True
+-        else:
+-            return super(ImChatSession, self).is_in_session()
++        notifications = super(MailChannel, self)._channel_message_notifications(message)
++        if not message.author_id:
++            unpinned_channel_partner = self.mapped('channel_last_seen_partner_ids').filtered(lambda cp: not cp.is_pinned)
++            if unpinned_channel_partner:
++                unpinned_channel_partner.write({'is_pinned': True})
++                notifications = self._channel_channel_notifications(unpinned_channel_partner.mapped('partner_id').ids) + notifications
++        return notifications
+ 
+     @api.multi
+-    def session_user_info(self):
+-        """ Get the user infos for all the identified user in the session + the anonymous if anonymous session
+-            :returns a list of user infos
++    def channel_info(self):
++        """ Extends the channel header by adding the livechat operator and the 'anonymous' profile
+             :rtype : list(dict)
+         """
+-        self.ensure_one()
+-        users_infos = super(ImChatSession, self).session_user_info()
+-        # identify the operator for the 'welcome message'
+-        for user_profile in users_infos:
+-            user_profile['is_operator'] = bool(user_profile['id'] == self.env.context.get('im_livechat_operator_id'))
+-        if self.anonymous_name:
+-            users_infos.append({'id': False, 'name': self.anonymous_name, 'im_status': 'online', 'is_operator': False})
+-        return users_infos
++        channel_infos = super(MailChannel, self).channel_info()
++        # add the operator id
++        if self.env.context.get('im_livechat_operator_partner_id'):
++            partner_name = self.env['res.partner'].browse(self.env.context.get('im_livechat_operator_partner_id')).name_get()[0]
++            for channel_info in channel_infos:
++                channel_info['operator_pid'] = partner_name
++        # add the anonymous name
++        channel_infos_dict = dict((c['id'], c) for c in channel_infos)
++        for channel in self:
++            if channel.anonymous_name:
++                channel_infos_dict[channel.id]['anonymous_name'] = channel.anonymous_name
++        return channel_infos_dict.values()
+ 
+     @api.model
+-    def quit_user(self, uuid):
+-        """ Remove the current user from the given session.
+-            Note : an anonymous user cannot leave the session, since he is not registered.
+-            Required to modify the base comportement, since a session can contain only 1 identified user.
+-            :param uuid : the uuid of the session to quit
+-        """
+-        session = self.search([('uuid', '=', uuid)], limit=1)
+-        if session.anonymous_name:
+-            # an identified user can leave an anonymous session if there is still another idenfied user in it
+-            if self._uid and self._uid in [u.id for u in session.user_ids] and len(session.user_ids) > 1:
+-                self._remove_user()
+-                return True
+-            return False
+-        else:
+-            return super(ImChatSession, self).quit_user(uuid)
++    def channel_fetch_slot(self):
++        values = super(MailChannel, self).channel_fetch_slot()
++        pinned_channels = self.env['mail.channel.partner'].search([('partner_id', '=', self.env.user.partner_id.id), ('is_pinned', '=', True)]).mapped('channel_id')
++        values['channel_livechat'] = self.search([('channel_type', '=', 'livechat'), ('public', 'in', ['public']), ('id', 'in', pinned_channels.ids)]).channel_info()
++        return values
+ 
+     @api.model
+     def cron_remove_empty_session(self):
+-        groups = self.env['im_chat.message'].read_group([], ['to_id'], ['to_id'])
+-        not_empty_session_ids = [group['to_id'][0] for group in groups]
+-        empty_sessions = self.search([('id', 'not in', not_empty_session_ids), ('channel_id', '!=', False)])
+-        empty_sessions.unlink()
++        self.env.cr.execute("""
++            SELECT id as id
++            FROM mail_channel C
++            WHERE NOT EXISTS (
++                SELECT *
++                FROM mail_message_mail_channel_rel R
++                WHERE R.mail_channel_id = C.id
++            ) AND C.channel_type = 'livechat' AND livechat_channel_id IS NOT NULL;
++        """)
++        empty_channel_ids = [item['id'] for item in self.env.cr.dictfetchall()]
++        self.browse(empty_channel_ids).unlink()
+
+--- a/addons/im_livechat/models/rating.py
++++ b/addons/im_livechat/models/rating.py
+@@ -11,9 +11,8 @@ class Rating(models.Model):
+     def _compute_res_name(self):
+         # cannot change the rec_name of session since it is use to create the bus channel
+         # so, need to override this method to set the same alternative rec_name as in reporting
+-        if self.res_model == 'im_chat.session':
++        if self.res_model == 'mail.channel':
+             current_object = self.env[self.res_model].sudo().browse(self.res_id)
+-            self.res_name = ('%s / %s') % (current_object.channel_id.name, current_object.id)
++            self.res_name = ('%s / %s') % (current_object.livechat_channel_id.name, current_object.id)
+         else:
+             super(Rating, self)._compute_res_name()
+-
