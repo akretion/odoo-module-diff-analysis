@@ -1,0 +1,194 @@
+PR: https://github.com/odoo/odoo/pull/106297
+
+From: 73ba81a8d15187efb27a72bf24783bd474711bfd
+From: std-odoo
+Date: 2023-01-23 10:19:50
+
+Structural Changes: 4
+Total Changes: 88
+
+[IMP] base: allow loading the SMTP CLI configuration in a mail server
+
+Purpose
+=======
+On our saas, when users configure a mail server, they can't use anymore
+the "odoo.com" configuration (which is stored in the odoo-bin argument).
+
+To allow them to continue using the SMTP CLI configuration, we add a
+new "smtp_authentication". When this authentication method is chosen,
+all the "connection" fields of the mail server are ignored, and the
+connection information are taken from the odoo-bin arguments. So they
+can choose the from filter of this SMTP configuration, the priority...
+
+Task-3061882
+
+closes odoo/odoo#106297
+
+Signed-off-by: Thibault Delavallee (tde) <tde@openerp.com>
+
+================================= pseudo patch: =================================
+
+--- a/odoo/addons/base/models/ir_mail_server.py
++++ b/odoo/addons/base/models/ir_mail_server.py
+@@ -98,9 +98,13 @@ class IrMailServer(models.Model):
+         "FROM Filtering",
+         help='Define for which email address or domain this server can be used.\n'
+              'e.g.: "notification@odoo.com" or "odoo.com"')
+-    smtp_host = fields.Char(string='SMTP Server', required=True, help="Hostname or IP of SMTP server")
+-    smtp_port = fields.Integer(string='SMTP Port', required=True, default=25, help="SMTP Port. Usually 465 for SSL, and 25 or 587 for other cases.")
+-    smtp_authentication = fields.Selection([('login', 'Username'), ('certificate', 'SSL Certificate')], string='Authenticate with', required=True, default='login')
++    smtp_host = fields.Char(string='SMTP Server', help="Hostname or IP of SMTP server")
++    smtp_port = fields.Integer(string='SMTP Port', default=25, help="SMTP Port. Usually 465 for SSL, and 25 or 587 for other cases.")
++    smtp_authentication = fields.Selection([
++        ('login', 'Username'),
++        ('certificate', 'SSL Certificate'),
++        ('cli', 'Command Line Interface')
++    ], string='Authenticate with', required=True, default='login')
+     smtp_authentication_info = fields.Text('Authentication Info', compute='_compute_smtp_authentication_info')
+     smtp_user = fields.Char(string='Username', help="Optional username for SMTP authentication", groups='base.group_system')
+     smtp_pass = fields.Char(string='Password', help="Optional password for SMTP authentication", groups='base.group_system')
+@@ -137,6 +141,9 @@ class IrMailServer(models.Model):
+                 server.smtp_authentication_info = _(
+                     'Authenticate by using SSL certificates, belonging to your domain name. \n'
+                     'SSL certificates allow you to authenticate your mail server for the entire domain name.')
++            elif server.smtp_authentication == 'cli':
++                server.smtp_authentication_info = _(
++                    'Use the SMTP configuration set in the "Command Line Interface" arguments.')
+             else:
+                 server.smtp_authentication = False
+ 
+@@ -310,7 +317,7 @@ class IrMailServer(models.Model):
+             mail_server = self.env['ir.mail_server']
+         ssl_context = None
+ 
+-        if mail_server:
++        if mail_server and mail_server.smtp_authentication != "cli":
+             smtp_server = mail_server.smtp_host
+             smtp_port = mail_server.smtp_port
+             if mail_server.smtp_authentication == "certificate":
+@@ -346,8 +353,12 @@ class IrMailServer(models.Model):
+             smtp_port = tools.config.get('smtp_port', 25) if port is None else port
+             smtp_user = user or tools.config.get('smtp_user')
+             smtp_password = password or tools.config.get('smtp_password')
+-            from_filter = self.env['ir.config_parameter'].sudo().get_param(
+-                'mail.default.from_filter', tools.config.get('from_filter'))
++            if mail_server:
++                from_filter = mail_server.from_filter
++            else:
++                from_filter = self.env['ir.config_parameter'].sudo().get_param(
++                    'mail.default.from_filter', tools.config.get('from_filter'))
++
+             smtp_encryption = encryption
+             if smtp_encryption is None and tools.config.get('smtp_ssl'):
+                 smtp_encryption = 'starttls' # smtp_ssl => STARTTLS as of v7
+
+--- a/odoo/addons/base/tests/test_ir_mail_server.py
++++ b/odoo/addons/base/tests/test_ir_mail_server.py
+@@ -14,9 +14,11 @@ from odoo.tools import mute_logger
+ @tagged('mail_server')
+ class TestIrMailServer(TransactionCase, MockSmtplibCase):
+ 
+-    def setUp(self):
+-        self._init_mail_config()
+-        self._init_mail_servers()
++    @classmethod
++    def setUpClass(cls):
++        super().setUpClass()
++        cls._init_mail_config()
++        cls._init_mail_servers()
+ 
+     def _build_email(self, mail_from, return_path=None):
+         return self.env['ir.mail_server'].build_email(
+@@ -267,7 +269,6 @@ class TestIrMailServer(TransactionCase, MockSmtplibCase):
+             from_filter='test.com',
+         )
+ 
+-
+     @mute_logger('odoo.models.unlink')
+     def test_mail_server_send_email_smtp_session(self):
+         """Test all the cases when we provide the SMTP session.
+@@ -431,6 +432,51 @@ class TestIrMailServer(TransactionCase, MockSmtplibCase):
+             from_filter='test.com',
+         )
+ 
++    @mute_logger('odoo.models.unlink')
++    @patch.dict('odoo.tools.config.options', {'from_filter': 'fake.com', 'smtp_server': 'cli_example.com'})
++    def test_mail_server_configuration_cli(self):
++        """Check the mail server when the "smtp_authentication" is "cli".
++
++        Should take the configuration from the odoo-bin argument.
++        The "from_filter" of the mail server should overwrite the one set
++        in the CLI arguments.
++        """
++        # should be ignored by the mail server
++        self.env['ir.config_parameter'].sudo().set_param('mail.default.from_filter', 'fake.com')
++
++        self.env['ir.mail_server'].create([{
++            'name': 'Server No From Filter',
++            'smtp_host': 'smtp_host',
++            'smtp_encryption': 'none',
++            'smtp_authentication': 'cli',
++            'from_filter': 'cli_example.com',
++        }])
++
++        IrMailServer = self.env['ir.mail_server']
++
++        # check that the CLI server take the configuration in the odoo-bin argument
++        # except the from_filter which is taken on the mail server
++        with self.mock_smtplib_connection():
++            message = self._build_email(mail_from='test@cli_example.com')
++            IrMailServer.send_email(message)
++
++        self.assert_email_sent_smtp(
++            smtp_from='test@cli_example.com',
++            message_from='test@cli_example.com',
++            from_filter='cli_example.com',
++        )
++
++        # other mail server still work
++        with self.mock_smtplib_connection():
++            message = self._build_email(mail_from='specific_user@test.com')
++            IrMailServer.send_email(message)
++
++        self.assert_email_sent_smtp(
++            smtp_from='specific_user@test.com',
++            message_from='specific_user@test.com',
++            from_filter='specific_user@test.com',
++        )
++
+     @mute_logger('odoo.models.unlink')
+     @patch.dict('odoo.tools.config.options', {'from_filter': 'test.com', 'smtp_server': 'example.com'})
+     def test_mail_server_mail_default_from_filter(self):
+
+--- a/odoo/addons/base/views/ir_mail_server_views.xml
++++ b/odoo/addons/base/views/ir_mail_server_views.xml
+@@ -33,14 +33,17 @@
+                                 </div>
+                             </group>
+                         </group>
+-                        <notebook colspan="4">
++                        <notebook colspan="4"
++                            attrs="{'invisible': [('smtp_authentication', '=', 'cli')]}">
+                             <page name="connection" string="Connection">
+                                 <group>
+                                     <group>
+                                         <field name="smtp_encryption" widget="radio"/>
+-                                        <field name="smtp_host"/>
+-                                        <field name="smtp_port" options="{'format': false}"/>
+                                         <field name="smtp_debug" groups="base.group_no_one"/>
++                                        <field name="smtp_host"
++                                            attrs="{'required': [('smtp_authentication', '!=', 'cli')]}"/>
++                                        <field name="smtp_port" options="{'format': false}"
++                                            attrs="{'required': [('smtp_authentication', '!=', 'cli')]}"/>
+                                     </group>
+                                     <group>
+                                         <field name="smtp_user" attrs="{'invisible': [('smtp_authentication', '=', 'certificate')]}" force_save="1"/>
+@@ -60,7 +63,7 @@
+             <field name="model">ir.mail_server</field>
+             <field name="arch" type="xml">
+                 <tree string="Outgoing Mail Servers">
+-                    <field name="sequence"/>
++                    <field name="sequence" widget="handle"/>
+                     <field name="name"/>
+                     <field name="smtp_host"/>
+                     <field name="smtp_user"/>
