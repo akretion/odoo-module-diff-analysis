@@ -1,0 +1,236 @@
+PR: https://github.com/odoo/odoo/pull/160148
+
+From: ec009d17e89353dfebda342f97d9f30780d173d3
+From: zel-odoo
+Date: 2024-05-31 09:35:45
+
+Structural Changes: 3
+Total Changes: 125
+
+[IMP] mail,*: config menu for notif settings
+
+Add a sub-menu for "Notifications" in the
+"Configuration" menu. The "notifications" sub-menu
+should have the following options to apply to all
+Discuss channels.
+Same options as for notifications on each channel:
+Mute (+choose time period) /
+All messages = default /
+@mentions/ nothing
+This setting should apply to all channels that use
+the default one, unless another configuration has
+been made for a specific one.
+
+define o-discuss-separator and remove duplicate code
+
+split of task-3503901
+
+closes odoo/odoo#160148
+
+Related: odoo/upgrade#5909
+Related: odoo/enterprise#60535
+Signed-off-by: Zelong Lin (zel) <zel@odoo.com>
+
+================================= pseudo patch: =================================
+
+--- a/addons/mail/models/discuss/discuss_channel.py
++++ b/addons/mail/models/discuss/discuss_channel.py
+@@ -51,7 +51,6 @@ class Channel(models.Model):
+         ('channel', 'Channel'),
+         ('group', 'Group')],
+         string='Channel Type', required=True, default='channel', readonly=True, help="Chat is private and unique between 2 persons. Group is private among invited persons. Channel can be freely joined (depending on its configuration).")
+-    is_chat = fields.Boolean(string='Is a chat', compute='_compute_is_chat')
+     is_editable = fields.Boolean('Is Editable', compute='_compute_is_editable')
+     default_display_mode = fields.Selection(string="Default Display Mode", selection=[('video_full_screen', "Full screen video")], help="Determines how the channel will be displayed by default when opening it from its invitation link. No value means display text (no voice/video).")
+     description = fields.Text('Description')
+@@ -106,11 +105,6 @@ class Channel(models.Model):
+ 
+     # COMPUTE / INVERSE
+ 
+-    @api.depends('channel_type')
+-    def _compute_is_chat(self):
+-        for record in self:
+-            record.is_chat = record.channel_type == 'chat'
+-
+     @api.depends('channel_type', 'is_member')
+     def _compute_is_editable(self):
+         for channel in self:
+@@ -514,9 +508,9 @@ class Channel(models.Model):
+             return []
+ 
+         recipients_data = []
++        author_id = msg_vals.get("author_id") or message.author_id.id
+         if pids:
+             email_from = tools.email_normalize(msg_vals.get('email_from') or message.email_from)
+-            author_id = msg_vals.get('author_id') or message.author_id.id
+             self.env['res.partner'].flush_model(['active', 'email', 'partner_share'])
+             self.env['res.users'].flush_model(['notification_type', 'partner_id'])
+             sql_query = """
+@@ -549,28 +543,50 @@ class Channel(models.Model):
+                     'ushare': ushare,
+                 })
+ 
+-        if self.is_chat or self.channel_type == "group":
+-            already_in_ids = [r['id'] for r in recipients_data]
+-            recipients_data += [
+-                {
+-                    'active': partner.active,
+-                    'id': partner.id,
+-                    'is_follower': False,
+-                    'groups': [],
+-                    'lang': partner.lang,
+-                    'notif': 'web_push',
+-                    'share': partner.partner_share,
+-                    'type': 'customer',
+-                    'uid': False,
+-                    'ushare': False,
+-                } for partner in self.sudo().channel_member_ids.filtered(
+-                    lambda member: (
+-                        not member.mute_until_dt and
+-                        member.partner_id.id not in already_in_ids
+-                    )
+-                ).partner_id
+-            ]
+-
++        domain = expression.AND([
++            [("channel_id", "=", self.id)],
++            [("partner_id", "!=", author_id)],
++            [("partner_id.active", "=", True)],
++            [("mute_until_dt", "=", False)],
++            [("partner_id.user_ids.res_users_settings_ids.mute_until_dt", "=", False)],
++            expression.OR([
++                [("channel_id.channel_type", "!=", "channel")],
++                expression.AND([
++                    [("channel_id.channel_type", "=", "channel")],
++                    expression.OR([
++                        [("custom_notifications", "=", "all")],
++                        expression.AND([
++                            [("custom_notifications", "=", False)],
++                            [("partner_id.user_ids.res_users_settings_ids.channel_notifications", "=", "all")],
++                        ]),
++                        expression.AND([
++                            [("custom_notifications", "=", "mentions")],
++                            [("partner_id", "in", pids)],
++                        ]),
++                        expression.AND([
++                            [("custom_notifications", "=", False)],
++                            [("partner_id.user_ids.res_users_settings_ids.channel_notifications", "=", False)],
++                            [("partner_id", "in", pids)],
++                        ]),
++                    ]),
++                ]),
++            ]),
++        ])
++        # sudo: discuss.channel.member - read to get the members of the channel and res.users.settings of the partners
++        members = self.env["discuss.channel.member"].sudo().search(domain)
++        for member in members:
++            recipients_data.append({
++                "active": True,
++                "id": member.partner_id.id,
++                "is_follower": False,
++                "groups": [],
++                "lang": member.partner_id.lang,
++                "notif": "web_push",
++                "share": member.partner_id.partner_share,
++                "type": "customer",
++                "uid": False,
++                "ushare": False,
++            })
+         return recipients_data
+ 
+     def _notify_get_recipients_groups(self, message, model_description, msg_vals=None):
+@@ -617,6 +633,12 @@ class Channel(models.Model):
+             payload['title'] = "#%s" % (record_name)
+         return payload
+ 
++    def _notify_thread_by_web_push(self, message, recipients_data, msg_vals=False, **kwargs):
++        # only notify "web_push" recipients in discuss channels.
++        # exclude "inbox" recipients in discuss channels as inbox and web push can be mutually exclusive.
++        # the user can turn off the web push but receive notifs via inbox if they want to.
++        super()._notify_thread_by_web_push(message, [r for r in recipients_data if r["notif"] == "web_push"], msg_vals=msg_vals, **kwargs)
++
+     def _message_receive_bounce(self, email, partner):
+         """ Override bounce management to unsubscribe bouncing addresses """
+         for p in partner:
+
+--- a/addons/mail/models/discuss/discuss_channel_member.py
++++ b/addons/mail/models/discuss/discuss_channel_member.py
+@@ -33,9 +33,9 @@ class ChannelMember(models.Model):
+     message_unread_counter = fields.Integer('Unread Messages Counter', compute='_compute_message_unread', compute_sudo=True)
+     fold_state = fields.Selection([('open', 'Open'), ('folded', 'Folded'), ('closed', 'Closed')], string='Conversation Fold State', default='closed')
+     custom_notifications = fields.Selection(
+-        [("mentions", "Mentions Only"), ("no_notif", "Nothing")],
++        [("all", "All Messages"), ("mentions", "Mentions Only"), ("no_notif", "Nothing")],
+         "Customized Notifications",
+-        help="All Messages if not specified",
++        help="Use default from user settings if not specified. This setting will only be applied to channels.",
+     )
+     mute_until_dt = fields.Datetime("Mute notifications until", help="If set, the member will not receive notifications from the channel until this date.")
+     is_pinned = fields.Boolean("Is pinned on the interface", compute="_compute_is_pinned", search="_search_is_pinned")
+
+--- a/addons/mail/models/res_users_settings.py
++++ b/addons/mail/models/res_users_settings.py
+@@ -1,6 +1,8 @@
+ # -*- coding: utf-8 -*-
+ # Part of Odoo. See LICENSE file for full copyright and licensing details.
+ 
++from datetime import datetime
++from dateutil.relativedelta import relativedelta
+ from odoo import api, fields, models
+ 
+ 
+@@ -16,6 +18,26 @@ class ResUsersSettings(models.Model):
+     voice_active_duration = fields.Integer(string="Duration of voice activity in ms", default=200, help="How long the audio broadcast will remain active after passing the volume threshold")
+     volume_settings_ids = fields.One2many('res.users.settings.volumes', 'user_setting_id', string="Volumes of other partners")
+ 
++    # Notifications
++    channel_notifications = fields.Selection(
++        [("all", "All Messages"), ("no_notif", "Nothing")],
++        "Channel Notifications",
++        help="This setting will only be applied to channels. Mentions only if not specified.",
++    )
++    mute_until_dt = fields.Datetime(string="Mute notifications until", index=True, help="If set, the user will not receive notifications from all the channels until this date.")
++
++    @api.model
++    def _cleanup_expired_mutes(self):
++        """
++        Cron job for cleanup expired unmute by resetting mute_until_dt and sending bus notifications.
++        """
++        settings = self.search([("mute_until_dt", "<=", fields.Datetime.now())])
++        settings.write({"mute_until_dt": False})
++        notifications = []
++        for setting in settings:
++            notifications.append((setting.user_id.partner_id, "res.users.settings", {"mute_until_dt": False}))
++        self.env["bus.bus"]._sendmany(notifications)
++
+     @api.model
+     def _format_settings(self, fields_to_format):
+         res = super()._format_settings(fields_to_format)
+@@ -23,8 +45,27 @@ class ResUsersSettings(models.Model):
+             volume_settings = self.volume_settings_ids._discuss_users_settings_volume_format()
+             res.pop('volume_settings_ids', None)
+             res['volumes'] = [('ADD', volume_settings)]
++        if "mute_until_dt" in fields_to_format:
++            res["mute_until_dt"] = fields.Datetime.to_string(self.mute_until_dt)
+         return res
+ 
++    def mute(self, minutes):
++        """
++        Mute notifications for the given number of minutes.
++        :param minutes: (integer) number of minutes to mute notifications,
++            0 means unmute,
++            -1 means forever mute.
++        """
++        self.ensure_one()
++        if minutes == -1:
++            self.mute_until_dt = datetime.max
++        elif minutes:
++            self.mute_until_dt = fields.Datetime.now() + relativedelta(minutes=minutes)
++            self.env.ref("mail.ir_cron_discuss_users_settings_unmute")._trigger(self.mute_until_dt)
++        else:
++            self.mute_until_dt = False
++        self.env["bus.bus"]._sendone(self.user_id.partner_id, "res.users.settings", {"mute_until_dt": self.mute_until_dt})
++
+     def set_res_users_settings(self, new_settings):
+         formated = super().set_res_users_settings(new_settings)
+         self.env['bus.bus']._sendone(self.user_id.partner_id, 'res.users.settings', formated)
