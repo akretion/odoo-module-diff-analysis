@@ -1,0 +1,392 @@
+PR: https://github.com/odoo/odoo/pull/35659
+
+From: 9920f20e4c7753bc17bea71dea3a90f7de687196
+From: Raphael Collet
+Date: 2019-08-20 12:43:59
+
+Structural Changes: 17.6
+Total Changes: 112
+
+[IMP] models: ORM speedup
+
+This branch is the combination of several optimizations in the ORM:
+
+* store field values once in the cache: the cache reflects more
+faithfully the database, only fields that explicitly depend on the
+context have an extra indirection in the cache;
+
+* delay recomputations by default: use method `recompute` to explicitly
+flush out pending recomputations;
+
+* delay updates in method `write`: updates are stored in a data
+structure that can be flushed efficiently to the database with method
+`flush` (which also flush out recomputations);
+
+* make method `modified` take advantage of inverse fields to inverse
+dependencies;
+
+* filter records by evaluating a domain on records in Python;
+
+* a computed field with `readonly=False` behaves like a normal field
+with an onchange method;
+
+* computed fields are computed in superuser mode by default.
+
+Work done by Toufik Ben Jaa, Raphael Collet, Denis Ledoux and Fabien
+Pinckaers.
+
+closes odoo/odoo#35659
+
+Signed-off-by: Denis Ledoux <beledouxdenis@users.noreply.github.com>
+
+================================= pseudo patch: =================================
+
+--- a/addons/mail/models/ir_actions.py
++++ b/addons/mail/models/ir_actions.py
+@@ -99,7 +99,7 @@ class ServerActions(models.Model):
+                 # Pick an arbitrary field; if it is marked to be recomputed,
+                 # it means we are in an extraneous write triggered by the recompute.
+                 # In this case, we should not create a new activity.
+-                if records._recompute_check(field):
++                if records & self.env.records_to_compute(field):
+                     return True
+         return False
+ 
+
+--- a/addons/mail/models/ir_model.py
++++ b/addons/mail/models/ir_model.py
+@@ -64,6 +64,7 @@ class IrModel(models.Model):
+             if 'is_mail_blacklist' in vals and not all(rec.is_mail_blacklist <= vals['is_mail_blacklist'] for rec in self):
+                 raise UserError(_('Field "Mail Blacklist" cannot be changed to "False".'))
+             res = super(IrModel, self).write(vals)
++            self.flush()
+             # setup models; this reloads custom models in registry
+             self.pool.setup_models(self._cr)
+             # update database schema of models
+
+--- a/addons/mail/models/ir_model_fields.py
++++ b/addons/mail/models/ir_model_fields.py
+@@ -46,5 +46,6 @@ class IrModelField(models.Model):
+                     WHERE f.id IN %s
+                 );
+             """
++            self.flush()
+             self.env.cr.execute(query, (tuple(self.ids),))
+         return super(IrModelField, self).unlink()
+
+--- a/addons/mail/models/mail_activity.py
++++ b/addons/mail/models/mail_activity.py
+@@ -115,13 +115,13 @@ class MailActivity(models.Model):
+         return res
+ 
+     # owner
+-    res_id = fields.Integer('Related Document ID', index=True, required=True)
+     res_model_id = fields.Many2one(
+         'ir.model', 'Document Model',
+         index=True, ondelete='cascade', required=True)
+     res_model = fields.Char(
+         'Related Document Model',
+         index=True, related='res_model_id.model', compute_sudo=True, store=True, readonly=True)
++    res_id = fields.Many2oneReference(string='Related Document ID', index=True, required=True, model_field='res_model')
+     res_name = fields.Char(
+         'Document Name', compute='_compute_res_name', compute_sudo=True, store=True,
+         help="Display name of the related document.", readonly=True)
+@@ -224,6 +224,26 @@ class MailActivity(models.Model):
+             self.activity_type_id = self.recommended_activity_type_id
+ 
+     def _filter_access_rules(self, operation):
++        # write / unlink: valid for creator / assigned
++        if operation in ('write', 'unlink'):
++            valid = super(MailActivity, self)._filter_access_rules(operation)
++            if valid and valid == self:
++                return self
++        else:
++            valid = self.env[self._name]
++        return self._filter_access_rules_remaining(valid, operation, '_filter_access_rules')
++
++    def _filter_access_rules_python(self, operation):
++        # write / unlink: valid for creator / assigned
++        if operation in ('write', 'unlink'):
++            valid = super(MailActivity, self)._filter_access_rules_python(operation)
++            if valid and valid == self:
++                return self
++        else:
++            valid = self.env[self._name]
++        return self._filter_access_rules_remaining(valid, operation, '_filter_access_rules_python')
++
++    def _filter_access_rules_remaining(self, valid, operation, filter_access_rules_method):
+         """ Return the subset of ``self`` for which ``operation`` is allowed.
+         A custom implementation is done on activities as this document has some
+         access rules and is based on related document for activities that are
+@@ -238,19 +258,6 @@ class MailActivity(models.Model):
+           * unlink: access rule OR
+                     (``mail_post_access`` or write) rights on related documents);
+         """
+-        if self.env.is_superuser():
+-            return self
+-        if not self.check_access_rights(operation, raise_exception=False):
+-            return self.env[self._name]
+-
+-        # write / unlink: valid for creator / assigned
+-        if operation in ('write', 'unlink'):
+-            valid = super(MailActivity, self)._filter_access_rules(operation)
+-            if valid and valid == self:
+-                return self
+-        else:  # create / read: linked to document only, no access rules defined
+-            valid = self.env[self._name]
+-
+         # compute remaining for hand-tailored rules
+         remaining = self - valid
+         remaining_sudo = remaining.sudo()
+@@ -273,7 +280,7 @@ class MailActivity(models.Model):
+                 doc_operation = 'write'
+             right = self.env[doc_model].check_access_rights(doc_operation, raise_exception=False)
+             if right:
+-                valid_doc_ids = self.env[doc_model].browse(doc_ids)._filter_access_rules(doc_operation)
++                valid_doc_ids = getattr(self.env[doc_model].browse(doc_ids), filter_access_rules_method)(doc_operation)
+                 valid += remaining.filtered(lambda activity: activity.res_model == doc_model and activity.res_id in valid_doc_ids.ids)
+ 
+         return valid
+@@ -569,8 +576,7 @@ class MailActivityMixin(models.AbstractModel):
+     activity_ids = fields.One2many(
+         'mail.activity', 'res_id', 'Activities',
+         auto_join=True,
+-        groups="base.group_user",
+-        domain=lambda self: [('res_model', '=', self._name)])
++        groups="base.group_user",)
+     activity_state = fields.Selection([
+         ('overdue', 'Overdue'),
+         ('today', 'Today'),
+@@ -622,9 +628,8 @@ class MailActivityMixin(models.AbstractModel):
+                     break
+                 if activity_type_id.decoration_type == 'warning':
+                     exception_activity_type_id = activity_type_id
+-            if exception_activity_type_id:
+-                record.activity_exception_decoration = exception_activity_type_id.decoration_type
+-                record.activity_exception_icon = exception_activity_type_id.icon
++            record.activity_exception_decoration = exception_activity_type_id and exception_activity_type_id.decoration_type
++            record.activity_exception_icon = exception_activity_type_id and exception_activity_type_id.icon
+ 
+     def _search_activity_exception_decoration(self, operator, operand):
+         return [('activity_ids.activity_type_id.decoration_type', operator, operand)]
+@@ -639,6 +644,8 @@ class MailActivityMixin(models.AbstractModel):
+                 record.activity_state = 'today'
+             elif 'planned' in states:
+                 record.activity_state = 'planned'
++            else:
++                record.activity_state = False
+ 
+     @api.depends('activity_ids.date_deadline')
+     def _compute_activity_date_deadline(self):
+
+--- a/addons/mail/models/mail_blacklist.py
++++ b/addons/mail/models/mail_blacklist.py
+@@ -113,6 +113,8 @@ class MailBlackListMixin(models.AbstractModel):
+     @api.model
+     def _search_is_blacklisted(self, operator, value):
+         # Assumes operator is '=' or '!=' and value is True or False
++        self.flush(['email_normalized'])
++        self.env['mail.blacklist'].flush(['email', 'active'])
+         self._assert_primary_email()
+         if operator != '=':
+             if operator == '!=' and isinstance(value, bool):
+
+--- a/addons/mail/models/mail_channel.py
++++ b/addons/mail/models/mail_channel.py
+@@ -82,8 +82,9 @@ class Channel(models.Model):
+     uuid = fields.Char('UUID', size=50, index=True, default=lambda self: str(uuid4()), copy=False)
+     email_send = fields.Boolean('Send messages by email', default=False)
+     # multi users channel
+-    channel_last_seen_partner_ids = fields.One2many('mail.channel.partner', 'channel_id', string='Last Seen')
+-    channel_partner_ids = fields.Many2many('res.partner', 'mail_channel_partner', 'channel_id', 'partner_id', string='Listeners')
++    # depends=['...'] is for `test_mail/tests/common.py`, class Moderation, `setUpClass`
++    channel_last_seen_partner_ids = fields.One2many('mail.channel.partner', 'channel_id', string='Last Seen', depends=['channel_partner_ids'])
++    channel_partner_ids = fields.Many2many('res.partner', 'mail_channel_partner', 'channel_id', 'partner_id', string='Listeners', depends=['channel_last_seen_partner_ids'])
+     channel_message_ids = fields.Many2many('mail.message', 'mail_message_mail_channel_rel')
+     is_member = fields.Boolean('Is a member', compute='_compute_is_member')
+     # access
+@@ -169,6 +170,8 @@ class Channel(models.Model):
+         for record in self:
+             if record.channel_type == 'chat':
+                 record.is_chat = True
++            else:
++                record.is_chat = False
+ 
+     @api.onchange('public')
+     def _onchange_public(self):
+
+--- a/addons/mail/models/mail_followers.py
++++ b/addons/mail/models/mail_followers.py
+@@ -26,8 +26,8 @@ class Followers(models.Model):
+     # (see 'ir.model' inheritance).
+     res_model = fields.Char(
+         'Related Document Model Name', required=True, index=True)
+-    res_id = fields.Integer(
+-        'Related Document ID', index=True, help='Id of the followed resource')
++    res_id = fields.Many2oneReference(
++        'Related Document ID', index=True, help='Id of the followed resource', model_field='res_model')
+     partner_id = fields.Many2one(
+         'res.partner', string='Related Partner', ondelete='cascade', index=True)
+     channel_id = fields.Many2one(
+@@ -46,9 +46,6 @@ class Followers(models.Model):
+         for record in (vals_list or [{'res_model': rec.res_model, 'res_id': rec.res_id} for rec in self]):
+             if record.get('res_id'):
+                 to_invalidate[record.get('res_model')].append(record.get('res_id'))
+-        # invalidate in batch for performance
+-        for res_model, res_ids in to_invalidate.items():
+-            self.env[res_model].invalidate_cache(ids=res_ids)
+ 
+     @api.model_create_multi
+     def create(self, vals_list):
+@@ -102,6 +99,12 @@ class Followers(models.Model):
+           notification status of partner or channel (email or inbox),
+           user groups of partner (void as irrelevant if channel ID),
+         """
++        self.env['mail.followers'].flush(['partner_id', 'channel_id', 'subtype_ids'])
++        self.env['mail.message.subtype'].flush(['internal'])
++        self.env['res.users'].flush(['notification_type', 'active', 'partner_id', 'groups_id'])
++        self.env['res.partner'].flush(['active', 'partner_share'])
++        self.env['res.groups'].flush(['users'])
++        self.env['mail.channel'].flush(['email_send', 'channel_type'])
+         if records and subtype_id:
+             query = """
+ WITH sub_followers AS (
+
+--- a/addons/mail/models/mail_mail.py
++++ b/addons/mail/models/mail_mail.py
+@@ -336,6 +336,9 @@ class MailMail(models.Model):
+                         'failure_type': 'UNKNOWN',
+                         'failure_reason': notif_msg,
+                     })
++                    # `test_mail_bounce_during_send`, force immediate update to obtain the lock.
++                    # see rev. 56596e5240ef920df14d99087451ce6f06ac6d36
++                    notifs.flush(fnames=['notification_status', 'failure_type', 'failure_reason'], records=notifs)
+ 
+                 # build an RFC2822 email.message.Message object and send it without queuing
+                 res = None
+
+--- a/addons/mail/models/mail_message.py
++++ b/addons/mail/models/mail_message.py
+@@ -55,7 +55,7 @@ class Message(models.Model):
+     child_ids = fields.One2many('mail.message', 'parent_id', 'Child Messages')
+     # related document
+     model = fields.Char('Related Document Model', index=True)
+-    res_id = fields.Integer('Related Document ID', index=True)
++    res_id = fields.Many2oneReference('Related Document ID', index=True, model_field='model')
+     record_name = fields.Char('Message Record Name', help="Name get of the related document.")
+     # characteristics
+     message_type = fields.Selection([
+@@ -87,7 +87,7 @@ class Message(models.Model):
+     # mainly usefull for testing
+     notified_partner_ids = fields.Many2many(
+         'res.partner', 'mail_message_res_partner_needaction_rel', string='Partners with Need Action',
+-        context={'active_test': False})
++        context={'active_test': False}, depends=['notification_ids'])
+     needaction = fields.Boolean(
+         'Need Action', compute='_get_needaction', search='_search_needaction',
+         help='Need Action')
+@@ -99,12 +99,12 @@ class Message(models.Model):
+     # notifications
+     notification_ids = fields.One2many(
+         'mail.notification', 'mail_message_id', 'Notifications',
+-        auto_join=True, copy=False)
++        auto_join=True, copy=False, depends=['notified_partner_ids'])
+     # user interface
+     starred_partner_ids = fields.Many2many(
+         'res.partner', 'mail_message_res_partner_starred_rel', string='Favorited By')
+     starred = fields.Boolean(
+-        'Starred', compute='_get_starred', search='_search_starred',
++        'Starred', compute='_get_starred', search='_search_starred', compute_sudo=False,
+         help='Current user has a starred notification linked to this message')
+     # tracking
+     tracking_value_ids = fields.One2many(
+@@ -130,6 +130,14 @@ class Message(models.Model):
+     #keep notification layout informations to be able to generate mail again
+     email_layout_xmlid = fields.Char('Layout', copy=False)  # xml id of layout
+     add_sign = fields.Boolean(default=True)
++    # `test_adv_activity`, `test_adv_activity_full`, `test_message_assignation_inbox`,...
++    # By setting an inverse for mail.mail_message_id, the number of SQL queries done by `modified` is reduced.
++    # 'mail.mail' inherits from `mail.message`: `_inherits = {'mail.message': 'mail_message_id'}`
++    # Therefore, when changing a field on `mail.message`, this triggers the modification of the same field on `mail.mail`
++    # By setting up the inverse one2many, we avoid to have to do a search to find the mails linked to the `mail.message`
++    # as the cache value for this inverse one2many is up-to-date.
++    # Besides for new messages, and messages never sending emails, there was no mail, and it was searching for nothing.
++    mail_ids = fields.One2many('mail.mail', 'mail_message_id', string='Mails')
+ 
+     def _get_needaction(self):
+         """ Need action on a mail.message = notified on my channel """
+@@ -159,6 +167,7 @@ class Message(models.Model):
+         return ['!', ('notification_ids.notification_status', 'in', ('bounce', 'exception'))]  # this wont work and will be equivalent to "not in" beacause of orm restrictions. Dont use "has_error = False"
+ 
+     @api.depends('starred_partner_ids')
++    @api.depends_context('uid')
+     def _get_starred(self):
+         """ Compute if the message is starred by the current user. """
+         # TDE FIXME: use SQL
+@@ -637,6 +646,10 @@ class Message(models.Model):
+         # check read access rights before checking the actual rules on the given ids
+         super(Message, self.with_user(access_rights_uid or self._uid)).check_access_rights('read')
+ 
++        self.flush(['model', 'res_id', 'author_id', 'message_type', 'partner_ids', 'channel_ids'])
++        self.env['mail.notification'].flush(['mail_message_id', 'res_partner_id'])
++        self.env['mail.channel'].flush(['channel_message_ids'])
++        self.env['mail.channel.partner'].flush(['channel_id', 'partner_id'])
+         self._cr.execute("""
+             SELECT DISTINCT m.id, m.model, m.res_id, m.author_id, m.message_type,
+                             COALESCE(partner_rel.res_partner_id, needaction_rel.res_partner_id),
+@@ -733,6 +746,12 @@ class Message(models.Model):
+         # Read mail_message.ids to have their values
+         message_values = dict((message_id, {}) for message_id in self.ids)
+ 
++        self.flush(['model', 'res_id', 'author_id', 'parent_id', 'moderation_status', 'message_type', 'partner_ids', 'channel_ids'])
++        self.env['mail.notification'].flush(['mail_message_id', 'res_partner_id'])
++        self.env['mail.channel'].flush(['channel_message_ids', 'moderator_ids'])
++        self.env['mail.channel.partner'].flush(['channel_id', 'partner_id'])
++        self.env['res.users'].flush(['moderation_channel_ids'])
++
+         if operation == 'read':
+             self._cr.execute("""
+                 SELECT DISTINCT m.id, m.model, m.res_id, m.author_id, m.parent_id,
+
+--- a/addons/mail/models/mail_thread.py
++++ b/addons/mail/models/mail_thread.py
+@@ -82,8 +82,7 @@ class MailThread(models.AbstractModel):
+     message_is_follower = fields.Boolean(
+         'Is Follower', compute='_compute_is_follower', search='_search_is_follower')
+     message_follower_ids = fields.One2many(
+-        'mail.followers', 'res_id', string='Followers',
+-        domain=lambda self: [('res_model', '=', self._name)])
++        'mail.followers', 'res_id', string='Followers')
+     message_partner_ids = fields.Many2many(
+         comodel_name='res.partner', string='Followers (Partners)',
+         compute='_get_followers', search='_search_follower_partners')
+@@ -92,7 +91,7 @@ class MailThread(models.AbstractModel):
+         compute='_get_followers', search='_search_follower_channels')
+     message_ids = fields.One2many(
+         'mail.message', 'res_id', string='Messages',
+-        domain=lambda self: [('model', '=', self._name), ('message_type', '!=', 'user_notification')], auto_join=True)
++        domain=lambda self: [('message_type', '!=', 'user_notification')], auto_join=True)
+     message_unread = fields.Boolean(
+         'Unread Messages', compute='_get_message_unread',
+         help="If checked new messages require your attention.")
+@@ -1741,6 +1740,9 @@ class MailThread(models.AbstractModel):
+ 
+         self = self.with_lang() # add lang to context imediatly since it will be usefull in various flows latter.
+ 
++        # Explicit access rights check, because display_name is computed as sudo.
++        self.check_access_rights('read')
++        self.check_access_rule('read')
+         record_name = record_name or self.display_name
+ 
+         partner_ids = set(partner_ids or [])
+
+--- a/addons/mail/models/res_partner.py
++++ b/addons/mail/models/res_partner.py
+@@ -39,6 +39,7 @@ class Partner(models.Model):
+     def get_needaction_count(self):
+         """ compute the number of needaction of the current user """
+         if self.env.user.partner_id:
++            self.env['mail.notification'].flush(['is_read', 'res_partner_id'])
+             self.env.cr.execute("""
+                 SELECT count(*) as needaction_count
+                 FROM mail_message_res_partner_needaction_rel R
