@@ -1,0 +1,245 @@
+PR: https://github.com/odoo/odoo/pull/78622
+
+From: 63c4a9b951d374bec5796c525c99a3fbd4689e53
+From: Kevin Baptiste
+Date: 2022-01-24 11:09:50
+
+Structural Changes: 10
+Total Changes: 109
+
+[IMP] hr_recruitment: add Interviewer access rights
+
+Create a new Interviewer access rights.
+
+This right is automatically given to users that are added as
+Interviewers on a Job Position or on an Application.
+
+An interviewer can only access applications they are interviewer of the
+job or the application itself, the chatter is disabled for them as it might
+contain some sensitive information (salary details, contract link, etc.)
+
+closes odoo/odoo#78622
+
+Taskid: 2669730
+Related: odoo/enterprise#21778
+Signed-off-by: Yannick Tivisse (yti) <yti@odoo.com>
+
+================================= pseudo patch: =================================
+
+--- a/addons/hr_recruitment/models/__init__.py
++++ b/addons/hr_recruitment/models/__init__.py
+@@ -7,3 +7,5 @@ from . import calendar
+ from . import digest
+ from . import utm_campaign
+ from . import utm_source
++from . import res_users
++from . import ir_ui_menu
+
+--- a/addons/hr_recruitment/models/hr_job.py
++++ b/addons/hr_recruitment/models/hr_job.py
+@@ -44,6 +44,13 @@ class Job(models.Model):
+     color = fields.Integer("Color Index")
+     is_favorite = fields.Boolean(compute='_compute_is_favorite', inverse='_inverse_is_favorite')
+     favorite_user_ids = fields.Many2many('res.users', 'job_favorite_user_rel', 'job_id', 'user_id', default=_get_default_favorite_user_ids)
++    interviewer_ids = fields.Many2many('res.users', string='Interviewers', domain="[('share', '=', False), ('company_ids', 'in', company_id)]")
++    extended_interviewer_ids = fields.Many2many('res.users', 'hr_job_extended_interviewer_res_users', compute='_compute_extended_interviewer_ids', store=True)
++
++    @api.depends('application_ids.interviewer_id')
++    def _compute_extended_interviewer_ids(self):
++        for job in self:
++            job.extended_interviewer_ids = job.application_ids.interviewer_id
+ 
+     def _compute_is_favorite(self):
+         for job in self:
+@@ -132,10 +139,17 @@ class Job(models.Model):
+                 'job_id': job.id,
+             } for job in jobs]
+             self.env['hr.recruitment.source'].create(source_vals)
++        jobs.sudo().interviewer_ids._create_recruitment_interviewers()
+         return jobs
+ 
+     def write(self, vals):
++        old_interviewers = self.interviewer_ids
+         res = super().write(vals)
++        if 'interviewer_ids' in vals:
++            interviewers_to_clean = old_interviewers - self.interviewer_ids
++            interviewers_to_clean._remove_recruitment_interviewers()
++            self.sudo().interviewer_ids._create_recruitment_interviewers()
++
+         # Since the alias is created upon record creation, the default values do not reflect the current values unless
+         # specifically rewritten
+         # List of fields to keep synched with the alias
+
+--- a/addons/hr_recruitment/models/hr_recruitment.py
++++ b/addons/hr_recruitment/models/hr_recruitment.py
+@@ -6,7 +6,7 @@ from random import randint
+ from odoo import api, fields, models, tools, SUPERUSER_ID
+ from odoo.osv.query import Query
+ from odoo.tools.translate import _
+-from odoo.exceptions import UserError
++from odoo.exceptions import AccessError, UserError
+ 
+ from dateutil.relativedelta import relativedelta
+ 
+@@ -137,10 +137,10 @@ class Applicant(models.Model):
+     date_last_stage_update = fields.Datetime("Last Stage Update", index=True, default=fields.Datetime.now)
+     priority = fields.Selection(AVAILABLE_PRIORITIES, "Appreciation", default='0')
+     job_id = fields.Many2one('hr.job', "Applied Job", domain="['|', ('company_id', '=', False), ('company_id', '=', company_id)]", tracking=True)
+-    salary_proposed_extra = fields.Char("Proposed Salary Extra", help="Salary Proposed by the Organisation, extra advantages", tracking=True)
+-    salary_expected_extra = fields.Char("Expected Salary Extra", help="Salary Expected by Applicant, extra advantages", tracking=True)
+-    salary_proposed = fields.Float("Proposed Salary", group_operator="avg", help="Salary Proposed by the Organisation", tracking=True)
+-    salary_expected = fields.Float("Expected Salary", group_operator="avg", help="Salary Expected by Applicant", tracking=True)
++    salary_proposed_extra = fields.Char("Proposed Salary Extra", help="Salary Proposed by the Organisation, extra advantages", tracking=True, groups="hr_recruitment.group_hr_recruitment_user")
++    salary_expected_extra = fields.Char("Expected Salary Extra", help="Salary Expected by Applicant, extra advantages", tracking=True, groups="hr_recruitment.group_hr_recruitment_user")
++    salary_proposed = fields.Float("Proposed Salary", group_operator="avg", help="Salary Proposed by the Organisation", tracking=True, groups="hr_recruitment.group_hr_recruitment_user")
++    salary_expected = fields.Float("Expected Salary", group_operator="avg", help="Salary Expected by Applicant", tracking=True, groups="hr_recruitment.group_hr_recruitment_user")
+     availability = fields.Date("Availability", help="The date at which the applicant will be available to start working", tracking=True)
+     partner_name = fields.Char("Applicant's Name")
+     partner_phone = fields.Char("Phone", size=32, compute='_compute_partner_phone_email',
+@@ -177,6 +177,7 @@ class Applicant(models.Model):
+     campaign_id = fields.Many2one(ondelete='set null')
+     medium_id = fields.Many2one(ondelete='set null')
+     source_id = fields.Many2one(ondelete='set null')
++    interviewer_id = fields.Many2one('res.users', string='Interviewer', domain="[('share', '=', False), ('company_ids', 'in', company_id)]")
+ 
+     @api.depends('date_open', 'date_closed')
+     def _compute_day(self):
+@@ -256,7 +257,6 @@ class Applicant(models.Model):
+             else:
+                 applicant.meeting_display_text = _('Last Meeting')
+ 
+-
+     def _get_attachment_number(self):
+         read_group_res = self.env['ir.attachment'].read_group(
+             [('res_model', '=', 'hr.applicant'), ('res_id', 'in', self.ids)],
+@@ -340,6 +340,10 @@ class Applicant(models.Model):
+             if not applicant.stage_id.hired_stage:
+                 applicant.date_closed = False
+ 
++    def _check_interviewer_access(self):
++        if self.user_has_groups('hr_recruitment.group_hr_recruitment_interviewer'):
++            raise AccessError(_('You are not allowed to perform this action.'))
++
+     @api.model_create_multi
+     def create(self, vals_list):
+         for vals in vals_list:
+@@ -348,6 +352,7 @@ class Applicant(models.Model):
+             if vals.get('email_from'):
+                 vals['email_from'] = vals['email_from'].strip()
+         applicants = super().create(vals_list)
++        applicants.sudo().interviewer_id._create_recruitment_interviewers()
+         # Record creation through calendar, creates the calendar event directly, it will also create the activity.
+         if 'default_activity_date_deadline' in self.env.context:
+             deadline = fields.Datetime.to_datetime(self.env.context.get('default_activity_date_deadline'))
+@@ -371,6 +376,7 @@ class Applicant(models.Model):
+             vals['date_open'] = fields.Datetime.now()
+         if vals.get('email_from'):
+             vals['email_from'] = vals['email_from'].strip()
++        old_interviewers = self.interviewer_id
+         # stage_id: track last stage before update
+         if 'stage_id' in vals:
+             vals['date_last_stage_update'] = fields.Datetime.now()
+@@ -381,6 +387,10 @@ class Applicant(models.Model):
+                 res = super(Applicant, self).write(vals)
+         else:
+             res = super(Applicant, self).write(vals)
++        if 'interviewer_id' in vals:
++            interviewers_to_clean = old_interviewers - self.interviewer_id
++            interviewers_to_clean._remove_recruitment_interviewers()
++            self.sudo().interviewer_id._create_recruitment_interviewers()
+         return res
+ 
+     def get_empty_list_help(self, help):
+@@ -406,6 +416,21 @@ class Applicant(models.Model):
+ 
+         return nocontent_body % nocontent_values
+ 
++    @api.model
++    def fields_view_get(self, view_id=None, view_type='form', toolbar=False, submenu=False):
++        if view_type == 'form' and self.user_has_groups('hr_recruitment.group_hr_recruitment_interviewer'):
++            view_id = self.env.ref('hr_recruitment.hr_applicant_view_form_interviewer').id
++        return super().fields_view_get(view_id, view_type, toolbar, submenu)
++
++    def _notify_compute_recipients(self, message, msg_vals):
++        """
++            Do not notify members of the Recruitment Interviewer group, as this
++            might leak some data they shouldn't have access to.
++        """
++        recipients = super()._notify_compute_recipients(message, msg_vals)
++        interviewer_group = self.env.ref('hr_recruitment.group_hr_recruitment_interviewer').id
++        return [recipient for recipient in recipients if interviewer_group not in recipient['groups']]
++
+     def action_makeMeeting(self):
+         """ This opens Meeting's calendar view to schedule meeting on current applicant
+             @return: Dictionary value for created Meeting view
+@@ -546,7 +571,8 @@ class Applicant(models.Model):
+ 
+     def create_employee_from_applicant(self):
+         """ Create an hr.employee from the hr.applicants """
+-        employee = False
++        self._check_interviewer_access()
++
+         for applicant in self:
+             contact_name = False
+             if applicant.partner_id:
+
+--- a/None
++++ b/addons/hr_recruitment/models/ir_ui_menu.py
+@@ -0,0 +1,14 @@
++# -*- coding: utf-8 -*-
++# Part of Odoo. See LICENSE file for full copyright and licensing details.
++
++from odoo import models
++
++
++class IrUiMenu(models.Model):
++    _inherit = 'ir.ui.menu'
++
++    def _load_menus_blacklist(self):
++        res = super()._load_menus_blacklist()
++        if self.env.user.has_group('hr_recruitment.group_hr_recruitment_interviewer'):
++            res.append(self.env.ref('hr_recruitment.menu_hr_job_position').id)
++        return res
+
+--- a/None
++++ b/addons/hr_recruitment/models/res_users.py
+@@ -0,0 +1,39 @@
++# -*- coding: utf-8 -*-
++# Part of Odoo. See LICENSE file for full copyright and licensing details.
++
++from odoo import models
++
++class ResUsers(models.Model):
++    _inherit = 'res.users'
++
++    def _create_recruitment_interviewers(self):
++        if not self:
++            return
++        interviewer_group = self.env.ref('hr_recruitment.group_hr_recruitment_interviewer')
++        recruitment_group = self.env.ref('hr_recruitment.group_hr_recruitment_user')
++
++        interviewer_group.sudo().write({
++            'users': [
++                (4, user.id) for user in self - recruitment_group.users
++            ]
++        })
++
++    def _remove_recruitment_interviewers(self):
++        if not self:
++            return
++        interviewer_group = self.env.ref('hr_recruitment.group_hr_recruitment_interviewer')
++        recruitment_group = self.env.ref('hr_recruitment.group_hr_recruitment_user')
++
++        job_interviewers = self.env['hr.job'].read_group([('interviewer_ids', 'in', self.ids)], ['interviewer_ids'], ['interviewer_ids'])
++        user_ids = {j['interviewer_ids'][0] for j in job_interviewers}
++
++        application_interviewers = self.env['hr.applicant'].read_group([('interviewer_id', 'in', self.ids)], ['interviewer_id'], ['interviewer_id'])
++        user_ids |= {a['interviewer_id'][0] for a in application_interviewers}
++
++        # Remove users that are no longer interviewers on at least a job or an application
++        users_to_remove = set(self.ids) - (user_ids | set(recruitment_group.users.ids))
++        interviewer_group.sudo().write({
++            'users': [
++                (3, user_id) for user_id in users_to_remove
++            ]
++        })

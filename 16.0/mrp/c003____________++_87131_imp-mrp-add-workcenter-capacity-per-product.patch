@@ -1,0 +1,123 @@
+PR: https://github.com/odoo/odoo/pull/87131
+
+From: fcc7b3d46a3a2c87df6d1e28880305db57fd468e
+From: JF Aubert
+Date: 2022-06-03 14:40:09
+
+Structural Changes: 5
+Total Changes: 39
+
+IMP] mrp: add workcenter capacity per product
+
+Allow workcenter capacities based on product instead of
+applying the same capacity for all.
+
+closes odoo/odoo#87131
+
+Task: 2691328
+Related: odoo/enterprise#25532
+Related: odoo/upgrade#3370
+Signed-off-by: William Henrotin (whe) <whe@odoo.com>
+
+================================= pseudo patch: =================================
+
+--- a/addons/mrp/models/mrp_routing.py
++++ b/addons/mrp/models/mrp_routing.py
+@@ -87,7 +87,8 @@ class MrpRoutingWorkcenter(models.Model):
+             cycle_number = 0  # Never 0 unless infinite item['workcenter_id'].capacity
+             for item in data:
+                 total_duration += item['duration']
+-                cycle_number += tools.float_round((item['qty_produced'] / item['workcenter_id'].capacity or 1.0), precision_digits=0, rounding_method='UP')
++                capacity = item['workcenter_id']._get_capacity(item.product_id)
++                cycle_number += tools.float_round((item['qty_produced'] / capacity or 1.0), precision_digits=0, rounding_method='UP')
+             if cycle_number:
+                 operation.time_cycle = total_duration / cycle_number
+             else:
+
+--- a/addons/mrp/models/mrp_workcenter.py
++++ b/addons/mrp/models/mrp_workcenter.py
+@@ -30,9 +30,9 @@ class MrpWorkcenter(models.Model):
+     note = fields.Html(
+         'Description',
+         help="Description of the Work Center.")
+-    capacity = fields.Float(
++    default_capacity = fields.Float(
+         'Capacity', default=1.0,
+-        help="Number of pieces that can be produced in parallel. In case the work center has a capacity of 5 and you have to produce 10 units on your work order, the usual operation time will be multiplied by 2.")
++        help="Default number of pieces that can be produced in parallel. In case the work center has a capacity of 5 and you have to produce 10 units on your work order, the usual operation time will be multiplied by 2.")
+     sequence = fields.Integer(
+         'Sequence', default=1, required=True,
+         help="Gives the sequence order when displaying a list of work centers.")
+@@ -73,6 +73,8 @@ class MrpWorkcenter(models.Model):
+         help="Alternative workcenters that can be substituted to this one in order to dispatch production"
+     )
+     tag_ids = fields.Many2many('mrp.workcenter.tag')
++    capacity_ids = fields.One2many('mrp.workcenter.capacity', 'workcenter_id', string='Product Capacities',
++        help="Specific number of pieces that can be produced in parallel per product.", copy=True)
+ 
+     @api.constrains('alternative_workcenter_ids')
+     def _check_alternative_workcenter(self):
+@@ -172,9 +174,9 @@ class MrpWorkcenter(models.Model):
+             else:
+                 workcenter.performance = 0.0
+ 
+-    @api.constrains('capacity')
++    @api.constrains('default_capacity')
+     def _check_capacity(self):
+-        if any(workcenter.capacity <= 0.0 for workcenter in self):
++        if any(workcenter.default_capacity <= 0.0 for workcenter in self):
+             raise exceptions.UserError(_('The capacity must be strictly positive.'))
+ 
+     def unblock(self):
+@@ -287,6 +289,10 @@ class MrpWorkcenter(models.Model):
+             }
+         return res
+ 
++    def _get_capacity(self, product):
++        product_capacity = self.capacity_ids.filtered(lambda capacity: capacity.product_id == product)
++        return product_capacity.capacity if product_capacity else self.default_capacity
++
+ 
+ class WorkcenterTag(models.Model):
+     _name = 'mrp.workcenter.tag'
+@@ -405,3 +411,19 @@ class MrpWorkcenterProductivity(models.Model):
+     def button_block(self):
+         self.ensure_one()
+         self.workcenter_id.order_ids.end_all()
++
++
++class MrpWorkCenterCapacity(models.Model):
++    _name = 'mrp.workcenter.capacity'
++    _description = 'Work Center Capacity'
++    _check_company_auto = True
++
++    workcenter_id = fields.Many2one('mrp.workcenter', string='Work Center', required=True)
++    product_id = fields.Many2one('product.product', string='Product', required=True)
++    product_uom_id = fields.Many2one('uom.uom', string='Product UoM', related='product_id.uom_id')
++    capacity = fields.Float('Capacity', default=1.0, help="Number of pieces that can be produced in parallel for this product.")
++
++    _sql_constraints = [
++        ('positive_capacity', 'CHECK(capacity > 0)', 'Capacity should be a positive number.'),
++        ('unique_product', 'UNIQUE(workcenter_id, product_id)', 'Product capacity should be unique for each workcenter.'),
++    ]
+
+--- a/addons/mrp/models/mrp_workorder.py
++++ b/addons/mrp/models/mrp_workorder.py
+@@ -736,13 +736,15 @@ class MrpWorkorder(models.Model):
+                 duration_expected_working = 0
+             return self.workcenter_id.time_start + self.workcenter_id.time_stop + duration_expected_working * ratio * 100.0 / self.workcenter_id.time_efficiency
+         qty_production = self.production_id.product_uom_id._compute_quantity(self.qty_production, self.production_id.product_id.uom_id)
+-        cycle_number = float_round(qty_production / self.workcenter_id.capacity, precision_digits=0, rounding_method='UP')
++        capacity = self.workcenter_id._get_capacity(self.product_id)
++        cycle_number = float_round(qty_production / capacity, precision_digits=0, rounding_method='UP')
+         if alternative_workcenter:
+             # TODO : find a better alternative : the settings of workcenter can change
+             duration_expected_working = (self.duration_expected - self.workcenter_id.time_start - self.workcenter_id.time_stop) * self.workcenter_id.time_efficiency / (100.0 * cycle_number)
+             if duration_expected_working < 0:
+                 duration_expected_working = 0
+-            alternative_wc_cycle_nb = float_round(qty_production / alternative_workcenter.capacity, precision_digits=0, rounding_method='UP')
++            capacity = alternative_workcenter._get_capacity(self.product_id)
++            alternative_wc_cycle_nb = float_round(qty_production / capacity, precision_digits=0, rounding_method='UP')
+             return alternative_workcenter.time_start + alternative_workcenter.time_stop + alternative_wc_cycle_nb * duration_expected_working * 100.0 / alternative_workcenter.time_efficiency
+         time_cycle = self.operation_id.time_cycle
+         return self.workcenter_id.time_start + self.workcenter_id.time_stop + cycle_number * time_cycle * 100.0 / self.workcenter_id.time_efficiency

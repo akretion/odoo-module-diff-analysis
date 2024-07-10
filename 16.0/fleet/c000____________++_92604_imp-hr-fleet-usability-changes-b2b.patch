@@ -1,0 +1,154 @@
+PR: https://github.com/odoo/odoo/pull/92604
+
+From: 45b175a18d7dabb96f9532769da5571906334435
+From: Kevin Baptiste
+Date: 2022-06-23 15:16:57
+
+Structural Changes: 4
+Total Changes: 34
+
+[IMP] (hr_)fleet: usability changes (b2b)
+
+Minor usability changes:
+
+  * Reorganize menu to be more consistent with other HR apps;
+  * Tweak several views;
+  * Don't expire contract when date is set to Today - they will be
+    automatically expired the next day;
+  * Show contract name on form view.
+
+closes odoo/odoo#92604
+
+Related: odoo/enterprise#27919
+Taskid: 2856135
+Signed-off-by: Kevin Baptiste <kba@odoo.com>
+
+================================= pseudo patch: =================================
+
+--- a/addons/fleet/models/fleet_vehicle.py
++++ b/addons/fleet/models/fleet_vehicle.py
+@@ -112,6 +112,17 @@ class FleetVehicle(models.Model):
+     frame_type = fields.Selection([('diamant', 'Diamant'), ('trapez', 'Trapez'), ('wave', 'Wave')], help="Frame type of the bike")
+     electric_assistance = fields.Boolean(compute='_compute_model_fields', store=True, readonly=False)
+     frame_size = fields.Float()
++    service_activity = fields.Selection([
++        ('none', 'None'),
++        ('overdue', 'Overdue'),
++        ('today', 'Today'),
++    ], compute='_compute_service_activity')
++
++    @api.depends('log_services')
++    def _compute_service_activity(self):
++        for vehicle in self:
++            activities_state = set(state for state in vehicle.log_services.mapped('activity_state') if state and state != 'planned')
++            vehicle.service_activity = sorted(activities_state)[0] if activities_state else 'none'
+ 
+     @api.depends('model_id')
+     def _compute_model_fields(self):
+
+--- a/addons/fleet/models/fleet_vehicle_log_contract.py
++++ b/addons/fleet/models/fleet_vehicle_log_contract.py
+@@ -23,7 +23,7 @@ class FleetVehicleLogContract(models.Model):
+     date = fields.Date(help='Date when the cost has been executed')
+     company_id = fields.Many2one('res.company', 'Company', default=lambda self: self.env.company)
+     currency_id = fields.Many2one('res.currency', related='company_id.currency_id')
+-    name = fields.Char(string='Name', compute='_compute_contract_name', store=True)
++    name = fields.Char(string='Name', compute='_compute_contract_name', store=True, readonly=False)
+     active = fields.Boolean(default=True)
+     user_id = fields.Many2one('res.users', 'Responsible', default=lambda self: self.env.user, index=True)
+     start_date = fields.Date(
+@@ -34,6 +34,7 @@ class FleetVehicleLogContract(models.Model):
+         self.compute_next_year_date(fields.Date.context_today(self)),
+         help='Date when the coverage of the contract expirates (by default, one year after begin date)')
+     days_left = fields.Integer(compute='_compute_days_left', string='Warning Date')
++    expires_today = fields.Boolean(compute='_compute_days_left')
+     insurer_id = fields.Many2one('res.partner', 'Vendor')
+     purchaser_id = fields.Many2one(related='vehicle_id.driver_id', string='Driver')
+     ins_ref = fields.Char('Reference', size=64, copy=False)
+@@ -72,14 +73,16 @@ class FleetVehicleLogContract(models.Model):
+         if contract is in a closed state, return -1
+         otherwise return the number of days before the contract expires
+         """
++        today = fields.Date.from_string(fields.Date.today())
+         for record in self:
+             if record.expiration_date and record.state in ['open', 'expired']:
+-                today = fields.Date.from_string(fields.Date.today())
+                 renew_date = fields.Date.from_string(record.expiration_date)
+                 diff_time = (renew_date - today).days
+                 record.days_left = diff_time if diff_time > 0 else 0
++                record.expires_today = diff_time == 0
+             else:
+                 record.days_left = -1
++                record.expires_today = False
+ 
+     def write(self, vals):
+         res = super(FleetVehicleLogContract, self).write(vals)
+@@ -89,7 +92,7 @@ class FleetVehicleLogContract(models.Model):
+             for contract in self.filtered(lambda c: c.start_date and c.state != 'closed'):
+                 if date_today < contract.start_date:
+                     future_contracts |= contract
+-                elif not contract.expiration_date or contract.start_date <= date_today < contract.expiration_date:
++                elif not contract.expiration_date or contract.start_date <= date_today <= contract.expiration_date:
+                     running_contracts |= contract
+                 else:
+                     expired_contracts |= contract
+
+--- a/addons/fleet/models/fleet_vehicle_log_services.py
++++ b/addons/fleet/models/fleet_vehicle_log_services.py
+@@ -13,6 +13,7 @@ class FleetVehicleLogServices(models.Model):
+ 
+     active = fields.Boolean(default=True)
+     vehicle_id = fields.Many2one('fleet.vehicle', 'Vehicle', required=True, help='Vehicle concerned by this log')
++    manager_id = fields.Many2one('res.users', 'Fleet Manager', related='vehicle_id.manager_id', store=True)
+     amount = fields.Monetary('Cost')
+     description = fields.Char('Description')
+     odometer_id = fields.Many2one('fleet.vehicle.odometer', 'Odometer', help='Odometer measure of the vehicle at the moment of this log')
+
+--- a/addons/fleet/models/fleet_vehicle_model.py
++++ b/addons/fleet/models/fleet_vehicle_model.py
+@@ -43,7 +43,6 @@ class FleetVehicleModel(models.Model):
+     horsepower_tax = fields.Float('Horsepower Taxation')
+     electric_assistance = fields.Boolean(default=False)
+ 
+-    @api.depends('name', 'brand_id')
+     def name_get(self):
+         res = []
+         for record in self:
+
+--- a/addons/fleet/models/fleet_vehicle_model_brand.py
++++ b/addons/fleet/models/fleet_vehicle_model_brand.py
+@@ -9,16 +9,20 @@ class FleetVehicleModelBrand(models.Model):
+     _description = 'Brand of the vehicle'
+     _order = 'name asc'
+ 
+-    name = fields.Char('Make', required=True)
++    name = fields.Char('Name', required=True)
+     image_128 = fields.Image("Logo", max_width=128, max_height=128)
+     model_count = fields.Integer(compute="_compute_model_count", string="", store=True)
+     model_ids = fields.One2many('fleet.vehicle.model', 'brand_id')
+ 
+     @api.depends('model_ids')
+     def _compute_model_count(self):
+-        Model = self.env['fleet.vehicle.model']
++        model_data = self.env['fleet.vehicle.model']._read_group([
++            ('brand_id', 'in', self.ids),
++        ], ['brand_id'], ['brand_id'])
++        models_brand = {x['brand_id'][0]: x['brand_id_count'] for x in model_data}
++
+         for record in self:
+-            record.model_count = Model.search_count([('brand_id', '=', record.id)])
++            record.model_count = models_brand.get(record.id, 0)
+ 
+     def action_brand_model(self):
+         self.ensure_one()
+
+--- a/addons/fleet/models/fleet_vehicle_tag.py
++++ b/addons/fleet/models/fleet_vehicle_tag.py
+@@ -9,6 +9,6 @@ class FleetVehicleTag(models.Model):
+     _description = 'Vehicle Tag'
+ 
+     name = fields.Char('Tag Name', required=True, translate=True)
+-    color = fields.Integer('Color Index')
++    color = fields.Integer('Color')
+ 
+     _sql_constraints = [('name_uniq', 'unique (name)', "Tag name already exists !")]
