@@ -1,0 +1,221 @@
+PR: https://github.com/odoo/odoo/pull/64560
+
+From: c8f031ad77494ad56875d9c0917cc86bcfdbe032
+From: Julien Castiaux
+Date: 2021-01-18 15:57:41
+
+Structural Changes: 1
+Total Changes: 128
+
+[IMP] calendar: schedule reminders using triggers
+
+The calendar reminders are emails or web notifications sent moments
+before an event start. The mechanism to send web notifications is
+controlled by the browser, it fetches all the future notifications and
+uses `setTimeout()` to delay them. The mechanism to send emails was
+controlled by a cron, every 30 minutes the cron would look for the
+coming events and send the mail reminder.
+
+The cron was running every 30 minutes even if there was no event. The
+best precision was 30 minutes.
+
+The new mechanism use cron triggers, every time one add email reminders,
+triggers are created to call the cron at the precise moment the alarm is
+set. The cron no longer send emails for events in the coming 30 minutes
+as those will be triggered too.
+
+closes odoo/odoo#64560
+
+Task: 2416741
+Signed-off-by: Julien Castiaux <Julien00859@users.noreply.github.com>
+
+================================= pseudo patch: =================================
+
+--- a/addons/calendar/models/calendar_alarm_manager.py
++++ b/addons/calendar/models/calendar_alarm_manager.py
+@@ -116,55 +116,55 @@ class AlarmManager(models.AbstractModel):
+         """
+         result = []
+         # TODO: remove event_maxdelta and if using it
+-        if one_date - timedelta(minutes=(missing * event_maxdelta)) < fields.Datetime.now() + timedelta(seconds=in_the_next_X_seconds):  # if an alarm is possible for this date
+-            for alarm in event.alarm_ids:
+-                if alarm.alarm_type == alarm_type and \
+-                    one_date - timedelta(minutes=(missing * alarm.duration_minutes)) < fields.Datetime.now() + timedelta(seconds=in_the_next_X_seconds) and \
+-                        (not after or one_date - timedelta(minutes=alarm.duration_minutes) > fields.Datetime.from_string(after)):
+-                    alert = {
+-                        'alarm_id': alarm.id,
+-                        'event_id': event.id,
+-                        'notify_at': one_date - timedelta(minutes=alarm.duration_minutes),
+-                    }
+-                    result.append(alert)
++        past = one_date - timedelta(minutes=(missing * event_maxdelta))
++        future = fields.Datetime.now() + timedelta(seconds=in_the_next_X_seconds)
++        if future <= past:
++            return result
++        for alarm in event.alarm_ids:
++            if alarm.alarm_type != alarm_type:
++                continue
++            past = one_date - timedelta(minutes=(missing * alarm.duration_minutes))
++            if future <= past:
++                continue
++            if after and past <= fields.Datetime.from_string(after):
++                continue
++            result.append({
++                'alarm_id': alarm.id,
++                'event_id': event.id,
++                'notify_at': one_date - timedelta(minutes=alarm.duration_minutes),
++            })
+         return result
+ 
+     @api.model
+-    def get_next_mail(self):
+-        return self._get_partner_next_mail(partners=None)
+-
+-    @api.model
+-    def _get_partner_next_mail(self, partners=None):
+-        self = self.with_context(mail_notify_force_send=True)
+-        last_notif_mail = fields.Datetime.to_string(self.env.context.get('lastcall') or fields.Datetime.now())
+-
+-        cron = self.env.ref('calendar.ir_cron_scheduler_alarm', raise_if_not_found=False)
+-        if not cron:
+-            _logger.error("Cron for " + self._name + " can not be identified !")
+-            return False
+-
+-        interval_to_second = {
+-            "weeks": 7 * 24 * 60 * 60,
+-            "days": 24 * 60 * 60,
+-            "hours": 60 * 60,
+-            "minutes": 60,
+-            "seconds": 1
+-        }
+-
+-        if cron.interval_type not in interval_to_second:
+-            _logger.error("Cron delay can not be computed !")
+-            return False
+-
+-        cron_interval = cron.interval_number * interval_to_second[cron.interval_type]
+-
+-        all_meetings = self._get_next_potential_limit_alarm('email', seconds=cron_interval, partners=partners)
+-
+-        for meeting in self.env['calendar.event'].browse(all_meetings):
+-            max_delta = all_meetings[meeting.id]['max_duration']
+-            in_date_format = meeting.start
+-            last_found = self.do_check_alarm_for_one_date(in_date_format, meeting, max_delta, 0, 'email', after=last_notif_mail, missing=True)
+-            for alert in last_found:
+-                self.do_mail_reminder(alert)
++    def _send_reminder_email(self, partners=None):
++        # Executed via cron
++        self.env.cr.execute('''
++            SELECT "event"."id"
++              FROM "calendar_event" AS "event"
++              JOIN "calendar_alarm_calendar_event_rel" AS "event_alarm_rel"
++                ON "event"."id" = "event_alarm_rel"."calendar_event_id"
++              JOIN "calendar_alarm" AS "alarm"
++                ON "event_alarm_rel"."calendar_alarm_id" = "alarm"."id"
++             WHERE (
++                   "alarm"."alarm_type" = 'email'
++               AND "event"."active"
++               AND "event"."start" - CAST("alarm"."duration" || ' ' || "alarm"."interval" AS Interval) >= %s
++               AND "event"."start" - CAST("alarm"."duration" || ' ' || "alarm"."interval" AS Interval) < now() at time zone 'utc'
++             )''', [self.env.context['lastcall']])
++
++        domain = [
++            ("event_id", "in", self.env.cr.fetchall()),
++            ("state", "!=", "declined"),
++        ]
++        if partners is not None:
++            domain.append(("partner_id", "in", partners.ids))
++
++        attendees = self.env["calendar.attendee"].search(domain)
++        attendees._send_mail_to_attendees(
++            'calendar.calendar_template_meeting_reminder',
++            force_send=True,
++            ignore_recurrence=True,
++        )
+ 
+     @api.model
+     def get_next_notif(self):
+@@ -186,15 +186,6 @@ class AlarmManager(models.AbstractModel):
+                     all_notif.append(self.do_notif_reminder(alert))
+         return all_notif
+ 
+-    def do_mail_reminder(self, alert):
+-        meeting = self.env['calendar.event'].browse(alert['event_id'])
+-        alarm = self.env['calendar.alarm'].browse(alert['alarm_id'])
+-
+-        result = False
+-        if alarm.alarm_type == 'email':
+-            result = meeting.attendee_ids.filtered(lambda r: r.state != 'declined')._send_mail_to_attendees('calendar.calendar_template_meeting_reminder', force_send=True, ignore_recurrence=True)
+-        return result
+-
+     def do_notif_reminder(self, alert):
+         alarm = self.env['calendar.alarm'].browse(alert['alarm_id'])
+         meeting = self.env['calendar.event'].browse(alert['event_id'])
+
+--- a/addons/calendar/models/calendar_event.py
++++ b/addons/calendar/models/calendar_event.py
+@@ -328,7 +328,7 @@ class Meeting(models.Model):
+ 
+     @api.depends('stop', 'start')
+     def _compute_duration(self):
+-        for event in self.with_context(dont_notify=True):
++        for event in self:
+             event.duration = self._get_duration(event.start, event.stop)
+ 
+     @api.depends('start', 'duration')
+@@ -675,11 +675,7 @@ class Meeting(models.Model):
+         (detached_events & self).active = False
+         (detached_events - self).with_context(archive_on_error=True).unlink()
+ 
+-        # Notify attendees if there is an alarm on the modified event, or if there was an alarm
+-        # that has just been removed, as it might have changed their next event notification
+-        if not self._context.get('dont_notify'):
+-            if self.alarm_ids or values.get('alarm_ids'):
+-                self.env['calendar.alarm_manager']._notify_next_alarm(self.partner_ids.ids)
++        self._setup_alarms()
+ 
+         current_attendees = self.filtered('active').attendee_ids
+         if 'partner_ids' in values:
+@@ -692,6 +688,15 @@ class Meeting(models.Model):
+ 
+         return True
+ 
++    def _setup_alarms(self):
++        """ Trigger the cron in the future for every email reminder """
++        cron = self.env.ref('calendar.ir_cron_scheduler_alarm')
++        for event in self:
++            for alarm in (alarm for alarm in event.alarm_ids if alarm.alarm_type == 'email'):
++                cron._trigger(at=event.start-timedelta(minutes=alarm.duration_minutes))
++            if any(alarm.alarm_type == 'notification' for alarm in event.alarm_ids):
++                self.env['calendar.alarm_manager']._notify_next_alarm(event.partner_ids.ids)
++
+     @api.model_create_multi
+     def create(self, vals_list):
+         vals_list = [  # Else bug with quick_create when we are filter on an other user
+@@ -741,12 +746,8 @@ class Meeting(models.Model):
+         events.filtered(lambda event: event.start > fields.Datetime.now()).attendee_ids._send_mail_to_attendees('calendar.calendar_template_meeting_invitation')
+         events._sync_activities(fields={f for vals in vals_list for f in vals.keys() })
+ 
+-        # Notify attendees if there is an alarm on the created event, as it might have changed their
+-        # next event notification
+-        if not self._context.get('dont_notify'):
+-            for event in events:
+-                if len(event.alarm_ids) > 0:
+-                    self.env['calendar.alarm_manager']._notify_next_alarm(event.partner_ids.ids)
++        events._setup_alarms()
++
+         return events
+ 
+     def read(self, fields=None, load='_classic_read'):
+
+--- a/addons/calendar/models/calendar_recurrence.py
++++ b/addons/calendar/models/calendar_recurrence.py
+@@ -284,7 +284,7 @@ class RecurrenceRule(models.Model):
+         :param dstart: if provided, only write events starting from this point in time
+         """
+         events = self._get_events_from(dtstart) if dtstart else self.calendar_event_ids
+-        return events.with_context(no_mail_to_attendees=True, dont_notify=True).write(dict(values, recurrence_update='self_only'))
++        return events.with_context(no_mail_to_attendees=True).write(dict(values, recurrence_update='self_only'))
+ 
+     def _rrule_serialize(self):
+         """
