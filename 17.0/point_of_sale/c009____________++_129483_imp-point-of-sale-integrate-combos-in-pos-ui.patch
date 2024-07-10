@@ -1,0 +1,325 @@
+PR: https://github.com/odoo/odoo/pull/129483
+
+From: 00dcc575b8af5bee5204c45b80290a8e59fe10f9
+From: vlst
+Date: 2023-09-04 08:03:34
+
+Structural Changes: 5
+Total Changes: 89
+
+[IMP] point_of_sale,*: integrate combos in pos ui
+
+*: pos_discount,pos_loyalty,pos_restaurant,pos_self_order
+
+In a previous commit (669b9fcc2fb82bb410e2b36e8bfa638ffd66cc2c) we added the
+backend logic needed for creating combos in `pos`.
+
+In this PR we add the combo functionality to the classic pos ui.
+
+This means that products can now be grouped together and sold as a combo.
+
+ex: Create a product called `Burger Menu` with type='combo'.This product will
+have multiple combos associated with it, for ex:
+
+- Drinks - will contain the list of drinks from which the customer can choose
+- Main Course - will contain the list of main courses from which the customer
+  can choose
+- Dessert - will contain the list of desserts from which the customer can choose
+
+In the event that one of the products inside one of the combos is to be more
+expensive, this product will have a specific `combo_price` which will be added
+to the main combo product's price.
+
+We add the relational fields `combo_parent_id` and `combo_line_ids` in the
+`pos.order.line` model. In the previous example, `combo_parent_id` will contain
+the `id` of the `orderline` of the `Burger Menu` product.
+
+In many cases `combo lines` have to be handled together. For example, deletion
+of an orderline containing a product from a combo implies the deletion of all
+other orderlines containing products from that combo. This means that multiple
+methods from the codebase had to be changed for this reason. Places that needed
+changes for this reason:
+
+- `split_bill_screen.js`
+- `addProductToCurrentOrder()`
+- `remove_orderline()` and `add_orderline()` from the `Order` js model
+
+In this PR we also:
+
+- improve the demo data such that it contains a `pos combo`;
+- refactor the `ProductItem` component such that it relies on a stateless
+  component. This stateless component can now be used anywhere; ( it is now used
+  in the popup which allows selecting the desired combo products )
+- add a new method called `is_pos_groupable` on the `Orderline` js model. Before
+  we relied on the product unit to see whether or not a product is groupable. We
+  now needed a new mechanism, which could account for different reasons for
+  which products are not groupable, such as belonging in a combo;
+
+Note on price calculation:
+
+- The idea is simple, imagine a rectangle divided into two parts. The whole
+  rectangle is the total order, whereas the two partitions are the orderlines.
+  - Now, imagine shrinking the rectangle by a certain factor. This shrinked
+    rectangle represents an order containing a combo -- because normally, a
+    combo results to smaller price. The two partitions are also shrinked by the
+    same factor.
+  - So the calculation will be:
+    - Nominal total price is calculated. This is the sum of the orderlines'
+      prices when they are added individually. This represents the whole
+      rectangle.
+    - Target price is derived from the combo product's price and selected
+      components' combo prices. This represents the shrinked rectangle.
+    - Reduction factor is computed as the ratio between the target price and the
+      nominal price.
+    - Each component's unit price is adjusted by multiplying the reduction
+      factor.
+    - When the unit prices of the components are computed, we now let the normal
+      price computation take place.
+- A spreadsheet is prepared to show a sample calculation:
+  https://docs.google.com/spreadsheets/d/1iOdnaILnvKiaf2_z7jTijYiVfB_3mjKWjq6nOB70Un0/edit#gid=0
+
+closes odoo/odoo#129483
+
+Task: 3430636
+Signed-off-by: Joseph Caburnay (jcb) <jcb@odoo.com>
+Co-authored-by: Joseph Caburnay <jcb@odoo.com>
+
+================================= pseudo patch: =================================
+
+--- a/addons/point_of_sale/models/pos_combo.py
++++ b/addons/point_of_sale/models/pos_combo.py
+@@ -5,6 +5,16 @@ class PosCombo(models.Model):
+     """
+     This model is used to allow the pos user to create menus.
+     This means that products can be grouped together and sold as a combo.
++
++    ex: Create a product called `Burger Menu`
++        - This product will have multiple combos associated with it, for ex:
++            - Drinks - will contain the list of drinks from which the customer can choose
++            - Main Course - will contain the list of main courses from which the customer can choose
++            - Dessert - will contain the list of desserts from which the customer can choose
++        The `Burger Menu` will have a certain price, for example 20$ and the rest of the
++        products will be listed with a price of 0$.
++        In the event that one of the products inside one of the combos is to be more expensive,
++        this product will have a specific `combo_price` which will be added to the total price
+     """
+     _name = "pos.combo"
+     _description = "Product combo choices"
+@@ -15,9 +25,19 @@ class PosCombo(models.Model):
+ 
+     @api.depends("combo_line_ids")
+     def _compute_num_of_products(self):
++        """
++        the read_group only returns info for the combos that have at least one line.
++        This is normally fine, because all the combos will have at least one line.
++        The problem is that this function is also run when the user creates a new combo,
++        and at that point, the combo doesn't have any lines, so the read_group will return
++        nothing and the function will fail to set the value of `num_of_products` to 0, thus
++        resulting in an error.
++        """
++        for rec in self:
++            rec.num_of_products = 0
+         # optimization trick to count the number of products in each combo
+-        for rec, num_of_products in self.env["pos.combo.line"]._read_group([("combo_id", "in", self.ids)], groupby=["combo_id"], aggregates=["__count"]):
+-            rec.num_of_products = num_of_products
++        for combo, num_of_products in self.env["pos.combo.line"]._read_group([("combo_id", "in", self.ids)], groupby=["combo_id"], aggregates=["__count"]):
++            combo.num_of_products = num_of_products
+ 
+     @api.constrains("combo_line_ids")
+     def _check_combo_line_ids_is_not_null(self):
+
+--- a/addons/point_of_sale/models/pos_combo_line.py
++++ b/addons/point_of_sale/models/pos_combo_line.py
+@@ -6,6 +6,6 @@ class PosComboLine(models.Model):
+     _description = "Product Combo Items"
+ 
+     product_id = fields.Many2one("product.product", string="Product", required=True)
+-    price = fields.Float("Price Extra", default=0.0)
++    combo_price = fields.Float("Price Extra", default=0.0)
+     lst_price = fields.Float("Original Price", related="product_id.lst_price")
+     combo_id = fields.Many2one("pos.combo")
+
+--- a/addons/point_of_sale/models/pos_config.py
++++ b/addons/point_of_sale/models/pos_config.py
+@@ -654,7 +654,7 @@ class PosConfig(models.Model):
+             if invoice_journal_id:
+                 pos_config.write({'invoice_journal_id': invoice_journal_id.id})
+ 
+-    def _get_availlable_product_domain(self):
++    def _get_available_product_domain(self):
+         domain = [
+             *self.env['product.product']._check_company_domain(self.company_id),
+             ('available_in_pos', '=', True),
+@@ -668,7 +668,7 @@ class PosConfig(models.Model):
+ 
+     def get_limited_products_loading(self, fields):
+         tables, where_clause, params = self.env['product.product']._where_calc(
+-            self._get_availlable_product_domain()
++            self._get_available_product_domain()
+         ).get_sql()
+         query = f"""
+             WITH pm AS (
+
+--- a/addons/point_of_sale/models/pos_order.py
++++ b/addons/point_of_sale/models/pos_order.py
+@@ -145,11 +145,23 @@ class PosOrder(models.Model):
+             order['user_id'] = pos_order.user_id.id
+             pos_order.write(self._order_fields(order))
+ 
++        pos_order._link_combo_items(order)
+         pos_order = pos_order.with_company(pos_order.company_id)
+         self = self.with_company(pos_order.company_id)
+         self._process_payment_lines(order, pos_order, pos_session, draft)
+         return pos_order._process_saved_order(draft)
+ 
++    def _link_combo_items(self, order_vals):
++        self.ensure_one()
++
++        lines = [l[2] for l in order_vals['lines'] if l[2].get('combo_parent_id') or l[2].get('combo_line_ids')]
++        uuid_by_cid = {line['id']: line['uuid'] for line in lines}
++        line_by_uuid = {line.uuid: line for line in  self.lines.filtered_domain([("uuid", "in", [line['uuid'] for line in lines])])}
++
++        for line in lines:
++            if line.get('combo_parent_id'):
++                line_by_uuid[line['uuid']].combo_parent_id = line_by_uuid[uuid_by_cid[line['combo_parent_id']]]
++
+     def _process_saved_order(self, draft):
+         self.ensure_one()
+         if not draft:
+@@ -896,12 +908,12 @@ class PosOrder(models.Model):
+         """ Create and update Orders from the frontend PoS application.
+ 
+         Create new orders and update orders that are in draft status. If an order already exists with a status
+-        diferent from 'draft'it will be discareded, otherwise it will be saved to the database. If saved with
++        different from 'draft'it will be discarded, otherwise it will be saved to the database. If saved with
+         'draft' status the order can be overwritten later by this function.
+ 
+         :param orders: dictionary with the orders to be created.
+         :type orders: dict.
+-        :param draft: Indicate if the orders are ment to be finalised or temporarily saved.
++        :param draft: Indicate if the orders are meant to be finalized or temporarily saved.
+         :type draft: bool.
+         :Returns: list -- list of db-ids for the created and updated orders.
+         """
+@@ -1152,7 +1164,7 @@ class PosOrderLine(models.Model):
+ 
+         # Clean up fields sent by the JS
+         line = [
+-            line[0], line[1], {k: v for k, v in line[2].items() if k in self.env['pos.order.line']._fields}
++            line[0], line[1], {k: v for k, v in line[2].items() if self._is_field_accepted(k)}
+         ]
+         return line
+ 
+@@ -1185,6 +1197,12 @@ class PosOrderLine(models.Model):
+     refunded_orderline_id = fields.Many2one('pos.order.line', 'Refunded Order Line', help='If this orderline is a refund, then the refunded orderline is specified in this field.')
+     refunded_qty = fields.Float('Refunded Quantity', compute='_compute_refund_qty', help='Number of items refunded in this orderline.')
+     uuid = fields.Char(string='Uuid', readonly=True, copy=False)
++    combo_parent_id = fields.Many2one('pos.order.line', string='Combo Parent')
++    combo_line_ids = fields.One2many('pos.order.line', 'combo_parent_id', string='Combo Lines')
++
++    @api.model
++    def _is_field_accepted(self, field):
++        return field in self._fields and not field in ['combo_parent_id', 'combo_line_ids']
+ 
+     @api.depends('refund_orderline_ids')
+     def _compute_refund_qty(self):
+@@ -1287,6 +1305,7 @@ class PosOrderLine(models.Model):
+ 
+     def _export_for_ui(self, orderline):
+         return {
++            'id': orderline.id,
+             'qty': orderline.qty,
+             'price_unit': orderline.price_unit,
+             'skip_change': orderline.skip_change,
+@@ -1296,13 +1315,14 @@ class PosOrderLine(models.Model):
+             'product_id': orderline.product_id.id,
+             'discount': orderline.discount,
+             'tax_ids': [[6, False, orderline.tax_ids.mapped(lambda tax: tax.id)]],
+-            'id': orderline.id,
+             'pack_lot_ids': [[0, 0, lot] for lot in orderline.pack_lot_ids.export_for_ui()],
+             'customer_note': orderline.customer_note,
+             'refunded_qty': orderline.refunded_qty,
+             'price_extra': orderline.price_extra,
+             'full_product_name': orderline.full_product_name,
+             'refunded_orderline_id': orderline.refunded_orderline_id.id,
++            'combo_parent_id': orderline.combo_parent_id.id,
++            'combo_line_ids': orderline.combo_line_ids.mapped('id'),
+         }
+ 
+     def export_for_ui(self):
+@@ -1321,7 +1341,7 @@ class PosOrderLine(models.Model):
+ 
+     def _prepare_procurement_values(self, group_id=False):
+         """ Prepare specific key for moves or other components that will be created from a stock rule
+-        comming from a sale order line. This method could be override in order to add other custom key that could
++        coming from a sale order line. This method could be override in order to add other custom key that could
+         be used in move/po creation.
+         """
+         self.ensure_one()
+
+--- a/addons/point_of_sale/models/pos_session.py
++++ b/addons/point_of_sale/models/pos_session.py
+@@ -1676,6 +1676,8 @@ class PosSession(models.Model):
+             'res.currency',
+             'pos.category',
+             'product.product',
++            'pos.combo',
++            'pos.combo.line',
+             'product.packaging',
+             'account.cash.rounding',
+             'pos.payment.method',
+@@ -1960,20 +1962,35 @@ class PosSession(models.Model):
+         domain = []
+         if self.config_id.limit_categories and self.config_id.iface_available_categ_ids:
+             domain = [('id', 'in', self.config_id.iface_available_categ_ids.ids)]
+-
+         return {'search_params': {'domain': domain, 'fields': ['id', 'name', 'parent_id', 'child_id', 'write_date', 'has_image']}}
+ 
+     def _get_pos_ui_pos_category(self, params):
+         return self.env['pos.category'].search_read(**params['search_params'])
+ 
++    def _loader_params_pos_combo(self):
++        products = self._context.get('loaded_data')['product.product']
++        combo_ids = set().union(*[product.get('combo_ids') for product in products])
++        return {'search_params': {'fields': ['id', 'name', 'combo_line_ids']}, 'ids': combo_ids}
++
++    def _get_pos_ui_pos_combo(self, params):
++        return self.env['pos.combo'].browse(params['ids']).read(**params['search_params'])
++
++    def _loader_params_pos_combo_line(self):
++        combo_ids = self._context.get('loaded_data')['pos.combo']
++        combo_line_ids = set().union(*[combo.get('combo_line_ids') for combo in combo_ids])
++        return {'search_params': {'fields': ['id', 'product_id', 'combo_price']}, 'ids': combo_line_ids}
++
++    def _get_pos_ui_pos_combo_line(self, params):
++        return self.env['pos.combo.line'].browse(params['ids']).read(**params['search_params'])
++
+     def _loader_params_product_product(self):
+         return {
+             'search_params': {
+-                'domain': self.config_id._get_availlable_product_domain(),
++                'domain': self.config_id._get_available_product_domain(),
+                 'fields': [
+                     'display_name', 'lst_price', 'standard_price', 'categ_id', 'pos_categ_ids', 'taxes_id', 'barcode',
+                     'default_code', 'to_weight', 'uom_id', 'description_sale', 'description', 'product_tmpl_id', 'tracking',
+-                    'write_date', 'available_in_pos', 'attribute_line_ids', 'active', 'image_128'
++                    'write_date', 'available_in_pos', 'attribute_line_ids', 'active', 'image_128', 'combo_ids',
+                 ],
+                 'order': 'sequence,default_code,name',
+             },
+
+--- a/addons/point_of_sale/models/product.py
++++ b/addons/point_of_sale/models/product.py
+@@ -16,6 +16,12 @@ class ProductTemplate(models.Model):
+         'pos.category', string='Point of Sale Category',
+         help="Category used in the Point of Sale.")
+     combo_ids = fields.Many2many('pos.combo', string='Combinations')
++    detailed_type = fields.Selection(selection_add=[
++        ('combo', 'Combo')
++    ], ondelete={'combo': 'set consu'})
++    type = fields.Selection(selection_add=[
++        ('combo', 'Combo')
++    ], ondelete={'combo': 'set consu'})
+ 
+     @api.ondelete(at_uninstall=False)
+     def _unlink_except_open_session(self):

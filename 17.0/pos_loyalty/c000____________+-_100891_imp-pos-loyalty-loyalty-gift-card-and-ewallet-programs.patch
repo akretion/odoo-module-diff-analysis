@@ -1,0 +1,299 @@
+PR: https://github.com/odoo/odoo/pull/100891
+
+From: fa20b34d7454c478f6299003fd1f78c3241c7d97
+From: Joseph Caburnay
+Date: 2022-09-22 22:39:01
+
+Structural Changes: 2
+Total Changes: 165
+
+[IMP] pos_loyalty: loyalty, gift card and ewallet programs
+
+* Allow multiple loyalty programs.
+* Improve gift card workflow: https://app.excalidraw.com/l/65VNwvy7c4X/1Xt93llULvo
+* Integration with the ewallet programs: https://app.excalidraw.com/l/65VNwvy7c4X/4B9AEOSbaku
+
+Note that we prevent refunding eWallet and gift card top up and
+reward products. If for instance the user wants to refund gift cards
+they'll have to transfer the gift card to ewallet by topping up the
+customer's ewallet and paying with the gift card to be refunded.
+
+closes odoo/odoo#100891
+
+Task-ids: 2959620, 2959661
+X-original-commit: fa06e3225650ed9d1a96709b0398e7f33313acf5
+Signed-off-by: Trinh Jacky (trj) <trj@odoo.com>
+Signed-off-by: Joseph Caburnay (jcb) <jcb@odoo.com>
+
+================================= pseudo patch: =================================
+
+--- a/addons/pos_loyalty/models/__init__.py
++++ b/addons/pos_loyalty/models/__init__.py
+@@ -5,6 +5,7 @@ from . import barcode_rule
+ from . import loyalty_card
+ from . import loyalty_mail
+ from . import loyalty_program
++from . import loyalty_reward
+ from . import loyalty_rule
+ from . import pos_config
+ from . import pos_order_line
+
+--- a/addons/pos_loyalty/models/loyalty_card.py
++++ b/addons/pos_loyalty/models/loyalty_card.py
+@@ -9,6 +9,9 @@ class LoyaltyCard(models.Model):
+     source_pos_order_id = fields.Many2one('pos.order', "PoS Order Reference",
+         help="PoS order where this coupon was generated.")
+ 
++    def _has_source_order(self):
++        return super()._has_source_order() or bool(self.source_pos_order_id)
++
+     def _get_default_template(self):
+         self.ensure_one()
+         if self.source_pos_order_id:
+
+--- a/addons/pos_loyalty/models/loyalty_program.py
++++ b/addons/pos_loyalty/models/loyalty_program.py
+@@ -10,7 +10,7 @@ class LoyaltyProgram(models.Model):
+ 
+     # NOTE: `pos_config_ids` satisfies an excpeptional use case: when no PoS is specified, the loyalty program is
+     # applied to every PoS. You can access the loyalty programs of a PoS using _get_program_ids() of pos.config
+-    pos_config_ids = fields.Many2many('pos.config', compute="_compute_pos_config_ids", store=True, readonly=False)
++    pos_config_ids = fields.Many2many('pos.config', compute="_compute_pos_config_ids", store=True, readonly=False, help="Restrict publishing to those shops.")
+     pos_order_count = fields.Integer("PoS Order Count", compute='_compute_pos_order_count')
+     pos_ok = fields.Boolean("Point of Sale", default=True)
+     pos_report_print_id = fields.Many2one('ir.actions.report', string="Print Report", domain=[('model', '=', 'loyalty.card')], compute='_compute_pos_report_print_id', inverse='_inverse_pos_report_print_id', readonly=False,
+
+--- a/None
++++ b/addons/pos_loyalty/models/loyalty_reward.py
+@@ -0,0 +1,13 @@
++# -*- coding: utf-8 -*-
++# Part of Odoo. See LICENSE file for full copyright and licensing details.
++
++from odoo import models
++
++class LoyaltyReward(models.Model):
++    _inherit = 'loyalty.reward'
++
++    def _get_discount_product_values(self):
++        res = super()._get_discount_product_values()
++        for vals in res:
++            vals.update({'taxes_id': False})
++        return res
+
+--- a/addons/pos_loyalty/models/pos_config.py
++++ b/addons/pos_loyalty/models/pos_config.py
+@@ -104,5 +104,6 @@ class PosConfig(models.Model):
+                 'coupon_id': coupon.id,
+                 'coupon_partner_id': coupon.partner_id.id,
+                 'points': coupon.points,
++                'has_source_order': coupon._has_source_order(),
+             },
+         }
+
+--- a/addons/pos_loyalty/models/pos_order.py
++++ b/addons/pos_loyalty/models/pos_order.py
+@@ -64,7 +64,7 @@ class PosOrder(models.Model):
+         coupon_new_id_map = {k: k for k in coupon_data.keys() if k > 0}
+ 
+         # Create the coupons that were awarded by the order.
+-        coupons_to_create = {k: v for k, v in coupon_data.items() if k < 0}
++        coupons_to_create = {k: v for k, v in coupon_data.items() if k < 0 and not v.get('giftCardId')}
+         coupon_create_vals = [{
+             'program_id': p['program_id'],
+             'partner_id': p.get('partner_id', False),
+@@ -72,8 +72,22 @@ class PosOrder(models.Model):
+             'points': 0,
+             'source_pos_order_id': self.id,
+         } for p in coupons_to_create.values()]
++
+         # Pos users don't have the create permission
+         new_coupons = self.env['loyalty.card'].sudo().create(coupon_create_vals)
++
++        # We update the gift card that we sold when the gift_card_settings = 'scan_use'.
++        gift_cards_to_update = [v for v in coupon_data.values() if v.get('giftCardId')]
++        updated_gift_cards = self.env['loyalty.card']
++        for coupon_vals in gift_cards_to_update:
++            gift_card = self.env['loyalty.card'].browse(coupon_vals.get('giftCardId'))
++            gift_card.write({
++                'points': coupon_vals['points'],
++                'source_pos_order_id': self.id,
++                'partner_id': coupon_vals.get('partner_id', False),
++            })
++            updated_gift_cards |= gift_card
++
+         # Map the newly created coupons
+         for old_id, new_id in zip(coupons_to_create.keys(), new_coupons):
+             coupon_new_id_map[new_id.id] = old_id
+@@ -93,7 +107,8 @@ class PosOrder(models.Model):
+         # Reports per program
+         report_per_program = {}
+         coupon_per_report = defaultdict(list)
+-        for coupon in new_coupons:
++        # Important to include the updated gift cards so that it can be printed. Check coupon_report.
++        for coupon in new_coupons | updated_gift_cards:
+             if coupon.program_id not in report_per_program:
+                 report_per_program[coupon.program_id] = coupon.program_id.communication_plan_ids.\
+                     filtered(lambda c: c.trigger == 'create').pos_report_print_id
+@@ -116,7 +131,12 @@ class PosOrder(models.Model):
+                 'program_name': coupon.program_id.name,
+                 'expiration_date': coupon.expiration_date,
+                 'code': coupon.code,
+-            } for coupon in new_coupons if coupon.program_id.applies_on == 'future'],
++            } for coupon in new_coupons if (
++                coupon.program_id.applies_on == 'future'
++                # Don't send the coupon code for the gift card and ewallet programs.
++                # It should not be printed in the ticket.
++                and coupon.program_id.program_type not in ['gift_card', 'ewallet']
++            )],
+             'coupon_report': coupon_per_report,
+         }
+ 
+
+--- a/addons/pos_loyalty/models/pos_order_line.py
++++ b/addons/pos_loyalty/models/pos_order_line.py
+@@ -28,3 +28,9 @@ class PosOrderLine(models.Model):
+ 
+     def _is_not_sellable_line(self):
+         return super().is_not_sellable_line() or self.reward_id
++
++    def _export_for_ui(self, orderline):
++        result = super()._export_for_ui(orderline)
++        result['is_reward_line'] = orderline.is_reward_line
++        result['reward_id'] = orderline.reward_id.id
++        return result
+
+--- a/addons/pos_loyalty/models/pos_session.py
++++ b/addons/pos_loyalty/models/pos_session.py
+@@ -22,7 +22,7 @@ class PosSession(models.Model):
+             'search_params': {
+                 'domain': [('id', 'in', self.config_id._get_program_ids().ids)],
+                 'fields': ['name', 'trigger', 'applies_on', 'program_type', 'date_to',
+-                    'limit_usage', 'max_usage', 'is_nominative', 'portal_point_name'],
++                    'limit_usage', 'max_usage', 'is_nominative', 'portal_visible', 'portal_point_name', 'trigger_product_ids'],
+             },
+         }
+ 
+@@ -56,45 +56,6 @@ class PosSession(models.Model):
+     def _get_pos_ui_loyalty_reward(self, params):
+         return self.env['loyalty.reward'].search_read(**params['search_params'])
+ 
+-    def _get_pos_ui_res_partner(self, params):
+-        result = super()._get_pos_ui_res_partner(params)
+-        return self._load_pos_ui_loyalty_points(result)
+-
+-    def get_pos_ui_res_partner_by_params(self, custom_search_params):
+-        partners = super().get_pos_ui_res_partner_by_params(custom_search_params)
+-        return self._load_pos_ui_loyalty_points(partners)
+-
+-    def _load_pos_ui_loyalty_points(self, result):
+-        # In order to make loyalty programs work offline we load the partner's point into
+-        # a non-existant field 'loyalty_points'.
+-        loyalty_programs = self.config_id._get_program_ids().filtered(lambda program: program.program_type == 'loyalty')
+-        if loyalty_programs:
+-            # collect ids in a list, group by id and default points to 0
+-            partner_ids = []
+-            res_by_id = {}
+-            for res in result:
+-                partner_ids.append(res['id'])
+-                res_by_id[res['id']] = res
+-                res['loyalty_points'] = 0
+-                res['loyalty_card_id'] = False
+-            # Direct query to avoid loading loyalty cards in the cache for no reason.
+-            # There is no context where we would need to flush.
+-            query = self.env['loyalty.card']._search(
+-                [('program_id', '=', loyalty_programs[0].id), ('partner_id', 'in', partner_ids)]
+-            )
+-            # query can be falsy
+-            if not query:
+-                return result
+-            query_str, params = query.select('id', 'partner_id', 'points')
+-            self.env.cr.execute(query_str, params)
+-            for res in self.env.cr.dictfetchall():
+-                # The result of where_calc also includes partner_id is null.
+-                if not res.get('partner_id'):
+-                    continue
+-                res_by_id[res['partner_id']]['loyalty_points'] = res['points']
+-                res_by_id[res['partner_id']]['loyalty_card_id'] = res['id']
+-        return result
+-
+     def _loader_params_product_product(self):
+         result = super(PosSession, self)._loader_params_product_product()
+         config = self.config_id
+@@ -115,34 +76,48 @@ class PosSession(models.Model):
+         result.extend(products)
+         return result
+ 
++    def _get_pos_ui_res_partner(self, params):
++        partners = super()._get_pos_ui_res_partner(params)
++        self._set_loyalty_cards(partners)
++        return partners
++
++    def get_pos_ui_res_partner_by_params(self, custom_search_params):
++        partners = super().get_pos_ui_res_partner_by_params(custom_search_params)
++        self._set_loyalty_cards(partners)
++        return partners
++
++    def _set_loyalty_cards(self, partners):
++        # Map partner_id to its loyalty cards from all loyalty programs.
++        loyalty_programs = self.config_id._get_program_ids().filtered(lambda p: p.program_type == 'loyalty')
++        loyalty_card_fields = ['points', 'code', 'program_id']
++        partner_id_to_loyalty_card = {}
++        for group in self.env['loyalty.card'].read_group(
++            domain=[('partner_id', 'in', [p['id'] for p in partners]), ('program_id', 'in', loyalty_programs.ids)],
++            fields=[f"{field_name}:array_agg" for field_name in loyalty_card_fields] + ["ids:array_agg(id)"],
++            groupby=['partner_id']
++        ):
++            loyalty_cards = {}
++            for i in range(group['partner_id_count']):
++                loyalty_cards[group['ids'][i]] = {field_name: group[field_name][i] for field_name in loyalty_card_fields}
++            partner_id_to_loyalty_card[group['partner_id'][0]] = loyalty_cards
++
++        # Assign loyalty cards to each partner to load.
++        for partner in partners:
++            partner['loyalty_cards'] = partner_id_to_loyalty_card.get(partner['id'], {})
++
++        return partners
++
+     def _pos_data_process(self, loaded_data):
+         super()._pos_data_process(loaded_data)
+-        config = loaded_data['pos.config']
+-        if not loaded_data.get('loyalty.program'):
+-            return
+-        programs = loaded_data['loyalty.program']
+-
+-        loyalty_programs, coupons, promotions, gift_cards = [], [], [], []
+-        for program in programs:
+-            if (program['program_type'] == 'loyalty'):
+-                loyalty_programs.append(program)
+-            if (program['program_type'] == 'coupon'):
+-                coupons.append(program)
+-            if (program['program_type'] == 'promotion'):
+-                promotions.append(program)
+-            if (program['program_type'] == 'gift_card'):
+-                gift_cards.append(program)
+-
+-        # NOTE: the following keys are only used in PoS frontend
+-        # TODO: remove them
+-        loyalty_program = loyalty_programs[0] if len(loyalty_programs) > 0 else False
+-        config['loyalty_program_id'] = loyalty_program and (loyalty_program['id'], loyalty_program['name'])
+-        config['module_pos_loyalty'] = bool(loyalty_program)
+-
+-        config['coupon_program_ids'] = [(coupon['id'], coupon['name']) for coupon in coupons]
+-        config['promo_program_ids'] = [(promotion['id'], promotion['name']) for promotion in promotions]
+-        config['use_coupon_programs'] = len(coupons) + len(promotions) > 0
+-
+-        gift_card = gift_cards[0] if len(gift_cards) > 0 else False
+-        config['gift_card_program_id'] = gift_card and (gift_card['id'], gift_card['name'])
+-        config['use_gift_card'] = bool(gift_card)
++
++        # Additional post processing to link gift card and ewallet programs
++        # to their rules' products.
++        # Important because points from their products are only counted once.
++        product_id_to_program_ids = {}
++        for program in self.config_id._get_program_ids():
++            if program.program_type in ['gift_card', 'ewallet']:
++                for product in program.trigger_product_ids:
++                    product_id_to_program_ids.setdefault(product['id'], [])
++                    product_id_to_program_ids[product['id']].append(program['id'])
++
++        loaded_data['product_id_to_program_ids'] = product_id_to_program_ids

@@ -1,0 +1,223 @@
+PR: https://github.com/odoo/odoo/pull/116477
+
+From: f13d537a42ff1a2713484d0e7c39b73fbb87a7fb
+From: Pieter Claeys (clpi)
+Date: 2023-06-23 15:59:57
+
+Structural Changes: 5
+Total Changes: 116
+
+[IMP] mrp: New analytic for MRP
+
+The (legacy) analytic account field on MOs, BOMs and workcenters has
+been replaced by the new "analytic distribution" field.
+
+The analytic line items are now created based on this distribution for
+the raw materials, workcenter costs and employee costs.
+
+A new analytic applicability (=domain) has been added for manufacturing
+orders as well.
+
+Community PR: https://github.com/odoo/odoo/pull/116477
+Enterprise PR: https://github.com/odoo/enterprise/pull/38690
+
+closes odoo/odoo#116477
+
+Task: 3196563
+Related: odoo/upgrade#4704
+Related: odoo/enterprise#38690
+Signed-off-by: Arnold Moyaux (arm) <arm@odoo.com>
+
+================================= pseudo patch: =================================
+
+--- a/addons/stock_account/models/__init__.py
++++ b/addons/stock_account/models/__init__.py
+@@ -3,6 +3,7 @@
+ 
+ from . import account_chart_template
+ from . import account_move
++from . import analytic_account
+ from . import product
+ from . import stock_move
+ from . import stock_location
+
+--- a/None
++++ b/addons/stock_account/models/analytic_account.py
+@@ -0,0 +1,77 @@
++#  -*- coding: utf-8 -*-
++#  Part of Odoo. See LICENSE file for full copyright and licensing details.
++
++from odoo import models
++from odoo.tools import float_compare, float_is_zero
++
++
++class AccountAnalyticPlan(models.Model):
++    _inherit = 'account.analytic.plan'
++
++    def _calculate_distribution_amount(self, amount, percentage, distribution_on_each_plan):
++        existing_amount = distribution_on_each_plan.get(self, 0)
++        distribution_plan = existing_amount + percentage
++        decimal_precision = self.env['decimal.precision'].precision_get('Percentage Analytic')
++        if float_compare(distribution_plan, 100, precision_digits=decimal_precision) == 0:
++            distributed_amount = amount * (100 - existing_amount) / 100.0
++        else:
++            distributed_amount = amount * percentage / 100.0
++        distribution_on_each_plan[self] = distribution_plan
++        return distributed_amount
++
++class AccountAnalyticAccount(models.Model):
++    _inherit = 'account.analytic.account'
++
++    def _perform_analytic_distribution(self, distribution, amount, unit_amount, lines, obj, additive=False):
++        """
++        Redistributes the analytic lines to match the given distribution:
++            - For account_ids where lines already exist, the amount and unit_amount of these lines get updated,
++              lines where the updated amount becomes zero get unlinked.
++            - For account_ids where lines don't exist yet, the line values to create them are returned,
++              lines where the amount becomes zero are not included.
++
++        :param distribution:    the desired distribution to match the analytic lines to
++        :param amount:          the total amount to distribute over the analytic lines
++        :param unit_amount:     the total unit amount (will not be distributed)
++        :param lines:           the (current) analytic account lines that need to be matched to the new distribution
++        :param obj:             the object on which _prepare_analytic_line_values(account_id, amount, unit_amount) will be
++                                called to get the template for the values of new analytic line objects
++        :param additive:        if True, the unit_amount and (distributed) amount get added to the existing lines
++
++        :returns: a list of dicts containing the values for new analytic lines that need to be created
++        :rtype:   dict
++        """
++        distribution_on_each_plan = {}
++        processed_distributions = []
++        for existing_aal in lines:
++            if distribution and existing_aal.account_id.id in [int(i) for i in distribution]:
++                # Update the existing AAL for this account
++                percentage = distribution[str(existing_aal.account_id.id)]
++                new_amount = existing_aal.account_id.root_plan_id._calculate_distribution_amount(amount, percentage, distribution_on_each_plan)
++                new_unit_amount = amount
++                if additive:
++                    new_amount += existing_aal.amount
++                    new_unit_amount += existing_aal.unit_amount
++                currency = existing_aal.account_id.currency_id or obj.company_id.currency_id
++                if float_is_zero(new_amount, precision_rounding=currency.rounding):
++                    existing_aal.unlink()
++                else:
++                    existing_aal.amount = new_amount
++                    existing_aal.unit_amount = new_unit_amount
++                processed_distributions.append(existing_aal.account_id.id)
++            else:
++                # Delete the existing AAL if it is no longer present in the new distribution
++                existing_aal.unlink()
++        lines_to_link = []
++        if not distribution:
++            return []
++        for account_id, percentage in distribution.items():
++            # Only create a new AAL if an existing one was not already modified before
++            account_id = int(account_id)
++            if account_id not in processed_distributions:
++                account = self.browse(account_id)
++                new_amount = account.root_plan_id._calculate_distribution_amount(amount, percentage, distribution_on_each_plan)
++                currency = account.currency_id or obj.company_id.currency_id
++                if not float_is_zero(new_amount, precision_rounding=currency.rounding):
++                    lines_to_link.append(obj._prepare_analytic_line_values(account.id, new_amount, unit_amount))
++        return lines_to_link
+
+--- a/addons/stock_account/models/stock_move.py
++++ b/addons/stock_account/models/stock_move.py
+@@ -5,7 +5,7 @@ from collections import defaultdict
+ 
+ from odoo import api, fields, models, _
+ from odoo.exceptions import UserError
+-from odoo.tools import float_compare, float_is_zero, float_round, OrderedSet
++from odoo.tools import float_is_zero, float_round, float_compare, OrderedSet
+ 
+ import logging
+ _logger = logging.getLogger(__name__)
+@@ -18,8 +18,7 @@ class StockMove(models.Model):
+                                help='Trigger a decrease of the delivered/received quantity in the associated Sale Order/Purchase Order')
+     account_move_ids = fields.One2many('account.move', 'stock_move_id')
+     stock_valuation_layer_ids = fields.One2many('stock.valuation.layer', 'stock_move_id')
+-    analytic_account_line_id = fields.Many2one(
+-        'account.analytic.line', copy=False)
++    analytic_account_line_ids = fields.Many2many('account.analytic.line', copy=False)
+ 
+     def _filter_anglo_saxon_moves(self, product):
+         return self.filtered(lambda m: m.product_id.id == product.id)
+@@ -31,7 +30,7 @@ class StockMove(models.Model):
+         return action_data
+ 
+     def _action_cancel(self):
+-        self.analytic_account_line_id.unlink()
++        self.analytic_account_line_ids.unlink()
+         return super()._action_cancel()
+ 
+     def _should_force_price_unit(self):
+@@ -407,7 +406,7 @@ class StockMove(models.Model):
+ 
+     def _prepare_analytic_lines(self):
+         self.ensure_one()
+-        if not self._get_analytic_account():
++        if not self._get_analytic_distribution() and not self.analytic_account_line_ids:
+             return False
+ 
+         if self.state in ['cancel', 'draft']:
+@@ -429,24 +428,19 @@ class StockMove(models.Model):
+         elif sum(self.stock_valuation_layer_ids.mapped('quantity')):
+             amount = sum(self.stock_valuation_layer_ids.mapped('value'))
+             unit_amount = - sum(self.stock_valuation_layer_ids.mapped('quantity'))
+-        if self.analytic_account_line_id:
+-            self.analytic_account_line_id.unit_amount = unit_amount
+-            self.analytic_account_line_id.amount = amount
+-            return False
+-        elif amount:
+-            return self._generate_analytic_lines_data(
+-                unit_amount, amount)
++
++        return self.env['account.analytic.account']._perform_analytic_distribution(
++            self._get_analytic_distribution(), amount, unit_amount, self.analytic_account_line_ids, self)
+ 
+     def _ignore_automatic_valuation(self):
+         return False
+ 
+-    def _generate_analytic_lines_data(self, unit_amount, amount):
++    def _prepare_analytic_line_values(self, account, amount, unit_amount):
+         self.ensure_one()
+-        account_id = self._get_analytic_account()
+         return {
+             'name': self.name,
+             'amount': amount,
+-            'account_id': account_id.id,
++            'account_id': account,
+             'unit_amount': unit_amount,
+             'product_id': self.product_id.id,
+             'product_uom_id': self.product_id.uom_id.id,
+@@ -532,18 +526,10 @@ class StockMove(models.Model):
+         }
+ 
+     def _account_analytic_entry_move(self):
+-        analytic_lines_vals = []
+-        moves_to_link = []
+         for move in self:
+             analytic_line_vals = move._prepare_analytic_lines()
+-            if not analytic_line_vals:
+-                continue
+-            moves_to_link.append(move.id)
+-            analytic_lines_vals.append(analytic_line_vals)
+-        analytic_lines = self.env['account.analytic.line'].sudo().create(analytic_lines_vals)
+-        for move_id, analytic_line in zip(moves_to_link, analytic_lines):
+-            self.env['stock.move'].browse(
+-                move_id).analytic_account_line_id = analytic_line
++            if analytic_line_vals:
++                move.analytic_account_line_ids += self.env['account.analytic.line'].sudo().create(analytic_line_vals)
+ 
+     def _account_entry_move(self, qty, description, svl_id, cost):
+         """ Accounting Valuation Entries """
+@@ -593,7 +579,7 @@ class StockMove(models.Model):
+ 
+         return am_vals
+ 
+-    def _get_analytic_account(self):
++    def _get_analytic_distribution(self):
+         return False
+ 
+     def _get_related_invoices(self):  # To be overridden in purchase and sale_stock

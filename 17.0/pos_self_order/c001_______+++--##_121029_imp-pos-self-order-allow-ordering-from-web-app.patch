@@ -1,0 +1,704 @@
+PR: https://github.com/odoo/odoo/pull/121029
+
+From: 13e37bda7c2976e2d00212aca3d51e7b8a065fe7
+From: vlst
+Date: 2023-05-19 11:33:08
+
+Structural Changes: 14
+Total Changes: 542
+
+[IMP] pos_self_order: Allow ordering from web app
+
+Currently from the pos_self_order app a customer can only view the menu.
+This PR adds the option to order items.
+A customer of the restaurant will now be able to scan a qr code on their table, and navigate to a website where they will be able to order items from the pos.
+The customer can select product variants and add a specific notes for each of the ordered products.
+
+This version does not support online payment. This means that the customer will still have to pay by the usual methods.
+
+The pos can be configured such that a customer can add items to an existing order. For example, ordering a second coffee will result in an update of the existing pos order containing the first coffee. Alternatively, the pos can be configured such that each order made from the web app results in a new pos order. Orders made from the self order app will be placed in the same pos session as regular orders. Once a customer orders from the self order app, a new order will appear in the pos app. Thus, a waiter will be able to quickly see all the orders placed by customers from the self order app. He/She will then be able to send the order to the preparation display. This step has to be done manually.
+
+In the interest of security, each table now has an associated access token. It is included in url that the customer gets from the qr code. When sending the order, the self order app also sends back to the server this access token. The server will only process the order if it receives a valid access token. When placing an order, the server will respond with the pos_reference and access_token of the created order. The web app will keep this data and will send it back to the
+ server as a proof of ownership in the event that it intends to get the latest state of the order or to update it. The server will only reveal information about an existing order when the request contains a valid pair of pos_reference and access_token.
+
+closes odoo/odoo#121029
+
+Task: 3058586
+Signed-off-by: Joseph Caburnay (jcb) <jcb@odoo.com>
+
+================================= pseudo patch: =================================
+
+--- a/addons/pos_self_order/models/__init__.py
++++ b/addons/pos_self_order/models/__init__.py
+@@ -1,6 +1,9 @@
+ # -*- coding: utf-8 -*-
+ 
+-from . import res_config_settings
++from . import ir_http
+ from . import pos_config
++from . import pos_order
++from . import pos_restaurant
+ from . import pos_self_order_custom_link
+-from . import ir_http
++from . import product_product
++from . import res_config_settings
+
+--- a/addons/pos_self_order/models/ir_http.py
++++ b/addons/pos_self_order/models/ir_http.py
+@@ -4,9 +4,9 @@ from odoo import models
+ 
+ 
+ class IrHttp(models.AbstractModel):
+-    _inherit = 'ir.http'
++    _inherit = "ir.http"
+ 
+     @classmethod
+     def _get_translation_frontend_modules_name(cls):
+         mods = super()._get_translation_frontend_modules_name()
+-        return mods + ['pos_self_order']
++        return mods + ["pos_self_order"]
+
+--- a/addons/pos_self_order/models/pos_config.py
++++ b/addons/pos_self_order/models/pos_config.py
+@@ -1,26 +1,104 @@
+ # -*- coding: utf-8 -*-
+ # Part of Odoo. See LICENSE file for full copyright and licensing details.
+ 
+-from odoo import fields, models
++from typing import Optional, List, Dict, Callable
++from werkzeug.urls import url_quote
++import base64
++
++
++from odoo import api, fields, models, modules
++from odoo.tools import file_open, split_every
++
++from odoo.addons.pos_self_order.models.product_product import ProductProduct
++from odoo.addons.pos_self_order.models.pos_order import PosOrderLine
+ 
+ 
+ class PosConfig(models.Model):
+     _inherit = "pos.config"
+ 
++    def _self_order_default_image_name(self) -> str:
++        return "default_background.jpg"
++
++    def _self_order_default_image(self) -> bytes:
++        image_path = modules.get_module_resource(
++            "pos_self_order", "static/img", self._self_order_default_image_name()
++        )
++        return base64.b64encode(file_open(image_path, "rb").read())
++
+     self_order_view_mode = fields.Boolean(
+         string="QR Code Menu",
+         help="Allow customers to view the menu on their phones by scanning the QR code on the table",
+     )
++    self_order_table_mode = fields.Boolean(
++        string="Self Order",
++        help="Allow customers to Order from their phones",
++    )
++    self_order_pay_after = fields.Selection(
++        [("each", "Each Order"), ("meal", "Meal")],
++        string="Pay After:",
++        default="each",
++        help="Choose when the customer will pay",
++        required=True,
++    )
+     self_order_image = fields.Image(
+         string="Self Order Image",
+         help="Image to display on the self order screen",
+-        max_width=1920, max_height=1080,
++        max_width=1920,
++        max_height=1080,
++        default=_self_order_default_image,
+     )
+     self_order_image_name = fields.Char(
+         string="Self Order Image Name",
+         help="Name of the image to display on the self order screen",
++        default=_self_order_default_image_name,
+     )
+ 
++    @api.model_create_multi
++    def create(self, vals_list):
++        """
++        We want self ordering to be enabled by default
++        (This would have been nicer to do using a default value
++        directly on the fields, but `module_pos_restaurant` would not be
++        known at the time that the function for this default value would run)
++        """
++        for vals in vals_list:
++            if vals.get("module_pos_restaurant"):
++                vals.update(
++                    {
++                        "self_order_view_mode": True,
++                        "self_order_table_mode": True,
++                    }
++                )
++        return super().create(vals_list)
++
++    @api.depends("module_pos_restaurant")
++    def _compute_self_order(self):
++        """
++        Self ordering will only be enabled for restaurants
++        """
++        for record in self:
++            if not record.module_pos_restaurant:
++                record.self_order_view_mode = False
++                record.self_order_table_mode = False
++
++    def _get_self_order_route(self, table_id: Optional[int] = None) -> str:
++        self.ensure_one()
++        base_route = f"/menu/{self.id}"
++        if not self.self_order_table_mode:
++            return base_route
++        table_access_token = (
++            self.env["restaurant.table"]
++            .search(
++                [("active", "=", True), *(table_id and [("id", "=", table_id)] or [])], limit=1
++            )
++            .access_token
++        )
++        return f"{base_route}?at={table_access_token}"
++
++    def _get_self_order_url(self, table_id: Optional[int] = None) -> str:
++        self.ensure_one()
++        return url_quote(self.get_base_url() + self._get_self_order_route(table_id))
++
+     def preview_self_order_app(self):
+         """
+         This function is called when the user clicks on the "Preview App" button
+@@ -29,6 +107,126 @@ class PosConfig(models.Model):
+         self.ensure_one()
+         return {
+             "type": "ir.actions.act_url",
+-            "url": f"/menu/{self.id}",
++            "url": self._get_self_order_route(),
+             "target": "new",
+         }
++
++    def _get_self_order_custom_links(self) -> List[Dict[str, str]]:
++        """
++        On the landing page of the app we can have a number of custom links
++        that are defined by the restaurant employee in the backend.
++        This function returns a list of dictionaries with the attributes of each link
++        that is available for the POS with id pos_config_id.
++        """
++        self.ensure_one()
++        return (
++            self.env["pos_self_order.custom_link"]
++            .sudo()
++            .search_read(
++                [
++                    "|",
++                    ("pos_config_ids", "in", [self.id]),
++                    ("pos_config_ids", "=", False),
++                ],
++                fields=["name", "url", "style"],
++                order="sequence",
++            )
++        )
++
++    def _get_available_products(self) -> ProductProduct:
++        """
++        This function returns the products that are available in the given PosConfig
++        """
++        self.ensure_one()
++        return (
++            self.env["product.product"]
++            .sudo()
++            .search(
++                [
++                    ("available_in_pos", "=", True),
++                    *(
++                        self.limit_categories
++                        and self.iface_available_categ_ids
++                        and [("pos_categ_id", "in", self.iface_available_categ_ids.ids)]
++                        or []
++                    ),
++                ],
++                order="pos_categ_id.sequence asc nulls last",
++            )
++        )
++
++    def _get_self_order_data(self) -> Dict:
++        self.ensure_one()
++        return {
++            "pos_config_id": self.id,
++            "company_name": self.company_id.name,
++            "currency_id": self.currency_id.id,
++            "show_prices_with_tax_included": self.iface_tax_included == "total",
++            "custom_links": self._get_self_order_custom_links(),
++            "products": self._get_available_products()._get_self_order_data(self),
++            "has_active_session": self.has_active_session,
++            "orderline_unique_keys": PosOrderLine._get_unique_keys(),
++        }
++
++    def _generate_data_for_qr_codes_page(self, cols: int = 4) -> Dict[str, List[Dict]]:
++        """
++        :cols: the number of qr codes per row
++        """
++        self.ensure_one()
++        return {
++            "floors": self._split_qr_codes_list(
++                self._get_qr_codes_info(cols * cols),
++                cols,
++            )
++        }
++
++    def _get_qr_codes_info(self, total_number: int) -> List[Dict]:
++        """
++        total_number: the number of qr codes to generate (in the case where we don't have
++                floor management)
++        return: a list of dictionaries with the following keys:
++            - name: the name of the floor
++            - tables: a list of dictionaries with the following keys:
++                - id: the id of the table
++                - url: the url of the table
++                - name?: the name of the table
++        """
++        self.ensure_one()
++        if self.self_order_table_mode:
++            return self.floor_ids._get_data_for_qr_codes_page(self._get_self_order_url)
++        else:
++            return self._get_default_qr_codes(total_number, self._get_self_order_url)
++
++    def _split_qr_codes_list(self, floors: List[Dict], cols: int) -> List[Dict]:
++        """
++        :floors: the list of floors
++        :cols: the number of qr codes per row
++        """
++        self.ensure_one()
++        return [
++            {
++                "name": floor.get("name"),
++                "rows_of_tables": list(split_every(cols, floor["tables"], list)),
++            }
++            for floor in floors
++        ]
++
++    def _get_default_qr_codes(
++        self, number: int, url: Callable[[Optional[int]], str]
++    ) -> List[Dict]:
++        """
++        :number: the number of qr codes to generate
++        :url: a function that takes a table id and returns the url of the table
++        """
++        self.ensure_one()
++        return [
++            {
++                "tables": [
++                    {
++                        "id": 0,
++                        "url": url(),
++                    }
++                ]
++                * number,
++            }
++        ]
+
+--- a/None
++++ b/addons/pos_self_order/models/pos_order.py
+@@ -0,0 +1,83 @@
++# -*- coding: utf-8 -*-
++# Part of Odoo. See LICENSE file for full copyright and licensing details.
++
++import re
++from typing import Dict, Union
++
++from odoo import models
++
++
++class PosOrderLine(models.Model):
++    _inherit = "pos.order.line"
++
++    def _export_for_ui(self, orderline):
++        return {
++            "uuid": orderline.uuid,
++            "note": orderline.note,
++            **super()._export_for_ui(orderline),
++        }
++
++    def _get_description(self):
++        """
++        The pos sends a "description" key to the backend, which is a string containing the selected value for
++        each attribute of the product, separated by a comma. In the db we end up storing the
++        "full_product_name", which is composed of the product name and the description.
++        :line.full_product_name: ex: "Desk Organizer (M, Leather)"
++        :return: ex: "M, Leather"
++        """
++        self.ensure_one()
++        description = re.findall(r"\(([^)]+)\)", self.full_product_name)
++        if description:
++            # It might happen that the product has a name with parenthesis. ex: "Salad (Vegie)"
++            # In that case the full_product_name will be "Salad (Vegie) (Small)", but are interested in returning the variant "Small"
++            # That's why we return the last element of the list
++            return description[-1]
++        return ""
++
++    @staticmethod
++    def _get_unique_keys():
++        """
++        These are the keys that define the uniqueness of an orderline.
++        We use them to check if 2 orderlines can be merged or not.
++        """
++        return ["product_id", "description", "customer_note"]
++
++
++class PosOrder(models.Model):
++    _inherit = "pos.order"
++
++    def _export_for_self_order(self) -> Dict:
++        """
++        Given an order, it returns a dictionary with the keys that we need in the frontend
++        """
++        self.ensure_one()
++        return {
++            "pos_reference": self.pos_reference,
++            "access_token": self.access_token,
++            "state": self.state,
++            "date": str(self.date_order),
++            "amount_total": self.amount_total,
++            "amount_tax": self.amount_tax,
++            "items": [
++                {
++                    "product_id": line.product_id.id,
++                    "qty": line.qty,
++                    "customer_note": line.customer_note,
++                    "price_extra": line.product_id._get_price_info(
++                        self.config_id,
++                        line.price_extra,
++                    ),
++                    "description": line._get_description(),
++                }
++                for line in self.lines
++            ],
++        }
++
++    def _get_self_order_data(self) -> Dict[str, Union[str, int]]:
++        return {
++            "id": self.pos_reference,
++            "sequence_number": self.sequence_number,
++            "access_token": self.access_token,
++            "session_id": self.session_id.id,
++            "table_id": self.table_id.id,
++        }
+
+--- a/None
++++ b/addons/pos_self_order/models/pos_restaurant.py
+@@ -0,0 +1,66 @@
++# -*- coding: utf-8 -*-
++# Part of Odoo. See LICENSE file for full copyright and licensing details.
++
++import uuid
++from typing import Dict, Callable, List, Optional
++
++from odoo import api, fields, models
++
++
++class RestaurantFloor(models.Model):
++    _inherit = "restaurant.floor"
++
++    def _get_data_for_qr_codes_page(self, url: Callable):
++        return [
++            {
++                "name": floor.name,
++                "tables": floor.table_ids.filtered("active")._get_data_for_qr_codes_page(url),
++            }
++            for floor in self
++        ]
++
++
++class RestaurantTable(models.Model):
++    _inherit = "restaurant.table"
++
++    access_token = fields.Char(
++        "Security Token",
++        copy=False,
++        required=True,
++        readonly=True,
++        default=lambda self: self._get_access_token(),
++    )
++
++    @staticmethod
++    def _get_access_token():
++        return uuid.uuid4().hex[:8]
++
++    def _get_self_order_data(self) -> Dict:
++        self.ensure_one()
++        return self.read(["name", "access_token"])[0]
++
++    def _get_data_for_qr_codes_page(self, url: Callable[[Optional[int]], str]) -> List[Dict]:
++        return [
++            {
++                "id": table.id,
++                "name": table.name,
++                "url": url(table.id),
++            }
++            for table in self
++        ]
++
++    @api.model
++    def _update_access_token(self):
++        """
++        We define a new access token field in this file.
++        There might already be databases that have restaurant.table records.
++        They will now also get an access token each; the problem is that
++        because of the way `default` values work, all those tables that
++        exist in the db will get the same access token.
++        This method will be ran at the moment the pos_self_order module
++        is installed and will thus make sure that every record has a
++        different access token.
++        """
++        tables = self.env["restaurant.table"].search([])
++        for table in tables:
++            table.access_token = self._get_access_token()
+
+--- a/addons/pos_self_order/models/pos_self_order_custom_link.py
++++ b/addons/pos_self_order/models/pos_self_order_custom_link.py
+@@ -1,17 +1,21 @@
+ # -*- coding: utf-8 -*-
+ # Part of Odoo. See LICENSE file for full copyright and licensing details.
+ 
++
+ from odoo import fields, models, api
++from markupsafe import escape
+ 
+ 
+ class PosSelfOrderCustomLink(models.Model):
+     _name = "pos_self_order.custom_link"
+-    _description = "Custom links that the restaurant can configure to be displayed on the self order screen"
++    _description = (
++        "Custom links that the restaurant can configure to be displayed on the self order screen"
++    )
+     name = fields.Char(string="Label", required=True, translate=True)
+     url = fields.Char(string="URL", required=True)
+     pos_config_ids = fields.Many2many(
+         "pos.config",
+-        string="Point of Sales",
++        string="Points of Sale",
+         domain="[('self_order_view_mode', '=', True)]",
+         help="Select for which points of sale you want to display this link. Leave empty to display it for all points of sale. You have to select among the points of sale that have the 'QR Code Menu' feature enabled.",
+     )
+@@ -33,8 +37,8 @@ class PosSelfOrderCustomLink(models.Model):
+     link_html = fields.Html("Preview", compute="_compute_link_html", store=True, readonly=True)
+     sequence = fields.Integer("Sequence", default=1)
+ 
+-    @api.depends('name', 'style')
++    @api.depends("name", "style")
+     def _compute_link_html(self):
+         for link in self:
+             if link.name:
+-                link.link_html = f"<a class=\"btn btn-{link.style} w-100\">{link.name}</a>"
++                link.link_html = f'<a class="btn btn-{link.style} w-100">{escape(link.name)}</a>'
+
+--- a/None
++++ b/addons/pos_self_order/models/product_product.py
+@@ -0,0 +1,107 @@
++# -*- coding: utf-8 -*-
++# Part of Odoo. See LICENSE file for full copyright and licensing details.
++from typing import List, Dict, Optional
++
++from odoo import models
++
++from odoo.addons.point_of_sale.models.pos_config import PosConfig
++
++
++class ProductProduct(models.Model):
++    _inherit = "product.product"
++
++    def _get_name(self) -> str:
++        """
++        Returns the name of the product without the code.
++        ex: product_sudo.display_name is '[FURN_7888] Desk Stand with Screen (Red)'
++        :return: 'Desk Stand with Screen (Red)' (we remove the [FURN_7888] part)
++        """
++        self.ensure_one()
++        return self.with_context(display_default_code=False).display_name
++
++    def _filter_applicable_attributes(self, attributes_by_ptal_id: Dict) -> List[Dict]:
++        """
++        The attributes_by_ptal_id is a dictionary that contains all the attributes that have
++        [('create_variant', '=', 'no_variant')]
++        This method filters out the attributes that are not applicable to the product in self
++        """
++        self.ensure_one()
++        return [
++            attributes_by_ptal_id[id]
++            for id in self.attribute_line_ids.ids
++            if attributes_by_ptal_id.get(id) is not None
++        ]
++
++    def _get_attributes(self, pos_config_sudo: PosConfig) -> List[Dict]:
++        self.ensure_one()
++
++        attributes = self._filter_applicable_attributes(
++            self.env["pos.session"].sudo()._get_attributes_by_ptal_id()
++        )
++        return self._add_price_info_to_attributes(
++            attributes,
++            pos_config_sudo,
++        )
++
++    def _add_price_info_to_attributes(
++        self, attributes: List[Dict], pos_config_sudo: PosConfig
++    ) -> List[Dict]:
++        """
++        Here we replace the price_extra of each attribute value with a price_extra
++        dictionary that includes the price with taxes included and the price with taxes excluded
++        """
++        self.ensure_one()
++        for attribute in attributes:
++            for value in attribute["values"]:
++                value.update(
++                    {
++                        "price_extra": self._get_price_info(
++                            pos_config_sudo, value.get("price_extra")
++                        )
++                    }
++                )
++        return attributes
++
++    def _get_price_info(
++        self, pos_config: PosConfig, price: Optional[float] = None, qty: int = 1
++    ) -> Dict[str, float]:
++        """
++        Function that returns a dict with the price info of a given product
++        """
++        self.ensure_one()
++        # if price == None it means that a price was not passed as a parameter, so we use the product's list price
++        # it could happen that a price was passed, but it was 0; in that case we want to use this 0 as the argument,
++        # and not the product's list price
++        if price is None:
++            price = pos_config.pricelist_id._get_product_price(
++                self, qty, currency=pos_config.currency_id
++            )
++        price_info = pos_config.default_fiscal_position_id.map_tax(self.taxes_id).compute_all(
++            price, pos_config.currency_id, qty, product=self
++        )
++
++        return {
++            "list_price": price_info["total_included"]
++            if pos_config.iface_tax_included == "total"
++            else price_info["total_excluded"],
++            "price_without_tax": price_info["total_excluded"],
++            "price_with_tax": price_info["total_included"],
++        }
++
++    def _get_self_order_data(self, pos_config: PosConfig) -> List[Dict]:
++        """
++        returns the list of products with the necessary info for the self order app
++        """
++        return [
++            {
++                "price_info": product._get_price_info(pos_config),
++                "has_image": bool(product.image_1920),
++                "attributes": product._get_attributes(pos_config),
++                "name": product._get_name(),
++                "product_id": product.id,
++                "description_sale": product.description_sale,
++                "tag": product.pos_categ_id.name if product.pos_categ_id else "Other",
++                "is_pos_groupable": product.uom_id.is_pos_groupable,
++            }
++            for product in self
++        ]
+
+--- a/addons/pos_self_order/models/res_config_settings.py
++++ b/addons/pos_self_order/models/res_config_settings.py
+@@ -1,19 +1,35 @@
+ # -*- coding: utf-8 -*-
+ 
+ from odoo import models, fields, api
+-from odoo.tools import split_every
+-
+ 
+ 
+ class ResConfigSettings(models.TransientModel):
+     _inherit = "res.config.settings"
+ 
+     pos_self_order_view_mode = fields.Boolean(
+-        compute="_compute_pos_module_pos_self_order", store=True, readonly=False)
++        compute="_compute_pos_module_pos_self_order", store=True, readonly=False
++    )
++    pos_self_order_table_mode = fields.Boolean(
++        compute="_compute_pos_module_pos_self_order", store=True, readonly=False
++    )
++    pos_self_order_pay_after = fields.Selection(
++        [("each", "Each Order"), ("meal", "Meal")],
++        string="Pay After:",
++        default="each",
++        help="Choose when the customer will pay",
++        readonly=False,
++        required=True,
++    )
+     pos_self_order_image = fields.Image(
+-        compute="_compute_pos_module_pos_self_order", store=True, readonly=False, max_width=1920, max_height=1080)
++        compute="_compute_pos_module_pos_self_order",
++        store=True,
++        readonly=False,
++        max_width=1920,
++        max_height=1080,
++    )
+     pos_self_order_image_name = fields.Char(
+-        compute="_compute_pos_module_pos_self_order", store=True, readonly=False)
++        compute="_compute_pos_module_pos_self_order", store=True, readonly=False
++    )
+ 
+     @api.depends("pos_config_id")
+     def _compute_pos_module_pos_self_order(self):
+@@ -22,6 +38,8 @@ class ResConfigSettings(models.TransientModel):
+                 res_config.update(
+                     {
+                         "pos_self_order_view_mode": False,
++                        "pos_self_order_table_mode": False,
++                        "pos_self_order_pay_after": "each",
+                         "pos_self_order_image": False,
+                         "pos_self_order_image_name": False,
+                     }
+@@ -30,31 +48,32 @@ class ResConfigSettings(models.TransientModel):
+                 res_config.update(
+                     {
+                         "pos_self_order_view_mode": res_config.pos_config_id.self_order_view_mode,
++                        "pos_self_order_table_mode": res_config.pos_config_id.self_order_table_mode,
++                        "pos_self_order_pay_after": res_config.pos_config_id.self_order_pay_after,
+                         "pos_self_order_image": res_config.pos_config_id.self_order_image,
+                         "pos_self_order_image_name": res_config.pos_config_id.self_order_image_name,
+                     }
+                 )
+ 
++    # self_order_table_mode is only available if self_order_view_mode is True
++    @api.onchange("pos_self_order_view_mode")
++    def _onchange_pos_self_order_view_mode(self):
++        if not self.pos_self_order_view_mode:
++            self.pos_self_order_table_mode = False
++
++    @api.onchange("pos_self_order_table_mode")
++    def _onchange_pos_self_order_table_mode(self):
++        if self.pos_self_order_table_mode:
++            self.pos_self_order_view_mode = True
++
+     def generate_qr_codes_page(self):
+         """
+         Generate the data needed to print the QR codes page
+         """
+-        no_of_qr_codes_per_page = 16
+-        qr_codes_to_print = [
+-            {
+-                "id": 0,
+-                "url": f"{self.get_base_url()}/menu/{self.pos_config_id.id}",
+-            }
+-            for i in range(no_of_qr_codes_per_page)
+-        ]
+-        data = {
+-            "groups_of_tables": list(split_every(4, qr_codes_to_print, list)),
+-        }
+-        return self.env.ref("pos_self_order.report_self_order_qr_codes_page").report_action([], data=data)
++        return self.env.ref("pos_self_order.report_self_order_qr_codes_page").report_action(
++            [], data=self.pos_config_id._generate_data_for_qr_codes_page(cols=3)
++        )
+ 
+     def preview_self_order_app(self):
+-        """
+-        This function calls the preview_self_order_app function of the pos.config model
+-        """
+         self.ensure_one()
+         return self.pos_config_id.preview_self_order_app()

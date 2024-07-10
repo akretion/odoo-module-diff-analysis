@@ -1,0 +1,278 @@
+PR: https://github.com/odoo/odoo/pull/126431
+
+From: 4a20cb320b8e251c3670c4fb25ee1b6ba9d2d19b
+From: Jérémy Hennecart (jeh)
+Date: 2023-10-13 07:33:49
+
+Structural Changes: 8
+Total Changes: 94
+
+[IMP] *event*: remove autoconfirm
+
+Remove autoconfirm logic and simplify the flow of event
+registrations. Now a registration is by default considered
+as confirmed.
+
+The draft state is kept for registrations with
+a payment pending.
+
+These registrations are no longer counted
+as expected attendees for the seats computation.
+To match the behavior of events, we also add a seats_expected
+computed field on event tickets.
+
+The registration status is now based on the sale order state.
+So the payment_status field is renamed sale_status.
+We consider now that a registration linked to a SO in a sale
+state should be confirmed and reserved.
+A sale order is in the `sale` state when manually confirmed
+or when the transactions done match the amount_total of the
+sale order.
+
+We also rename the seats_expected field into seats_taken to
+better match the process. It was a bit weird to have expected
+in the name when the registration attended were counted into it.
+
+UPG PR: odoo/upgrade#4836
+
+task-3061849
+
+Part-of: odoo/odoo#126431
+
+================================= pseudo patch: =================================
+
+--- a/addons/event/models/event_event.py
++++ b/addons/event/models/event_event.py
+@@ -63,10 +63,6 @@ class EventType(models.Model):
+         'Maximum Registrations', compute='_compute_seats_max',
+         readonly=False, store=True,
+         help="It will select this default maximum value when you choose this event")
+-    auto_confirm = fields.Boolean(
+-        'Automatically Confirm Registrations', default=False,
+-        help="Events and registrations will automatically be confirmed "
+-             "upon creation, easing the flow for simple events.")
+     default_timezone = fields.Selection(
+         _tz_get, string='Timezone', default=lambda self: self.env.user.tz or 'UTC')
+     # communication
+@@ -166,19 +162,13 @@ class EventEvent(models.Model):
+     seats_available = fields.Integer(
+         string='Available Seats',
+         store=False, readonly=True, compute='_compute_seats')
+-    seats_unconfirmed = fields.Integer(
+-        string='Unconfirmed Registrations',
+-        store=False, readonly=True, compute='_compute_seats')
+     seats_used = fields.Integer(
+         string='Number of Attendees',
+         store=False, readonly=True, compute='_compute_seats')
+-    seats_expected = fields.Integer(
+-        string='Number of Expected Attendees',
++    seats_taken = fields.Integer(
++        string='Number of Taken Seats',
+         store=False, readonly=True, compute='_compute_seats')
+     # Registration fields
+-    auto_confirm = fields.Boolean(
+-        string='Autoconfirmation', compute='_compute_auto_confirm', readonly=False, store=True,
+-        help='Autoconfirm Registrations. Registrations will automatically be confirmed upon creation.')
+     registration_ids = fields.One2many('event.registration', 'event_id', string='Attendees')
+     event_ticket_ids = fields.One2many(
+         'event.event.ticket', 'event_id', string='Event Ticket', copy=True,
+@@ -255,13 +245,12 @@ class EventEvent(models.Model):
+ 
+     @api.depends('seats_max', 'registration_ids.state', 'registration_ids.active')
+     def _compute_seats(self):
+-        """ Determine reserved, available, reserved but unconfirmed and used seats. """
++        """ Determine available, reserved, used and taken seats. """
+         # initialize fields to 0
+         for event in self:
+-            event.seats_unconfirmed = event.seats_reserved = event.seats_used = event.seats_available = 0
++            event.seats_reserved = event.seats_used = event.seats_available = 0
+         # aggregate registrations by event and by state
+         state_field = {
+-            'draft': 'seats_unconfirmed',
+             'open': 'seats_reserved',
+             'done': 'seats_used',
+         }
+@@ -270,7 +259,7 @@ class EventEvent(models.Model):
+         if self.ids:
+             query = """ SELECT event_id, state, count(event_id)
+                         FROM event_registration
+-                        WHERE event_id IN %s AND state IN ('draft', 'open', 'done') AND active = true
++                        WHERE event_id IN %s AND state IN ('open', 'done') AND active = true
+                         GROUP BY event_id, state
+                     """
+             self.env['event.registration'].flush_model(['event_id', 'state', 'active'])
+@@ -285,7 +274,7 @@ class EventEvent(models.Model):
+             if event.seats_max > 0:
+                 event.seats_available = event.seats_max - (event.seats_reserved + event.seats_used)
+ 
+-            event.seats_expected = event.seats_unconfirmed + event.seats_reserved + event.seats_used
++            event.seats_taken = event.seats_reserved + event.seats_used
+ 
+     @api.depends('date_tz', 'start_sale_datetime')
+     def _compute_event_registrations_started(self):
+@@ -463,15 +452,6 @@ class EventEvent(models.Model):
+             if not event.seats_limited:
+                 event.seats_limited = False
+ 
+-    @api.depends('event_type_id')
+-    def _compute_auto_confirm(self):
+-        """ Update event configuration from its event type. Depends are set only
+-        on event_type_id itself, not its sub fields. Purpose is to emulate an
+-        onchange: if event type is changed, update event configuration. Changing
+-        event type content itself should not trigger this method. """
+-        for event in self:
+-            event.auto_confirm = event.event_type_id.auto_confirm
+-
+     @api.depends('event_type_id')
+     def _compute_event_mail_ids(self):
+         """ Update event configuration from its event type. Depends are set only
+
+--- a/addons/event/models/event_registration.py
++++ b/addons/event/models/event_registration.py
+@@ -38,7 +38,7 @@ class EventRegistration(models.Model):
+     active = fields.Boolean(default=True)
+     barcode = fields.Char(string='Barcode', default=lambda self: self._get_random_barcode(), readonly=True, copy=False)
+     # utm informations
+-    utm_campaign_id = fields.Many2one('utm.campaign', 'Campaign',  index=True, ondelete='set null')
++    utm_campaign_id = fields.Many2one('utm.campaign', 'Campaign', index=True, ondelete='set null')
+     utm_source_id = fields.Many2one('utm.source', 'Source', index=True, ondelete='set null')
+     utm_medium_id = fields.Many2one('utm.medium', 'Medium', index=True, ondelete='set null')
+     # attendee
+@@ -62,9 +62,16 @@ class EventRegistration(models.Model):
+         'res.company', string='Company', related='event_id.company_id',
+         store=True, readonly=False)
+     state = fields.Selection([
+-        ('draft', 'Unconfirmed'), ('cancel', 'Cancelled'),
+-        ('open', 'Confirmed'), ('done', 'Attended')],
+-        string='Status', default='draft', readonly=True, copy=False, tracking=6)
++        ('draft', 'Unconfirmed'),
++        ('open', 'Registered'),
++        ('done', 'Attended'),
++        ('cancel', 'Cancelled')],
++        string='Status', default='open',
++        readonly=True, copy=False, tracking=6,
++        help='Unconfirmed: registrations in a pending state waiting for an action (specific case, notably with sale status)\n'
++             'Registered: registrations considered taken by a client\n'
++             'Attended: registrations for which the attendee attended the event\n'
++             'Cancelled: registrations cancelled manually')
+     # properties
+     registration_properties = fields.Properties(
+         'Properties', definition='event_id.registration_properties_definition', copy=True)
+@@ -73,6 +80,12 @@ class EventRegistration(models.Model):
+         ('barcode_event_uniq', 'unique(barcode)', "Barcode should be unique")
+     ]
+ 
++    @api.constrains('state', 'event_id', 'event_ticket_id')
++    def _check_seats_availability(self):
++        registrations_confirmed = self.filtered(lambda registration: registration.state in ('open', 'done'))
++        registrations_confirmed.event_id._check_seats_availability()
++        registrations_confirmed.event_ticket_id._check_seats_availability()
++
+     @api.depends('partner_id')
+     def _compute_name(self):
+         for registration in self:
+@@ -185,11 +198,7 @@ class EventRegistration(models.Model):
+ 
+         registrations = super(EventRegistration, self).create(vals_list)
+ 
+-        # auto_confirm if possible; if not automatically confirmed, call mail schedulers in case
+-        # some were created already open
+-        if registrations._check_auto_confirmation():
+-            registrations.sudo().action_confirm()
+-        elif not self.env.context.get('install_mode', False):
++        if not self.env.context.get('install_mode', False):
+             # running the scheduler for demo data can cause an issue where wkhtmltopdf runs during
+             # server start and hangs indefinitely, leading to serious crashes
+             # we currently avoid this by not running the scheduler, would be best to find the actual
+@@ -202,19 +211,12 @@ class EventRegistration(models.Model):
+         to_confirm = (self.filtered(lambda registration: registration.state in {'draft', 'cancel'})
+                       if confirming else None)
+         ret = super(EventRegistration, self).write(vals)
+-        # As these Event(Ticket) methods are model constraints, it is not necessary to call them
+-        # explicitly when creating new registrations. However, it is necessary to trigger them here
+-        # as changes in registration states cannot be used as constraints triggers.
+-        if confirming:
+-            to_confirm.event_id._check_seats_availability()
+-            to_confirm.event_ticket_id._check_seats_availability()
+-
+-            if not self.env.context.get('install_mode', False):
+-                # running the scheduler for demo data can cause an issue where wkhtmltopdf runs
+-                # during server start and hangs indefinitely, leading to serious crashes we
+-                # currently avoid this by not running the scheduler, would be best to find the
+-                # actual reason for this issue and fix it so we can remove this check
+-                to_confirm._update_mail_schedulers()
++        if confirming and not self.env.context.get('install_mode', False):
++            # running the scheduler for demo data can cause an issue where wkhtmltopdf runs
++            # during server start and hangs indefinitely, leading to serious crashes we
++            # currently avoid this by not running the scheduler, would be best to find the
++            # actual reason for this issue and fix it so we can remove this check
++            to_confirm._update_mail_schedulers()
+ 
+         return ret
+ 
+@@ -233,10 +235,6 @@ class EventRegistration(models.Model):
+             pre_inactive.event_id._check_seats_availability()
+             pre_inactive.event_ticket_id._check_seats_availability()
+ 
+-    def _check_auto_confirmation(self):
+-        """ Checks that all registrations are for `auto-confirm` events. """
+-        return all(event.auto_confirm for event in self.event_id)
+-
+     # ------------------------------------------------------------
+     # ACTIONS / BUSINESS
+     # ------------------------------------------------------------
+
+--- a/addons/event/models/event_ticket.py
++++ b/addons/event/models/event_ticket.py
+@@ -42,7 +42,7 @@ class EventTemplateTicket(models.Model):
+ 
+ 
+ class EventTicket(models.Model):
+-    """ Ticket model allowing to have differnt kind of registrations for a given
++    """ Ticket model allowing to have different kind of registrations for a given
+     event. Ticket are based on ticket type as they share some common fields
+     and behavior. Those models come from <= v13 Odoo event.event.ticket that
+     modeled both concept: tickets for event templates, and tickets for events. """
+@@ -76,8 +76,8 @@ class EventTicket(models.Model):
+     # seats
+     seats_reserved = fields.Integer(string='Reserved Seats', compute='_compute_seats', store=False)
+     seats_available = fields.Integer(string='Available Seats', compute='_compute_seats', store=False)
+-    seats_unconfirmed = fields.Integer(string='Unconfirmed Seats', compute='_compute_seats', store=False)
+     seats_used = fields.Integer(string='Used Seats', compute='_compute_seats', store=False)
++    seats_taken = fields.Integer(string="Taken Seats", compute="_compute_seats", store=False)
+     is_sold_out = fields.Boolean(
+         'Sold Out', compute='_compute_is_sold_out', help='Whether seats are not available for this ticket.')
+     # reports
+@@ -113,21 +113,20 @@ class EventTicket(models.Model):
+ 
+     @api.depends('seats_max', 'registration_ids.state', 'registration_ids.active')
+     def _compute_seats(self):
+-        """ Determine reserved, available, reserved but unconfirmed and used seats. """
++        """ Determine available, reserved, used and taken seats. """
+         # initialize fields to 0 + compute seats availability
+         for ticket in self:
+-            ticket.seats_unconfirmed = ticket.seats_reserved = ticket.seats_used = ticket.seats_available = 0
++            ticket.seats_reserved = ticket.seats_used = ticket.seats_available = 0
+         # aggregate registrations by ticket and by state
+         results = {}
+         if self.ids:
+             state_field = {
+-                'draft': 'seats_unconfirmed',
+                 'open': 'seats_reserved',
+                 'done': 'seats_used',
+             }
+             query = """ SELECT event_ticket_id, state, count(event_id)
+                         FROM event_registration
+-                        WHERE event_ticket_id IN %s AND state IN ('draft', 'open', 'done') AND active = true
++                        WHERE event_ticket_id IN %s AND state IN ('open', 'done') AND active = true
+                         GROUP BY event_ticket_id, state
+                     """
+             self.env['event.registration'].flush_model(['event_id', 'event_ticket_id', 'state', 'active'])
+@@ -140,6 +139,7 @@ class EventTicket(models.Model):
+             ticket.update(results.get(ticket._origin.id or ticket.id, {}))
+             if ticket.seats_max > 0:
+                 ticket.seats_available = ticket.seats_max - (ticket.seats_reserved + ticket.seats_used)
++            ticket.seats_taken = ticket.seats_reserved + ticket.seats_used
+ 
+     @api.depends('seats_limited', 'seats_available')
+     def _compute_is_sold_out(self):

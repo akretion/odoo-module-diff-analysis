@@ -1,0 +1,118 @@
+PR: https://github.com/odoo/odoo/pull/124563
+
+From: 6b3c5370a82d3f69ea90fd9e4cde176172fc8511
+From: Audric Onockx (auon)
+Date: 2023-06-10 10:18:56
+
+Structural Changes: 4
+Total Changes: 31
+
+[IMP] hr_timesheet: allow timesheeting on sub-tasks with no project
+
+Allow timesheeting on sub-tasks with no project_id set.
+Instead, refer to the project_id set on its parent_id, and so on,
+recursively.
+
+task-3336215
+
+X-original-commit: d794e41619a36a8c9ad1e77a816e57051207cdcf
+Part-of: odoo/odoo#124563
+
+================================= pseudo patch: =================================
+
+--- a/addons/hr_timesheet/models/hr_timesheet.py
++++ b/addons/hr_timesheet/models/hr_timesheet.py
+@@ -50,7 +50,7 @@ class AccountAnalyticLine(models.Model):
+     task_id = fields.Many2one(
+         'project.task', 'Task', index='btree_not_null',
+         compute='_compute_task_id', store=True, readonly=False,
+-        domain="[('company_id', '=', company_id), ('project_id.allow_timesheets', '=', True), ('project_id', '=?', project_id)]")
++        domain="[('company_id', '=', company_id), ('project_root_id.allow_timesheets', '=', True), ('project_root_id', '=?', project_id)]")
+     parent_task_id = fields.Many2one('project.task', related='task_id.parent_id', store=True)
+     project_id = fields.Many2one(
+         'project.project', 'Project', domain=_domain_project_id, index=True,
+@@ -103,12 +103,12 @@ class AccountAnalyticLine(models.Model):
+             if timesheet.project_id:
+                 timesheet.partner_id = timesheet.task_id.partner_id or timesheet.project_id.partner_id
+ 
+-    @api.depends('task_id', 'task_id.project_id')
++    @api.depends('task_id')
+     def _compute_project_id(self):
+         for line in self:
+-            if not line.task_id.project_id or line.project_id == line.task_id.project_id:
++            if not line.task_id.project_root_id or line.project_id == line.task_id.project_root_id:
+                 continue
+-            line.project_id = line.task_id.project_id
++            line.project_id = line.task_id.project_root_id
+ 
+     @api.depends('project_id')
+     def _compute_task_id(self):
+@@ -120,7 +120,7 @@ class AccountAnalyticLine(models.Model):
+         # TODO KBA in master - check to do it "properly", currently:
+         # This onchange is used to reset the task_id when the project changes.
+         # Doing it in the compute will remove the task_id when the project of a task changes.
+-        if self.project_id != self.task_id.project_id:
++        if self.project_id != self.task_id.project_root_id:
+             self.task_id = False
+ 
+     @api.depends('employee_id')
+@@ -313,9 +313,9 @@ class AccountAnalyticLine(models.Model):
+             tasks = self.env['project.task'].sudo().browse(task_ids)
+             for task in tasks:
+                 task_per_id[task.id] = task
+-                if not task.project_id:
++                if not task.project_root_id:
+                     raise ValidationError(_('Timesheets cannot be created on a private task.'))
+-            account_ids = account_ids.union(tasks.analytic_account_id.ids, tasks.project_id.analytic_account_id.ids)
++            account_ids = account_ids.union(tasks.analytic_account_id.ids, tasks.project_root_id.analytic_account_id.ids)
+ 
+         project_per_id = {}
+         if project_ids:
+@@ -335,7 +335,7 @@ class AccountAnalyticLine(models.Model):
+             vals = vals_list[index]
+             data = task_per_id[vals['task_id']] if vals.get('task_id') else project_per_id[vals['project_id']]
+             if not vals.get('project_id'):
+-                vals['project_id'] = data.project_id.id
++                vals['project_id'] = data.project_root_id.id
+             if not vals.get('account_id'):
+                 account = data._get_task_analytic_account_id() if vals.get('task_id') else data.analytic_account_id
+                 if not account or not account.active:
+
+--- a/addons/hr_timesheet/models/project_task.py
++++ b/addons/hr_timesheet/models/project_task.py
+@@ -26,8 +26,9 @@ class Task(models.Model):
+     _inherit = "project.task"
+ 
+     project_id = fields.Many2one(domain=[('is_internal_project', '=', False)])
+-    analytic_account_active = fields.Boolean("Active Analytic Account", compute='_compute_analytic_account_active', compute_sudo=True)
+-    allow_timesheets = fields.Boolean("Allow timesheets", related='project_id.allow_timesheets', help="Timesheets can be logged on this task.", readonly=True)
++    project_root_id = fields.Many2one(domain=[('is_internal_project', '=', False)])
++    analytic_account_active = fields.Boolean("Active Analytic Account", compute='_compute_analytic_account_active', compute_sudo=True, recursive=True)
++    allow_timesheets = fields.Boolean("Allow timesheets", related="project_root_id.allow_timesheets", help="Timesheets can be logged on this task.", readonly=True, recursive=True)
+     remaining_hours = fields.Float("Remaining Hours", compute='_compute_remaining_hours', store=True, readonly=True, help="Number of allocated hours minus the number of hours spent.")
+     remaining_hours_percentage = fields.Float(compute='_compute_remaining_hours_percentage', search='_search_remaining_hours_percentage')
+     effective_hours = fields.Float("Hours Spent", compute='_compute_effective_hours', compute_sudo=True, store=True)
+@@ -54,7 +55,7 @@ class Task(models.Model):
+     def _compute_encode_uom_in_days(self):
+         self.encode_uom_in_days = self._uom_in_days()
+ 
+-    @api.depends('analytic_account_id.active', 'project_id.analytic_account_id.active')
++    @api.depends('analytic_account_id.active', 'project_root_id.analytic_account_id.active')
+     def _compute_analytic_account_active(self):
+         """ Overridden in sale_timesheet """
+         for task in self:
+@@ -162,7 +163,13 @@ class Task(models.Model):
+ 
+     def write(self, values):
+         # a timesheet must have an analytic account (and a project)
+-        if 'project_id' in values and not values.get('project_id') and self._get_timesheet():
++        is_removed_project = 'project_id' in values and not values['project_id']
++        is_removed_parent = 'parent_id' in values and not values['parent_id']
++        if (
++            ((is_removed_project and (not self.parent_id or is_removed_parent))
++            or (is_removed_parent and not (self.project_id or is_removed_project)))
++            and self._get_timesheet()
++        ):
+             raise UserError(_('This task must be part of a project because there are some timesheets linked to it.'))
+         res = super(Task, self).write(values)
+ 
