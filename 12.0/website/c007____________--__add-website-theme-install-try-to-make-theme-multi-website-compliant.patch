@@ -1,0 +1,326 @@
+PR: https://github.com/odoo/odoo/pull/
+
+From: c0968e68eda55df624fb94016d036a2af598b10c
+From: Jeremy Kersten
+Date: 2018-08-13 18:16:34
+
+Structural Changes: 6.9
+Total Changes: 159
+
+[ADD] website_theme_install: try to make theme multi website compliant
+
+From now, when you install a theme, it load the data from xml to template
+table theme [ir.ui.view|ir.attachment|website.page|website.menu].
+
+Data are only copied from this template table into the real table when you
+choose a theme on a website; Making them website_specific and with a link
+to the original to allow futur update.
+
+A special case is done to create theme.ir.ui.view when you are installing
+a theme, even if you continue to use template tag to create quick view.
+
+Co-authored-by: Derie Romain <rde@odoo.com>
+Co-authored-by: Kersten Jérémy <jke@odoo.com>
+
+================================= pseudo patch: =================================
+
+--- a/addons/website/models/ir_attachment.py
++++ b/addons/website/models/ir_attachment.py
+@@ -2,16 +2,18 @@
+ # Part of Odoo. See LICENSE file for full copyright and licensing details.
+ 
+ import logging
+-from odoo import api, fields, models
+-
++from odoo import fields, models, api
+ _logger = logging.getLogger(__name__)
+ 
++
+ class Attachment(models.Model):
+ 
+     _inherit = "ir.attachment"
+ 
+     # related for backward compatibility with saas-6
+     website_url = fields.Char(string="Website URL", related='local_url', deprecated=True)
++    key = fields.Char(help='Technical field used to resolve multiple attachments in a multi-website environment.')
++    website_id = fields.Many2one('website')
+ 
+     @api.model
+     def create(self, vals):
+@@ -23,50 +25,3 @@ class Attachment(models.Model):
+     @api.model
+     def get_serving_groups(self):
+         return super(Attachment, self).get_serving_groups() + ['website.group_website_designer']
+-
+-    key = fields.Char(help='Technical field used to resolve multiple attachments in a multi-website environment.')
+-    theme_id = fields.Many2one('ir.module.module')
+-
+-    @api.multi
+-    def unlink(self):
+-        self |= self.search([('key', 'in', self.filtered('key').mapped('key'))])
+-        return super(Attachment, self).unlink()
+-
+-    @api.multi
+-    def _get_theme_specific_attachment(self, theme_name):
+-        self.ensure_one()
+-        attachment = self
+-        module_being_updated = self.env['ir.module.module'].search([('name', '=', theme_name)])
+-        xml_id = self.env['ir.model.data'].search([('model', '=', 'ir.attachment'), ('res_id', '=', attachment.id)])
+-        if xml_id and xml_id.module != theme_name:
+-            _logger.info('%s is updating attachment %s (ID: %s)', theme_name, xml_id.complete_name, attachment.id)
+-
+-            # check if a previously copied attachment for this theme already exists
+-            theme_specific_attachment = self.env['ir.attachment'].search([('key', '=', attachment.key), ('theme_id', '=', module_being_updated.id)])
+-            if theme_specific_attachment:
+-                attachment = theme_specific_attachment
+-                _logger.info('diverting write to %s (ID: %s)', attachment.name, attachment.id)
+-            else:
+-                attachment.with_context(no_cow=True).key = xml_id.complete_name
+-                attachment = attachment.copy({
+-                    'theme_id': module_being_updated.id,
+-                    'key': xml_id.complete_name,
+-                })
+-                _logger.info('created new theme-specific attachment %s (ID: %s)', attachment.name, attachment.id)
+-
+-        return attachment
+-
+-    @api.multi
+-    def write(self, vals):
+-        if not self._context.get('no_cow'):
+-            for attachment in self:
+-                currently_updating = self._context.get('install_mode_data', {}).get('module', '')
+-                if currently_updating.startswith('theme_'):
+-                    attachment = attachment._get_theme_specific_attachment(currently_updating)
+-
+-                super(Attachment, attachment).write(vals)
+-        else:
+-            super(Attachment, self).write(vals)
+-
+-        return True
+->>>>>>> [IMP] website,*: support multiple websites
+
+--- a/addons/website/models/ir_http.py
++++ b/addons/website/models/ir_http.py
+@@ -255,8 +255,8 @@ class Http(models.AbstractModel):
+     @classmethod
+     def _xmlid_to_obj(cls, env, xmlid):
+         website_id = env['website'].get_current_website()
+-        if website_id and website_id.installed_theme_id:
+-            obj = env['ir.attachment'].search([('key', '=', xmlid), ('theme_id', '=', website_id.installed_theme_id.id)])
++        if website_id and website_id.theme_id:
++            obj = env['ir.attachment'].search([('key', '=', xmlid), ('website_id', '=', website_id.id)])
+             if obj:
+                 return obj[0]
+ 
+
+--- a/addons/website/models/ir_ui_view.py
++++ b/addons/website/models/ir_ui_view.py
+@@ -23,11 +23,12 @@ class View(models.Model):
+     website_id = fields.Many2one('website', ondelete='cascade', string="Website")
+     page_ids = fields.One2many('website.page', 'view_id')
+     first_page_id = fields.Many2one('website.page', string='Website Page', help='First page linked to this view', compute='_compute_first_page_id')
+-    theme_id = fields.Many2one('ir.module.module')
++    # theme_id = fields.Many2one('ir.module.module')
+ 
+-    @api.one
++    @api.multi
+     def _compute_first_page_id(self):
+-        self.first_page_id = self.env['website.page'].search([('view_id', '=', self.id)], limit=1)
++        for view in self:
++            view.first_page_id = self.env['website.page'].search([('view_id', '=', view.id)], limit=1)
+ 
+     @api.multi
+     def write(self, vals):
+@@ -38,11 +39,6 @@ class View(models.Model):
+         if not self._context.get('no_cow'):
+             current_website_id = self._context.get('website_id')
+             for view in self:
+-                currently_updating = self._context.get('install_mode_data', {}).get('module', '')
+-                if 'theme_' in currently_updating:
+-                    current_website_id = False
+-                    view = view._get_theme_specific_view(currently_updating)
+-
+                 # if generic view in multi-website context
+                 if current_website_id and not view.website_id:
+                     new_website_specific_view = view.copy({'website_id': current_website_id})
+@@ -81,30 +77,10 @@ class View(models.Model):
+         self.clear_caches()
+         return result
+ 
+-    @api.multi
+-    def _get_theme_specific_view(self, theme_name):
+-        self.ensure_one()
+-        view = self
+-        module_being_updated = self.env['ir.module.module'].search([('name', '=', theme_name)])
+-        xml_id = self.env['ir.model.data'].search([('model', '=', 'ir.ui.view'), ('res_id', '=', view.id)])
+-        if xml_id and xml_id.module != theme_name:
+-            _logger.info('%s is updating view %s (ID: %s)', theme_name, xml_id.complete_name, view.id)
+-
+-            # check if a previously copied view for this theme already exists
+-            theme_specific_view = self.env['ir.ui.view'].search([('key', '=', view.key), ('theme_id', '=', module_being_updated.id)])
+-            if theme_specific_view:
+-                view = theme_specific_view
+-                _logger.info('diverting write to %s (ID: %s)', view.name, view.id)
+-            else:
+-                view = view.copy({'theme_id': module_being_updated.id})
+-                _logger.info('created new theme-specific view %s (ID: %s)', view.name, view.id)
+-
+-        return view
+-
+     def _create_website_specific_pages_for_view(self, new_view, website):
+         for page in self.page_ids:
+             # create new pages for this view
+-            new_page = page.copy({
++            page.copy({
+                 'view_id': new_view.id,
+             })
+ 
+@@ -184,9 +160,6 @@ class View(models.Model):
+         # we will prefer inactive website-specific views over active generic ones
+         if current_website:
+             domain = [leaf for leaf in domain if 'active' not in leaf]
+-            if current_website.theme_ids:
+-                theme_views_domain = [('theme_id', 'in', current_website.theme_ids.ids)]
+-                website_views_domain = expression.OR([website_views_domain, theme_views_domain])
+ 
+         return expression.AND([website_views_domain, domain])
+ 
+@@ -207,10 +180,7 @@ class View(models.Model):
+     def get_view_id(self, xml_id):
+         if 'website_id' in self._context and not isinstance(xml_id, pycompat.integer_types):
+             current_website = self.env['website'].browse(self._context.get('website_id'))
+-            key_domain = [('key', '=', xml_id)]
+-            theme_views_domain = [('theme_id', 'in', current_website.theme_ids.ids)]
+-            website_views_domain = [('theme_id', '=', False)] + current_website.website_domain()
+-            domain = expression.AND([expression.OR([theme_views_domain, website_views_domain]), key_domain])
++            domain = ['&', ('key', '=', xml_id)] + current_website.website_domain()
+ 
+             view = self.search(domain, order='website_id', limit=1)
+             if not view:
+
+--- a/addons/website/models/res_users.py
++++ b/addons/website/models/res_users.py
+@@ -16,7 +16,7 @@ class ResUsers(models.Model):
+         string='Website Editor', compute='_compute_groups_id', inverse='_inverse_groups_id',
+         category_xml_id='base.module_category_website')
+     has_group_multi_website = fields.Boolean(
+-        'Multi-Website',
++        'Multi-Websites',
+         compute='_compute_groups_id', inverse='_inverse_groups_id',
+         group_xml_id='website.group_multi_website')
+ 
+
+--- a/addons/website/models/website.py
++++ b/addons/website/models/website.py
+@@ -101,8 +101,8 @@ class Website(models.Model):
+     menu_id = fields.Many2one('website.menu', compute='_compute_menu', string='Main Menu')
+     homepage_id = fields.Many2one('website.page', string='Homepage')
+     favicon = fields.Binary(string="Website Favicon", help="This field holds the image used to display a favicon on the website.")
+-    installed_theme_id = fields.Many2one('ir.module.module')
+-    theme_ids = fields.Many2many('ir.module.module', 'website_theme', 'website_id', 'ir_module_module_id')
++    theme_id = fields.Many2one('ir.module.module', help='Installed theme')
++
+     auth_signup_uninvited = fields.Selection([
+         ('b2b', 'On invitation'),
+         ('b2c', 'Free sign up'),
+@@ -168,13 +168,14 @@ class Website(models.Model):
+         self.homepage_id = self.env['website.page'].search([('website_id', '=', self.id),
+                                                             ('key', '=', standard_homepage.key)])
+         top_menu = self.env['website.menu'].create({
+-            'name': 'Top Menu for website ' + str(self.id),
++            'name': _('Top Menu for website %s') % self.id,
+             'website_id': self.id,
+             'sequence': 0
+         })
+         self.menu_id = top_menu.id
+         self.env['website.menu'].create({
+-            'name': 'Home', 'url': '/',
++            'name': _('Home'),
++            'url': '/',
+             'website_id': self.id,
+             'parent_id': top_menu.id,
+             'sequence': 10
+@@ -391,15 +392,16 @@ class Website(models.Model):
+ 
+         return dependencies
+ 
+-    @api.model
+-    def page_exists(self, name, module='website'):
+-        try:
+-            name = (name or "").replace("/website.", "").replace("/", "")
+-            if not name:
+-                return False
+-            return self.env.ref('%s.%s' % module, name)
+-        except Exception:
+-            return False
++    # removed by 3c9e6c89e7207636c1bdab4ed8118c0c1089d43e
++    # @api.model
++    # def page_exists(self, name, module='website'):
++    #     try:
++    #         name = (name or "").replace("/website.", "").replace("/", "")
++    #         if not name:
++    #             return False
++    #         return self.env.ref('%s.%s' % module, name)
++    #     except Exception:
++    #         return False
+ 
+     # ----------------------------------------------------------
+     # Languages
+@@ -532,8 +534,7 @@ class Website(models.Model):
+                 endpoint.routing['type'] == 'http' and
+                 endpoint.routing['auth'] in ('none', 'public') and
+                 endpoint.routing.get('website', False) and
+-                all(hasattr(converter, 'generate') for converter in converters) and
+-                endpoint.routing.get('website')):
++                all(hasattr(converter, 'generate') for converter in converters)):
+                 return False
+ 
+         # dont't list routes without argument having no default value or converter
+@@ -915,21 +916,14 @@ class Page(models.Model):
+     @api.multi
+     @api.returns('self', lambda value: value.id)
+     def copy(self, default=None):
+-        if default and not default.get('view_id'):
+-            view = self.env['ir.ui.view'].browse(self.view_id.id)
+-            # website.page's ir.ui.view should have a different key than the one it
+-            # is copied from.
+-            # (eg: website_version: an ir.ui.view record with the same key is
+-            # expected to be the same ir.ui.view but from another version)
+-            website_id = default.get('website_id')
+-            # website_id should be set during copy to avoid copying a generic page to another generic copy and then write on it
+-            # which would result in the generic page copied to a generic one and a specific one
+-            new_view = view.copy({'key': view.key + '.copy', 'name': '%s %s' % (view.name, _('(copy)')), 'website_id': website_id.id})
+-            default = {
+-                'name': '%s %s' % (self.name, _('(copy)')),
+-                'url': self.env['website'].get_unique_path(self.url),
+-                'view_id': new_view.id,
+-            }
++        if default:
++            if not default.get('view_id'):
++                view = self.env['ir.ui.view'].browse(self.view_id.id)
++                new_view = view.copy({'website_id': default.get('website_id')})
++                default['view_id'] = new_view.id
++
++            default['name'] = default.get('name', '%s %s' % (self.name, _('(copy)')))
++            default['url'] = default.get('url', self.env['website'].get_unique_path(self.url))
+         return super(Page, self).copy(default=default)
+ 
+     @api.model
+@@ -938,7 +932,7 @@ class Page(models.Model):
+             :param page_id : website.page identifier
+         """
+         page = self.browse(int(page_id))
+-        new_page = page.copy(dict(website_id=self.env['website'].get_current_website()))
++        new_page = page.copy(dict(website_id=self.env['website'].get_current_website().id))
+         # Should not clone menu if the page was cloned from one website to another
+         # Eg: Cloning a generic page (no website) will create a page with a website, we can't clone menu (not same container)
+         if clone_menu and new_page.website_id == page.website_id:
+@@ -1013,7 +1007,7 @@ class Menu(models.Model):
+         if vals.get('website_id'):
+             return super(Menu, self).create(vals)
+         elif self._context.get('website_id'):
+-            vals.update({'website_id': self._context.get('website_id')})
++            vals['website_id'] = self._context.get('website_id')
+             return super(Menu, self).create(vals)
+         else:
+             # create for every site
