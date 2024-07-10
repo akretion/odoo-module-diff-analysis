@@ -1,0 +1,3200 @@
+PR: https://github.com/odoo/odoo/pull/97692
+
+From: 4e82c45abdb0b420edead2bd1d0ba9ff4bb4a224
+From: Odoo's Mergebot
+Date: 2022-09-16 12:25:13
+
+Structural Changes: 15
+Total Changes: 2274
+
+[IMP] core: store translated fields as JSONB columns
+
+[IMP] core: store translated fields as JSONB columns
+
+Translated fields no longer use the model ir.translation.  Instead they store
+all their values as JSON, and store them into JSONB columns in the model's
+table.  The field's column value is either NULL or a JSON dict mapping language
+codes to text (the field's value in the corresponding language), and must
+contain an entry for key 'en_US' (as it is used as a fallback for all other
+languages).  Empty text is allowed in translation values, but not NULL.
+
+Here are examples for a field with translate=True:
+
+    `NULL`
+    `{"en_US": "Foo"}`
+    `{"en_US": "Foo", "fr_FR": "Bar", "nl_NL": "Baz"}`
+    `{"en_US": "Foo", "fr_FR": "", "nl_NL": "Baz"}`
+
+Like before, writing False to the field makes it NULL, i.e., False in all
+languages.  However, writing "" to the field makes its value empty in the
+current language, but does not discard the values in the other languages.
+
+Here are examples for a field with translate=xml_translate:
+
+   ` NULL`
+    `{"en_US": "<div>Foo<p>Bar</p></div>", "fr_FR": "<div>Fou<p>Barre</p></div>"}`
+
+Change for callable(translate) fields: one can now write any value in any
+language on such a field.  The new value will be adapted in all languages, based
+on the mapping of terms between languages in the old values.  Basically the
+structure of the value must remain the same in all languages, like before.
+
+Reading a translated field is now both simpler and faster than the former
+implementation.  We fetch the value of the field in the current language by
+coalescing its value with the 'en_US' value of the field:
+
+    `SELECT id, COALESCE(name->>'fr_FR', name->>'en_US') AS name ...`
+
+The raw cache of the field contains either None or a dict which is conceptually
+a subset of the JSON value in database (except for missing languages).  For the
+sake of simplicity, most cache operations deal with the dict and return the text
+value in the current language.
+
+Trigram indexes have been adapted to the new storing strategy, and should enable
+to search in any language.  Before this change, only the source value of the
+field ('en_US') could be indexed.
+
+Computed stored translated fields are not supported by the framework, because of
+the complexity of the computation itself: the field would need to be computed in
+all active languages.  We chose to not provide any hook to compute a field in
+all languages at once, and the framework always invokes a compute method once to
+recompute it.
+
+Code translations are no longer stored into the database.  They become static,
+and are extracted from the PO files when needed.  The worker simply uses a cache
+with extracted code translations for performance.  This is reasonable, since
+fr_FR code translations for all modules takes around 2MB of memory, and the
+cache can be shared among all registries in the worker.  Changing code
+translations requires to update the corresponding PO file and reloading the
+worker(s).
+
+Performance summary:
+(+) reading 'model' translated fields is faster
+(+) reading 'model_terms' translated fields is much faster (no need to inject
+     translations into the source value)
+(+) searching translated fields with operator 'ilike' is much faster when the
+     field is indexed with 'trigram'
+(+) updating translated fields requires less ORM flushing
+(-) importing translations from PO files is 2x slower
+
+Some extra fixes:
+- make field 'name' of ir.actions.actions translated; because of the PG
+   inheritance, this is necessary to make the column definition consistent in
+   all models that inherit from ir.actions.actions.
+- add some backend API for the web/website client for editing translations
+- move methods get_field_string() to model ir.model.fields
+- move _load_module_terms to model ir.module.module
+- adapt tests in test_impex, test_new_api
+- because env.lang is injected into SQL queries, its returned value is
+   now guaranteed to correspond to a valid active language or None
+- remove wizard to insert missing translations (no longer makes sense)
+
+closes odoo/odoo#97692
+
+Task-id: 2081307
+Signed-off-by: Raphael Collet <rco@odoo.com>
+
+================================= pseudo patch: =================================
+
+--- a/odoo/addons/base/__manifest__.py
++++ b/odoo/addons/base/__manifest__.py
+@@ -39,7 +39,6 @@ The kernel of Odoo, needed for all installation.
+         'views/ir_attachment_views.xml',
+         'views/ir_rule_views.xml',
+         'views/ir_sequence_views.xml',
+-        'views/ir_translation_views.xml',
+         'views/ir_ui_menu_views.xml',
+         'views/ir_ui_view_views.xml',
+         'views/ir_default_views.xml',
+@@ -59,7 +58,6 @@ The kernel of Odoo, needed for all installation.
+         'wizard/base_module_upgrade_views.xml',
+         'wizard/base_module_uninstall_views.xml',
+         'wizard/base_export_language_views.xml',
+-        'wizard/base_update_translations_views.xml',
+         'wizard/base_partner_merge_views.xml',
+         'data/ir_actions_data.xml',
+         'data/ir_demo_failure_data.xml',
+
+--- a/odoo/addons/base/data/base_data.sql
++++ b/odoo/addons/base/data/base_data.sql
+@@ -27,7 +27,7 @@ CREATE TABLE res_users (
+ 
+ CREATE TABLE res_groups (
+     id serial NOT NULL,
+-    name varchar NOT NULL,
++    name jsonb NOT NULL,
+     primary key(id)
+ );
+ 
+@@ -38,7 +38,7 @@ CREATE TABLE ir_module_category (
+     write_date timestamp without time zone,
+     write_uid integer, -- references res_users on delete set null,
+     parent_id integer REFERENCES ir_module_category ON DELETE SET NULL,
+-    name character varying NOT NULL,
++    name jsonb NOT NULL,
+     primary key(id)
+ );
+ 
+@@ -49,15 +49,15 @@ CREATE TABLE ir_module_module (
+     write_date timestamp without time zone,
+     write_uid integer, -- references res_users on delete set null,
+     website character varying,
+-    summary character varying,
++    summary jsonb,
+     name character varying NOT NULL,
+     author character varying,
+     icon varchar,
+     state character varying(16),
+     latest_version character varying,
+-    shortdesc character varying,
++    shortdesc jsonb,
+     category_id integer REFERENCES ir_module_category ON DELETE SET NULL,
+-    description text,
++    description jsonb,
+     application boolean default False,
+     demo boolean default False,
+     web boolean DEFAULT FALSE,
+@@ -135,6 +135,6 @@ insert into res_users (id, login, password, active, partner_id, company_id, crea
+ insert into ir_model_data (name, module, model, noupdate, res_id) VALUES ('user_root', 'base', 'res.users', true, 1);
+ select setval('res_users_id_seq', 1);
+ 
+-insert into res_groups (id, name) VALUES (1, 'Employee');
++insert into res_groups (id, name) VALUES (1, '{"en_US": "Employee"}');
+ insert into ir_model_data (name, module, model, noupdate, res_id) VALUES ('group_user', 'base', 'res.groups', true, 1);
+ select setval('res_groups_id_seq', 1);
+
+--- a/odoo/addons/base/i18n/base.pot
++++ b/odoo/addons/base/i18n/base.pot
+@@ -29684,3 +29684,27 @@ msgstr ""
+ #: model:res.country,name:base.ax
+ msgid "Åland Islands"
+ msgstr ""
++
++#. module: base
++#: code:addons/base/models/ir_fields.py:0
++#, python-format
++msgid "yes"
++msgstr ""
++
++#. module: base
++#: code:addons/base/models/ir_fields.py:0
++#, python-format
++msgid "no"
++msgstr ""
++
++#. module: base
++#: code:addons/base/models/ir_fields.py:0
++#, python-format
++msgid "true"
++msgstr ""
++
++#. module: base
++#: code:addons/base/models/ir_fields.py:0
++#, python-format
++msgid "false"
++msgstr ""
+
+--- a/odoo/addons/base/models/__init__.py
++++ b/odoo/addons/base/models/__init__.py
+@@ -14,7 +14,6 @@ from . import ir_binary
+ from . import ir_cron
+ from . import ir_filters
+ from . import ir_default
+-from . import ir_translation
+ from . import ir_exports
+ from . import ir_rule
+ from . import ir_config_parameter
+
+--- a/odoo/addons/base/models/ir_actions.py
++++ b/odoo/addons/base/models/ir_actions.py
+@@ -25,7 +25,7 @@ class IrActions(models.Model):
+     _table = 'ir_actions'
+     _order = 'name'
+ 
+-    name = fields.Char(required=True)
++    name = fields.Char(string='Action Name', required=True, translate=True)
+     type = fields.Char(string='Action Type', required=True)
+     xml_id = fields.Char(compute='_compute_xml_id', string="External ID")
+     help = fields.Html(string='Action Description',
+@@ -240,7 +240,6 @@ class IrActionsActWindow(models.Model):
+             fvg = self.env[act.res_model].get_view(act.search_view_id.id, 'search')
+             act.search_view = str(fvg)
+ 
+-    name = fields.Char(string='Action Name', translate=True)
+     type = fields.Char(default="ir.actions.act_window")
+     view_id = fields.Many2one('ir.ui.view', string='View Ref.', ondelete='set null')
+     domain = fields.Char(string='Domain Value',
+@@ -372,7 +371,6 @@ class IrActionsActUrl(models.Model):
+     _inherit = 'ir.actions.actions'
+     _order = 'name'
+ 
+-    name = fields.Char(string='Action Name', translate=True)
+     type = fields.Char(default='ir.actions.act_url')
+     url = fields.Text(string='Action URL', required=True)
+     target = fields.Selection([('new', 'New Window'), ('self', 'This Window')],
+@@ -421,7 +419,6 @@ class IrActionsServer(models.Model):
+ #  - Command: x2Many commands namespace
+ # To return an action, assign: action = {...}\n\n\n\n"""
+ 
+-    name = fields.Char(string='Action Name', translate=True)
+     type = fields.Char(default='ir.actions.server')
+     usage = fields.Selection([
+         ('ir_actions_server', 'Server Action'),
+@@ -842,7 +839,6 @@ class IrActionsActClient(models.Model):
+     _table = 'ir_act_client'
+     _order = 'name'
+ 
+-    name = fields.Char(string='Action Name', translate=True)
+     type = fields.Char(default='ir.actions.client')
+ 
+     tag = fields.Char(string='Client action tag', required=True,
+
+--- a/odoo/addons/base/models/ir_actions_report.py
++++ b/odoo/addons/base/models/ir_actions_report.py
+@@ -91,7 +91,6 @@ class IrActionsReport(models.Model):
+     _table = 'ir_act_report_xml'
+     _order = 'name'
+ 
+-    name = fields.Char(translate=True)
+     type = fields.Char(default='ir.actions.report')
+     binding_type = fields.Selection(default='report')
+     model = fields.Char(required=True, string='Model Name')
+
+--- a/odoo/addons/base/models/ir_cron.py
++++ b/odoo/addons/base/models/ir_cron.py
+@@ -179,7 +179,7 @@ class ir_cron(models.Model):
+     def _get_all_ready_jobs(cls, cr):
+         """ Return a list of all jobs that are ready to be executed """
+         cr.execute("""
+-            SELECT *
++            SELECT *, cron_name->>'en_US' as cron_name
+             FROM ir_cron
+             WHERE active = true
+               AND numbercall != 0
+@@ -241,7 +241,7 @@ class ir_cron(models.Model):
+         # Learn more: https://www.postgresql.org/docs/current/explicit-locking.html#LOCKING-ROWS
+ 
+         query = """
+-            SELECT *
++            SELECT *, cron_name->>'en_US' as cron_name
+             FROM ir_cron
+             WHERE active = true
+               AND numbercall != 0
+
+--- a/odoo/addons/base/models/ir_fields.py
++++ b/odoo/addons/base/models/ir_fields.py
+@@ -8,7 +8,8 @@ import psycopg2
+ import pytz
+ 
+ from odoo import api, Command, fields, models, _
+-from odoo.tools import ustr
++from odoo.tools import ustr, OrderedSet
++from odoo.tools.translate import code_translations, _lt
+ 
+ REFERENCING_FIELDS = {None, 'id', '.id'}
+ def only_ref_fields(record):
+@@ -16,6 +17,13 @@ def only_ref_fields(record):
+ def exclude_ref_fields(record):
+     return {k: v for k, v in record.items() if k not in REFERENCING_FIELDS}
+ 
++# these lazy translations promise translations for ['yes', 'no', 'true', 'false']
++BOOLEAN_TRANSLATIONS = (
++    _lt('yes'),
++    _lt('no'),
++    _lt('true'),
++    _lt('false')
++)
+ 
+ class ImportWarning(Warning):
+     """ Used to send warnings upwards the stack during the import process """
+@@ -190,8 +198,8 @@ class IrFieldsConverter(models.AbstractModel):
+         # potentially broken casefolding? What about locales?
+         trues = set(word.lower() for word in itertools.chain(
+             [u'1', u"true", u"yes"], # don't use potentially translated values
+-            self._get_translations(['code'], u"true"),
+-            self._get_translations(['code'], u"yes"),
++            self._get_boolean_translations(u"true"),
++            self._get_boolean_translations(u"yes"),
+         ))
+         if value.lower() in trues:
+             return True, []
+@@ -199,8 +207,8 @@ class IrFieldsConverter(models.AbstractModel):
+         # potentially broken casefolding? What about locales?
+         falses = set(word.lower() for word in itertools.chain(
+             [u'', u"0", u"false", u"no"],
+-            self._get_translations(['code'], u"false"),
+-            self._get_translations(['code'], u"no"),
++            self._get_boolean_translations(u"false"),
++            self._get_boolean_translations(u"no"),
+         ))
+         if value.lower() in falses:
+             return False, []
+@@ -296,17 +304,46 @@ class IrFieldsConverter(models.AbstractModel):
+         return fields.Datetime.to_string(dt.astimezone(pytz.UTC)), []
+ 
+     @api.model
+-    def _get_translations(self, types, src):
+-        types = tuple(types)
++    def _get_boolean_translations(self, src):
+         # Cache translations so they don't have to be reloaded from scratch on
+         # every row of the file
+         tnx_cache = self._cr.cache.setdefault(self._name, {})
+-        if tnx_cache.setdefault(types, {}) and src in tnx_cache[types]:
+-            return tnx_cache[types][src]
++        if src in tnx_cache:
++            return tnx_cache[src]
+ 
+-        Translations = self.env['ir.translation']
+-        tnx = Translations.search([('type', 'in', types), ('src', '=', src)])
+-        result = tnx_cache[types][src] = [t.value for t in tnx if t.value is not False]
++        values = OrderedSet()
++        for lang, __ in self.env['res.lang'].get_installed():
++            translations = code_translations.get_python_translations('base', lang)
++            if src in translations:
++                values.add(translations[src])
++
++        result = tnx_cache[src] = list(values)
++        return result
++
++    @api.model
++    def _get_selection_translations(self, field, src):
++        if not src:
++            return []
++        # Cache translations so they don't have to be reloaded from scratch on
++        # every row of the file
++        tnx_cache = self._cr.cache.setdefault(self._name, {})
++        if src in tnx_cache:
++            return tnx_cache[src]
++
++        values = OrderedSet()
++        self.env['ir.model.fields.selection'].flush_model()
++        query = """
++            SELECT s.name
++            FROM ir_model_fields_selection s
++            JOIN ir_model_fields f ON s.field_id = f.id
++            WHERE f.model = %s AND f.name = %s AND s.name->>'en_US' = %s
++        """
++        self.env.cr.execute(query, [field.model_name, field.name, src])
++        for (name,) in self.env.cr.fetchall():
++            name.pop('en_US')
++            values.update(name.values())
++
++        result = tnx_cache[src] = list(values)
+         return result
+ 
+     @api.model
+@@ -317,7 +354,14 @@ class IrFieldsConverter(models.AbstractModel):
+ 
+         for item, label in selection:
+             label = ustr(label)
+-            labels = [label] + self._get_translations(('selection', 'model', 'code'), label)
++            if callable(field.selection):
++                labels = [label]
++                for item2, label2 in field._description_selection(self.env):
++                    if item2 == item:
++                        labels.append(label2)
++                        break
++            else:
++                labels = [label] + self._get_selection_translations(field, label)
+             # case insensitive comparaison of string to allow to set the value even if the given 'value' param is not
+             # exactly (case sensitive) the same as one of the selection item.
+             if value.lower() == str(item).lower() or any(value.lower() == label.lower() for label in labels):
+
+--- a/odoo/addons/base/models/ir_filters.py
++++ b/odoo/addons/base/models/ir_filters.py
+@@ -11,7 +11,7 @@ class IrFilters(models.Model):
+     _description = 'Filters'
+     _order = 'model_id, name, id desc'
+ 
+-    name = fields.Char(string='Filter Name', translate=True, required=True)
++    name = fields.Char(string='Filter Name', required=True)
+     user_id = fields.Many2one('res.users', string='User', ondelete='cascade',
+                               help="The user this filter is private to. When left empty the filter is public "
+                                    "and available to all users.")
+@@ -28,7 +28,11 @@ class IrFilters(models.Model):
+ 
+     @api.model
+     def _list_all_models(self):
+-        self._cr.execute("SELECT model, name FROM ir_model ORDER BY name")
++        lang = self.env.lang or 'en_US'
++        self._cr.execute(
++            "SELECT model, COALESCE(name->>%s, name->>'en_US') FROM ir_model ORDER BY 2",
++            [lang],
++        )
+         return self._cr.fetchall()
+ 
+     def copy(self, default=None):
+
+--- a/odoo/addons/base/models/ir_http.py
++++ b/odoo/addons/base/models/ir_http.py
+@@ -4,6 +4,7 @@
+ #----------------------------------------------------------
+ import base64
+ import hashlib
++import json
+ import logging
+ import mimetypes
+ import os
+@@ -22,6 +23,7 @@ from odoo.exceptions import AccessDenied, AccessError, MissingError
+ from odoo.http import request, Response, ROUTING_KEYS, Stream
+ from odoo.service import security
+ from odoo.tools import consteq, submap
++from odoo.tools.translate import code_translations
+ from odoo.modules.module import get_resource_path, get_module_path
+ 
+ _logger = logging.getLogger(__name__)
+@@ -198,3 +200,45 @@ class IrHttp(models.AbstractModel):
+     @api.autovacuum
+     def _gc_sessions(self):
+         http.root.session_store.vacuum()
++
++    @api.model
++    def get_translations_for_webclient(self, modules, lang):
++        if not modules:
++            modules = self.pool._init_modules
++        if not lang:
++            lang = self._context.get("lang")
++        langs = self.env['res.lang']._lang_get(lang)
++        lang_params = None
++        if langs:
++            lang_params = {
++                "name": langs.name,
++                "direction": langs.direction,
++                "date_format": langs.date_format,
++                "time_format": langs.time_format,
++                "grouping": langs.grouping,
++                "decimal_point": langs.decimal_point,
++                "thousands_sep": langs.thousands_sep,
++                "week_start": langs.week_start,
++            }
++            lang_params['week_start'] = int(lang_params['week_start'])
++            lang_params['code'] = lang
++
++        # Regional languages (ll_CC) must inherit/override their parent lang (ll), but this is
++        # done server-side when the language is loaded, so we only need to load the user's lang.
++        translations_per_module = {}
++        for module in modules:
++            translations_per_module[module] = code_translations.get_web_translations(module, lang)
++
++        return translations_per_module, lang_params
++
++    @api.model
++    @tools.ormcache('frozenset(modules)', 'lang')
++    def get_web_translations_hash(self, modules, lang):
++        translations, lang_params = self.get_translations_for_webclient(modules, lang)
++        translation_cache = {
++            'lang_parameters': lang_params,
++            'modules': translations,
++            'lang': lang,
++            'multi_lang': len(self.env['res.lang'].sudo().get_installed()) > 1,
++        }
++        return hashlib.sha1(json.dumps(translation_cache, sort_keys=True).encode()).hexdigest()
+
+--- a/odoo/addons/base/models/ir_model.py
++++ b/odoo/addons/base/models/ir_model.py
+@@ -11,6 +11,7 @@ from collections.abc import Mapping
+ from operator import itemgetter
+ 
+ from psycopg2 import sql
++from psycopg2.extras import Json
+ 
+ from odoo import api, fields, models, tools, _, _lt, Command
+ from odoo.exceptions import AccessError, UserError, ValidationError
+@@ -101,29 +102,55 @@ def query_update(cr, table, values, selectors):
+     return [row[0] for row in cr.fetchall()]
+ 
+ 
+-def upsert(cr, table, cols, rows, conflict):
++def select_en(model, fnames, where, params):
++    """ Select the given columns from the given model's table, with the given WHERE clause.
++    Translated fields are returned in 'en_US'.
++    """
++    table = quote(model._table)
++    cols = ", ".join(
++        f"{quote(fname)}->>'en_US'" if model._fields[fname].translate else quote(fname)
++        for fname in fnames
++    )
++    query = f"SELECT {cols} FROM {table} WHERE {where}"
++    model.env.cr.execute(query, params)
++    return model.env.cr.fetchall()
++
++
++def upsert_en(model, fnames, rows, conflict):
+     """ Insert or update the table with the given rows.
+ 
+-    :param cr: database cursor
+-    :param table: table name
+-    :param cols: list of column names
++    :param model: recordset of the model to query
++    :param fnames: list of column names
+     :param rows: list of tuples, where each tuple value corresponds to a column name
+     :param conflict: list of column names to put into the ON CONFLICT clause
+     :return: the ids of the inserted or updated rows
+     """
+-    query = """
+-        INSERT INTO {table} ({cols}) VALUES {rows}
+-        ON CONFLICT ({conflict}) DO UPDATE SET ({cols}) = ({excluded})
++    table = quote(model._table)
++    cols = ", ".join(quote(fname) for fname in fnames)
++    values = ", ".join("%s" for row in rows)
++    conf = ", ".join(conflict)
++    excluded = ", ".join(f"EXCLUDED.{quote(fname)}" for fname in fnames)
++    query = f"""
++        INSERT INTO {table} ({cols}) VALUES {values}
++        ON CONFLICT ({conf}) DO UPDATE SET ({cols}) = ({excluded})
+         RETURNING id
+-    """.format(
+-        table=quote(table),
+-        cols=", ".join(quote(col) for col in cols),
+-        rows=", ".join("%s" for row in rows),
+-        conflict=", ".join(conflict),
+-        excluded=", ".join("EXCLUDED." + quote(col) for col in cols),
+-    )
+-    cr.execute(query, rows)
+-    return [row[0] for row in cr.fetchall()]
++    """
++
++    # for translated fields, we can actually erase the json value, as
++    # translations will be reloaded after this
++    def identity(val):
++        return val
++
++    def jsonify(val):
++        return Json({'en_US': val}) if val is not None else val
++
++    wrappers = [(jsonify if model._fields[fname].translate else identity) for fname in fnames]
++    params = [
++        tuple(func(val) for func, val in zip(wrappers, row))
++        for row in rows
++    ]
++    model.env.cr.execute(query, params)
++    return [row[0] for row in model.env.cr.fetchall()]
+ 
+ 
+ #
+@@ -260,11 +287,6 @@ class IrModel(models.Model):
+                     self._cr.execute(sql.SQL('DROP VIEW {}').format(sql.Identifier(table)))
+                 elif kind == 'r':
+                     self._cr.execute(sql.SQL('DROP TABLE {} CASCADE').format(sql.Identifier(table)))
+-                    # discard all translations for this model
+-                    self._cr.execute("""
+-                        DELETE FROM ir_translation
+-                        WHERE type IN ('model', 'model_terms') AND name LIKE %s
+-                    """, [model.model + ',%'])
+             else:
+                 _logger.runbot('The model %s could not be dropped because it did not exist in the registry.', model.model)
+         return True
+@@ -357,21 +379,16 @@ class IrModel(models.Model):
+         cols = list(unique(['model'] + list(rows[0])))
+         expected = [tuple(row[col] for col in cols) for row in rows]
+ 
+-        cr = self.env.cr
+-        query = "SELECT {}, id FROM ir_model WHERE model IN %s".format(
+-            ", ".join(quote(col) for col in cols)
+-        )
+-        cr.execute(query, [tuple(model_names)])
+         model_ids = {}
+         existing = {}
+-        for row in cr.fetchall():
+-            model_ids[row[0]] = row[-1]
+-            existing[row[0]] = row[:-1]
++        for row in select_en(self, ['id'] + cols, "model IN %s", [tuple(model_names)]):
++            model_ids[row[1]] = row[0]
++            existing[row[1]] = row[1:]
+ 
+         # create or update rows
+         rows = [row for row in expected if existing.get(row[0]) != row]
+         if rows:
+-            ids = upsert(self.env.cr, self._table, cols, rows, ['model'])
++            ids = upsert_en(self, cols, rows, ['model'])
+             for row, id_ in zip(rows, ids):
+                 model_ids[row[0]] = id_
+             self.pool.post_init(mark_modified, self.browse(ids), cols[1:])
+@@ -417,7 +434,8 @@ class IrModel(models.Model):
+                         Parent._inherit_children.discard(name)
+         # add manual models
+         cr = self.env.cr
+-        cr.execute('SELECT * FROM ir_model WHERE state=%s', ['manual'])
++        # we cannot use self._fields to determine translated fields, as it has not been set up yet
++        cr.execute("SELECT *, name->>'en_US' AS name FROM ir_model WHERE state = 'manual'")
+         for model_data in cr.dictfetchall():
+             model_class = self._instanciate(model_data)
+             Model = model_class._build_model(self.pool, cr)
+@@ -725,12 +743,6 @@ class IrModelFields(models.Model):
+                     tables_to_drop.add(rel_name)
+             if field.state == 'manual' and is_model:
+                 model._pop_field(field.name)
+-            if field.translate:
+-                # discard all translations for this field
+-                self._cr.execute("""
+-                    DELETE FROM ir_translation
+-                    WHERE type IN ('model', 'model_terms') AND name=%s
+-                """, ['%s,%s' % (field.model, field.name)])
+ 
+         if tables_to_drop:
+             # drop the relation tables that are not used by other fields
+@@ -911,9 +923,12 @@ class IrModelFields(models.Model):
+         # names of the models to patch
+         patched_models = set()
+ 
++        # write callable(self._fields[fname].translate) means changing content
++        translate_only = self.env.lang not in (None, 'en_US') and all(self._fields[fname].translate is True for fname in vals)
++
+         if vals and self:
+             for item in self:
+-                if item.state != 'manual':
++                if item.state != 'manual' and not translate_only:
+                     raise UserError(_('Properties of base fields cannot be altered in this manner! '
+                                       'Please modify them through Python code, '
+                                       'preferably through a custom addon!'))
+@@ -1041,20 +1056,16 @@ class IrModelFields(models.Model):
+         cols = list(unique(['model', 'name'] + list(rows[0])))
+         expected = [tuple(row[col] for col in cols) for row in rows]
+ 
+-        query = "SELECT {}, id FROM ir_model_fields WHERE model IN %s".format(
+-            ", ".join(quote(col) for col in cols),
+-        )
+-        cr.execute(query, [tuple(model_names)])
+         field_ids = {}
+         existing = {}
+-        for row in cr.fetchall():
+-            field_ids[row[:2]] = row[-1]
+-            existing[row[:2]] = row[:-1]
++        for row in select_en(self, ['id'] + cols, "model IN %s", [tuple(model_names)]):
++            field_ids[row[1:3]] = row[0]
++            existing[row[1:3]] = row[1:]
+ 
+         # create or update rows
+         rows = [row for row in expected if existing.get(row[:2]) != row]
+         if rows:
+-            ids = upsert(cr, self._table, cols, rows, ['model', 'name'])
++            ids = upsert_en(self, cols, rows, ['model', 'name'])
+             for row, id_ in zip(rows, ids):
+                 field_ids[row[:2]] = id_
+             self.pool.post_init(mark_modified, self.browse(ids), cols[2:])
+@@ -1086,7 +1097,12 @@ class IrModelFields(models.Model):
+     @tools.ormcache()
+     def _all_manual_field_data(self):
+         cr = self._cr
+-        cr.execute("SELECT * FROM ir_model_fields WHERE state='manual'")
++        # we cannot use self._fields to determine translated fields, as it has not been set up yet
++        cr.execute("""
++            SELECT *, field_description->>'en_US' AS field_description, help->>'en_US' AS help
++            FROM ir_model_fields
++            WHERE state = 'manual'
++        """)
+         result = defaultdict(dict)
+         for row in cr.dictfetchall():
+             result[row['model']][row['name']] = row
+@@ -1168,6 +1184,42 @@ class IrModelFields(models.Model):
+                 except Exception:
+                     _logger.exception("Failed to load field %s.%s: skipped", model._name, field_data['name'])
+ 
++    @api.model
++    @tools.ormcache_context('model_name', keys=('lang',))
++    def get_field_string(self, model_name):
++        """ Return the translation of fields strings in the context's language.
++        Note that the result contains the available translations only.
++
++        :param model_name: the name of a model
++        :return: the model's fields' strings as a dictionary `{field_name: field_string}`
++        """
++        fields = self.sudo().search([('model', '=', model_name)])
++        return {field.name: field.field_description for field in fields}
++
++    @api.model
++    @tools.ormcache_context('model_name', keys=('lang',))
++    def get_field_help(self, model_name):
++        """ Return the translation of fields help in the context's language.
++        Note that the result contains the available translations only.
++
++        :param model_name: the name of a model
++        :return: the model's fields' help as a dictionary `{field_name: field_help}`
++        """
++        fields = self.sudo().search([('model', '=', model_name)])
++        return {field.name: field.help for field in fields}
++
++    @api.model
++    @tools.ormcache_context('model_name', 'field_name', keys=('lang',))
++    def get_field_selection(self, model_name, field_name):
++        """ Return the translation of a field's selection in the context's language.
++        Note that the result contains the available translations only.
++
++        :param model_name: the name of the field's model
++        :param field_name: the name of the field
++        :return: the fields' selection as a list
++        """
++        field = self._get(model_name, field_name)
++        return [(sel.value, sel.name) for sel in field.selection_ids]
+ 
+ class IrModelSelection(models.Model):
+     _name = 'ir.model.fields.selection'
+@@ -1192,8 +1244,9 @@ class IrModelSelection(models.Model):
+         return self._get_selection_data(field_id)
+ 
+     def _get_selection_data(self, field_id):
++        # return selection as expected on registry (no translations)
+         self._cr.execute("""
+-            SELECT value, name
++            SELECT value, name->>'en_US'
+             FROM ir_model_fields_selection
+             WHERE field_id=%s
+             ORDER BY sequence, id
+@@ -1223,7 +1276,7 @@ class IrModelSelection(models.Model):
+ 
+         cr = self.env.cr
+         query = """
+-            SELECT s.field_id, s.value, s.name, s.sequence
++            SELECT s.field_id, s.value, s.name->>'en_US', s.sequence
+             FROM ir_model_fields_selection s, ir_model_fields f
+             WHERE s.field_id = f.id AND f.model IN %s
+         """
+@@ -1234,7 +1287,7 @@ class IrModelSelection(models.Model):
+         cols = ['field_id', 'value', 'name', 'sequence']
+         rows = [key + val for key, val in expected.items() if existing.get(key) != val]
+         if rows:
+-            ids = upsert(cr, self._table, cols, rows, ['field_id', 'value'])
++            ids = upsert_en(self, cols, rows, ['field_id', 'value'])
+             self.pool.post_init(mark_modified, self.browse(ids), cols[2:])
+ 
+         # update their XML ids
+@@ -1285,8 +1338,10 @@ class IrModelSelection(models.Model):
+                                     cur_row['value'], model_name, field_name)
+                     rows_to_remove.append(cur_row['id'])
+             elif cur_row is None:
++                new_row['name'] = Json({'en_US': new_row['name']})
+                 rows_to_insert.append(dict(new_row, field_id=field_id))
+             elif any(new_row[key] != cur_row[key] for key in new_row):
++                new_row['name'] = Json({'en_US': new_row['name']})
+                 rows_to_update.append(dict(new_row, id=cur_row['id']))
+ 
+         if rows_to_insert:
+@@ -1308,7 +1363,7 @@ class IrModelSelection(models.Model):
+             a dict {field_name: {value: row_values}}.
+         """
+         query = """
+-            SELECT s.*
++            SELECT s.*, s.name->>'en_US' AS name
+             FROM ir_model_fields_selection s
+             JOIN ir_model_fields f ON s.field_id=f.id
+             WHERE f.model=%s and f.name=%s
+@@ -1556,7 +1611,7 @@ class IrModelConstraint(models.Model):
+             return
+         assert type in ('f', 'u')
+         cr = self._cr
+-        query = """ SELECT c.id, type, definition, message
++        query = """ SELECT c.id, type, definition, message->>'en_US' as message
+                     FROM ir_model_constraint c, ir_module_module m
+                     WHERE c.module=m.id AND c.name=%s AND m.name=%s """
+         cr.execute(query, (conname, module))
+@@ -1572,8 +1627,7 @@ class IrModelConstraint(models.Model):
+                                 (SELECT id FROM ir_model WHERE model=%s),
+                                 %s, %s, %s)
+                         RETURNING id"""
+-            cr.execute(query,
+-                (conname, self.env.uid, self.env.uid, module, model._name, type, definition, message))
++            cr.execute(query, (conname, self.env.uid, self.env.uid, module, model._name, type, definition, Json({'en_US': message})))
+             return self.browse(cr.fetchone()[0])
+ 
+         cons_id = cons.pop('id')
+@@ -1582,7 +1636,7 @@ class IrModelConstraint(models.Model):
+                         SET write_date=now() AT TIME ZONE 'UTC',
+                             write_uid=%s, type=%s, definition=%s, message=%s
+                         WHERE id=%s"""
+-            cr.execute(query, (self.env.uid, type, definition, message, cons_id))
++            cr.execute(query, (self.env.uid, type, definition, Json({'en_US': message}), cons_id))
+         return self.browse(cons_id)
+ 
+     def _reflect_constraints(self, model_names):
+@@ -1735,17 +1789,18 @@ class IrModelAccess(models.Model):
+            :rtype: list
+         """
+         assert access_mode in ('read', 'write', 'create', 'unlink'), 'Invalid access mode'
+-        self._cr.execute("""
+-            SELECT c.name, g.name
++        lang = self.env.lang or 'en_US'
++        self._cr.execute(f"""
++            SELECT COALESCE(c.name->>%s, c.name->>'en_US'), COALESCE(g.name->>%s, g.name->>'en_US')
+               FROM ir_model_access a
+               JOIN ir_model m ON (a.model_id = m.id)
+               JOIN res_groups g ON (a.group_id = g.id)
+          LEFT JOIN ir_module_category c ON (c.id = g.category_id)
+-             WHERE m.model = %%s
++             WHERE m.model = %s
+                AND a.active = TRUE
+-               AND a.perm_%s = TRUE
++               AND a.perm_{access_mode} = TRUE
+           ORDER BY c.name, g.name NULLS LAST
+-        """ % access_mode, [model_name])
++        """, [lang, lang, model_name])
+         return [('%s/%s' % x) if x[0] else x[1] for x in self._cr.fetchall()]
+ 
+     # The context parameter is useful when the method translates error messages.
+
+--- a/odoo/addons/base/models/ir_module.py
++++ b/odoo/addons/base/models/ir_module.py
+@@ -32,6 +32,7 @@ from odoo.osv import expression
+ from odoo.tools.parse_version import parse_version
+ from odoo.tools.misc import topological_sort
+ from odoo.http import request
++from odoo.modules import get_module_path, get_module_resource
+ 
+ _logger = logging.getLogger(__name__)
+ 
+@@ -947,7 +948,7 @@ class Module(models.Model):
+             for mod in update_mods
+         }
+         mod_names = topological_sort(mod_dict)
+-        self.env['ir.translation']._load_module_terms(mod_names, filter_lang, overwrite)
++        self.env['ir.module.module']._load_module_terms(mod_names, filter_lang, overwrite)
+ 
+     def _check(self):
+         for module in self:
+@@ -1024,6 +1025,50 @@ class Module(models.Model):
+ 
+         return super(Module, self).search_panel_select_range(field_name, **kwargs)
+ 
++    @api.model
++    def _load_module_terms(self, modules, langs, overwrite=False):
++        """ Load PO files of the given modules for the given languages. """
++        # load i18n files
++        for module_name in modules:
++            modpath = get_module_path(module_name)
++            if not modpath:
++                continue
++            for lang in langs:
++                lang_code = tools.get_iso_codes(lang)
++                lang_overwrite = overwrite
++                base_lang_code = None
++                if '_' in lang_code:
++                    base_lang_code = lang_code.split('_')[0]
++
++                # Step 1: for sub-languages, load base language first (e.g. es_CL.po is loaded over es.po)
++                if base_lang_code:
++                    base_trans_file = get_module_resource(module_name, 'i18n', base_lang_code + '.po')
++                    if base_trans_file:
++                        _logger.info('module %s: loading base translation file %s for language %s', module_name, base_lang_code, lang)
++                        tools.trans_load(self._cr, base_trans_file, lang, verbose=False, overwrite=lang_overwrite)
++                        lang_overwrite = True  # make sure the requested translation will override the base terms later
++
++                    # i18n_extra folder is for additional translations handle manually (eg: for l10n_be)
++                    base_trans_extra_file = get_module_resource(module_name, 'i18n_extra', base_lang_code + '.po')
++                    if base_trans_extra_file:
++                        _logger.info('module %s: loading extra base translation file %s for language %s', module_name, base_lang_code, lang)
++                        tools.trans_load(self._cr, base_trans_extra_file, lang, verbose=False, overwrite=lang_overwrite)
++                        lang_overwrite = True  # make sure the requested translation will override the base terms later
++
++                # Step 2: then load the main translation file, possibly overriding the terms coming from the base language
++                trans_file = get_module_resource(module_name, 'i18n', lang_code + '.po')
++                if trans_file:
++                    _logger.info('module %s: loading translation file (%s) for language %s', module_name, lang_code, lang)
++                    tools.trans_load(self._cr, trans_file, lang, verbose=False, overwrite=lang_overwrite)
++                elif lang_code != 'en_US':
++                    _logger.info('module %s: no translation for language %s', module_name, lang_code)
++
++                trans_extra_file = get_module_resource(module_name, 'i18n_extra', lang_code + '.po')
++                if trans_extra_file:
++                    _logger.info('module %s: loading extra translation file (%s) for language %s', module_name, lang_code, lang)
++                    tools.trans_load(self._cr, trans_extra_file, lang, verbose=False, overwrite=lang_overwrite)
++        return True
++
+ 
+ DEP_STATES = STATES + [('unknown', 'Unknown')]
+ 
+
+--- a/odoo/addons/base/models/ir_translation.py
++++ b/None
+@@ -1,927 +0,0 @@
+-# -*- coding: utf-8 -*-
+-# Part of Odoo. See LICENSE file for full copyright and licensing details.
+-import hashlib
+-import itertools
+-import json
+-import logging
+-import operator
+-from collections import defaultdict
+-from difflib import get_close_matches
+-
+-from odoo import api, fields, models, tools, SUPERUSER_ID, _
+-from odoo.exceptions import AccessError, UserError, ValidationError
+-from odoo.modules import get_module_path, get_module_resource
+-
+-_logger = logging.getLogger(__name__)
+-
+-TRANSLATION_TYPE = [
+-    ('model', 'Model Field'),
+-    ('model_terms', 'Structured Model Field'),
+-    ('code', 'Code'),
+-]
+-
+-
+-class IrTranslationImport(object):
+-    """ Temporary cursor for optimizing mass insert into model 'ir.translation'.
+-
+-    Open it (attached to a sql cursor), feed it with translation data and
+-    finish() it in order to insert multiple translations in a batch.
+-    """
+-    _table = 'tmp_ir_translation_import'
+-
+-    def __init__(self, cr, overwrite=False):
+-        """ Store some values, and also create a temporary SQL table to accept
+-        the data.
+-
+-        :param model: the model to insert the data into (as a recordset)
+-        """
+-        self._cr = cr
+-        self._model_table = "ir_translation"
+-        self._overwrite = overwrite
+-        self._debug = False
+-        self._rows = []
+-
+-        # Note that Postgres will NOT inherit the constraints or indexes
+-        # of ir_translation, so this copy will be much faster.
+-        query = """ CREATE TEMP TABLE %s (
+-                        imd_model VARCHAR(64),
+-                        imd_name VARCHAR(128),
+-                        noupdate BOOLEAN
+-                    ) INHERITS (%s) """ % (self._table, self._model_table)
+-        self._cr.execute(query)
+-
+-    def push(self, trans_dict):
+-        """ Feed a translation, as a dictionary, into the cursor """
+-        params = dict(trans_dict, state="translated")
+-
+-        self._rows.append((params['name'], params['lang'], params['res_id'],
+-                           params['src'], params['type'], params['imd_model'],
+-                           params['module'], params['imd_name'], params['value'],
+-                           params['state'], params['comments']))
+-
+-    def finish(self):
+-        """ Transfer the data from the temp table to ir.translation """
+-        cr = self._cr
+-
+-        # Step 0: insert rows in batch
+-        query = """ INSERT INTO %s (name, lang, res_id, src, type, imd_model,
+-                                    module, imd_name, value, state, comments)
+-                    VALUES """ % self._table
+-        for rows in cr.split_for_in_conditions(self._rows):
+-            cr.execute(query + ", ".join(["%s"] * len(rows)), rows)
+-
+-        _logger.debug("ir.translation.cursor: We have %d entries to process", len(self._rows))
+-
+-        # Step 1: resolve ir.model.data references to res_ids
+-        cr.execute(""" UPDATE %s AS ti
+-                          SET res_id = imd.res_id,
+-                              noupdate = imd.noupdate
+-                       FROM ir_model_data AS imd
+-                       WHERE ti.res_id IS NULL
+-                       AND ti.module IS NOT NULL AND ti.imd_name IS NOT NULL
+-                       AND ti.module = imd.module AND ti.imd_name = imd.name
+-                       AND ti.imd_model = imd.model; """ % self._table)
+-
+-        if self._debug:
+-            cr.execute(""" SELECT module, imd_name, imd_model FROM %s
+-                           WHERE res_id IS NULL AND module IS NOT NULL """ % self._table)
+-            for row in cr.fetchall():
+-                _logger.info("ir.translation.cursor: missing res_id for %s.%s <%s> ", *row)
+-
+-        # Records w/o res_id must _not_ be inserted into our db, because they are
+-        # referencing non-existent data.
+-        cr.execute("DELETE FROM %s WHERE res_id IS NULL AND module IS NOT NULL" % self._table)
+-
+-        count = 0
+-        # Step 2: insert new or upsert non-noupdate translations
+-        if self._overwrite:
+-            cr.execute(""" INSERT INTO %s(name, lang, res_id, src, type, value, module, state, comments)
+-                           SELECT name, lang, res_id, src, type, value, module, state, comments
+-                           FROM %s
+-                           WHERE type = 'code'
+-                           AND noupdate IS NOT TRUE
+-                           ON CONFLICT (type, lang, md5(src)) WHERE type = 'code'
+-                            DO UPDATE SET (name, lang, res_id, src, type, value, module, state, comments) = (EXCLUDED.name, EXCLUDED.lang, EXCLUDED.res_id, EXCLUDED.src, EXCLUDED.type, EXCLUDED.value, EXCLUDED.module, EXCLUDED.state,
+-                                                                                                             CASE WHEN %s.comments = 'openerp-web' THEN 'openerp-web' ELSE EXCLUDED.comments END
+-                                                                                                            )
+-                            WHERE EXCLUDED.value IS NOT NULL AND EXCLUDED.value != '';
+-                       """ % (self._model_table, self._table, self._model_table))
+-            count += cr.rowcount
+-            cr.execute(""" INSERT INTO %s(name, lang, res_id, src, type, value, module, state, comments)
+-                           SELECT name, lang, res_id, src, type, value, module, state, comments
+-                           FROM %s
+-                           WHERE type = 'model'
+-                           AND noupdate IS NOT TRUE
+-                           ON CONFLICT (type, lang, name, res_id) WHERE type = 'model'
+-                            DO UPDATE SET (name, lang, res_id, src, type, value, module, state, comments) = (EXCLUDED.name, EXCLUDED.lang, EXCLUDED.res_id, EXCLUDED.src, EXCLUDED.type, EXCLUDED.value, EXCLUDED.module, EXCLUDED.state, EXCLUDED.comments)
+-                            WHERE EXCLUDED.value IS NOT NULL AND EXCLUDED.value != '';
+-                       """ % (self._model_table, self._table))
+-            count += cr.rowcount
+-
+-            cr.execute(""" INSERT INTO %s(name, lang, res_id, src, type, value, module, state, comments)
+-                           SELECT name, lang, res_id, src, type, value, module, state, comments
+-                           FROM %s
+-                           WHERE type = 'model_terms'
+-                           AND noupdate IS NOT TRUE
+-                           ON CONFLICT (type, name, lang, res_id, md5(src))
+-                            DO UPDATE SET (name, lang, res_id, src, type, value, module, state, comments) = (EXCLUDED.name, EXCLUDED.lang, EXCLUDED.res_id, EXCLUDED.src, EXCLUDED.type, EXCLUDED.value, EXCLUDED.module, EXCLUDED.state, EXCLUDED.comments)
+-                            WHERE EXCLUDED.value IS NOT NULL AND EXCLUDED.value != '';
+-                       """ % (self._model_table, self._table))
+-            count += cr.rowcount
+-        cr.execute(""" INSERT INTO %s(name, lang, res_id, src, type, value, module, state, comments)
+-                       SELECT name, lang, res_id, src, type, value, module, state, comments
+-                       FROM %s
+-                       WHERE %%s OR noupdate is true
+-                       ON CONFLICT DO NOTHING;
+-                   """ % (self._model_table, self._table), [not self._overwrite])
+-        count += cr.rowcount
+-
+-        if self._debug:
+-            cr.execute("SELECT COUNT(*) FROM ONLY %s" % self._model_table)
+-            total = cr.fetchone()[0]
+-            _logger.debug("ir.translation.cursor: %d entries now in ir.translation, %d common entries with tmp", total, count)
+-
+-        # Step 3: cleanup
+-        cr.execute("DROP TABLE %s" % self._table)
+-        self._rows.clear()
+-        return True
+-
+-
+-class IrTranslation(models.Model):
+-    _name = "ir.translation"
+-    _description = 'Translation'
+-    _log_access = False
+-
+-    name = fields.Char(string='Translated field', required=True)
+-    res_id = fields.Integer(string='Record ID', index=True)
+-    lang = fields.Selection(selection='_get_languages', string='Language', validate=False)
+-    type = fields.Selection(TRANSLATION_TYPE, string='Type', index=True)
+-    src = fields.Text(string='Internal Source')  # stored in database, kept for backward compatibility
+-    value = fields.Text(string='Translation Value')
+-    module = fields.Char(index=True, help="Module this term belongs to")
+-
+-    state = fields.Selection([('to_translate', 'To Translate'),
+-                              ('inprogress', 'Translation in Progress'),
+-                              ('translated', 'Translated')],
+-                             string="Status", default='to_translate',
+-                             help="Automatically set to let administators find new terms that might need to be translated")
+-
+-    # aka gettext extracted-comments - we use them to flag openerp-web translation
+-    # cfr: http://www.gnu.org/savannah-checkouts/gnu/gettext/manual/html_node/PO-Files.html
+-    comments = fields.Text(string='Translation comments', index=True)
+-
+-    _sql_constraints = [
+-        ('lang_fkey_res_lang', 'FOREIGN KEY(lang) REFERENCES res_lang(code)',
+-         'Language code of translation item must be among known languages'),
+-    ]
+-
+-    @api.model
+-    def _get_languages(self):
+-        return self.env['res.lang'].get_installed()
+-
+-    def _auto_init(self):
+-        res = super(IrTranslation, self)._auto_init()
+-        # Add separate md5 index on src (no size limit on values, and good performance).
+-        tools.create_index(self._cr, 'ir_translation_src_md5', self._table, ['md5(src)'])
+-        # Cover 'model_terms' type
+-        tools.create_unique_index(self._cr, 'ir_translation_unique', self._table,
+-                                  ['type', 'name', 'lang', 'res_id', 'md5(src)'])
+-        if not tools.index_exists(self._cr, 'ir_translation_code_unique'):
+-            self._cr.execute("CREATE UNIQUE INDEX ir_translation_code_unique ON ir_translation (type, lang, md5(src)) WHERE type = 'code'")
+-        if not tools.index_exists(self._cr, 'ir_translation_model_unique'):
+-            self._cr.execute("CREATE UNIQUE INDEX ir_translation_model_unique ON ir_translation (type, lang, name, res_id) WHERE type = 'model'")
+-
+-        return res
+-
+-    @api.model
+-    def _get_ids(self, name, tt, lang, ids):
+-        """ Return the translations of records.
+-
+-        :param name: a string defined as "<model_name>,<field_name>"
+-        :param tt: the type of translation (should always be "model")
+-        :param lang: the language code
+-        :param ids: the ids of the given records
+-        """
+-        translations = dict.fromkeys(ids, False)
+-        if ids:
+-            self._cr.execute("""SELECT res_id, value FROM ir_translation
+-                                WHERE lang=%s AND type=%s AND name=%s AND res_id IN %s""",
+-                             (lang, tt, name, tuple(ids)))
+-            for res_id, value in self._cr.fetchall():
+-                translations[res_id] = value
+-        return translations
+-
+-    CACHED_MODELS = {'ir.model.fields', 'ir.ui.view'}
+-
+-    def _modified_model(self, model_name):
+-        """ Invalidate the ormcache if necessary, depending on ``model_name``.
+-        This should be called when modifying translations of type 'model'.
+-        """
+-        if model_name in self.CACHED_MODELS:
+-            self.clear_caches()
+-
+-    def _modified(self):
+-        """ Invalidate the ormcache if necessary, depending on the translations ``self``. """
+-        # DLE P63: test_views.py
+-        for trans in self:
+-            if trans.type == 'model_terms' and trans.res_id:
+-                model, field = trans.name.split(',')
+-                if model in self.env:
+-                    model = self.env[model]
+-                    if field in model._fields:
+-                        field = model._fields[field]
+-                        record = model.browse(trans.res_id)
+-                        record.modified([field.name])
+-        for trans in self:
+-            if (trans.type != 'model' or
+-               (trans.name.split(',')[0] in self.CACHED_MODELS) or
+-               (trans.comments and 'openerp-web' in trans.comments)):  # clear get_web_trans_hash
+-                        self.clear_caches()
+-                        break
+-
+-    @api.model
+-    def _set_ids(self, name, tt, lang, ids, value, src=None):
+-        """ Update the translations of records.
+-
+-        :param name: a string defined as "<model_name>,<field_name>"
+-        :param tt: the type of translation (should always be "model")
+-        :param lang: the language code
+-        :param ids: the ids of the given records
+-        :param value: the value of the translation
+-        :param src: the source of the translation
+-        """
+-        self._modified_model(name.split(',')[0])
+-        self.flush_model()
+-
+-        # update existing translations
+-        self._cr.execute("""UPDATE ir_translation
+-                            SET value=%s, src=%s, state=%s
+-                            WHERE lang=%s AND type=%s AND name=%s AND res_id IN %s
+-                            RETURNING res_id""",
+-                         (value, src, 'translated', lang, tt, name, tuple(ids)))
+-        existing_ids = [row[0] for row in self._cr.fetchall()]
+-        self.invalidate_model(['value', 'src', 'state'])
+-
+-        # create missing translations
+-        self.sudo().create([{
+-                'lang': lang,
+-                'type': tt,
+-                'name': name,
+-                'res_id': res_id,
+-                'value': value,
+-                'src': src,
+-                'state': 'translated',
+-            }
+-            for res_id in set(ids) - set(existing_ids)
+-        ])
+-        return len(ids)
+-
+-    def _set_source(self, name, ids, src):
+-        """ Update the translation source of records.
+-
+-        :param name: a string defined as "<model_name>,<field_name>"
+-        :param ids: the ids of the given records
+-        :param src: the source of the translation
+-        """
+-        self.flush_model()
+-        self._cr.execute("""UPDATE ir_translation
+-                            SET src=%s
+-                            WHERE type=%s AND name=%s AND res_id IN %s
+-                            RETURNING id""",
+-                         (src, 'model', name, tuple(ids)))
+-        existing_ids = [row[0] for row in self._cr.fetchall()]
+-        # invalidate src for updated translations
+-        self.browse(existing_ids).invalidate_recordset(['src'])
+-
+-    @api.model
+-    def _get_source_query(self, name, types, lang, source, res_id):
+-        self.flush_model()
+-        if source:
+-            # Note: the extra test on md5(src) is a hint for postgres to use the
+-            # index ir_translation_src_md5
+-            query = """SELECT value FROM ir_translation
+-                       WHERE lang=%s AND type in %s AND src=%s AND md5(src)=md5(%s)"""
+-            source = tools.ustr(source)
+-            params = (lang or '', types, source, source)
+-            if res_id:
+-                query += " AND res_id in %s"
+-                params += (res_id,)
+-            if name:
+-                query += " AND name=%s"
+-                params += (tools.ustr(name),)
+-        else:
+-            query = """ SELECT value FROM ir_translation
+-                        WHERE lang=%s AND type in %s AND name=%s """
+-            params = (lang or '', types, tools.ustr(name))
+-
+-        return (query, params)
+-
+-    @tools.ormcache('name', 'types', 'lang', 'source', 'res_id')
+-    def __get_source(self, name, types, lang, source, res_id):
+-        # res_id is a tuple or None, otherwise ormcache cannot cache it!
+-        query, params = self._get_source_query(name, types, lang, source, res_id)
+-        self._cr.execute(query, params)
+-        res = self._cr.fetchone()
+-        trad = res and res[0] or u''
+-        if source and not trad:
+-            return tools.ustr(source)
+-        return trad
+-
+-    @api.model
+-    def _get_source(self, name, types, lang, source=None, res_id=None):
+-        """ Return the translation for the given combination of ``name``,
+-        ``type``, ``language`` and ``source``. All values passed to this method
+-        should be unicode (not byte strings), especially ``source``.
+-
+-        :param name: identification of the term to translate, such as field name (optional if source is passed)
+-        :param types: single string defining type of term to translate (see ``type`` field on ir.translation), or sequence of allowed types (strings)
+-        :param lang: language code of the desired translation
+-        :param source: optional source term to translate (should be unicode)
+-        :param res_id: optional resource id or a list of ids to translate (if used, ``source`` should be set)
+-        :rtype: unicode
+-        :return: the request translation, or an empty unicode string if no translation was
+-                 found and `source` was not passed
+-        """
+-        # FIXME: should assert that `source` is unicode and fix all callers to
+-        # always pass unicode so we can remove the string encoding/decoding.
+-        if not lang:
+-            return tools.ustr(source or '')
+-        if isinstance(types, str):
+-            types = (types,)
+-        if res_id:
+-            if isinstance(res_id, int):
+-                res_id = (res_id,)
+-            else:
+-                res_id = tuple(res_id)
+-        return self.__get_source(name, types, lang, source, res_id)
+-
+-    @api.model
+-    def _get_terms_query(self, field, records):
+-        """ Utility function that makes the query for field terms. """
+-        self.flush_model()
+-        query = """ SELECT * FROM ir_translation
+-                    WHERE lang=%s AND type=%s AND name=%s AND res_id IN %s """
+-        name = "%s,%s" % (field.model_name, field.name)
+-        params = (records.env.lang, 'model_terms', name, tuple(records.ids))
+-        return query, params
+-
+-    @api.model
+-    def _get_terms_mapping(self, field, records):
+-        """ Return a function mapping a ir_translation row (dict) to a value.
+-        This method is called before querying the database for translations.
+-        """
+-        return lambda data: data['value']
+-
+-    @api.model
+-    def _get_terms_translations(self, field, records):
+-        """ Return the terms and translations of a given `field` on `records`.
+-
+-        :return: {record_id: {source: value}}
+-        """
+-        result = {rid: {} for rid in records.ids}
+-        if records:
+-            map_trans = self._get_terms_mapping(field, records)
+-            query, params = self._get_terms_query(field, records)
+-            self._cr.execute(query, params)
+-            for data in self._cr.dictfetchall():
+-                result[data['res_id']][data['src']] = map_trans(data)
+-        return result
+-
+-    @api.model
+-    def _sync_terms_translations(self, field, records):
+-        """ Synchronize the translations to the terms to translate, after the
+-        English value of a field is modified. The algorithm tries to match
+-        existing translations to the terms to translate, provided the distance
+-        between modified strings is not too large. It allows to not retranslate
+-        data where a typo has been fixed in the English value.
+-        """
+-        if not callable(field.translate):
+-            return
+-
+-        Translation = self.env['ir.translation']
+-        outdated = Translation
+-        discarded = Translation
+-
+-        for record in records:
+-            # get field value and terms to translate
+-            value = record[field.name]
+-            terms = set(field.get_trans_terms(value))
+-            translations = Translation.search([
+-                ('type', '=', 'model_terms'),
+-                ('name', '=', "%s,%s" % (field.model_name, field.name)),
+-                ('res_id', '=', record.id),
+-            ])
+-
+-            if not terms:
+-                # discard all translations for that field
+-                discarded += translations
+-                continue
+-
+-            # remap existing translations on terms when possible; each term
+-            # should be translated at most once per language
+-            done = set()                # {(src, lang), ...}
+-            translations_to_match = []
+-
+-            for translation in translations:
+-                if not translation.value:
+-                    discarded += translation
+-                    # consider it done to avoid being matched against another term
+-                    done.add((translation.src, translation.lang))
+-                elif translation.src in terms:
+-                    done.add((translation.src, translation.lang))
+-                else:
+-                    translations_to_match.append(translation)
+-
+-            if translations_to_match:
+-                text2term = {field.get_text_content(term): term for term in terms}
+-            for translation in translations_to_match:
+-                # match the terms without formatting elements
+-                src_text = field.get_text_content(translation.src)
+-                matches = get_close_matches(src_text, text2term, 1, 0.9)
+-                src = text2term[matches[0]] if matches else None
+-                if not src:
+-                    outdated += translation
+-                elif (src, translation.lang) in done:
+-                    discarded += translation
+-                else:
+-                    vals = {'src': src, 'state': translation.state}
+-                    if translation.lang == records.env.lang:
+-                        vals['value'] = src
+-                    translation.write(vals)
+-                    done.add((src, translation.lang))
+-
+-        # process outdated and discarded translations
+-        outdated.write({'state': 'to_translate'})
+-
+-        if discarded:
+-            # delete in SQL to avoid invalidating the whole cache
+-            discarded._modified()
+-            discarded.modified(self._fields)
+-            discarded.flush_recordset()
+-            discarded.invalidate_recordset()
+-            self.env.cr.execute("DELETE FROM ir_translation WHERE id IN %s", [discarded._ids])
+-
+-    @api.model
+-    @tools.ormcache_context('model_name', keys=('lang',))
+-    def get_field_string(self, model_name):
+-        """ Return the translation of fields strings in the context's language.
+-        Note that the result contains the available translations only.
+-
+-        :param model_name: the name of a model
+-        :return: the model's fields' strings as a dictionary `{field_name: field_string}`
+-        """
+-        fields = self.env['ir.model.fields'].sudo().search([('model', '=', model_name)])
+-        return {field.name: field.field_description for field in fields}
+-
+-    @api.model
+-    @tools.ormcache_context('model_name', keys=('lang',))
+-    def get_field_help(self, model_name):
+-        """ Return the translation of fields help in the context's language.
+-        Note that the result contains the available translations only.
+-
+-        :param model_name: the name of a model
+-        :return: the model's fields' help as a dictionary `{field_name: field_help}`
+-        """
+-        fields = self.env['ir.model.fields'].sudo().search([('model', '=', model_name)])
+-        return {field.name: field.help for field in fields}
+-
+-    @api.model
+-    @tools.ormcache_context('model_name', 'field_name', keys=('lang',))
+-    def get_field_selection(self, model_name, field_name):
+-        """ Return the translation of a field's selection in the context's language.
+-        Note that the result contains the available translations only.
+-
+-        :param model_name: the name of the field's model
+-        :param field_name: the name of the field
+-        :return: the fields' selection as a list
+-        """
+-        field = self.env['ir.model.fields']._get(model_name, field_name)
+-        return [(sel.value, sel.name) for sel in field.selection_ids]
+-
+-    def check(self, mode):
+-        """ Check access rights of operation ``mode`` on ``self`` for the
+-        current user. Raise an AccessError in case conditions are not met.
+-        """
+-        if self.env.is_superuser():
+-            return
+-
+-        # collect translated field records (model_ids) and other translations
+-        trans_ids = []
+-        model_ids = defaultdict(set)
+-        model_fields = defaultdict(set)
+-        for trans in self:
+-            if trans.type in ('model', 'model_terms'):
+-                mname, fname = trans.name.split(',')
+-                model_ids[mname].add(trans.res_id)
+-                model_fields[mname].add(fname)
+-            else:
+-                trans_ids.append(trans.id)
+-
+-        # check for regular access rights on other translations
+-        if trans_ids:
+-            records = self.browse(trans_ids)
+-            records.check_access_rights(mode)
+-            records.check_access_rule(mode)
+-
+-        # check for read/write access on translated field records
+-        fmode = 'read' if mode == 'read' else 'write'
+-        for mname, ids in model_ids.items():
+-            records = self.env[mname].browse(ids).exists()
+-            records.check_access_rights(fmode)
+-            records.check_field_access_rights(fmode, model_fields[mname])
+-            if mode == 'create' and set(records._ids) != ids:
+-                raise ValidationError(_("Creating translation on non existing records"))
+-            if not records:
+-                continue
+-            records.check_access_rule(fmode)
+-
+-    @api.constrains('type', 'name', 'value')
+-    def _check_value(self):
+-        for trans in self.with_context(lang=None):
+-            if trans.type == 'model' and trans.value:
+-                mname, fname = trans.name.split(',')
+-                record = trans.env[mname].browse(trans.res_id)
+-                field = record._fields[fname]
+-                if callable(field.translate):
+-                    src = trans.src
+-                    val = trans.value.strip()
+-                    # check whether applying (src -> val) then (val -> src)
+-                    # gives the original value back
+-                    value0 = field.translate(lambda term: None, record[fname])
+-                    value1 = field.translate({src: val}.get, value0)
+-                    # don't check the reverse if no translation happened
+-                    if value0 == value1:
+-                        continue
+-                    value2 = field.translate({val: src}.get, value1)
+-                    if value2 != value0:
+-                        raise ValidationError(_("Translation is not valid:\n%s", val))
+-
+-    @api.model_create_multi
+-    def create(self, vals_list):
+-        records = super(IrTranslation, self.sudo()).create(vals_list).with_env(self.env)
+-        records.check('create')
+-        records._modified()
+-        # DLE P62: `test_translate.py`, `test_sync`
+-        self.env.flush_all()
+-        return records
+-
+-    def write(self, vals):
+-        if vals.get('value'):
+-            vals.setdefault('state', 'translated')
+-        elif vals.get('src') or not vals.get('value', True):
+-            vals.setdefault('state', 'to_translate')
+-        self.check('write')
+-        result = super(IrTranslation, self.sudo()).write(vals)
+-        self.check('write')
+-        self._modified()
+-        # DLE P62: `test_translate.py`, `test_sync`
+-        # when calling `flush` with a field list, if there is no value for one of these fields,
+-        # the flush to database is not done.
+-        # this causes issues when changing the src/value of a translation, as when we read, we ask the flush,
+-        # but its not really the field which is in the towrite values, but its translation
+-        self.env.flush_all()
+-        return result
+-
+-    def unlink(self):
+-        self.check('unlink')
+-        self._modified()
+-        return super(IrTranslation, self.sudo()).unlink()
+-
+-    @api.model
+-    def _search(self, args, offset=0, limit=None, order=None, count=False, access_rights_uid=None):
+-        # DLE P67, `test_new_fields.py`, `test_80_copy`
+-        # When assigning a translation to a field
+-        # e.g. email.with_context(lang='fr_FR').label = "bonjour"
+-        # and then search on translations for this translation, must flush as the translation has not yet been written in database
+-        if any(field.translate for field in self.env.cache.get_dirty_fields()):
+-            self.env.flush_all()
+-        return super(IrTranslation, self)._search(args, offset=offset, limit=limit, order=order, count=count, access_rights_uid=access_rights_uid)
+-
+-    @api.model
+-    def insert_missing(self, field, records):
+-        """ Insert missing translations for `field` on `records`. """
+-        self.flush_model()
+-        records = records.with_context(lang=None)
+-        external_ids = records.get_external_id()  # if no xml_id, empty string
+-        if callable(field.translate):
+-            # insert missing translations for each term in src
+-            query = """ INSERT INTO ir_translation (lang, type, name, res_id, src, value, module, state)
+-                        SELECT l.code, 'model_terms', %(name)s, %(res_id)s, %(src)s, '', %(module)s, 'to_translate'
+-                        FROM res_lang l
+-                        WHERE l.active AND NOT EXISTS (
+-                            SELECT 1 FROM ir_translation
+-                            WHERE lang=l.code AND type='model' AND name=%(name)s AND res_id=%(res_id)s AND src=%(src)s
+-                        )
+-                        ON CONFLICT DO NOTHING;
+-                    """
+-            for record in records:
+-                module = external_ids[record.id].split('.')[0]
+-                src = record[field.name] or None
+-                for term in set(field.get_trans_terms(src)):
+-                    self._cr.execute(query, {
+-                        'name': "%s,%s" % (field.model_name, field.name),
+-                        'res_id': record.id,
+-                        'src': term,
+-                        'module': module
+-                    })
+-        else:
+-            # insert missing translations for src
+-            query = """ INSERT INTO ir_translation (lang, type, name, res_id, src, value, module, state)
+-                        SELECT l.code, 'model', %(name)s, %(res_id)s, %(src)s, '', %(module)s, 'to_translate'
+-                        FROM res_lang l
+-                        WHERE l.active AND NOT EXISTS (
+-                            SELECT 1 FROM ir_translation
+-                            WHERE lang=l.code AND type='model' AND name=%(name)s AND res_id=%(res_id)s
+-                        );
+-
+-                        DELETE FROM ir_translation dup
+-                        WHERE type='model' AND name=%(name)s AND res_id=%(res_id)s
+-                            AND dup.id NOT IN (SELECT MAX(t.id)
+-                                       FROM ir_translation t
+-                                       WHERE t.lang=dup.lang AND type='model' AND name=%(name)s AND res_id=%(res_id)s
+-                            );
+-
+-                        UPDATE ir_translation SET src=%(src)s
+-                        WHERE type='model' AND name=%(name)s AND res_id=%(res_id)s;
+-                    """
+-            for record in records:
+-                module = external_ids[record.id].split('.')[0]
+-                self._cr.execute(query, {
+-                    'name': "%s,%s" % (field.model_name, field.name),
+-                    'res_id': record.id,
+-                    'src': record[field.name] or None,
+-                    'module': module
+-                })
+-        self._modified_model(field.model_name)
+-
+-    @api.model
+-    def _upsert_translations(self, vals_list):
+-        """ Insert or update translations of type 'model' or 'model_terms'.
+-
+-            This method is used for creations of translations where the given
+-            ``vals_list`` is trusted to be the right values and potential
+-            conflicts should be updated to the new given value.
+-            Mandatory values: name, lang, res_id, src, type
+-            The other keys are ignored during update if not present
+-        """
+-        self.flush_model()
+-        rows_by_type = defaultdict(list)
+-        for vals in vals_list:
+-            rows_by_type[vals['type']].append((
+-                vals['name'], vals['lang'], vals['res_id'], vals['src'] or '', vals['type'],
+-                vals.get('module'), vals['value'] or '', vals.get('state'), vals.get('comments'),
+-            ))
+-
+-        if rows_by_type['model']:
+-            query = """
+-                INSERT INTO ir_translation (name, lang, res_id, src, type,
+-                                            module, value, state, comments)
+-                VALUES {}
+-                ON CONFLICT (type, lang, name, res_id) WHERE type='model'
+-                DO UPDATE SET (name, lang, res_id, src, type, value, module, state, comments) =
+-                    (EXCLUDED.name, EXCLUDED.lang, EXCLUDED.res_id, EXCLUDED.src, EXCLUDED.type,
+-                     EXCLUDED.value,
+-                     COALESCE(EXCLUDED.module, ir_translation.module),
+-                     COALESCE(EXCLUDED.state, ir_translation.state),
+-                     COALESCE(EXCLUDED.comments, ir_translation.comments))
+-                WHERE EXCLUDED.value IS NOT NULL AND EXCLUDED.value != '';
+-            """.format(", ".join(["%s"] * len(rows_by_type['model'])))
+-            self.env.cr.execute(query, rows_by_type['model'])
+-
+-        if rows_by_type['model_terms']:
+-            query = """
+-                INSERT INTO ir_translation (name, lang, res_id, src, type,
+-                                            module, value, state, comments)
+-                VALUES {}
+-                ON CONFLICT (type, name, lang, res_id, md5(src))
+-                DO UPDATE SET (name, lang, res_id, src, type, value, module, state, comments) =
+-                    (EXCLUDED.name, EXCLUDED.lang, EXCLUDED.res_id, EXCLUDED.src, EXCLUDED.type,
+-                     EXCLUDED.value, EXCLUDED.module, EXCLUDED.state, EXCLUDED.comments)
+-                WHERE EXCLUDED.value IS NOT NULL AND EXCLUDED.value != '';
+-            """.format(", ".join(["%s"] * len(rows_by_type['model_terms'])))
+-            self.env.cr.execute(query, rows_by_type['model_terms'])
+-
+-    def _update_translations(self, vals_list):
+-        """ Update translations of type 'model' or 'model_terms'.
+-
+-            This method is used for update of translations where the given
+-            ``vals_list`` is trusted to be the right values
+-            No new translation will be created
+-        """
+-        self.flush_model()
+-        grouped_rows = {}
+-        for vals in vals_list:
+-            key = (vals['lang'], vals['type'], vals['name'])
+-            grouped_rows.setdefault(key, [vals['value'], vals['src'], vals['state'], []])
+-            grouped_rows[key][3].append(vals['res_id'])
+-
+-        for where, values in grouped_rows.items():
+-            self._cr.execute(
+-                """ UPDATE ir_translation
+-                    SET value=%s,
+-                        src=%s,
+-                        state=%s
+-                    WHERE lang=%s AND type=%s AND name=%s AND res_id in %s
+-                """,
+-                (values[0], values[1], values[2], where[0], where[1], where[2], tuple(values[3]))
+-            )
+-        self.invalidate_model(['value', 'src', 'state'])
+-
+-    @api.model
+-    def translate_fields(self, model, id, field=None):
+-        """ Open a view for translating the field(s) of the record (model, id). """
+-        main_lang = 'en_US'
+-        if not self.env['res.lang'].search_count([('code', '!=', main_lang)]):
+-            raise UserError(_("Translation features are unavailable until you install an extra translation."))
+-
+-        # determine domain for selecting translations
+-        record = self.env[model].with_context(lang=main_lang).browse(id)
+-        domain = ['&', ('res_id', '=', id), ('name', '=like', model + ',%')]
+-
+-        def make_domain(fld, rec):
+-            name = "%s,%s" % (fld.model_name, fld.name)
+-            return ['&', ('res_id', '=', rec.id), ('name', '=', name)]
+-
+-        # insert missing translations, and extend domain for related fields
+-        for name, fld in record._fields.items():
+-            if not fld.translate:
+-                continue
+-
+-            rec = record
+-            if fld.related:
+-                try:
+-                    # traverse related fields up to their data source
+-                    while fld.related:
+-                        rec, fld = fld.traverse_related(rec)
+-                    if rec:
+-                        domain = ['|'] + domain + make_domain(fld, rec)
+-                except AccessError:
+-                    continue
+-
+-            assert fld.translate and rec._name == fld.model_name
+-            self.insert_missing(fld, rec)
+-
+-        action = {
+-            'name': _('Translate'),
+-            'res_model': 'ir.translation',
+-            'type': 'ir.actions.act_window',
+-            'view_mode': 'tree',
+-            'view_id': self.env.ref('base.view_translation_dialog_tree').id,
+-            'target': 'current',
+-            'domain': domain,
+-            'context': {},
+-        }
+-        if field:
+-            fld = record._fields[field]
+-            if not fld.related:
+-                action['context'] = {
+-                    'search_default_name': "%s,%s" % (fld.model_name, fld.name),
+-                }
+-            else:
+-                rec = record
+-                try:
+-                    while fld.related:
+-                        rec, fld = fld.traverse_related(rec)
+-                    if rec:
+-                        action['context'] = {'search_default_name': "%s,%s" % (fld.model_name, fld.name),}
+-                except AccessError:
+-                    pass
+-
+-            action['target'] = 'new'
+-            action['context']['translation_type'] = 'text' if fld.type in ['text', 'html'] else 'char'
+-            action['context']['translation_show_src'] = False
+-            if callable(fld.translate):
+-                action['view_id'] = self.env.ref('base.view_translation_lang_src_value_tree').id,
+-                action['context']['translation_show_src'] = True
+-            else:
+-                action['view_id'] = self.env.ref('base.view_translation_lang_value_tree').id,
+-
+-        return action
+-
+-    def _get_import_cursor(self, overwrite):
+-        """ Return a cursor-like object for fast inserting translations """
+-        return IrTranslationImport(self._cr, overwrite)
+-
+-    def _load_module_terms(self, modules, langs, overwrite=False):
+-        """ Load PO files of the given modules for the given languages. """
+-        # load i18n files
+-        for module_name in modules:
+-            modpath = get_module_path(module_name)
+-            if not modpath:
+-                continue
+-            for lang in langs:
+-                lang_code = tools.get_iso_codes(lang)
+-                lang_overwrite = overwrite
+-                base_lang_code = None
+-                if '_' in lang_code:
+-                    base_lang_code = lang_code.split('_')[0]
+-
+-                # Step 1: for sub-languages, load base language first (e.g. es_CL.po is loaded over es.po)
+-                if base_lang_code:
+-                    base_trans_file = get_module_resource(module_name, 'i18n', base_lang_code + '.po')
+-                    if base_trans_file:
+-                        _logger.info('module %s: loading base translation file %s for language %s', module_name, base_lang_code, lang)
+-                        tools.trans_load(self._cr, base_trans_file, lang, verbose=False, overwrite=lang_overwrite)
+-                        lang_overwrite = True  # make sure the requested translation will override the base terms later
+-
+-                    # i18n_extra folder is for additional translations handle manually (eg: for l10n_be)
+-                    base_trans_extra_file = get_module_resource(module_name, 'i18n_extra', base_lang_code + '.po')
+-                    if base_trans_extra_file:
+-                        _logger.info('module %s: loading extra base translation file %s for language %s', module_name, base_lang_code, lang)
+-                        tools.trans_load(self._cr, base_trans_extra_file, lang, verbose=False, overwrite=lang_overwrite)
+-                        lang_overwrite = True  # make sure the requested translation will override the base terms later
+-
+-                # Step 2: then load the main translation file, possibly overriding the terms coming from the base language
+-                trans_file = get_module_resource(module_name, 'i18n', lang_code + '.po')
+-                if trans_file:
+-                    _logger.info('module %s: loading translation file (%s) for language %s', module_name, lang_code, lang)
+-                    tools.trans_load(self._cr, trans_file, lang, verbose=False, overwrite=lang_overwrite)
+-                elif lang_code != 'en_US':
+-                    _logger.info('module %s: no translation for language %s', module_name, lang_code)
+-
+-                trans_extra_file = get_module_resource(module_name, 'i18n_extra', lang_code + '.po')
+-                if trans_extra_file:
+-                    _logger.info('module %s: loading extra translation file (%s) for language %s', module_name, lang_code, lang)
+-                    tools.trans_load(self._cr, trans_extra_file, lang, verbose=False, overwrite=lang_overwrite)
+-        return True
+-
+-    @api.model
+-    def get_technical_translations(self, model_name):
+-        """ Find the translations for the fields of `model_name`
+-
+-        Find the technical translations for the fields of the model, including
+-        string, tooltip and available selections.
+-
+-        :return: action definition to open the list of available translations
+-        """
+-        fields = self.env['ir.model.fields'].search([('model', '=', model_name)])
+-        selection_ids = tools.flatten([field.selection_ids.ids for field in fields if field.ttype == 'selection'])
+-        view = self.env.ref("base.view_translation_tree", False) or self.env['ir.ui.view']
+-        return {
+-            'name': _("Technical Translations"),
+-            'view_mode': 'tree',
+-            'views': [(view.id, "list")],
+-            'res_model': 'ir.translation',
+-            'type': 'ir.actions.act_window',
+-            'domain': [
+-                '&',
+-                    ('type', '=', 'model'),
+-                    '|',
+-                        '&', ('res_id', 'in', fields.ids),
+-                             ('name', 'like', 'ir.model.fields,'),
+-                        '&', ('res_id', 'in', selection_ids),
+-                             ('name', 'like', 'ir.model.fields.selection,')
+-            ],
+-        }
+-
+-    @api.model
+-    def get_translations_for_webclient(self, mods, lang):
+-        if not mods:
+-            mods = [x['name'] for x in self.env['ir.module.module'].sudo().search_read(
+-                [('state', '=', 'installed')], ['name'])]
+-        if not lang:
+-            lang = self._context.get("lang")
+-        langs = self.env['res.lang']._lang_get(lang)
+-        lang_params = None
+-        if langs:
+-            lang_params = {
+-                "name": langs.name,
+-                "direction": langs.direction,
+-                "date_format": langs.date_format,
+-                "time_format": langs.time_format,
+-                "grouping": langs.grouping,
+-                "decimal_point": langs.decimal_point,
+-                "thousands_sep": langs.thousands_sep,
+-                "week_start": langs.week_start,
+-            }
+-            lang_params['week_start'] = int(lang_params['week_start'])
+-            lang_params['code'] = lang
+-
+-        # Regional languages (ll_CC) must inherit/override their parent lang (ll), but this is
+-        # done server-side when the language is loaded, so we only need to load the user's lang.
+-        translations_per_module = {}
+-        messages = self.env['ir.translation'].sudo().search_read([
+-            ('module', 'in', mods), ('lang', '=', lang),
+-            ('comments', 'like', 'openerp-web'), ('value', '!=', False),
+-            ('value', '!=', '')],
+-            ['module', 'src', 'value', 'lang'], order='module')
+-        for mod, msg_group in itertools.groupby(messages, key=operator.itemgetter('module')):
+-            translations_per_module.setdefault(mod, {'messages': []})
+-            translations_per_module[mod]['messages'].extend({
+-                'id': m['src'],
+-                'string': m['value']}
+-                for m in msg_group)
+-
+-        return translations_per_module, lang_params
+-
+-    @api.model
+-    @tools.ormcache('frozenset(mods)', 'lang')
+-    def get_web_translations_hash(self, mods, lang):
+-        translations, lang_params = self.get_translations_for_webclient(mods, lang)
+-        translation_cache = {
+-            'lang_parameters': lang_params,
+-            'modules': translations,
+-            'lang': lang,
+-            'multi_lang': len(self.env['res.lang'].sudo().get_installed()) > 1,
+-        }
+-        return hashlib.sha1(json.dumps(translation_cache, sort_keys=True).encode()).hexdigest()
+
+--- a/odoo/addons/base/models/ir_ui_view.py
++++ b/odoo/addons/base/models/ir_ui_view.py
+@@ -320,6 +320,9 @@ actual arch.
+                     data['arch_fs'] = '/'.join(path_info[0:2])
+                     data['arch_updated'] = False
+             view.write(data)
++            # the xml_translate will clean the arch_db when write (e.g. ('<div>') -> ('<div></div>'))
++            # view.arch should be reassigned here
++            view.arch = view.arch_db
+         # the field 'arch' depends on the context and has been implicitly
+         # modified in all languages; the invalidation below ensures that the
+         # field does not keep an old value in another environment
+@@ -566,6 +569,12 @@ actual arch.
+             self.inherit_children_ids.unlink()
+         return super(View, self).unlink()
+ 
++    def _update_field_translations(self, fname, translations, digest=None):
++        res = super()._update_field_translations(fname, translations, digest)
++        if fname == 'arch_db' and 'install_filename' not in self._context:
++            self.write({'arch_updated': True})
++        return res
++
+     @api.returns('self', lambda value: value.id)
+     def copy(self, default=None):
+         self.ensure_one()
+@@ -2028,10 +2037,6 @@ actual arch.
+     # Misc
+     #------------------------------------------------------
+ 
+-    def open_translations(self):
+-        """ Open a view for editing the translations of field 'arch_db'. """
+-        return self.env['ir.translation'].translate_fields('ir.ui.view', self.id, 'arch_db')
+-
+     @api.model
+     def _validate_custom_views(self, model):
+         """Validate architecture of custom views (= without xml id) for a given model.
+
+--- a/odoo/addons/base/models/res_lang.py
++++ b/odoo/addons/base/models/res_lang.py
+@@ -305,8 +305,6 @@ class Lang(models.Model):
+                 raise UserError(_("You cannot delete the language which is Active!\nPlease de-activate the language first."))
+ 
+     def unlink(self):
+-        for language in self:
+-            self.env['ir.translation'].search([('lang', '=', language.code)]).unlink()
+         self.clear_caches()
+         return super(Lang, self).unlink()
+ 
+
+--- a/odoo/addons/base/security/ir.model.access.csv
++++ b/odoo/addons/base/security/ir.model.access.csv
+@@ -28,8 +28,6 @@
+ "access_ir_sequence_group_system","ir_sequence group_system","model_ir_sequence","group_system",1,1,1,1
+ "access_ir_sequence_date_range_group_user","ir_sequence_date_range group_user","model_ir_sequence_date_range","group_user",1,0,0,0
+ "access_ir_sequence_date_range_group_system","ir_sequence_date_range group_system","model_ir_sequence_date_range","group_system",1,1,1,1
+-"access_ir_translation_all","ir_translation all","model_ir_translation","group_user",1,1,1,1
+-"access_ir_translation_group_system","ir_translation group_system","model_ir_translation","group_system",1,1,1,1
+ "access_ir_ui_menu_group_user","ir_ui_menu group_user","model_ir_ui_menu",base.group_user,1,0,0,0
+ "access_ir_ui_menu_group_system","ir_ui_menu group_system","model_ir_ui_menu","group_system",1,1,1,1
+ "access_ir_ui_view_group_user","ir_ui_view group_user","model_ir_ui_view",,0,0,0,0
+@@ -121,7 +119,6 @@
+ "access_base_module_upgrade","access.base.module.upgrade","model_base_module_upgrade","base.group_system",1,1,1,0
+ "access_base_module_uninstall","access.base.module.uninstall","model_base_module_uninstall","base.group_system",1,1,1,0
+ "access_base_language_export","access.base.language.export","model_base_language_export","base.group_user",1,1,1,0
+-"access_base_update_translations","access.base.update.translations","model_base_update_translations","base.group_system",1,1,1,0
+ "access_base_partner_merge_line","access.base.partner.merge.line","model_base_partner_merge_line","base.group_partner_manager",1,1,1,1
+ "access_base_partner_merge_automatic_wizard","access.base.partner.merge.automatic.wizard","model_base_partner_merge_automatic_wizard","base.group_partner_manager",1,1,1,0
+ "access_ir_profile","ir_profile","model_ir_profile","group_system",1,1,1,1
+
+--- a/odoo/addons/base/tests/test_api.py
++++ b/odoo/addons/base/tests/test_api.py
+@@ -214,6 +214,17 @@ class TestAPI(SavepointCaseWithUserDemo):
+         with self.assertRaises(AccessError):
+             demo_partner.company_id.name
+ 
++    @mute_logger('odoo.models')
++    def test_55_environment_lang(self):
++        """ Check the record env.lang behavior """
++        partner = self.partner_demo
++        self.env['res.lang']._activate_lang('fr_FR')
++        self.assertEqual(partner.with_context(lang=None).env.lang, None, 'None lang context should have None env.lang')
++        self.assertEqual(partner.with_context(lang='en_US').env.lang, 'en_US', 'en_US active lang context should have en_US env.lang')
++        self.assertEqual(partner.with_context(lang='fr_FR').env.lang, 'fr_FR', 'fr_FR active lang context should have fr_FR env.lang')
++        self.assertEqual(partner.with_context(lang='nl_NL').env.lang, None, 'Inactive lang context lang should have None env.lang')
++        self.assertEqual(partner.with_context(lang='Dummy').env.lang, None, 'Ilegal lang context should have None env.lang')
++
+     @mute_logger('odoo.models')
+     def test_60_cache(self):
+         """ Check the record cache behavior """
+
+--- a/odoo/addons/base/tests/test_expression.py
++++ b/odoo/addons/base/tests/test_expression.py
+@@ -1171,14 +1171,8 @@ class TestQueries(TransactionCase):
+         with self.assertQueries(['''
+             SELECT "res_partner_title".id
+             FROM "res_partner_title"
+-            LEFT JOIN "ir_translation" AS "res_partner_title__name" ON
+-                ("res_partner_title"."id" = "res_partner_title__name"."res_id"
+-                 AND "res_partner_title__name"."type" = 'model'
+-                 AND "res_partner_title__name"."name" = %s
+-                 AND "res_partner_title__name"."lang" = %s
+-                 AND "res_partner_title__name"."value" != %s)
+-            WHERE COALESCE("res_partner_title__name"."value", "res_partner_title"."name") LIKE %s
+-            ORDER BY COALESCE("res_partner_title__name"."value", "res_partner_title"."name")
++            WHERE jsonb_path_query_array("res_partner_title"."name", '$.*')::text like %s
++            ORDER BY COALESCE("res_partner_title"."name"->>'fr_FR', "res_partner_title"."name"->>'en_US')   
+         ''']):
+             Model.search([('name', 'like', 'foo')])
+ 
+@@ -1226,7 +1220,7 @@ class TestQueries(TransactionCase):
+         with self.assertQueries(['''
+             SELECT "ir_model".id
+             FROM "ir_model"
+-            WHERE ("ir_model"."name" ILIKE %s OR ("ir_model"."model"::text ILIKE %s))
++            WHERE (jsonb_path_query_array("ir_model"."name",'$.*')::text ILIKE %s OR ("ir_model"."model"::text ILIKE %s))
+             ORDER BY "ir_model"."model"
+             LIMIT 100
+         ''']):
+@@ -1237,7 +1231,7 @@ class TestQueries(TransactionCase):
+             SELECT "ir_model".id
+             FROM "ir_model"
+             WHERE (
+-                "ir_model"."name" NOT ILIKE %s
++                jsonb_path_query_array("ir_model"."name",'$.*')::text NOT ILIKE %s
+                 AND (("ir_model"."model"::text NOT ILIKE %s) OR "ir_model"."model" IS NULL)
+             )
+             ORDER BY "ir_model"."model"
+
+--- a/odoo/addons/base/tests/test_translate.py
++++ b/odoo/addons/base/tests/test_translate.py
+@@ -5,9 +5,11 @@ import logging
+ import time
+ 
+ from psycopg2 import IntegrityError
++from psycopg2.extras import Json
++import io
+ 
+ from odoo.exceptions import AccessError, ValidationError
+-from odoo.tools import mute_logger
++from odoo.tools import trans_load_data
+ from odoo.tools.translate import quote, unquote, xml_translate, html_translate
+ from odoo.tests.common import TransactionCase, BaseCase, new_test_user, tagged
+ 
+@@ -264,7 +266,7 @@ class TestLanguageInstall(TransactionCase):
+         def _load_module_terms(self, modules, langs, overwrite=False):
+             loaded.append((modules, langs, overwrite))
+ 
+-        with patch('odoo.addons.base.models.ir_translation.IrTranslation._load_module_terms', _load_module_terms):
++        with patch('odoo.addons.base.models.ir_module.Module._load_module_terms', _load_module_terms):
+             wizard.lang_install()
+ 
+         # _load_module_terms is called once with lang='fr_FR' and overwrite=True
+@@ -280,15 +282,17 @@ class TestTranslation(TransactionCase):
+         cls.env['res.lang']._activate_lang('fr_FR')
+         cls.env.ref('base.module_base')._update_translations(['fr_FR'])
+         cls.customers = cls.env['res.partner.category'].create({'name': 'Customers'})
+-        cls.env['ir.translation'].create({
+-            'type': 'model',
+-            'name': 'res.partner.category,name',
+-            'module': 'base',
+-            'lang': 'fr_FR',
+-            'res_id': cls.customers.id,
+-            'value': 'Clients',
+-            'state': 'translated',
+-        })
++
++        cls.customers_xml_id = cls.customers.export_data(['id']).get('datas')[0][0]
++        po_string = '''
++        #. module: __export__
++        #: model:res.partner.category,name:%s
++        msgid "Customers"
++        msgstr "Clients"
++        ''' % cls.customers_xml_id
++        with io.BytesIO(bytes(po_string, encoding='utf-8')) as f:
++            f.name = 'dummy'
++            trans_load_data(cls.env.cr, f, 'po', 'fr_FR', verbose=True, overwrite=True)
+ 
+     def test_101_create_translated_record(self):
+         category = self.customers.with_context({})
+@@ -301,18 +305,11 @@ class TestTranslation(TransactionCase):
+         category = self.customers.with_context({'lang': 'fr_FR'}).copy()
+ 
+         category_no = category.with_context({})
+-        self.assertEqual(category_no.name, 'Customers', "Duplication did not set untranslated value")
++        self.assertEqual(category_no.name, 'Customers', "Duplication should copy all translations")
+ 
+         category_fr = category.with_context({'lang': 'fr_FR'})
+         self.assertEqual(category_fr.name, 'Clients', "Did not found translation for initial value")
+ 
+-        translation_fr = self.env['ir.translation'].search([
+-            ('name', '=', 'res.partner.category,name'),
+-            ('res_id', '=', category.id),
+-            ('lang', '=', 'fr_FR'),
+-        ])
+-        self.assertEqual(translation_fr.src, 'Customers', "Did not set English version as source")
+-
+     def test_103_duplicate_record_fr(self):
+         category = self.customers.with_context({'lang': 'fr_FR'}).copy({'name': 'Clients (copie)'})
+ 
+@@ -322,13 +319,6 @@ class TestTranslation(TransactionCase):
+         category_fr = category.with_context({'lang': 'fr_FR'})
+         self.assertEqual(category_fr.name, 'Clients (copie)', "Did not used default value for translated value")
+ 
+-        translation_fr = self.env['ir.translation'].search([
+-            ('name', '=', 'res.partner.category,name'),
+-            ('res_id', '=', category.id),
+-            ('lang', '=', 'fr_FR'),
+-        ])
+-        self.assertEqual(translation_fr.src, 'Clients (copie)', "Did not set new name as source")
+-
+     def test_104_orderby_translated_field(self):
+         """ Test search ordered by a translated field. """
+         # create a category with a French translation
+@@ -340,75 +330,6 @@ class TestTranslation(TransactionCase):
+         self.assertEqual(categories.ids, [padawans.id, self.customers.id],
+             "Search ordered by translated name should return Padawans (Apprentis) before Customers (Clients)")
+ 
+-    def test_105_duplicated_translation(self):
+-        """ Test synchronizing translations with duplicated source """
+-        # create a category with a French translation
+-        padawans = self.env['res.partner.category'].create({'name': 'Padawan'})
+-        self.env['ir.translation'].create({
+-            'type': 'model',
+-            'name': 'res.partner.category,name',
+-            'module':'base',
+-            'lang': 'fr_FR',
+-            'res_id': padawans.id,
+-            'value': 'Apprenti',
+-            'state': 'translated',
+-        })
+-        # change name and insert a duplicate manually
+-        padawans.write({'name': 'Padawans'})
+-        with self.assertRaises(IntegrityError), mute_logger('odoo.sql_db'):
+-            with self.env.cr.savepoint():
+-                self.env['ir.translation'].create({
+-                    'type': 'model',
+-                    'name': 'res.partner.category,name',
+-                    'module':'base',
+-                    'lang': 'fr_FR',
+-                    'res_id': padawans.id,
+-                    'value': 'Apprentis',
+-                    'state': 'translated',
+-                })
+-        self.env['ir.translation'].translate_fields('res.partner.category', padawans.id, 'name')
+-        translations = self.env['ir.translation'].search([
+-            ('res_id', '=', padawans.id), ('name', '=', 'res.partner.category,name'), ('lang', '=', 'fr_FR'),
+-        ])
+-        self.assertEqual(len(translations), 1, "Translations were not duplicated after `translate_fields` call")
+-        self.assertEqual(translations.value, "Apprenti", "The first translation must stay")
+-
+-    def test_106_en_us_translation(self):
+-        """ Test synchronizing translations with duplicated source """
+-        # create a category with a French translation
+-        cheese = self.env['res.partner.category'].create({'name': 'Cheese'})
+-
+-        self.env['ir.translation'].translate_fields('res.partner.category', cheese.id, 'name')
+-
+-        translations = self.env['ir.translation'].search([('name', '=', 'res.partner.category,name'), ('res_id', '=', cheese.id)], order='lang')
+-        self.assertEqual(len(translations), 2)
+-        self.assertRecordValues(translations,
+-            [{'lang': 'en_US', 'src': 'Cheese', 'value': ''},
+-             {'lang': 'fr_FR', 'src': 'Cheese', 'value': ''}])
+-
+-        # Translate in both language
+-        translations[0].value = 'The Cheese'
+-        translations[1].value = 'Fromage'
+-
+-        # lang=None bypass translation system
+-        self.assertEqual(cheese.with_context(lang=None).name, 'Cheese')
+-        self.assertEqual(cheese.with_context(lang='fr_FR').name, 'Fromage')
+-        self.assertEqual(cheese.with_context(lang='en_US').name, 'The Cheese')
+-        self.env.flush_all()
+-
+-        # set a new master value
+-        cheese.with_context(lang='en_US').write({'name': 'Delicious Cheese'})
+-
+-        # every src must be updated
+-        self.assertEqual(cheese.with_context(lang=None).name, 'Delicious Cheese')
+-        self.assertRecordValues(translations,
+-            [{'lang': 'en_US', 'src': 'Delicious Cheese', 'value': 'Delicious Cheese'},
+-             {'lang': 'fr_FR', 'src': 'Delicious Cheese', 'value': 'Fromage'}])
+-
+-        self.assertEqual(cheese.with_context(lang=None).name, 'Delicious Cheese')
+-        self.assertEqual(cheese.with_context(lang='fr_FR').name, 'Fromage')
+-        self.assertEqual(cheese.with_context(lang='en_US').name, 'Delicious Cheese')
+-
+     def test_107_duplicate_record_en(self):
+         category = self.customers.with_context({'lang': 'en_US'}).copy()
+ 
+@@ -418,52 +339,93 @@ class TestTranslation(TransactionCase):
+         category_fr = category.with_context({'lang': 'fr_FR'})
+         self.assertEqual(category_fr.name, 'Clients', "Did not found translation for initial value")
+ 
+-        translation_fr = self.env['ir.translation'].search([
+-            ('name', '=', 'res.partner.category,name'),
+-            ('res_id', '=', category.id),
+-            ('lang', '=', 'fr_FR'),
+-        ])
+-        self.assertEqual(translation_fr.src, 'Customers', "Did not set English version as source")
++    def test_108_search_en(self):
++        CategoryEn = self.env['res.partner.category'].with_context(lang='en_US')
++        category_equal = CategoryEn.search([('name', '=', 'Customers')])
++        self.assertEqual(category_equal.id, self.customers.id, "Search with '=' doesn't work for English")
++        category_ilike = CategoryEn.search([('name', 'ilike', 'stoMer')])
++        self.assertIn(self.customers, category_ilike, "Search with 'ilike' doesn't work for English")
++        category_eq_ilike = CategoryEn.search([('name', '=ilike', 'CustoMers')])
++        self.assertIn(self.customers, category_eq_ilike, "Search with '=ilike' doesn't work for English")
++        category_in = CategoryEn.search([('name', 'in', ['Customers'])])
++        self.assertIn(self.customers, category_in, "Search with 'in' doesn't work for English")
++
++    def test_109_search_fr(self):
++        CategoryFr = self.env['res.partner.category'].with_context(lang='fr_FR')
++        category_equal = CategoryFr.search([('name', '=', 'Clients')])
++        self.assertEqual(category_equal.id, self.customers.id, "Search with '=' doesn't work for non English")
++        category_ilike = CategoryFr.search([('name', 'ilike', 'lIen')])
++        self.assertIn(self.customers, category_ilike, "Search with 'ilike' doesn't work for non English")
++        category_eq_ilike = CategoryFr.search([('name', '=ilike', 'clieNts')])
++        self.assertIn(self.customers, category_eq_ilike, "Search with '=ilike' doesn't work for non English")
++        category_in = CategoryFr.search([('name', 'in', ['Clients'])])
++        self.assertIn(self.customers, category_in, "Search with 'in' doesn't work for non English")
++
++    def test_110_search_es(self):
++        self.env['res.lang']._activate_lang('es_ES')
++        langs = self.env['res.lang'].get_installed()
++        self.assertEqual([('en_US', 'English (US)'), ('fr_FR', 'French / Français'), ('es_ES', 'Spanish / Español')],
++                         langs, "Test did not start with the expected languages")
++        CategoryEs = self.env['res.partner.category'].with_context(lang='es_ES')
++        category_equal = CategoryEs.search([('name', '=', 'Customers')])
++        self.assertEqual(category_equal.id, self.customers.id, "Search with '=' should use the English name if the current language translation is not available")
++        category_ilike = CategoryEs.search([('name', 'ilike', 'usTom')])
++        self.assertIn(self.customers, category_ilike, "Search with 'ilike' should use the English name if the current language translation is not available")
++        category_eq_ilike = CategoryEs.search([('name', '=ilike', 'CustoMers')])
++        self.assertIn(self.customers, category_eq_ilike, "Search with '=ilike' should use the English name if the current language translation is not available")
++        category_in = CategoryEs.search([('name', 'in', ['Customers'])])
++        self.assertIn(self.customers, category_in, "Search with 'in' should use the English name if the current language translation is not available")
++
++    # TODO Currently, the unique constraint doesn't work for translatable field
++    # def test_111_unique_en(self):
++    #     Country = self.env['res.country']
++    #     country_1 = Country.create({'name': 'Odoo'})
++    #     country_1.with_context(lang='fr_FR').name = 'Odoo_Fr'
++    #     country_1.flush_recordset()
++    #
++    #     country_2 = Country.create({'name': 'Odoo2'})
++    #     with self.assertRaises(IntegrityError), mute_logger('odoo.sql_db'):
++    #         country_2.name = 'Odoo'
++    #         country_2.flush_recordset()
++    #
++    #     with self.assertRaises(IntegrityError), mute_logger('odoo.sql_db'):
++    #         country_3 = Country.create({'name': 'Odoo'})
+ 
+ class TestTranslationWrite(TransactionCase):
+     @classmethod
+     def setUpClass(cls):
+         super().setUpClass()
+         cls.category = cls.env['res.partner.category'].create({'name': 'Reblochon'})
++        cls.category_xml_id = cls.category.export_data(['id']).get('datas')[0][0]
+ 
+-    def test_01_en(self):
+-        langs = self.env['res.lang'].get_installed()
+-        self.assertEqual([('en_US', 'English (US)')], langs, "Test did not started with expected languages")
++    def test_00(self):
++        self.env['res.lang']._activate_lang('fr_FR')
+ 
+-        self.category.with_context(lang='en_US').write({'name': 'English Name'})
+-        name = self.category.with_context(lang=None).read(['name'])
+-        self.assertEqual(name[0]['name'], "English Name", "Reference field not updated")
+-        translations = self.env['ir.translation'].search([
+-            ('name', '=', 'res.partner.category,name'),
+-            ('res_id', '=', self.category.id),
+-            ('lang', '=', 'en_US'),
+-        ])
+-        self.assertEqual(len(translations), 0, "No English translation should be created when writing in English")
+-
+-    def test_02_en_translated(self):
+         langs = self.env['res.lang'].get_installed()
+-        self.assertEqual([('en_US', 'English (US)')], langs, "Test did not started with expected languages")
+-        translation = self.env['ir.translation'].create({
+-            'type': 'model',
+-            'name': 'res.partner.category,name',
+-            'lang': 'en_US',
+-            'res_id': self.category.id,
+-            'src': 'Reblochon',
+-            'value': 'Translated Name',
+-            'state': 'translated',
+-        })
++        self.assertEqual([('en_US', 'English (US)'), ('fr_FR', 'French / Français')], langs,
++                         "Test did not started with expected languages")
+ 
+-        self.category.with_context(lang='en_US').write({'name': 'English Name'})
+-        translation_value = translation.read(['value'])
+-        self.assertEqual(translation_value[0]['value'], "English Name", "Existing translation was not updated")
++        category = self.env['res.partner.category'].with_context(lang='en_US').create({'name': 'English'})
++        self.assertEqual(category.with_context(lang='en_US').name, 'English')
++        self.assertEqual(category.with_context(lang='fr_FR').name, 'English')
++
++        category.with_context(lang='en_US').name = 'English 2'
++        self.assertEqual(category.with_context(lang='fr_FR').name, 'English 2')
++
++        category2 = self.env['res.partner.category'].with_context(lang='fr_FR').create({'name': 'French'})
++        self.assertEqual(category2.with_context(lang='en_US').name, 'French')
++        self.assertEqual(category2.with_context(lang='fr_FR').name, 'French')
+ 
+-        source_name = self.category.with_context(lang=None).read(['name'])
+-        self.assertEqual(source_name[0]['name'], "English Name", "Reference field not updated")
++        category2.with_context(lang='en_US').name = 'English'
++        self.assertEqual(category2.with_context(lang='fr_FR').name, 'French')
++
++        category3 = self.env['res.partner.category'].with_context(lang='en_US').create({'name': 'English'})
++        self.assertEqual(category3.with_context(lang='en_US').name, 'English')
++        self.assertEqual(category3.with_context(lang='fr_FR').name, 'English')
++
++        category3.with_context(lang='fr_FR').name = 'French 2'
++        category3.with_context(lang='en_US').name = 'English 2'
++        self.assertEqual(category3.with_context(lang='fr_FR').name, 'French 2')
+ 
+     def test_03_fr_single(self):
+         self.env['res.lang']._activate_lang('fr_FR')
+@@ -474,14 +436,16 @@ class TestTranslationWrite(TransactionCase):
+         self.assertEqual([('fr_FR', 'French / Français')], langs, "Test did not started with expected languages")
+ 
+         self.category.with_context(lang='fr_FR').write({'name': 'French Name'})
+-        source_name = self.category.with_context(lang=None).read(['name'])
+-        self.assertEqual(source_name[0]['name'], "French Name", "Reference field not updated")
+-        translations = self.env['ir.translation'].search([
+-            ('name', '=', 'res.partner.category,name'),
+-            ('res_id', '=', self.category.id),
+-            ('lang', '=', 'fr_FR'),
+-        ])
+-        self.assertEqual(len(translations), 0, "No French translation should be created when writing in French")
++
++        fr_name = self.category.with_context(lang='fr_FR').read(['name'])
++        self.assertEqual(fr_name[0]['name'], "French Name", "Reference field not updated")
++
++        # read from the cache
++        self.assertEqual(self.category.with_context(lang='fr_FR').name, "French Name")
++
++        # read from database
++        self.category.invalidate_recordset()
++        self.assertEqual(self.category.with_context(lang='fr_FR').name, "French Name")
+ 
+     def test_04_fr_multi(self):
+         self.env['res.lang']._activate_lang('fr_FR')
+@@ -490,58 +454,31 @@ class TestTranslationWrite(TransactionCase):
+         self.assertEqual([('en_US', 'English (US)'), ('fr_FR', 'French / Français')], langs,
+             "Test did not started with expected languages")
+ 
+-        category_en = self.category.with_context(lang='en_US')
+-        category_fr = self.category.with_context(lang='fr_FR')
+-
+-        # no translation at first
+-        self.assertEqual(category_fr.name, 'Reblochon')
+-        self.assertFalse(self.env['ir.translation'].search([
+-            ('name', '=', 'res.partner.category,name'),
+-            ('res_id', '=', self.category.id),
+-        ], order='lang'))
+-
+-        # change source
+-        self.category.write({'name': 'Blorb'})
+-        self.assertEqual(category_fr.name, 'Blorb')
+-        self.assertFalse(self.env['ir.translation'].search([
+-            ('name', '=', 'res.partner.category,name'),
+-            ('res_id', '=', self.category.id),
+-        ], order='lang'))
+-
+-        # change source
+-        category_en.write({'name': 'Cheese'})
+-        self.assertEqual(category_fr.name, 'Cheese')
+-        translations = self.env['ir.translation'].search([
+-            ('name', '=', 'res.partner.category,name'),
+-            ('res_id', '=', self.category.id),
+-        ], order='lang')
+-        self.assertRecordValues(translations, [
+-            {'src': 'Cheese', 'value': 'Cheese', 'lang': 'en_US'},
+-        ])
+-
+-        # add a translation
+-        category_fr.write({'name': 'French Name'})
+-        self.assertEqual(category_en.name, 'Cheese')
+-        translations = self.env['ir.translation'].search([
+-            ('name', '=', 'res.partner.category,name'),
+-            ('res_id', '=', self.category.id),
+-        ], order='lang')
+-        self.assertRecordValues(translations, [
+-            {'src': 'Cheese', 'value': 'Cheese', 'lang': 'en_US'},
+-            {'src': 'Cheese', 'value': 'French Name', 'lang': 'fr_FR'},
+-        ])
+-
+-        # change source
+-        category_en.write({'name': 'English Name'})
+-        self.assertEqual(category_fr.name, 'French Name')
+-        translations = self.env['ir.translation'].search([
+-            ('name', '=', 'res.partner.category,name'),
+-            ('res_id', '=', self.category.id),
+-        ], order='lang')
+-        self.assertRecordValues(translations, [
+-            {'src': 'English Name', 'value': 'English Name', 'lang': 'en_US'},
+-            {'src': 'English Name', 'value': 'French Name', 'lang': 'fr_FR'}
+-        ])
++        po_string = '''
++        #. module: __export__
++        #: model:res.partner.category,name:%s
++        msgid "Reblochon"
++        msgstr "Translated Name"
++        ''' % self.category_xml_id
++        with io.BytesIO(bytes(po_string, encoding='utf-8')) as f:
++            f.name = 'dummy'
++            trans_load_data(self.env.cr, f, 'po', 'en_US', verbose=True, overwrite=True)
++
++        self.category.with_context(lang='fr_FR').write({'name': 'French Name'})
++        self.category.with_context(lang='en_US').write({'name': 'English Name'})
++
++        # read from the cache first
++        self.assertEqual(self.category.with_context(lang=None).name, "English Name")
++        self.assertEqual(self.category.with_context(lang='fr_FR').name, "French Name")
++        self.assertEqual(self.category.with_context(lang='en_US').name, "English Name")
++
++        # force save to database and clear the cache: force a clean state
++        self.category.invalidate_recordset()
++
++        # read from database
++        self.assertEqual(self.category.with_context(lang=None).name, "English Name")
++        self.assertEqual(self.category.with_context(lang='fr_FR').name, "French Name")
++        self.assertEqual(self.category.with_context(lang='en_US').name, "English Name")
+ 
+     def test_04_fr_multi_no_en(self):
+         self.env['res.lang']._activate_lang('fr_FR')
+@@ -557,17 +494,18 @@ class TestTranslationWrite(TransactionCase):
+         self.category.with_context(lang='es_ES').write({'name': 'Spanish Name'})
+         self.category.with_context(lang=None).write({'name': 'None Name'})
+ 
+-        translations = self.env['ir.translation'].search([
+-            ('name', '=', 'res.partner.category,name'),
+-            ('res_id', '=', self.category.id),
+-        ], order='lang')
+-        self.assertRecordValues(translations, [
+-            {'src': 'None Name', 'value': 'Spanish Name', 'lang': 'es_ES'},
+-            {'src': 'None Name', 'value': 'French Name', 'lang': 'fr_FR'},
+-        ])
++        # read from the cache first
++        self.assertEqual(self.category.with_context(lang='fr_FR').name, "French Name")
++        self.assertEqual(self.category.with_context(lang='es_ES').name, "Spanish Name")
++        self.assertEqual(self.category.with_context(lang=None).name, "None Name")
++
++        # force save to database and clear the cache: force a clean state
++        self.category.invalidate_recordset()
+ 
+-    def test_05_remove_multi_empty_string(self):
+-        self._test_05_remove_multi("")
++        # read from database
++        self.assertEqual(self.category.with_context(lang='fr_FR').name, "French Name")
++        self.assertEqual(self.category.with_context(lang='es_ES').name, "Spanish Name")
++        self.assertEqual(self.category.with_context(lang=None).name, "None Name")
+ 
+     def test_05_remove_multi_false(self):
+         self._test_05_remove_multi(False)
+@@ -584,142 +522,100 @@ class TestTranslationWrite(TransactionCase):
+         belgium.with_context(lang='en_US').write({'vat_label': 'VAT'})
+         belgium.with_context(lang='fr_FR').write({'vat_label': 'TVA'})
+ 
+-        translations = self.env['ir.translation'].search([
+-            ('name', '=', 'res.country,vat_label'),
+-            ('res_id', '=', belgium.id),
+-        ])
+-        self.assertEqual(len(translations), 2, "Translations are not created")
+-
+         # remove the value
+         belgium.with_context(lang='fr_FR').write({'vat_label': empty_value})
+         # should recover the initial value from db
+-        self.assertFalse(
++        self.assertEqual(
++            empty_value,
+             belgium.with_context(lang='fr_FR').vat_label,
+-            "Value was not reset"
++            "Value should be the empty_value"
+         )
+-        self.assertFalse(
++        self.assertEqual(
++            empty_value,
+             belgium.with_context(lang='en_US').vat_label,
+-            "Value was not reset in other languages"
++            "Value should be the empty_value"
+         )
+-        self.assertFalse(
++        self.assertEqual(
++            empty_value,
+             belgium.with_context(lang=None).vat_label,
+-            "Value was not reset on the field model"
++            "Value should be the empty_value"
+         )
+ 
+-        translations = self.env['ir.translation'].search([
+-            ('name', '=', 'res.country,vat_label'),
+-            ('res_id', '=', belgium.id),
+-        ])
+-        self.assertEqual(len(translations), 0, "Translations were not removed")
+-
+-        # simulate remove the English translation in the interface
+-        belgium.with_context(lang='fr_FR').write({'vat_label': 'TVA'})
+         belgium.with_context(lang='en_US').write({'vat_label': 'VAT'})
+-        self.env['ir.translation'].translate_fields('res.country', belgium.id, 'vat_label')
+-        en_translation = self.env['ir.translation'].search([
+-            ('name', '=', 'res.country,vat_label'),
+-            ('res_id', '=', belgium.id),
+-            ('lang', '=', 'en_US'),
+-        ])
+-        en_translation.write({'value': ''})
++        belgium.with_context(lang='fr_FR').write({'vat_label': 'TVA'})
+ 
+-        # should recover the initial value from db
++        # remove the value
++        belgium.with_context(lang='en_US').write({'vat_label': empty_value})
+         self.assertEqual(
+-            "TVA", belgium.with_context(lang='fr_FR').vat_label,
+-            "French translation was not kept"
++            empty_value,
++            belgium.with_context(lang='fr_FR').vat_label,
++            "Value should be the empty_value"
++        )
++        self.assertEqual(
++            empty_value,
++            belgium.with_context(lang='en_US').vat_label,
++            "Value should be the empty_value"
+         )
+         self.assertEqual(
+-            "VAT", belgium.with_context(lang='en_US').vat_label,
+-            "Did not fallback to source when reset"
++            empty_value,
++            belgium.with_context(lang=None).vat_label,
++            "Value should be the empty_value"
+         )
+ 
+-    def test_orphan(self):
+-        """ What happens with orphan translations. """
++    def test_write_empty_and_value(self):
+         self.env['res.lang']._activate_lang('fr_FR')
++        self.env['res.lang']._activate_lang('nl_NL')
+ 
+-        # create a user with access rights on partner categories
+-        user = new_test_user(self.env, 'deleter')
+-        group = self.env.ref('base.group_partner_manager')
+-        user.groups_id = [(4, group.id)]
++        langs = self.env['res.lang'].get_installed()
++        self.assertEqual([('nl_NL', 'Dutch / Nederlands'), ('en_US', 'English (US)'), ('fr_FR', 'French / Français')], langs,
++                         "Test did not started with expected languages")
+ 
+-        # this access rule triggers a MissingError
+-        self.env['ir.rule'].create({
+-            'model_id': self.env['ir.model']._get_id('res.partner.category'),
+-            'groups': [(4, group.id)],
+-            'domain_force': "[('name', 'ilike', 'e')]",
+-        })
++        belgium = self.env.ref('base.be')
++        # vat_label is translatable and not required
++        belgium.with_context(lang='en_US').write({'vat_label': 'VAT_US'})
++        belgium.with_context(lang='fr_FR').write({'vat_label': 'VAT_FR'})
++        belgium.with_context(lang='nl_NL').write({'vat_label': 'VAT_NL'})
+ 
+-        # create a translation, and delete the record from the database
+-        translation = self.env['ir.translation'].create({
+-            'type': 'model',
+-            'name': 'res.partner.category,name',
+-            'lang': 'fr_FR',
+-            'res_id': self.category.id,
+-            'src': 'Reblochon',
+-            'value': 'Parfum Exquis',
+-            'state': 'translated',
+-        })
+-        self.env.flush_all()
+-        self.env.invalidate_all()
+-        self.cr.execute("DELETE FROM res_partner_category WHERE id=%s", [self.category.id])
+-
+-        # deleting the translation should be possible, provided the user has
+-        # access rights on the translation's model
+-        user0 = new_test_user(self.env, 'cannot modify category')
+-        with self.assertRaises(AccessError):
+-            translation.with_user(user0).unlink()
+-
+-        translation.with_user(user).unlink()
+-
+-        # however, creating orphan translations should not be possible
+-        with self.assertRaises(ValidationError):
+-            translation.with_user(user).create({
+-                'type': 'model',
+-                'name': 'res.partner.category,name',
+-                'lang': 'fr_FR',
+-                'res_id': self.category.id,
+-                'src': 'Reblochon',
+-                'value': 'Parfum Exquis',
+-                'state': 'translated',
+-            })
+-
+-    def test_write(self):
+-        """ What happens with orphan translations. """
+-        self.env['res.lang']._activate_lang('fr_FR')
++        belgium.invalidate_recordset()
+ 
+-        # create a user with access rights on partner categories
+-        user = new_test_user(self.env, 'updater')
+-        group = self.env.ref('base.group_system')
+-        user.groups_id = [(4, group.id)]
+-        action = user.env["ir.actions.act_window"].create({
+-            "name": "Dummy Action",
+-            "res_model": "res.users",
+-            "help": "<p>Cheese</p>",
+-        })
++        belgium.with_context(lang='en_US').write({'vat_label': False})
++        belgium.with_context(lang='fr_FR').write({'vat_label': 'TVA_FR2'})
++        self.assertEqual(belgium.with_context(lang='en_US').vat_label, 'TVA_FR2')
++        self.assertEqual(belgium.with_context(lang='nl_NL').vat_label, 'TVA_FR2')
+ 
+-        # create a translation, and delete the record from the database
+-        translation = user.env['ir.translation'].create({
+-            'type': 'model_terms',
+-            'name': 'ir.actions.act_window,help',
+-            'lang': 'fr_FR',
+-            'res_id': action.id,
+-            'src': 'Cheese',
+-            'value': 'Fromage',
+-            'state': 'translated',
+-        })
+-        self.env.flush_all()
+-        self.env.invalidate_all()
++        belgium.with_context(lang='fr_FR').write({'vat_label': 'TVA_FR3'})
++        belgium.with_context(lang='en_US').write({'vat_label': ''})
++        self.assertEqual(belgium.with_context(lang='en_US').vat_label, '')
++        self.assertEqual(belgium.with_context(lang='nl_NL').vat_label, '')
++
++    def test_cresate_emtpy_false(self):
++        self._test_create_empty(False)
++
++    # feature removed
++    # def test_cresate_emtpy_empty_string(self):
++    #     self._test_create_empty('')
++
++    def _test_create_empty(self, empty_value):
++        self.env['res.lang']._activate_lang('fr_FR')
++        langs = self.env['res.lang'].get_installed()
++        self.assertEqual([('en_US', 'English (US)'), ('fr_FR', 'French / Français')], langs,
++                         "Test did not started with expected languages")
+ 
+-        # deleting the translation should be possible, provided the user has
+-        # access rights on the translation's model
+-        user0 = new_test_user(self.env, 'cannot modify an action')
+-        with self.assertRaises(AccessError):
+-            translation.with_user(user0).unlink()
++        group = self.env['res.groups'].create({'name': 'test_group', 'comment': empty_value})
++        self.assertEqual(group.with_context(lang='en_US').comment, empty_value)
++        self.assertEqual(group.with_context(lang='fr_FR').comment, empty_value)
+ 
+-        translation.with_user(user).unlink()
++        group.with_context(lang='fr_FR').comment = 'French comment'
++        self.assertEqual(group.with_context(lang='fr_FR').comment, 'French comment')
++        self.assertEqual(group.with_context(lang='en_US').comment, 'French comment')
++
++        group.with_context(lang='fr_FR').comment = 'French comment 2'
++        self.assertEqual(group.with_context(lang='fr_FR').comment, 'French comment 2')
++        self.assertEqual(group.with_context(lang='en_US').comment, 'French comment')
+ 
+     def test_field_selection(self):
+         """ Test translations of field selections. """
++        self.env['res.lang']._activate_lang('fr_FR')
+         field = self.env['ir.model']._fields['state']
+         self.assertEqual([key for key, _ in field.selection], ['manual', 'base'])
+ 
+@@ -742,14 +638,17 @@ class TestTranslationWrite(TransactionCase):
+         # add translation for the string of field ir.model.name
+         ir_model_field = self.env['ir.model.fields']._get('ir.model', 'name')
+         LABEL = "Description du Modèle"
+-        self.env['ir.translation'].create({
+-            'type': 'model',
+-            'name': 'ir.model.fields,field_description',
+-            'lang': 'fr_FR',
+-            'res_id': ir_model_field.id,
+-            'src': 'Name',
+-            'value': LABEL,
+-        })
++
++        ir_model_field_xml_id = ir_model_field.export_data(['id']).get('datas')[0][0]
++        po_string = '''
++        #. module: __export__
++        #: model:ir.model.fields,field_description:%s
++        msgid "Model Description"
++        msgstr "%s"
++        ''' % (ir_model_field_xml_id, LABEL)
++        with io.BytesIO(bytes(po_string, encoding='utf-8')) as f:
++            f.name = 'dummy'
++            trans_load_data(self.env.cr, f, 'po', 'fr_FR', verbose=True, overwrite=True)
+ 
+         # check that fields_get() returns the expected label
+         model = self.env['ir.model'].with_context(lang='fr_FR')
+@@ -775,23 +674,15 @@ class TestXMLTranslation(TransactionCase):
+             'model': 'res.partner',
+             'arch': archf % terms,
+         })
+-        # DLE P70: `_sync_terms_translations`, which delete translations for which there is no value, is called sooner than before
+-        # because it's called in `_write`, which is called by `flush`, which is called by the `search`.
+-        # `arch_db` is in `_write` instead of `create` because `arch_db` is the inverse of `arch`.
+-        # We need to flush `arch_db` before creating the translations otherwise the translation for which there is no value will be deleted,
+-        # while the `test_sync_update` specifically needs empty translations
+-        self.env.flush_all()
++        view.invalidate_recordset()
++
++        val = {'en_US': archf % terms}
+         for lang, trans_terms in kwargs.items():
+-            for src, val in zip(terms, trans_terms):
+-                self.env['ir.translation'].create({
+-                    'type': 'model_terms',
+-                    'name': 'ir.ui.view,arch_db',
+-                    'lang': lang,
+-                    'res_id': view.id,
+-                    'src': src,
+-                    'value': val,
+-                    'state': 'translated',
+-                })
++            val[lang] = archf % trans_terms
++        query = """UPDATE ir_ui_view
++                      SET arch_db = %s
++                    WHERE id = %s"""
++        self.env.cr.execute(query, (Json(val), view.id))
+         return view
+ 
+     def test_copy(self):
+@@ -801,7 +692,7 @@ class TestXMLTranslation(TransactionCase):
+         terms_fr = ('Couteau', 'Fourchette', 'Cuiller')
+         view0 = self.create_view(archf, terms_en, fr_FR=terms_fr)
+ 
+-        env_en = self.env(context={})
++        env_en = self.env(context={'lang': 'en_US'})
+         env_fr = self.env(context={'lang': 'fr_FR'})
+ 
+         # check translated field
+@@ -865,17 +756,16 @@ class TestXMLTranslation(TransactionCase):
+         view.with_env(env_fr).write({'arch_db': archf % new_terms_fr})
+ 
+         # check whether translations have been synchronized
+-        self.assertEqual(view.with_env(env_nolang).arch_db, archf % new_terms_fr)
+         self.assertEqual(view.with_env(env_en).arch_db, archf % terms_en)
+         self.assertEqual(view.with_env(env_fr).arch_db, archf % new_terms_fr)
+         self.assertEqual(view.with_env(env_nl).arch_db, archf % terms_nl)
+ 
+     def test_sync_xml(self):
+         """ Check translations of 'arch' after xml tags changes in source terms. """
+-        archf = '<form string="X">%s</form>'
+-        terms_en = ('Bread and cheese',)
+-        terms_fr = ('Pain et fromage',)
+-        terms_nl = ('Brood and kaas',)
++        archf = '<form string="X">%s<div>%s</div></form>'
++        terms_en = ('Bread and cheese', 'Fork')
++        terms_fr = ('Pain et fromage', 'Fourchette')
++        terms_nl = ('Brood and kaas', 'Vork')
+         view = self.create_view(archf, terms_en, en_US=terms_en, fr_FR=terms_fr, nl_NL=terms_nl)
+ 
+         env_nolang = self.env(context={})
+@@ -883,57 +773,30 @@ class TestXMLTranslation(TransactionCase):
+         env_fr = self.env(context={'lang': 'fr_FR'})
+         env_nl = self.env(context={'lang': 'nl_NL'})
+ 
+-        self.assertEqual(view.with_env(env_nolang).arch, archf % terms_en)
+-        self.assertEqual(view.with_env(env_en).arch, archf % terms_en)
+-        self.assertEqual(view.with_env(env_fr).arch, archf % terms_fr)
+-        self.assertEqual(view.with_env(env_nl).arch, archf % terms_nl)
++        self.assertEqual(view.with_env(env_nolang).arch_db, archf % terms_en)
++        self.assertEqual(view.with_env(env_en).arch_db, archf % terms_en)
++        self.assertEqual(view.with_env(env_fr).arch_db, archf % terms_fr)
++        self.assertEqual(view.with_env(env_nl).arch_db, archf % terms_nl)
+ 
+         # modify source term in view (add css style)
+-        terms_en = ('Bread <span style="font-weight:bold">and</span> cheese',)
+-        view.with_env(env_en).write({'arch': archf % terms_en})
++        terms_en = ('Bread <span style="font-weight:bold">and</span> cheese', 'Fork')
++        view.with_env(env_en).write({'arch_db': archf % terms_en})
+ 
+         # check whether translations have been kept
+-        self.assertEqual(view.with_env(env_nolang).arch, archf % terms_en)
+-        self.assertEqual(view.with_env(env_en).arch, archf % terms_en)
+-        self.assertEqual(view.with_env(env_fr).arch, archf % terms_fr)
+-        self.assertEqual(view.with_env(env_nl).arch, archf % terms_nl)
++        self.assertEqual(view.with_env(env_nolang).arch_db, archf % terms_en)
++        self.assertEqual(view.with_env(env_en).arch_db, archf % terms_en)
++        self.assertEqual(view.with_env(env_fr).arch_db, archf % terms_fr)
++        self.assertEqual(view.with_env(env_nl).arch_db, archf % terms_nl)
+ 
+         # modify source term in view (actual text change)
+-        terms_en = ('Bread <span style="font-weight:bold">and</span> butter',)
+-        view.with_env(env_en).write({'arch': archf % terms_en})
++        terms_en = ('Bread <span style="font-weight:bold">and</span> butter', 'Fork')
++        view.with_env(env_en).write({'arch_db': archf % terms_en})
+ 
+         # check whether translations have been reset
+-        self.assertEqual(view.with_env(env_nolang).arch, archf % terms_en)
+-        self.assertEqual(view.with_env(env_en).arch, archf % terms_en)
+-        self.assertEqual(view.with_env(env_fr).arch, archf % terms_en)
+-        self.assertEqual(view.with_env(env_nl).arch, archf % terms_en)
+-
+-    def test_sync_update(self):
+-        """ Check translations after major changes in source terms. """
+-        archf = '<form string="X"><div>%s</div><div>%s</div></form>'
+-        terms_src = ('Subtotal', 'Subtotal:')
+-        terms_en = ('', 'Sub total:')
+-        view = self.create_view(archf, terms_src, en_US=terms_en)
+-
+-        translations = self.env['ir.translation'].search([
+-            ('type', '=', 'model_terms'),
+-            ('name', '=', "ir.ui.view,arch_db"),
+-            ('res_id', '=', view.id),
+-        ])
+-        self.assertEqual(len(translations), 2)
+-
+-        # modifying the arch should sync existing translations without errors
+-        new_arch = archf % ('Subtotal', 'Subtotal : <br/>')
+-        view.write({"arch_db": new_arch})
+-
+-        translations = self.env['ir.translation'].search([
+-            ('type', '=', 'model_terms'),
+-            ('name', '=', "ir.ui.view,arch_db"),
+-            ('res_id', '=', view.id),
+-        ])
+-        # 'Subtotal' being src==value, it will be discared
+-        # 'Subtotal:' will be discarded as it match 'Subtotal' instead of 'Subtotal : <br/>'
+-        self.assertEqual(len(translations), 0)
++        self.assertEqual(view.with_env(env_nolang).arch_db, archf % terms_en)
++        self.assertEqual(view.with_env(env_en).arch_db, archf % terms_en)
++        self.assertEqual(view.with_env(env_fr).arch_db, archf % (terms_en[0], terms_fr[1]))
++        self.assertEqual(view.with_env(env_nl).arch_db, archf % (terms_en[0], terms_nl[1]))
+ 
+     def test_cache_consistency(self):
+         view = self.env["ir.ui.view"].create({
+@@ -950,6 +813,35 @@ class TestXMLTranslation(TransactionCase):
+         self.assertIn("<i>", view.arch_db)
+         self.assertIn("<i>", view_fr.arch_db)
+ 
++    # TODO 1. add method to translate html/xml field. 2. add tests new translation method
++    def test_update_field_translations(self):
++        archf = '<form string="X">%s<div>%s</div></form>'
++        terms_en = ('Bread and cheese', 'Fork')
++        terms_fr = ('Pain et fromage', 'Fourchette')
++        terms_nl = ('Brood and kaas', 'Vork')
++        view = self.create_view(archf, terms_en, fr_FR=terms_fr, nl_NL=terms_nl)
++
++        # cache arch_db
++        view.arch_db
++        view.with_context(lang='en_US').arch_db
++        view.with_context(lang='fr_FR').arch_db
++        view_nl = view.with_context(lang='nl_NL').arch_db
++
++        view.update_field_translations('arch_db', {
++            'en_US': {'Fork': 'Fork2'},
++            'fr_FR': {'Fourchette': 'Fourchette2'}
++        })
++
++        self.assertEqual(view.arch_db, '<form string="X">Bread and cheese<div>Fork2</div></form>')
++        self.assertEqual(view.with_context(lang='en_US').arch_db, '<form string="X">Bread and cheese<div>Fork2</div></form>')
++        self.assertEqual(view.with_context(lang='fr_FR').arch_db, '<form string="X">Pain et fromage<div>Fourchette2</div></form>')
++        self.assertEqual(view.with_context(lang='nl_NL').arch_db, view_nl)
++
++        view.invalidate_recordset()
++        self.assertEqual(view.arch_db, '<form string="X">Bread and cheese<div>Fork2</div></form>')
++        self.assertEqual(view.with_context(lang='en_US').arch_db, '<form string="X">Bread and cheese<div>Fork2</div></form>')
++        self.assertEqual(view.with_context(lang='fr_FR').arch_db, '<form string="X">Pain et fromage<div>Fourchette2</div></form>')
++        self.assertEqual(view.with_context(lang='nl_NL').arch_db, view_nl)
+ 
+ @tagged('post_install', '-at_install')
+ class TestLanguageInstallPerformance(TransactionCase):
+
+--- a/odoo/addons/base/tests/test_views.py
++++ b/odoo/addons/base/tests/test_views.py
+@@ -9,6 +9,7 @@ from functools import partial
+ from lxml import etree
+ from lxml.builder import E
+ from psycopg2 import IntegrityError
++from psycopg2.extras import Json
+ 
+ from odoo.exceptions import AccessError, ValidationError
+ from odoo.tests import common
+@@ -295,26 +296,12 @@ class TestViewInheritance(ViewCase):
+         self.env['res.lang']._activate_lang('fr_FR')
+ 
+         v = self.makeView("T", arch='<form string="Foo">Bar</form>')
+-        self.env['ir.translation']._upsert_translations([{
+-            'type': 'model_terms',
+-            'name': 'ir.ui.view,arch_db',
+-            'lang': 'fr_FR',
+-            'res_id': v.id,
+-            'src': 'Foo',
+-            'value': 'Fou',
+-        }, {
+-            'type': 'model_terms',
+-            'name': 'ir.ui.view,arch_db',
+-            'lang': 'fr_FR',
+-            'res_id': v.id,
+-            'src': 'Bar',
+-            'value': 'Barre',
+-        }])
++        v.update_field_translations('arch_db', {'fr_FR': {'Foo': 'Fou', 'Bar': 'Barre'}})
+         self.assertEqual(v.arch, '<form string="Foo">Bar</form>')
+ 
+         # modify v to discard translations; this should not invalidate 'arch'!
+-        v.arch = '<form></form>'
+-        self.assertEqual(v.arch, '<form></form>')
++        v.arch = '<form/>'
++        self.assertEqual(v.arch, '<form/>')
+ 
+     def test_get_combined_arch_query_count(self):
+         # If the query count increases, you probably made the view combination
+@@ -744,14 +731,7 @@ class TestNoModel(ViewCase):
+             'inherit_id': False,
+             'type': 'qweb',
+         })
+-        self.env['ir.translation'].create({
+-            'type': 'model_terms',
+-            'name': 'ir.ui.view,arch_db',
+-            'res_id': view.id,
+-            'lang': 'fr_FR',
+-            'src': TEXT_EN,
+-            'value': TEXT_FR,
+-        })
++        view.update_field_translations('arch_db', {'fr_FR': {TEXT_EN: TEXT_FR}})
+         view = view.with_context(lang='fr_FR')
+         self.assertEqual(view.arch, ARCH % TEXT_FR)
+ 
+@@ -1516,6 +1496,9 @@ class TestViews(ViewCase):
+         kw.pop('id', None)
+         kw.setdefault('mode', 'extension' if kw.get('inherit_id') else 'primary')
+         kw.setdefault('active', True)
++        if 'arch_db' in kw:
++            arch_db = kw['arch_db']
++            kw['arch_db'] = Json({'en_US': arch_db}) if self.env.lang == 'en_US' else Json({'en_US': arch_db, self.env.lang: arch_db})
+ 
+         keys = sorted(kw)
+         fields = ','.join('"%s"' % (k.replace('"', r'\"'),) for k in keys)
+@@ -3216,7 +3199,7 @@ class TestViewTranslations(common.TransactionCase):
+         super().setUpClass()
+         cls.env['res.lang']._activate_lang('fr_FR')
+         cls.env['res.lang']._activate_lang('nl_NL')
+-        cls.env['ir.translation']._load_module_terms(['base'], ['fr_FR', 'nl_NL'])
++        cls.env['ir.module.module']._load_module_terms(['base'], ['fr_FR', 'nl_NL'])
+ 
+     def create_view(self, archf, terms, **kwargs):
+         view = self.env['ir.ui.view'].create({
+@@ -3230,19 +3213,12 @@ class TestViewTranslations(common.TransactionCase):
+         # We need to flush `arch_db` before creating the translations otherwise the translation for which there is no value will be deleted,
+         # while the `test_sync_update` specifically needs empty translations
+         self.env.flush_all()
+-        self.env['ir.translation'].create([
+-            {
+-                'type': 'model_terms',
+-                'name': 'ir.ui.view,arch_db',
+-                'lang': lang,
+-                'res_id': view.id,
+-                'src': src,
+-                'value': val,
+-                'state': 'translated',
+-            }
+-            for lang, trans_terms in kwargs.items()
+-            for src, val in zip(terms, trans_terms)
+-        ])
++        val = {'en_US': archf % terms}
++        for lang, trans_terms in kwargs.items():
++            val[lang] = archf % trans_terms
++        query = "UPDATE ir_ui_view SET arch_db = %s WHERE id = %s"
++        self.env.cr.execute(query, [Json(val), view.id])
++        self.env.invalidate_all()
+         return view
+ 
+     def test_sync(self):
+@@ -3279,7 +3255,7 @@ class TestViewTranslations(common.TransactionCase):
+         view.with_env(env_fr).write({'arch': archf % new_terms_fr})
+ 
+         # check whether translations have been synchronized
+-        self.assertEqual(view.with_env(env_nolang).arch, archf % new_terms_fr)
++        self.assertEqual(view.with_env(env_nolang).arch, archf % terms_en)
+         self.assertEqual(view.with_env(env_en).arch, archf % terms_en)
+         self.assertEqual(view.with_env(env_fr).arch, archf % new_terms_fr)
+         self.assertEqual(view.with_env(env_nl).arch, archf % terms_nl)
+@@ -3329,27 +3305,11 @@ class TestViewTranslations(common.TransactionCase):
+         terms_en = ('', 'Sub total:')
+         view = self.create_view(archf, terms_src, en_US=terms_en)
+ 
+-        translations = self.env['ir.translation'].search([
+-            ('type', '=', 'model_terms'),
+-            ('name', '=', "ir.ui.view,arch_db"),
+-            ('res_id', '=', view.id),
+-        ])
+-        self.assertEqual(len(translations), 2)
+-
+         # modifying the arch should sync existing translations without errors
+         new_arch = archf % ('Subtotal', 'Subtotal : <br/>')
+         view.write({"arch": new_arch})
+         self.assertEqual(view.arch, new_arch)
+ 
+-        translations = self.env['ir.translation'].search([
+-            ('type', '=', 'model_terms'),
+-            ('name', '=', "ir.ui.view,arch_db"),
+-            ('res_id', '=', view.id),
+-        ])
+-        # 'Subtotal' being src==value, it will be discared
+-        # 'Subtotal:' will be discarded as it match 'Subtotal' instead of 'Subtotal : <br/>'
+-        self.assertEqual(len(translations), 0)
+-
+     def test_cache_consistency(self):
+         view = self.env["ir.ui.view"].create({
+             "name": "test_translate_xml_cache_invalidation",
+
+--- a/odoo/addons/base/views/ir_translation_views.xml
++++ b/None
+@@ -1,112 +0,0 @@
+-<?xml version="1.0" encoding="utf-8"?>
+-<odoo>
+-        <!-- Translations -->
+-        <record id="view_translation_search" model="ir.ui.view">
+-            <field name="model">ir.translation</field>
+-            <field name="arch" type="xml">
+-                <search string="Translations">
+-                    <filter string="Untranslated" name="untranslated"
+-                        domain="['|','|',('state','=','to_translate'),('value', '=', False),('value','=','')]"/>
+-                    <filter name="openerp-web"
+-                        string="Web-only translations"
+-                        domain="[('comments', 'like', 'openerp-web')]"/>
+-                    <field name="lang"/>
+-                    <field name="src"/>
+-                    <field name="value"/>
+-                    <field name="name" filter_domain="('|', ('name', '=', self), ('name', 'ilike', self + ','))" string="Model"/>
+-                    <field name="res_id" filter_domain="('&amp;', ('name', '=', 'ir.ui.view,arch_db'), ('res_id', '=', self))" string="View ID"/>
+-                    <field name="module"/>
+-                </search>
+-            </field>
+-        </record>
+-
+-        <record id="view_translation_form" model="ir.ui.view">
+-            <field name="model">ir.translation</field>
+-            <field name="arch" type="xml">
+-                <form string="Translations">
+-                   <header>
+-                        <field name="state" widget="statusbar" nolabel="1"/>
+-                   </header>
+-                   <sheet>
+-                    <group>
+-                        <group>
+-                            <field name="name"/>
+-                            <field name="lang"/>
+-                        </group>
+-                        <group>
+-                            <field name="module"/>
+-                            <field name="type"/>
+-                            <field name="res_id"/>
+-                        </group>
+-                        <group string="Source Term">
+-                           <field name="src" nolabel="1" height="400"/>
+-                        </group>
+-                        <group string="Translation">
+-                           <field name="value" nolabel="1" height="400"/>
+-                        </group>
+-                        <group string="Comments">
+-                           <field name="comments" nolabel="1" height="100"/>
+-                        </group>
+-                    </group>
+-                   </sheet>
+-                </form>
+-            </field>
+-        </record>
+-        <record id="view_translation_tree" model="ir.ui.view">
+-            <field name="model">ir.translation</field>
+-            <field name="arch" type="xml">
+-                <tree string="Translations" editable="top">
+-                    <field name="src"/>
+-                    <field name="value"/>
+-                    <field name="name"/>
+-                    <field name="lang"/>
+-                    <field name="module"/>
+-                    <field name="type"/>
+-                    <field name="state"/>
+-                </tree>
+-            </field>
+-        </record>
+-
+-        <record id="view_translation_dialog_tree" model="ir.ui.view">
+-            <field name="model">ir.translation</field>
+-            <field name="arch" type="xml">
+-                <tree string="Translations" editable="top" create="false">
+-                    <field name="lang" readonly="1"/>
+-                    <field name="name" readonly="1"/>
+-                    <field name="src"/>
+-                    <field name="value"/>
+-                    <field name="state"/>
+-                </tree>
+-            </field>
+-        </record>
+-
+-        <record id="view_translation_lang_value_tree" model="ir.ui.view">
+-            <field name="model">ir.translation</field>
+-            <field name="arch" type="xml">
+-                <tree string="Translations" editable="top" create="false">
+-                    <field name="lang" readonly="1"/>
+-                    <field name="value"/>
+-                </tree>
+-            </field>
+-        </record>
+-
+-        <record id="view_translation_lang_src_value_tree" model="ir.ui.view">
+-            <field name="model">ir.translation</field>
+-            <field name="arch" type="xml">
+-                <tree string="Translations" editable="top" create="false">
+-                    <field name="lang" readonly="1"/>
+-                    <field name="src" readonly="1"/>
+-                    <field name="value"/>
+-                </tree>
+-            </field>
+-        </record>
+-
+-        <record id="action_translation" model="ir.actions.act_window">
+-            <field name="name">Translated Terms</field>
+-            <field name="res_model">ir.translation</field>
+-            <field name="view_id" ref="view_translation_tree"/>
+-        </record>
+-
+-        <menuitem action="action_translation" id="menu_action_translation" parent="base.menu_translation_app" />
+-
+-</odoo>
+
+--- a/odoo/addons/base/views/ir_ui_view_views.xml
++++ b/odoo/addons/base/views/ir_ui_view_views.xml
+@@ -28,8 +28,7 @@
+                     </div>
+                     <notebook>
+                         <page string="Architecture" name="architecture">
+-                            <button type="object" name="open_translations"
+-                                string="Edit Translations" class="oe_link oe_right"/>
++                            <field name="arch_db" class="oe_no_translation_content"/>
+                             <field name="arch_base" string="View Architecture" widget="ace" options="{'mode': 'xml'}" required="1"/>
+                         </page>
+                         <page string="Access Rights" name="access_rights">
+
+--- a/odoo/addons/base/wizard/__init__.py
++++ b/odoo/addons/base/wizard/__init__.py
+@@ -7,5 +7,4 @@ from . import base_import_language
+ from . import base_module_upgrade
+ from . import base_module_uninstall
+ from . import base_export_language
+-from . import base_update_translations
+ from . import base_partner_merge
+
+--- a/odoo/addons/base/wizard/base_language_install.py
++++ b/odoo/addons/base/wizard/base_language_install.py
+@@ -38,7 +38,6 @@ class BaseLanguageInstall(models.TransientModel):
+         mods = self.env['ir.module.module'].search([('state', '=', 'installed')])
+         self.lang_ids.active = True
+         mods._update_translations(self.lang_ids.mapped('code'), self.overwrite)
+-        self.env.cr.execute('ANALYZE ir_translation')
+ 
+         if len(self.lang_ids) == 1:
+             return {
+
+--- a/odoo/addons/base/wizard/base_update_translations.py
++++ b/None
+@@ -1,38 +0,0 @@
+-# -*- coding: utf-8 -*-
+-# Part of Odoo. See LICENSE file for full copyright and licensing details.
+-
+-import tarfile
+-import tempfile
+-
+-from odoo import api, fields, models, tools, _
+-from odoo.exceptions import UserError
+-
+-
+-class BaseUpdateTranslations(models.TransientModel):
+-    _name = 'base.update.translations'
+-    _description = 'Update Translations'
+-
+-    @api.model
+-    def _get_languages(self):
+-        return self.env['res.lang'].get_installed()
+-
+-
+-    lang = fields.Selection(_get_languages, 'Language', required=True)
+-
+-    @api.model
+-    def _get_lang_name(self, lang_code):
+-        lang = self.env['res.lang']._lang_get(lang_code)
+-        if not lang:
+-            raise UserError(_('No language with code "%s" exists', lang_code))
+-        return lang.name
+-
+-    def act_update(self):
+-        with tempfile.NamedTemporaryFile() as buf:
+-            tools.trans_export(self.lang, ['all'], buf, 'tgz', self._cr)
+-            buf.seek(0)
+-            tar = tarfile.open(fileobj=buf)
+-            for file_info in tar:
+-                module_file = tar.extractfile(file_info)
+-                tools.trans_load_data(self._cr, module_file, 'po', self.lang, create_empty_translation=True)
+-            tar.close()
+-        return {'type': 'ir.actions.act_window_close'}
+
+--- a/odoo/addons/base/wizard/base_update_translations_views.xml
++++ b/None
+@@ -1,29 +0,0 @@
+-<?xml version="1.0" encoding="utf-8"?>
+-<odoo>
+-    <data>
+-         <record id="wizard_update_translations" model="ir.ui.view">
+-            <field name="name">Generate Missing Terms</field>
+-            <field name="model">base.update.translations</field>
+-            <field name="arch" type="xml">
+-                <form string="Generate Missing Terms">
+-                    <group string="Generate Missing Terms">
+-                        <field name="lang"/>
+-                    </group>
+-                    <footer>
+-                        <button name="act_update" string="Update" type="object" class="btn-primary" data-hotkey="q"/>
+-                        <button special="cancel" data-hotkey="z" string="Cancel" type="object" class="btn-secondary"/>
+-                    </footer>
+-                </form>
+-            </field>
+-        </record>
+-        <record id="action_wizard_update_translations" model="ir.actions.act_window">
+-            <field name="name">Generate Missing Terms</field>
+-            <field name="type">ir.actions.act_window</field>
+-            <field name="res_model">base.update.translations</field>
+-            <field name="view_mode">form</field>
+-            <field name="target">new</field>
+-        </record>
+-        <menuitem action="action_wizard_update_translations" id="menu_wizard_update_translations" parent="menu_translation_app"/>
+-
+-    </data>
+-</odoo>
+
+--- a/odoo/addons/base/models/assetsbundle.py
++++ b/odoo/addons/base/models/assetsbundle.py
+@@ -193,14 +193,18 @@ class AssetsBundle(object):
+         return response
+ 
+     @func.lazy_property
+-    def last_modified(self):
++    def last_modified_combined(self):
+         """Returns last modified date of linked files"""
++        # WebAsset are recreate here when a better solution would be to use self.stylesheets and self.javascripts
++        # We currently have no garanty that they are present since it will depends on js and css parameters
++        # last_modified is actually only usefull for the checksum and checksum should be extension specific since
++        # they are differents bundles. This will be a future work.
++
++        # changing the logic from max date to combined date to fix bundle invalidation issues.
+         assets = [WebAsset(self, url=f['url'], filename=f['filename'], inline=f['content'])
+             for f in self.files
+             if f['atype'] in ['text/sass', "text/scss", "text/less", "text/css", "text/javascript", "text/xml"]]
+-        return max(itertools.chain(
+-            (asset.last_modified for asset in assets),
+-        ))
++        return ','.join(str(asset.last_modified) for asset in assets)
+ 
+     @func.lazy_property
+     def version(self):
+@@ -210,9 +214,9 @@ class AssetsBundle(object):
+     def checksum(self):
+         """
+         Not really a full checksum.
+-        We compute a SHA512/256 on the rendered bundle + max linked files last_modified date
++        We compute a SHA512/256 on the rendered bundle + combined linked files last_modified date
+         """
+-        check = u"%s%s" % (json.dumps(self.files, sort_keys=True), self.last_modified)
++        check = u"%s%s" % (json.dumps(self.files, sort_keys=True), self.last_modified_combined)
+         return hashlib.sha512(check.encode('utf-8')).hexdigest()[:64]
+ 
+     def _get_asset_template_url(self):
