@@ -1,0 +1,133 @@
+PR: https://github.com/odoo/odoo/pull/
+
+From: e40553723b893bcd2244e9b9fcc5c1a7e1bf27d3
+From: Rémy Voet (ryv)
+Date: 2020-08-18 07:48:27
+
+Structural Changes: 2.9
+Total Changes: 37
+
+[IMP] stock,mrp,purchase: refactor priority
+
+- MO/picking/PO/stock.move have now the "same" `priority` fields
+(Boolean logic: Normal or Urgent).
+These models are now sort by priority first. Note that the priority field of
+stock move is a technical one.
+- For MO and picking, the set of `priority` field change priority of
+the related stock move. The prioriry field on stock move is
+used by the scheduler for reservation ('Urgent' before 'Normal')
+- The Stock Replenishment Report also take in account the priority
+to be consistent with the reservation.
+
+task-2246665
+
+================================= pseudo patch: =================================
+
+--- a/addons/stock/models/stock_move.py
++++ b/addons/stock/models/stock_move.py
+@@ -16,7 +16,7 @@ from odoo.exceptions import UserError
+ from odoo.tools.float_utils import float_compare, float_is_zero, float_repr, float_round
+ from odoo.tools.misc import format_date
+ 
+-PROCUREMENT_PRIORITIES = [('0', 'Not urgent'), ('1', 'Normal'), ('2', 'Urgent'), ('3', 'Very Urgent')]
++PROCUREMENT_PRIORITIES = [('0', 'Normal'), ('1', 'Urgent')]
+ 
+ 
+ class StockMove(models.Model):
+@@ -31,7 +31,9 @@ class StockMove(models.Model):
+ 
+     name = fields.Char('Description', index=True, required=True)
+     sequence = fields.Integer('Sequence', default=10)
+-    priority = fields.Selection(PROCUREMENT_PRIORITIES, 'Priority', default='1')
++    priority = fields.Selection(
++        PROCUREMENT_PRIORITIES, 'Priority', default='0',
++        compute="_compute_priority", store=True, index=True)
+     create_date = fields.Datetime('Creation Date', index=True, readonly=True)
+     date = fields.Datetime(
+         'Date', default=fields.Datetime.now, index=True, required=True,
+@@ -198,6 +200,11 @@ class StockMove(models.Model):
+                 not move.picking_type_id.use_existing_lots
+             )
+ 
++    @api.depends('picking_id.priority')
++    def _compute_priority(self):
++        for move in self:
++            move.priority = move.picking_id.priority or '0'
++
+     @api.depends('picking_id.is_locked')
+     def _compute_is_locked(self):
+         for move in self:
+@@ -390,7 +397,7 @@ class StockMove(models.Model):
+                 total_availability = self.env['stock.quant']._get_available_quantity(move.product_id, move.location_id) if move.product_id else 0.0
+                 move.availability = min(move.product_qty, total_availability)
+ 
+-    @api.depends('product_id', 'picking_type_id', 'picking_id', 'reserved_availability')
++    @api.depends('product_id', 'picking_type_id', 'picking_id', 'reserved_availability', 'priority')
+     def _compute_json_forecast(self):
+         self.json_forecast = False
+         if not any(self._ids):
+
+--- a/addons/stock/models/stock_picking.py
++++ b/addons/stock/models/stock_picking.py
+@@ -280,10 +280,7 @@ class Picking(models.Model):
+         'procurement.group', 'Procurement Group',
+         readonly=True, related='move_lines.group_id', store=True)
+     priority = fields.Selection(
+-        PROCUREMENT_PRIORITIES, string='Priority',
+-        compute='_compute_priority', inverse='_set_priority', store=True,
+-        index=True, tracking=True,
+-        states={'done': [('readonly', True)], 'cancel': [('readonly', True)]},
++        PROCUREMENT_PRIORITIES, string='Priority', default='0', index=True,
+         help="Products will be reserved first for the transfers with the highest priorities.")
+     scheduled_date = fields.Datetime(
+         'Scheduled Date', compute='_compute_scheduled_date', inverse='_set_scheduled_date', store=True,
+@@ -483,19 +480,6 @@ class Picking(models.Model):
+                 else:
+                     picking.state = relevant_move_state
+ 
+-    @api.depends('move_lines.priority')
+-    def _compute_priority(self):
+-        for picking in self:
+-            if picking.mapped('move_lines'):
+-                priorities = [priority for priority in picking.mapped('move_lines.priority') if priority] or ['1']
+-                picking.priority = max(priorities)
+-            else:
+-                picking.priority = '1'
+-
+-    def _set_priority(self):
+-        for picking in self:
+-            picking.move_lines.write({'priority': picking.priority})
+-
+     @api.depends('move_lines.date_expected')
+     def _compute_scheduled_date(self):
+         for picking in self:
+@@ -767,7 +751,7 @@ class Picking(models.Model):
+                     new_move._action_confirm()
+                     todo_moves |= new_move
+         todo_moves._action_done(cancel_backorder=self.env.context.get('cancel_backorder'))
+-        self.write({'date_done': fields.Datetime.now()})
++        self.write({'date_done': fields.Datetime.now(), 'priority': '0'})
+ 
+         # if incoming moves make other confirmed/partially_available moves available, assign them
+         done_incoming_moves = self.filtered(lambda p: p.picking_type_id.code == 'incoming').move_lines.filtered(lambda m: m.state == 'done')
+
+--- a/addons/stock/models/stock_rule.py
++++ b/addons/stock/models/stock_rule.py
+@@ -320,7 +320,7 @@ class StockRule(models.Model):
+             'propagate_date': self.propagate_date,
+             'propagate_date_minimum_delta': self.propagate_date_minimum_delta,
+             'description_picking': picking_description,
+-            'priority': values.get('priority', "1"),
++            'priority': values.get('priority', "0"),
+             'delay_alert': self.delay_alert,
+             'orderpoint_id': values.get('orderpoint_id') and values['orderpoint_id'].id,
+         }
+@@ -411,7 +411,7 @@ class ProcurementGroup(models.Model):
+         procurement_errors = []
+         for procurement in procurements:
+             procurement.values.setdefault('company_id', self.env.company)
+-            procurement.values.setdefault('priority', '1')
++            procurement.values.setdefault('priority', '0')
+             procurement.values.setdefault('date_planned', fields.Datetime.now())
+             if (
+                 procurement.product_id.type not in ('consu', 'product') or
