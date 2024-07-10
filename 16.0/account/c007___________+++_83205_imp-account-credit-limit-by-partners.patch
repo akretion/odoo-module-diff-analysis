@@ -1,0 +1,204 @@
+PR: https://github.com/odoo/odoo/pull/83205
+
+From: ff0275be6b937487f22b672f5d29f20ac439fefc
+From: John Laterre (jol)
+Date: 2022-04-01 16:49:46
+
+Structural Changes: 10
+Total Changes: 97
+
+[IMP] account: credit limit by partners
+
+The basic idea of this functionality is for users
+to be able to put limits on Partners that would
+trigger non-blocking warnings when trying to confirm new:
+
+- Sales Orders
+- Invoices
+
+when that partner has too many open invoices.
+
+task-2722165
+
+Part-of: odoo/odoo#83205
+
+================================= pseudo patch: =================================
+
+--- a/addons/account/models/account_move.py
++++ b/addons/account/models/account_move.py
+@@ -2,7 +2,7 @@
+ 
+ from odoo import api, fields, models, Command, _
+ from odoo.exceptions import RedirectWarning, UserError, ValidationError, AccessError
+-from odoo.tools import float_compare, date_utils, email_split, email_re, html_escape, is_html_empty, sql
++from odoo.tools import float_compare, date_utils, email_split, email_re, is_html_empty, sql
+ from odoo.tools.misc import format_amount, formatLang, format_date, get_lang
+ 
+ from datetime import date, timedelta
+@@ -11,7 +11,6 @@ from contextlib import contextmanager
+ from itertools import zip_longest
+ from hashlib import sha256
+ from json import dumps
+-from markupsafe import Markup
+ 
+ import ast
+ import json
+@@ -376,6 +375,10 @@ class AccountMove(models.Model):
+     # Technical field to hide Reconciled Entries stat button
+     has_reconciled_entries = fields.Boolean(compute="_compute_has_reconciled_entries")
+     show_reset_to_draft_button = fields.Boolean(compute='_compute_show_reset_to_draft_button')
++    # Credit Limit related field
++    partner_credit_warning = fields.Text(
++        compute='_compute_partner_credit_warning',
++        groups="account.group_account_invoice,account.group_account_readonly")
+ 
+     # ==== Hash Fields ====
+     restrict_mode_hash_table = fields.Boolean(related='journal_id.restrict_mode_hash_table')
+@@ -1691,6 +1694,37 @@ class AccountMove(models.Model):
+         for record in self:
+             record.tax_country_code = record.tax_country_id.code
+ 
++    @api.depends('company_id', 'partner_id', 'amount_total_signed')
++    def _compute_partner_credit_warning(self):
++        for move in self:
++            move.with_company(move.company_id)
++            move.partner_credit_warning = ''
++            show_warning = move.state == 'draft' and \
++                           move.move_type == 'out_invoice' and \
++                           move.company_id.account_use_credit_limit
++            if show_warning:
++                updated_credit = move.partner_id.credit + move.amount_total_signed
++                move.partner_credit_warning = self._build_credit_warning_message(move, updated_credit)
++
++    def _build_credit_warning_message(self, record, updated_credit):
++        ''' Build the warning message that will be displayed in a yellow banner on top of the current record
++            if the partner exceeds a credit limit (set on the company or the partner itself).
++
++            :param record:                  The record where the warning will appear (Invoice, Sales Order...).
++            :param updated_credit (float):  The partner's updated credit limit including the current record.
++            :return (str):                  The warning message to be showed.
++        '''
++        credit_limit = record.partner_id.credit_limit
++        if (not credit_limit) or updated_credit <= credit_limit:
++            return ''
++        msg = _('%s has reached its Credit Limit of : %s\nTotal amount due ',
++                record.partner_id.name,
++                formatLang(self.env, credit_limit, currency_obj=record.company_id.currency_id))
++        if updated_credit > record.partner_id.credit:
++            msg += _('(including this document) ')
++        msg += ': %s' % formatLang(self.env, updated_credit, currency_obj=record.company_id.currency_id)
++        return msg
++
+     # -------------------------------------------------------------------------
+     # BUSINESS MODELS SYNCHRONIZATION
+     # -------------------------------------------------------------------------
+
+--- a/addons/account/models/company.py
++++ b/addons/account/models/company.py
+@@ -98,6 +98,8 @@ class ResCompany(models.Model):
+ 
+     invoice_is_email = fields.Boolean('Email by default', default=True)
+     invoice_is_print = fields.Boolean('Print by default', default=True)
++    account_use_credit_limit = fields.Boolean(
++        string='Sales Credit Limit', help='Enable the use of credit limit on partners.')
+ 
+     #Fields of the setup step for opening move
+     account_opening_move_id = fields.Many2one(string='Opening Journal Entry', comodel_name='account.move', help="The journal entry containing the initial balance of all this company's accounts.")
+
+--- a/addons/account/models/partner.py
++++ b/addons/account/models/partner.py
+@@ -433,9 +433,21 @@ class ResPartner(models.Model):
+                 partner.currency_id = self.env.company.currency_id
+ 
+     credit = fields.Monetary(compute='_credit_debit_get', search=_credit_search,
+-        string='Total Receivable', help="Total amount this customer owes you.")
+-    debit = fields.Monetary(compute='_credit_debit_get', search=_debit_search, string='Total Payable',
+-        help="Total amount you have to pay to this vendor.")
++        string='Total Receivable', help="Total amount this customer owes you.",
++        groups='account.group_account_invoice,account.group_account_readonly')
++    credit_limit = fields.Float(
++        string='Credit Limit', help='Credit limit specific to this partner.',
++        groups='account.group_account_invoice,account.group_account_readonly',
++        company_dependent=True, copy=False, readonly=False)
++    use_partner_credit_limit = fields.Boolean(
++        string='Partner Limit', groups='account.group_account_invoice,account.group_account_readonly',
++        compute='_compute_use_partner_credit_limit', inverse='_inverse_use_partner_credit_limit')
++    show_credit_limit = fields.Boolean(
++        compute='_compute_show_credit_limit', groups='account.group_account_invoice,account.group_account_readonly')
++    debit = fields.Monetary(
++        compute='_credit_debit_get', search=_debit_search, string='Total Payable',
++        help="Total amount you have to pay to this vendor.",
++        groups='account.group_account_invoice,account.group_account_readonly')
+     debit_limit = fields.Monetary('Payable Limit')
+     total_invoiced = fields.Monetary(compute='_invoice_total', string="Total Invoiced",
+         groups='account.group_account_invoice,account.group_account_readonly')
+@@ -527,6 +539,22 @@ class ResPartner(models.Model):
+         for partner in self:
+             partner.duplicated_bank_account_partners_count = len(partner._get_duplicated_bank_accounts())
+ 
++    @api.depends_context('company')
++    def _compute_use_partner_credit_limit(self):
++        for partner in self:
++            company_limit = self.env['ir.property']._get('credit_limit', 'res.partner')
++            partner.use_partner_credit_limit = partner.credit_limit != company_limit
++
++    def _inverse_use_partner_credit_limit(self):
++        for partner in self:
++            if not partner.use_partner_credit_limit:
++                partner.credit_limit = self.env['ir.property']._get('credit_limit', 'res.partner')
++
++    @api.depends_context('company')
++    def _compute_show_credit_limit(self):
++        for partner in self:
++            partner.show_credit_limit = self.env.company.account_use_credit_limit
++
+     def _find_accounting_partner(self, partner):
+         ''' Find the partner for which the accounting entries will be created '''
+         return partner.commercial_partner_id
+@@ -535,7 +563,7 @@ class ResPartner(models.Model):
+     def _commercial_fields(self):
+         return super(ResPartner, self)._commercial_fields() + \
+             ['debit_limit', 'property_account_payable_id', 'property_account_receivable_id', 'property_account_position_id',
+-             'property_payment_term_id', 'property_supplier_payment_term_id', 'last_time_entries_checked']
++             'property_payment_term_id', 'property_supplier_payment_term_id', 'last_time_entries_checked', 'credit_limit']
+ 
+     def action_view_partner_invoices(self):
+         self.ensure_one()
+
+--- a/addons/account/models/res_config_settings.py
++++ b/addons/account/models/res_config_settings.py
+@@ -141,6 +141,13 @@ class ResConfigSettings(models.TransientModel):
+     use_invoice_terms = fields.Boolean(
+         string='Default Terms & Conditions',
+         config_parameter='account.use_invoice_terms')
++    account_use_credit_limit = fields.Boolean(
++        string="Sales Credit Limit", related="company_id.account_use_credit_limit", readonly=False,
++        help="Enable the use of credit limit on partners.")
++    account_default_credit_limit = fields.Monetary(
++        string="Default Credit Limit", readonly=False,
++        help='This is the default credit limit that will be used on partners that do not have a specific limit on them.',
++        compute="_compute_account_default_credit_limit", inverse="_inverse_account_default_credit_limit")
+ 
+     # Technical field to hide country specific fields from accounting configuration
+     country_code = fields.Char(related='company_id.account_fiscal_country_id.code', readonly=True)
+@@ -159,6 +166,20 @@ class ResConfigSettings(models.TransientModel):
+                 and self.chart_template_id != self.company_id.chart_template_id:
+             self.chart_template_id._load(self.env.company)
+ 
++    @api.depends('company_id')
++    def _compute_account_default_credit_limit(self):
++        for setting in self:
++            setting.account_default_credit_limit = self.env['ir.property']._get('credit_limit', 'res.partner')
++
++    def _inverse_account_default_credit_limit(self):
++        for setting in self:
++            self.env['ir.property']._set_default(
++                'credit_limit',
++                'res.partner',
++                setting.account_default_credit_limit,
++                self.company_id.id
++            )
++
+     @api.depends('company_id')
+     def _compute_has_chart_of_accounts(self):
+         self.has_chart_of_accounts = bool(self.company_id.chart_template_id)
