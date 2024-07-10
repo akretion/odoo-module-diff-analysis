@@ -1,0 +1,139 @@
+PR: https://github.com/odoo/odoo/pull/38255
+
+From: 045e0c0a26412d001a5f735225719d8d77887d9e
+From: wan
+Date: 2019-10-22 07:44:14
+
+Structural Changes: 10
+Total Changes: 60
+
+[IMP] account: Control Access: Journals that can be allowed by accounts
+Task 2074811
+
+Allow to specify on an account the journals that can be allowed
+
+Example of use case :
+* I create an IFRS journal and some specific IFRS accounts
+* I want to make sure that the accounts I configured for the IFRS are
+  only use to make entries in the IFRS journal
+
+In this commit we also prevent from changing the configuration of a
+journal if there are account.move.line that should not have been allowed
+to be created with the new configuration.
+
+closes odoo/odoo#38255
+
+Signed-off-by: Quentin De Paoli (qdp) <qdp@openerp.com>
+
+================================= pseudo patch: =================================
+
+--- a/addons/account/models/account.py
++++ b/addons/account/models/account.py
+@@ -228,6 +228,7 @@ class AccountAccount(models.Model):
+     tag_ids = fields.Many2many('account.account.tag', 'account_account_account_tag', string='Tags', help="Optional tags you may want to assign for custom reporting")
+     group_id = fields.Many2one('account.group')
+     root_id = fields.Many2one('account.root', compute='_compute_account_root', store=True)
++    allowed_journal_ids = fields.Many2many('account.journal', string="Allowed Journals", help="Define in which journals this account can be used. If empty, can be used in all journals.")
+ 
+     opening_debit = fields.Monetary(string="Opening debit", compute='_compute_opening_debit_credit', inverse='_set_opening_debit', help="Opening debit value for this account.")
+     opening_credit = fields.Monetary(string="Opening credit", compute='_compute_opening_debit_credit', inverse='_set_opening_credit', help="Opening credit value for this account.")
+@@ -245,6 +246,22 @@ class AccountAccount(models.Model):
+                 if record.tax_ids:
+                     raise UserError(_('An Off-Balance account can not have taxes'))
+ 
++    @api.constrains('allowed_journal_ids')
++    def _constrains_allowed_journal_ids(self):
++        self.env['account.move.line'].flush(['account_id', 'journal_id'])
++        self.flush(['allowed_journal_ids'])
++        self._cr.execute("""
++            SELECT aml.id
++            FROM account_move_line aml
++            WHERE aml.account_id in (%s)
++            AND EXISTS (SELECT 1 FROM account_account_account_journal_rel WHERE account_account_id = aml.account_id)
++            AND NOT EXISTS (SELECT 1 FROM account_account_account_journal_rel WHERE account_account_id = aml.account_id AND account_journal_id = aml.journal_id)
++        """, tuple(self.ids))
++        ids = self._cr.fetchall()
++        if ids:
++            # import pdb; pdb.set_trace()
++            raise ValidationError(_('Some journal items already exist with this account but in other journals than the allowed ones.'))
++
+     @api.depends('code')
+     def _compute_account_root(self):
+         # this computes the first 2 digits of the account.
+@@ -620,8 +637,8 @@ class AccountJournal(models.Model):
+         "Select 'Purchase' for vendor bills journals.\n"\
+         "Select 'Cash' or 'Bank' for journals that are used in customer or vendor payments.\n"\
+         "Select 'General' for miscellaneous operations journals.")
+-    type_control_ids = fields.Many2many('account.account.type', 'account_journal_type_rel', 'journal_id', 'type_id', string='Account Types Allowed')
+-    account_control_ids = fields.Many2many('account.account', 'account_account_type_rel', 'journal_id', 'account_id', string='Accounts Allowed',
++    type_control_ids = fields.Many2many('account.account.type', 'journal_account_type_control_rel', 'journal_id', 'type_id', string='Account Types Allowed')
++    account_control_ids = fields.Many2many('account.account', 'journal_account_control_rel', 'journal_id', 'account_id', string='Accounts Allowed',
+         domain="[('deprecated', '=', False), ('company_id', '=', company_id)]")
+     default_credit_account_id = fields.Many2one('account.account', string='Default Credit Account',
+         domain=[('deprecated', '=', False)], help="It acts as a default account for credit amount",
+@@ -739,6 +756,36 @@ class AccountJournal(models.Model):
+                 sequence = journal.refund_sequence_id._get_current_sequence()
+                 sequence.sudo().number_next = journal.refund_sequence_number_next
+ 
++    @api.constrains('type_control_ids')
++    def _constrains_type_control_ids(self):
++        self.env['account.move.line'].flush(['account_id', 'journal_id'])
++        self.flush(['type_control_ids'])
++        self._cr.execute("""
++            SELECT aml.id
++            FROM account_move_line aml
++            WHERE aml.journal_id in (%s)
++            AND EXISTS (SELECT 1 FROM journal_account_type_control_rel rel WHERE rel.journal_id = aml.journal_id)
++            AND NOT EXISTS (SELECT 1 FROM account_account acc
++                            JOIN journal_account_type_control_rel rel ON acc.user_type_id = rel.type_id
++                            WHERE acc.id = aml.account_id AND rel.journal_id = aml.journal_id)
++        """, tuple(self.ids))
++        if self._cr.fetchone():
++            raise ValidationError(_('Some journal items already exist in this journal but with accounts from different types than the allowed ones.'))
++
++    @api.constrains('account_control_ids')
++    def _constrains_account_control_ids(self):
++        self.env['account.move.line'].flush(['account_id', 'journal_id'])
++        self.flush(['account_control_ids'])
++        self._cr.execute("""
++            SELECT aml.id
++            FROM account_move_line aml
++            WHERE aml.journal_id in (%s)
++            AND EXISTS (SELECT 1 FROM journal_account_control_rel rel WHERE rel.journal_id = aml.journal_id)
++            AND NOT EXISTS (SELECT 1 FROM journal_account_control_rel rel WHERE rel.account_id = aml.account_id AND rel.journal_id = aml.journal_id)
++        """, tuple(self.ids))
++        if self._cr.fetchone():
++            raise ValidationError(_('Some journal items already exist in this journal but with other accounts than the allowed ones.'))
++
+     @api.constrains('currency_id', 'default_credit_account_id', 'default_debit_account_id')
+     def _check_currency(self):
+         for journal in self:
+
+--- a/addons/account/models/account_move.py
++++ b/addons/account/models/account_move.py
+@@ -2970,8 +2970,8 @@ class AccountMoveLine(models.Model):
+     # CONSTRAINT METHODS
+     # -------------------------------------------------------------------------
+ 
+-    @api.constrains('account_id')
+-    def _check_constrains_account_id(self):
++    @api.constrains('account_id', 'journal_id')
++    def _check_constrains_account_id_journal_id(self):
+         for line in self:
+             account = line.account_id
+             journal = line.journal_id
+@@ -2979,10 +2979,13 @@ class AccountMoveLine(models.Model):
+             if account.deprecated:
+                 raise UserError(_('The account %s (%s) is deprecated.') % (account.name, account.code))
+ 
++            control_journal_failed = account.allowed_journal_ids and journal not in account.allowed_journal_ids
+             control_type_failed = journal.type_control_ids and account.user_type_id not in journal.type_control_ids
+             control_account_failed = journal.account_control_ids and account not in journal.account_control_ids
++            if control_journal_failed:
++                raise UserError(_('You cannot use this account (%s) in this journal, check the field \'Allowed Journals\' on the related account.') % account.display_name)
+             if control_type_failed or control_account_failed:
+-                raise UserError(_('You cannot use this general account in this journal, check the tab \'Entry Controls\' on the related journal.'))
++                raise UserError(_('You cannot use this account (%s) in this journal, check the tab \'Control-Access\' on the related journal.') % account.display_name)
+ 
+     @api.constrains('account_id', 'tax_ids', 'tax_line_id', 'reconciled')
+     def _check_off_balance(self):

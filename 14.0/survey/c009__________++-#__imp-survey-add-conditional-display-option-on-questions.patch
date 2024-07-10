@@ -1,0 +1,442 @@
+PR: https://github.com/odoo/odoo/pull/
+
+From: 0675d68afb7afe69e5e9d62a172c273a6d0b83e8
+From: David Beguin
+Date: 2020-03-06 10:29:50
+
+Structural Changes: 6
+Total Changes: 255
+
+[IMP] survey: add conditional display option on questions
+
+Purpose
+=======
+
+This commit adds a new survey mode : conditional questions. A conditional
+question is a question that will be displayed to the user only if the user
+selects a specific answer from another previous question i.e. question B is
+displayed if user answers 'Choice 1' at question A.
+
+Specifications
+==============
+
+There are 2 different ways to handle conditional questions.
+
+  * For one_page and page_per_section survey layout: conditional management is
+    done mainly at frontend side. The idea is to be able to load all the
+    questions of the section, hide the conditional questions and display them
+    dynamically on answer check.
+    E.g.: If user checks answer 'Choice 1' from question A, question B is
+    displayed immediately.
+    If question B is on section 2 and survey layout is set to section per page,
+    question B will be displayed immediately on next page template load.
+    Indeed, on each page load, server sends all the selected answers and the
+    template displays the conditional question depending on the already
+    elected answers;
+
+  * For page_per_question survey layout: conditional management is done mainly
+    at backend side. The idea is to find on each page the next question to
+    display depending on:
+
+    * navigation direction (next - previous)
+    * already selected answers and conditional question dependance
+    * survey questions sequence
+
+	E.g.: If questions survey are Question A, B and C and question B must be
+	displayed if answer 'Choice 1' from question A is selected.
+	At Question A, if user select 'Choice 1' and goes next: display B
+	At Question B, no matter the answer, if user goes next: display C
+	At Question B, no matter the answer, if user goes prev: display A
+	At Question A, if user select 'Choice 2' and goes next: display C
+	At Question C, no matter the answer, if user goes next: End survey
+	At Question C, if user has selected 'Choice 1' at question A and goes prev -> B
+	At Question C, if user has selected 'Choice 2' at question A and goes prev -> A
+
+In both modes answers on questions that should not have been displayed to the
+user depending on the previous selected answers are cleared.
+E.g. : User checks 'choice 1' from question A, then complete question B.
+Then user unchecks 'choice 1' -> answer on question B is cleared.
+
+Ignore conditional configuration :
+
+  * during survey session, to avoid having different users answering different
+    questions on the same session. That would be confusing for users to see
+    questions on presenter screen that they didn't have the opportunity to
+    answer;
+  * if survey questions selection is random, because it will not display
+    conditional questions if they are not kept by randomization. To avoid
+    confusion, conditional configuration is simply ignored, not unset, so the
+	user can still reactivate it without having to reconfigure everything.
+
+Remove questions that should not have been displayed to the user (depending of
+the made choices) in scoring computation and print layout.
+--> Inactives questions are removed from predefined questions when user finish
+the survey.
+E.g.: If the user selects first path on 2, he will never see second path.
+If the user answers correctly to all question of first path, he should have
+100%, instead of 50%, even if questions of path 2 are mandatory and scored.
+
+Link
+====
+
+Task ID: 23509
+PR #44950
+
+================================= pseudo patch: =================================
+
+--- a/addons/survey/models/survey_question.py
++++ b/addons/survey/models/survey_question.py
+@@ -130,6 +130,23 @@ class SurveyQuestion(models.Model):
+         'survey.user_input.line', 'question_id', string='Answers',
+         domain=[('skipped', '=', False)], groups='survey.group_survey_user')
+ 
++    # Conditional display
++    is_conditional = fields.Boolean(
++        string='Conditional Display', copy=False, help="""If checked, this question will be displayed only 
++        if the specified conditional answer have been selected in a previous question""")
++    triggering_question_id = fields.Many2one(
++        'survey.question', string="Triggering Question", copy=False, compute="_compute_triggering_question_id",
++        store=True, readonly=False, help="Question containing the triggering answer to display the current question.",
++        domain="""[('survey_id', '=', survey_id),
++                 '&', ('question_type', 'in', ['simple_choice', 'multiple_choice']),
++                 '|',
++                     ('sequence', '<', sequence),
++                     '&', ('sequence', '=', sequence), ('id', '<', id)]""")
++    triggering_answer_id = fields.Many2one(
++        'survey.question.answer', string="Triggering Answer", copy=False, compute="_compute_triggering_answer_id",
++        store=True, readonly=False, help="Answer that will trigger the display the current question.",
++        domain="[('question_id', '=', triggering_question_id)]")
++
+     _sql_constraints = [
+         ('positive_len_min', 'CHECK (validation_length_min >= 0)', 'A length must be positive!'),
+         ('positive_len_max', 'CHECK (validation_length_max >= 0)', 'A length must be positive!'),
+@@ -193,6 +210,25 @@ class SurveyQuestion(models.Model):
+             if question.question_type != 'char_box':
+                 question.save_as_nickname = False
+ 
++    @api.depends('is_conditional')
++    def _compute_triggering_question_id(self):
++        """ Used as an 'onchange' : Reset the triggering question if user uncheck 'Conditional Display'
++            Avoid CacheMiss : set the value to False if the value is not set yet."""
++        for question in self:
++            if not question.is_conditional or question.triggering_question_id is None:
++                question.triggering_question_id = False
++
++    @api.depends('triggering_question_id')
++    def _compute_triggering_answer_id(self):
++        """ Used as an 'onchange' : Reset the triggering answer if user unset or change the triggering question
++            or uncheck 'Conditional Display'.
++            Avoid CacheMiss : set the value to False if the value is not set yet."""
++        for question in self:
++            if not question.triggering_question_id \
++                    or question.triggering_question_id != question.triggering_answer_id.question_id\
++                    or question.triggering_answer_id is None:
++                question.triggering_answer_id = False
++
+     # Validation methods
+     def validate_question(self, answer, comment=None):
+         """ Validate question, depending on question type and parameters
+
+--- a/addons/survey/models/survey_survey.py
++++ b/addons/survey/models/survey_survey.py
+@@ -83,7 +83,8 @@ class Survey(models.Model):
+         string="Scoring", required=True, default='no_scoring')
+     scoring_success_min = fields.Float('Success %', default=80.0)
+     # attendees context: attempts and time limitation
+-    is_attempts_limited = fields.Boolean('Limited number of attempts', help="Check this option if you want to limit the number of attempts per user")
++    is_attempts_limited = fields.Boolean('Limited number of attempts', help="Check this option if you want to limit the number of attempts per user",
++                                         compute="_compute_is_attempts_limited", store=True, readonly=False)
+     attempts_limit = fields.Integer('Number of attempts', default=1)
+     is_time_limited = fields.Boolean('The survey is limited in time')
+     time_limit = fields.Float("Time limit (minutes)")
+@@ -126,6 +127,8 @@ class Survey(models.Model):
+     session_show_leaderboard = fields.Boolean("Show Session Leaderboard", compute='_compute_session_show_leaderboard',
+         help="Whether or not we want to show the attendees leaderboard for this survey.")
+     session_speed_rating = fields.Boolean("Reward quick answers", help="Attendees get more points if they answer quickly")
++    # conditional questions management
++    has_conditional_questions = fields.Boolean("Contains conditional questions", compute="_compute_has_conditional_questions")
+ 
+     _sql_constraints = [
+         ('access_token_unique', 'unique(access_token)', 'Access token should be unique'),
+@@ -178,6 +181,14 @@ class Survey(models.Model):
+             survey.page_ids = survey.question_and_page_ids.filtered(lambda question: question.is_page)
+             survey.question_ids = survey.question_and_page_ids - survey.page_ids
+ 
++    @api.depends('question_and_page_ids.is_conditional', 'users_login_required', 'access_mode')
++    def _compute_is_attempts_limited(self):
++        for survey in self:
++            if any(question.is_conditional for question in survey.question_and_page_ids)\
++                    or (survey.access_mode == 'public' and not survey.users_login_required)\
++                    or survey.is_attempts_limited is None:
++                survey.is_attempts_limited = False
++
+     @api.depends('session_start_time', 'user_input_ids')
+     def _compute_session_answer_count(self):
+         """ We have to loop since our result is dependent of the survey.session_start_time.
+@@ -221,6 +232,11 @@ class Survey(models.Model):
+             survey.session_show_leaderboard = survey.scoring_type != 'no_scoring' and \
+                 any(question.save_as_nickname for question in survey.question_and_page_ids)
+ 
++    @api.depends('question_and_page_ids.is_conditional')
++    def _compute_has_conditional_questions(self):
++        for survey in self:
++            survey.has_conditional_questions = any(question.is_conditional for question in survey.question_and_page_ids)
++
+     @api.onchange('scoring_success_min')
+     def _onchange_scoring_success_min(self):
+         if self.scoring_success_min < 0 or self.scoring_success_min > 100:
+@@ -232,11 +248,6 @@ class Survey(models.Model):
+             self.certification = False
+             self.is_time_limited = False
+ 
+-    @api.onchange('users_login_required', 'access_mode')
+-    def _onchange_access_mode(self):
+-        if self.access_mode == 'public' and not self.users_login_required:
+-            self.is_attempts_limited = False
+-
+     @api.onchange('attempts_limit')
+     def _onchange_attempts_limit(self):
+         if self.attempts_limit <= 0:
+@@ -430,63 +441,57 @@ class Survey(models.Model):
+     @api.model
+     def _get_pages_or_questions(self, user_input):
+         if self.questions_layout == 'one_page':
+-            return None
++            return self.env['survey.question']
+         elif self.questions_layout == 'page_per_question' and self.questions_selection == 'random':
+-            return list(enumerate(
+-                user_input.predefined_question_ids
+-            ))
++            return user_input.predefined_question_ids
+         else:
+-            return list(enumerate(
+-                self.question_ids if self.questions_layout == 'page_per_question' else self.page_ids
+-            ))
+-
+-    @api.model
+-    def _previous_page_or_question_id(self, user_input, page_or_question_id):
+-        survey = user_input.survey_id
+-        pages_or_questions = survey._get_pages_or_questions(user_input)
+-
+-        current_page_index = pages_or_questions.index(next(p for p in pages_or_questions if p[1].id == page_or_question_id))
+-        # is first page
+-        if current_page_index == 0:
+-            return None
+-
+-        previous_page_id = pages_or_questions[current_page_index - 1][1].id
+-
+-        return previous_page_id
+-
+-    @api.model
+-    def next_page_or_question(self, user_input, page_or_question_id):
+-        """ The next page to display to the user, knowing that page_id is the id
+-            of the last displayed page.
++            return self.question_ids if self.questions_layout == 'page_per_question' else self.page_ids
+ 
+-            If page_id == 0, it will always return the first page of the survey.
+-
+-            If all the pages have been displayed, it will return None
+-
+-            .. note::
+-                It is assumed here that a careful user will not try to set go_back
+-                to True if she knows that the page to display is the first one!
+-                (doing this will probably cause a giant worm to eat her house)
++    def _get_next_page_or_question(self, user_input, page_or_question_id, go_back=False):
++        """
++        This methods gets the next question or page to display.
++        In case the survey contains conditional question, when navigating to next or previous questions,
++        in page_per_question layout only, the next or previous question to display depends on the selected answers
++        and the questions hierarchy. This methods returns the next question index to display among the survey_questions.
++        :param user_input: user's answers
++        :param page_or_question_id: current page or question id
++        :param go_back: must be True to get the previous question
++        :return: next or previous question.id
+         """
+ 
+         survey = user_input.survey_id
+-
+         pages_or_questions = survey._get_pages_or_questions(user_input)
+-        if not pages_or_questions:
+-            return (None, False)
+-
+-        # First page
+-        if page_or_question_id == 0:
+-            return (pages_or_questions[0][1], len(pages_or_questions) == 1)
++        Question = self.env['survey.question']
++
++        # Get Next
++        if not go_back:
++            if not pages_or_questions:
++                return Question
++            # First page
++            if page_or_question_id == 0:
++                return pages_or_questions[0]
++
++        current_page_index = pages_or_questions.ids.index(next(p.id for p in pages_or_questions if p.id == page_or_question_id))
++
++        # Get previous and we are on first page  OR Get Next and we are on last page
++        if (go_back and current_page_index == 0) or current_page_index == len(pages_or_questions) - 1:
++            return Question
++
++        # Conditional Questions Management
++        triggering_answer_by_question, triggered_questions_by_answer, selected_answers = user_input._get_conditional_values()
++        if survey.has_conditional_questions and survey.questions_layout == 'page_per_question' and triggered_questions_by_answer:
++            potential_next_questions = pages_or_questions[0:current_page_index] if go_back \
++                else pages_or_questions[current_page_index+1:]
++            for question in sorted(potential_next_questions, key=lambda q: q.id, reverse=go_back):
++                triggering_answer = triggering_answer_by_question.get(question)
++                if not triggering_answer or triggering_answer in selected_answers:
++                    # If next question found
++                    return question
++        else:
++            return pages_or_questions[current_page_index + (1 if not go_back else -1)]
+ 
+-        current_page_index = pages_or_questions.index(next(p for p in pages_or_questions if p[1].id == page_or_question_id))
++        return Question
+ 
+-        # All the pages have been displayed
+-        if current_page_index == len(pages_or_questions) - 1:
+-            return (None, False)
+-        else:
+-            show_last = current_page_index == len(pages_or_questions) - 2
+-            return (pages_or_questions[current_page_index + 1][1], show_last)
+ 
+     def _get_survey_questions(self, answer=None, page_id=None, question_id=None):
+         """ Returns a tuple containing: the survey question and the passed question_id / page_id
+@@ -530,6 +535,23 @@ class Survey(models.Model):
+             questions = questions & answer.predefined_question_ids
+         return questions, page_or_question_id
+ 
++    # ------------------------------------------------------------
++    # CONDITIONAL QUESTIONS MANAGEMENT
++    # ------------------------------------------------------------
++
++    def _get_conditional_maps(self):
++        triggering_answer_by_question = {}
++        triggered_questions_by_answer = {}
++        for question in self.question_ids:
++            triggering_answer_by_question[question] = question.is_conditional and question.triggering_answer_id
++
++            if question.is_conditional:
++                if question.triggering_answer_id in triggered_questions_by_answer:
++                    triggered_questions_by_answer[question.triggering_answer_id] |= question
++                else:
++                    triggered_questions_by_answer[question.triggering_answer_id] = question
++        return triggering_answer_by_question, triggered_questions_by_answer
++
+     # ------------------------------------------------------------
+     # SESSIONS MANAGEMENT
+     # ------------------------------------------------------------
+
+--- a/addons/survey/models/survey_user.py
++++ b/addons/survey/models/survey_user.py
+@@ -55,7 +55,7 @@ class SurveyUserInput(models.Model):
+         ('unique_token', 'UNIQUE (access_token)', 'An access token must be unique!'),
+     ]
+ 
+-    @api.depends('user_input_line_ids.answer_score', 'user_input_line_ids.question_id')
++    @api.depends('user_input_line_ids.answer_score', 'user_input_line_ids.question_id', 'predefined_question_ids')
+     def _compute_scoring_values(self):
+         for user_input in self:
+             total_possible_score = sum([
+@@ -209,6 +209,9 @@ class SurveyUserInput(models.Model):
+                 if user_input.survey_id.certification_give_badge:
+                     badge_ids.append(user_input.survey_id.certification_badge_id.id)
+ 
++            # Update predefined_question_id to remove inactive questions
++            user_input.predefined_question_ids -= user_input._get_inactive_conditional_questions()
++
+         if badge_ids:
+             challenges = Challenge.search([('reward_id', 'in', badge_ids)])
+             if challenges:
+@@ -359,6 +362,90 @@ class SurveyUserInput(models.Model):
+             {'text': _("Unanswered"), 'count': res[user_input]['skipped']}
+         ] for user_input in self]
+ 
++    # ------------------------------------------------------------
++    # Conditional Questions Management
++    # ------------------------------------------------------------
++
++    def _get_conditional_values(self):
++        """ For survey containing conditional questions, we need a triggered_questions_by_answer map that contains
++                {key: answer, value: the question that the answer triggers, if selected},
++         The idea is to be able to verify, on every answer check, if this answer is triggering the display
++         of another question.
++         If answer is not in the conditional map:
++            - nothing happens.
++         If the answer is in the conditional map:
++            - If we are in ONE PAGE survey : (handled at CLIENT side)
++                -> display immediately the depending question
++            - If we are in PAGE PER SECTION : (handled at CLIENT side)
++                - If related question is on the same page :
++                    -> display immediately the depending question
++                - If the related question is not on the same page :
++                    -> keep the answers in memory and check at next page load if the depending question is in there and
++                       display it, if so.
++            - If we are in PAGE PER QUESTION : (handled at SERVER side)
++                -> During submit, determine which is the next question to display getting the next question
++                   that is the next in sequence and that is either not triggered by another question's answer, or that
++                   is triggered by an already selected answer.
++         To do all this, we need to return:
++            - list of all selected answers: [answer_id1, answer_id2, ...] (for survey reloading, otherwise, this list is
++              updated at client side)
++            - triggered_questions_by_answer: dict -> for a given answer, list of questions triggered by this answer;
++                Used mainly for dynamic show/hide behaviour at client side
++            - triggering_answer_by_question: dict -> for a given question, the answer that triggers it
++                Used mainly to ease template rendering
++        """
++        triggering_answer_by_question, triggered_questions_by_answer = {}, {}
++        # Ignore conditional configuration if randomised questions selection
++        if self.survey_id.questions_selection != 'random':
++            triggering_answer_by_question, triggered_questions_by_answer = self.survey_id._get_conditional_maps()
++        selected_answers = self._get_selected_suggested_answers()
++
++        return triggering_answer_by_question, triggered_questions_by_answer, selected_answers
++
++    def _get_selected_suggested_answers(self):
++        """
++        For now, only simple and multiple choices question type are handled by the conditional questions feature.
++        Mapping all the suggested answers selected by the user will also include answers from matrix question type,
++        Those ones won't be used.
++        Maybe someday, conditional questions feature will be extended to work with matrix question.
++        :return: all the suggested answer selected by the user.
++        """
++        return self.mapped('user_input_line_ids.suggested_answer_id')
++
++    def _clear_inactive_conditional_answers(self):
++        """
++        Clean eventual answers on conditional questions that should not have been displayed to user.
++        This method is used mainly for page per question survey, a similar method does the same treatment
++        at client side for the other survey layouts.
++        E.g.: if depending answer was uncheck after answering conditional question, we need to clear answers
++              of that conditional question, for two reasons:
++              - ensure correct scoring
++              - if the selected answer triggers another question later in the survey, if the answer is not cleared,
++                a question that should not be displayed to the user will be.
++        
++        TODO DBE: Maybe this can be the only cleaning method, even for section_per_page or one_page where 
++        conditional questions are, for now, cleared in JS directly. But this can be annoying if user typed a long 
++        answer, changed his mind unchecking depending answer and changed again his mind by rechecking the depending 
++        answer -> For now, the long answer will be lost. If we use this as the master cleaning method, 
++        long answer will be cleared only during submit.
++        """
++        inactive_questions = self._get_inactive_conditional_questions()
++
++        # delete user.input.line on question that should not be answered.
++        answers_to_delete = self.user_input_line_ids.filtered(lambda answer: answer.question_id in inactive_questions)
++        answers_to_delete.unlink()
++
++    def _get_inactive_conditional_questions(self):
++        triggering_answer_by_question, triggered_questions_by_answer, selected_answers = self._get_conditional_values()
++
++        # get questions that should not be answered
++        inactive_questions = self.env['survey.question']
++        for answer in triggered_questions_by_answer.keys():
++            if answer not in selected_answers:
++                for question in triggered_questions_by_answer[answer]:
++                    inactive_questions |= question
++        return inactive_questions
++
+ 
+ class SurveyUserInputLine(models.Model):
+     _name = 'survey.user_input.line'

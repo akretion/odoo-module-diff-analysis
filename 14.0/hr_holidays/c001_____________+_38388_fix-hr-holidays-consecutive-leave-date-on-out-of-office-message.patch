@@ -1,0 +1,156 @@
+PR: https://github.com/odoo/odoo/pull/38388
+
+From: 802817c92586f87ef6dd431011d8a9615eb4df8c
+From: Barad Mahendra
+Date: 2019-11-25 15:59:03
+
+Structural Changes: 3
+Total Changes: 52
+
+[FIX] hr_holidays: consecutive leave date on out of office message
+
+Before this commit, when a user was on leave, the out of office
+message displayed the current leave-in-progress date-to.
+This information was misleading when the user on leave used different
+types of leaves, because other users would expect their colleague to
+come back from vacation sooner.
+
+For instance, suppose that user is on vacation on October from 18-22
+(included), and from 25-28 (incl.), with a week-end from 23-24:
+
+    +--------------------------------------+
+    |          OCTOBER calendar            |
+    +--------------------------------------+
+    |   Mo.  Tu.  We.  Th.  Fr.  Sa.  Su.  |
+    |                                      |
+    |                                      |
+    |          on-leave          week-end  |
+    |   <-------------------->   <------>  |
+    |   18   19   20   21   22   23   24   |
+    |                                      |
+    |        on-leave                      |
+    |   <--------------->                  |
+    |   25   26   27   28   29   30   31   |
+    +--------------------------------------+
+
+On November 20, other users would see "On leave until _November
+22_ included", instead of _November 28_.
+
+This commit fixes the issue by taking into account consecutive
+holidays to compute the actual end date of vacation.
+
+Task-2002525
+
+closes odoo/odoo#38388
+
+Signed-off-by: Alexandre Kühn (aku) <aku@odoo.com>
+
+================================= pseudo patch: =================================
+
+--- a/addons/hr_holidays/models/hr_employee.py
++++ b/addons/hr_holidays/models/hr_employee.py
+@@ -2,6 +2,8 @@
+ # Part of Odoo. See LICENSE file for full copyright and licensing details.
+ 
+ import datetime
++from collections import defaultdict
++from datetime import timedelta
+ 
+ from odoo import api, fields, models
+ from odoo.tools.float_utils import float_round
+@@ -30,6 +32,7 @@ class HrEmployeeBase(models.AbstractModel):
+     current_leave_id = fields.Many2one('hr.leave.type', compute='_compute_leave_status', string="Current Time Off Type")
+     leave_date_from = fields.Date('From Date', compute='_compute_leave_status')
+     leave_date_to = fields.Date('To Date', compute='_compute_leave_status')
++    leave_consolidated_date_to = fields.Date('Leave Consolidated To Date', compute='_compute_leave_consolidated_date_to')
+     leaves_count = fields.Float('Number of Time Off', compute='_compute_remaining_leaves')
+     allocation_count = fields.Float('Total number of days allocated.', compute='_compute_allocation_count')
+     allocation_used_count = fields.Float('Total number of days off used', compute='_compute_total_allocation_used')
+@@ -97,6 +100,34 @@ class HrEmployeeBase(models.AbstractModel):
+         employees = self.filtered(lambda employee: employee.hr_presence_state != 'present' and employee.is_absent)
+         employees.update({'hr_presence_state': 'absent'})
+ 
++    def _compute_leave_consolidated_date_to(self):
++        holidays = self.env['hr.leave'].sudo().search([
++            ('employee_id', 'in', self.ids),
++            ('date_to', '>=', fields.Datetime.now()),
++            ('state', 'not in', ('cancel', 'refuse'))
++        ], order="date_from")
++
++        leave_data = defaultdict(list)
++        for holiday in holidays:
++            leave_data[holiday.employee_id].append({'date_to': holiday.date_to.date(), 'date_from': holiday.date_from.date()})
++
++        for employee, leave_data in leave_data.items():
++            first_leave = leave_data[0]
++            date_to = first_leave['date_to']
++            working_days = employee.mapped('resource_calendar_id.attendance_ids.dayofweek')
++            days = 1
++            for next_leave in leave_data:
++                while str((first_leave['date_to'] + timedelta(days=days)).weekday()) not in working_days:
++                    days += 1
++                if next_leave['date_from'] == first_leave['date_to'] + timedelta(days=days):
++                    days = 1
++                    date_to = next_leave['date_to']
++                    first_leave = next_leave
++            employee.leave_consolidated_date_to = date_to
++
++        for employee in self - holidays.employee_id:
++            employee.leave_consolidated_date_to = False
++
+     def _compute_leave_status(self):
+         # Used SUPERUSER_ID to forcefully get status of other user's leave, to bypass record rule
+         holidays = self.env['hr.leave'].sudo().search([
+
+--- a/addons/hr_holidays/models/mail_channel.py
++++ b/addons/hr_holidays/models/mail_channel.py
+@@ -1,7 +1,7 @@
+ # -*- coding: utf-8 -*-
+ # Part of Odoo. See LICENSE file for full copyright and licensing details.
+ 
+-from odoo import api, fields, models
++from odoo import models
+ 
+ 
+ class Channel(models.Model):
+@@ -12,16 +12,7 @@ class Channel(models.Model):
+         # only search for leave out_of_office_message if im_status is on leave
+         partners_on_leave = [partner_id for partner_id in direct_partners.ids if 'leave' in partner_infos[partner_id]['im_status']]
+         if partners_on_leave:
+-            now = fields.Datetime.now()
+-            self.env.cr.execute('''SELECT res_users.partner_id as partner_id, hr_leave.date_to as date_to
+-                                FROM res_users
+-                                JOIN hr_leave ON hr_leave.user_id = res_users.id
+-                                AND hr_leave.state not in ('cancel', 'refuse')
+-                                AND res_users.active = 't'
+-                                AND hr_leave.date_from <= %s
+-                                AND hr_leave.date_to >= %s
+-                                AND res_users.partner_id in %s''', (now, now, tuple(partners_on_leave)))
+-            out_of_office_infos = dict(((res['partner_id'], res) for res in self.env.cr.dictfetchall()))
+-            for partner_id, out_of_office_info in out_of_office_infos.items():
+-                partner_infos[partner_id]['out_of_office_date_end'] = out_of_office_info['date_to']
++            for user in self.env['res.users'].sudo().search([('partner_id', 'in', partners_on_leave)]):
++                partner_infos[user.partner_id.id]['out_of_office_date_end'] = user.leave_consolidated_date_to
++
+         return partner_infos
+
+--- a/addons/hr_holidays/models/res_users.py
++++ b/addons/hr_holidays/models/res_users.py
+@@ -11,7 +11,7 @@ class User(models.Model):
+     show_leaves = fields.Boolean(related='employee_id.show_leaves')
+     allocation_used_count = fields.Float(related='employee_id.allocation_used_count')
+     allocation_count = fields.Float(related='employee_id.allocation_count')
+-    leave_date_to = fields.Date(related='employee_id.leave_date_to')
++    leave_consolidated_date_to = fields.Date(related='employee_id.leave_consolidated_date_to')
+     is_absent = fields.Boolean(related='employee_id.is_absent')
+     allocation_used_display = fields.Char(related='employee_id.allocation_used_display')
+     allocation_display = fields.Char(related='employee_id.allocation_display')
+@@ -27,7 +27,7 @@ class User(models.Model):
+             'show_leaves',
+             'allocation_used_count',
+             'allocation_count',
+-            'leave_date_to',
++            'leave_consolidated_date_to',
+             'is_absent',
+             'allocation_used_display',
+             'allocation_display',
