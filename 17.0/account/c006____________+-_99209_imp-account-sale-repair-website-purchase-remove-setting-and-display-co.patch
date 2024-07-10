@@ -1,0 +1,132 @@
+PR: https://github.com/odoo/odoo/pull/99209
+
+From: ee2c82700e7de09e0db1d67425b2b5e0a2f9eed3
+From: maximilien(malb)
+Date: 2023-03-02 18:24:45
+
+Structural Changes: 6
+Total Changes: 54
+
+[IMP] account,sale,repair,website,purchase: remove setting and display correction
+
+Before this commit, the accounting module had a setting on the selection of taxes used by the sales, purchase, website_sale, ... modules. In addition, the website_sale module had the same setting related to the accounting one.
+This PR isolates the tax selection parameter in the website_sale module, and instead of using the tax selection, the accounting module will use rounding method (round per line, round globally).
+Selecting one of the two will change the display of all account_move or other view using the tax selection setting.
+
+Display changes:
+In round per line, a column tax excluded will always be displayed while a column tax included will be in optional hide.
+On the other hand, in the round globally, only the tax excluded columns will be available.
+
+closes odoo/odoo#99209
+
+Task-id: 2954332
+Related: odoo/upgrade#3826
+Related: odoo/enterprise#30853
+Signed-off-by: William André (wan) <wan@odoo.com>
+
+================================= pseudo patch: =================================
+
+--- a/addons/account/models/account_move.py
++++ b/addons/account/models/account_move.py
+@@ -282,7 +282,9 @@ class AccountMove(models.Model):
+     )
+     needed_terms = fields.Binary(compute='_compute_needed_terms')
+     needed_terms_dirty = fields.Boolean(compute='_compute_needed_terms')
+-
++    tax_calculation_rounding_method = fields.Selection(
++        related='company_id.tax_calculation_rounding_method',
++        string='Tax calculation rounding method', readonly=True)
+     # === Partner fields === #
+     partner_id = fields.Many2one(
+         'res.partner',
+
+--- a/addons/account/models/account_move_line.py
++++ b/addons/account/models/account_move_line.py
+@@ -345,7 +345,9 @@ class AccountMoveLine(models.Model):
+         digits='Discount',
+         default=0.0,
+     )
+-
++    tax_calculation_rounding_method = fields.Selection(
++        related='company_id.tax_calculation_rounding_method',
++        string='Tax calculation rounding method', readonly=True)
+     # === Invoice sync fields === #
+     term_key = fields.Binary(compute='_compute_term_key')
+     tax_key = fields.Binary(compute='_compute_tax_key')
+
+--- a/addons/account/models/res_config_settings.py
++++ b/addons/account/models/res_config_settings.py
+@@ -71,28 +71,10 @@ class ResConfigSettings(models.TransientModel):
+     module_account_accountant = fields.Boolean(string='Accounting')
+     group_warning_account = fields.Boolean(string="Warnings in Invoices", implied_group='account.group_warning_account')
+     group_cash_rounding = fields.Boolean(string="Cash Rounding", implied_group='account.group_cash_rounding')
+-    # group_show_line_subtotals_tax_excluded and group_show_line_subtotals_tax_included are opposite,
+-    # so we can assume exactly one of them will be set, and not the other.
+-    # We need both of them to coexist so we can take advantage of automatic group assignation.
+-    group_show_line_subtotals_tax_excluded = fields.Boolean(
+-        "Show line subtotals without taxes (B2B)",
+-        implied_group='account.group_show_line_subtotals_tax_excluded',
+-        group='base.group_portal,base.group_user,base.group_public',
+-        compute='_compute_group_show_line_subtotals', store=True, readonly=False)
+-    group_show_line_subtotals_tax_included = fields.Boolean(
+-        "Show line subtotals with taxes (B2C)",
+-        implied_group='account.group_show_line_subtotals_tax_included',
+-        group='base.group_portal,base.group_user,base.group_public',
+-        compute='_compute_group_show_line_subtotals', store=True, readonly=False)
+     group_show_sale_receipts = fields.Boolean(string='Sale Receipt',
+         implied_group='account.group_sale_receipts')
+     group_show_purchase_receipts = fields.Boolean(string='Purchase Receipt',
+         implied_group='account.group_purchase_receipts')
+-    show_line_subtotals_tax_selection = fields.Selection([
+-        ('tax_excluded', 'Tax Excluded'),
+-        ('tax_included', 'Tax Included')], string="Line Subtotals Tax Display",
+-        required=True, default='tax_excluded',
+-        config_parameter='account.show_line_subtotals_tax_selection')
+     module_account_budget = fields.Boolean(string='Budget Management')
+     module_account_payment = fields.Boolean(string='Invoice Online Payment')
+     module_account_reports = fields.Boolean("Dynamic Reports")
+@@ -208,12 +190,6 @@ class ResConfigSettings(models.TransientModel):
+         self.has_chart_of_accounts = bool(self.company_id.chart_template)
+         self.has_accounting_entries = self.company_id._existing_accounting()
+ 
+-    @api.depends('show_line_subtotals_tax_selection')
+-    def _compute_group_show_line_subtotals(self):
+-        for wizard in self:
+-            wizard.group_show_line_subtotals_tax_included = wizard.show_line_subtotals_tax_selection == "tax_included"
+-            wizard.group_show_line_subtotals_tax_excluded = wizard.show_line_subtotals_tax_selection == "tax_excluded"
+-
+     @api.onchange('group_analytic_accounting')
+     def onchange_analytic_accounting(self):
+         if self.group_analytic_accounting:
+
+--- a/addons/account/models/res_users.py
++++ b/addons/account/models/res_users.py
+@@ -5,28 +5,6 @@ from odoo import api, models, _
+ from odoo.exceptions import ValidationError
+ 
+ 
+-class Users(models.Model):
+-    _inherit = "res.users"
+-
+-    @api.constrains('groups_id')
+-    def _check_one_user_type(self):
+-        super(Users, self)._check_one_user_type()
+-
+-        g1 = self.env.ref('account.group_show_line_subtotals_tax_included', False)
+-        g2 = self.env.ref('account.group_show_line_subtotals_tax_excluded', False)
+-
+-        if not g1 or not g2:
+-            # A user cannot be in a non-existant group
+-            return
+-
+-        for user in self:
+-            if user._has_multiple_groups([g1.id, g2.id]):
+-                raise ValidationError(_("A user cannot have both Tax B2B and Tax B2C.\n"
+-                                        "You should go in General Settings, and choose to display Product Prices\n"
+-                                        "either in 'Tax-Included' or in 'Tax-Excluded' mode\n"
+-                                        "(or switch twice the mode if you are already in the desired one)."))
+-
+-
+ class GroupsView(models.Model):
+     _inherit = 'res.groups'
+ 
