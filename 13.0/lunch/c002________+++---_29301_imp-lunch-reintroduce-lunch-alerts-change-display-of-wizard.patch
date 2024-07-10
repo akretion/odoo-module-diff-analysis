@@ -1,0 +1,274 @@
+PR: https://github.com/odoo/odoo/pull/29301
+
+From: 6f5dc5733fa387a410166afb24339bb2a4a88019
+From: RomainLibert
+Date: 2018-12-06 09:33:30
+
+Structural Changes: 19
+Total Changes: 177
+
+[IMP] lunch: reintroduce lunch_alerts, change display of wizard
+
+We want to be able to use alerts in order to display a message to the
+users.
+We want to have a minimal display in the wizard.
+We want to link the toppings to the categories instead of the suppliers.
+
+closes odoo/odoo#29301
+
+================================= pseudo patch: =================================
+
+--- a/addons/lunch/models/__init__.py
++++ b/addons/lunch/models/__init__.py
+@@ -1,5 +1,6 @@
+ # -*- coding: utf-8 -*-
+ 
++from . import lunch_alert
+ from . import lunch_cashmove
+ from . import lunch_order
+ from . import lunch_product
+
+--- a/None
++++ b/addons/lunch/models/lunch_alert.py
+@@ -0,0 +1,115 @@
++# -*- coding: utf-8 -*-
++# Part of Odoo. See LICENSE file for full copyright and licensing details.
++
++import math
++import pytz
++
++from datetime import datetime, time
++
++from odoo import api, fields, models
++
++from odoo.osv import expression
++from odoo.tools import float_round
++
++
++WEEKDAY_TO_NAME = ['monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday']
++
++def float_to_time(hours, tz=None):
++    """ Convert a number of hours into a time object. """
++    if hours == 24.0:
++        return time.max
++    fractional, integral = math.modf(hours)
++    res = time(int(integral), int(float_round(60 * fractional, precision_digits=0)), 0)
++    if tz:
++        res = res.replace(tzinfo=pytz.timezone(tz))
++    return res
++
++def time_to_float(t):
++    return float_round(t.hour + t.minute/60 + t.second/3600, precision_digits=2)
++
++
++class LunchAlert(models.Model):
++    """ Alerts to display during a lunch order. An alert can be specific to a
++    given day, weekly or daily. The alert is displayed from start to end hour. """
++    _name = 'lunch.alert'
++    _description = 'Lunch Alert'
++    _rec_name = 'message'
++
++    message = fields.Text('Message', required=True)
++
++    recurrency = fields.Selection([('once', 'Specific Day'), ('reccurent', 'Reccurent')], 'Recurrency', default='once')
++    recurrency_from = fields.Float('From', default=7)
++    recurrency_to = fields.Float('To', default=23)
++    recurrency_date = fields.Date('Day', default=fields.Date.today())
++    recurrency_date_from = fields.Datetime('from', compute='_compute_recurrency_date_from', store=True)
++    recurrency_date_to = fields.Datetime('to', compute='_compute_recurrency_date_to', store=True)
++    recurrency_monday = fields.Boolean('Monday')
++    recurrency_tuesday = fields.Boolean('Tuesday')
++    recurrency_wednesday = fields.Boolean('Wednesday')
++    recurrency_thursday = fields.Boolean('Thursday')
++    recurrency_friday = fields.Boolean('Friday')
++    recurrency_saturday = fields.Boolean('Saturday')
++    recurrency_sunday = fields.Boolean('Sunday')
++
++    available_today = fields.Boolean('This is True when if the supplier is available today',
++                                     compute='_compute_available_today', search='_search_available_today')
++
++    @api.depends('recurrency_date', 'recurrency_from')
++    def _compute_recurrency_date_from(self):
++        for alert in self:
++            if alert.recurrency_date and alert.recurrency_from:
++                alert.recurrency_date_from = datetime.combine(alert.recurrency_date, float_to_time(alert.recurrency_from))
++
++    @api.depends('recurrency_date', 'recurrency_to')
++    def _compute_recurrency_date_to(self):
++        for alert in self:
++            if alert.recurrency_date and alert.recurrency_to:
++                alert.recurrency_date_to = datetime.combine(alert.recurrency_date, float_to_time(alert.recurrency_to))
++
++    @api.depends('recurrency', 'recurrency_date', 'recurrency_from', 'recurrency_to', 'recurrency_monday',
++                 'recurrency_tuesday', 'recurrency_wednesday', 'recurrency_thursday',
++                 'recurrency_friday', 'recurrency_saturday', 'recurrency_sunday')
++    def _compute_available_today(self):
++        now = fields.Datetime.now()
++
++        for alert in self:
++            time_from = float_to_time(alert.recurrency_from)
++            time_to = float_to_time(alert.recurrency_to)
++
++            if alert.recurrency == 'once':
++                alert.available_today = (alert.recurrency_date_from <= now <= alert.recurrency_date_to)
++            else:
++                fieldname = 'recurrency_%s' % (WEEKDAY_TO_NAME[now.weekday()])
++                alert.available_today = alert[fieldname] and (time_from <= now.time() <= time_to)
++
++    def _search_available_today(self, operator, value):
++        if (not operator in ['=', '!=']) or (not value in [True, False]):
++            return []
++
++        searching_for_true = (operator == '=' and value) or (operator == '!=' and not value)
++        now = fields.Datetime.now()
++        float_now = time_to_float(now.time())
++        fieldname = 'recurrency_%s' % (WEEKDAY_TO_NAME[now.weekday()])
++
++        if searching_for_true:
++            specific = expression.AND([
++                [('recurrency', '=', 'once')],
++                [('recurrency_date_from', '<=', now)],
++                [('recurrency_date_to', '>=', now)]
++            ])
++        else:
++            specific = expression.AND([
++                [('recurrency', '=', 'once')],
++                expression.OR([
++                    [('recurrency_date_from', '>=', now)],
++                    [('recurrency_date_to', '<=', now)]
++                ])
++            ])
++
++        recurrence = expression.AND([
++            [(fieldname, operator, value)],
++            [('recurrency_from', '<=' if searching_for_true else '>=', float_now)],
++            [('recurrency_to', '>=' if searching_for_true else '<=', float_now)]
++        ])
++
++        return expression.OR([specific, recurrence])
+
+--- a/addons/lunch/models/lunch_order.py
++++ b/addons/lunch/models/lunch_order.py
+@@ -123,8 +123,8 @@ class LunchOrderLine(models.Model):
+ 
+     name = fields.Char(related='product_id.name', string="Product Name", readonly=True)
+     order_id = fields.Many2one('lunch.order', 'Order', ondelete='cascade', required=True)
+-    topping_ids = fields.Many2many('lunch.product', string='Toppings')
+-    product_id = fields.Many2one('lunch.product', string="Product", domain=[('is_topping', '=', False)], required=True)
++    topping_ids = fields.Many2many('lunch.topping', string='Toppings')
++    product_id = fields.Many2one('lunch.product', string="Product", required=True)
+     category_id = fields.Many2one('lunch.product.category', string='Product Category',
+                                   related='product_id.category_id', readonly=True, store=True)
+     date = fields.Date(string='Date', related='order_id.date', readonly=True, store=True)
+@@ -147,7 +147,7 @@ class LunchOrderLine(models.Model):
+     @api.depends('topping_ids', 'product_id', 'quantity')
+     def _compute_total_price(self):
+         for line in self:
+-            line.price = line.quantity * sum(product.price for product in line.product_id | line.topping_ids)
++            line.price = line.quantity * (line.product_id.price + sum(line.topping_ids.mapped('price')))
+ 
+     def update_quantity(self, increment):
+         for line in self:
+
+--- a/addons/lunch/models/lunch_product.py
++++ b/addons/lunch/models/lunch_product.py
+@@ -14,6 +14,37 @@ class LunchProductCategory(models.Model):
+     _description = 'Lunch Product Category'
+ 
+     name = fields.Char('Product Category', required=True)
++    topping_ids = fields.One2many('lunch.topping', 'category_id')
++
++
++class LunchToppingType(models.Model):
++    """"""
++    _name = 'lunch.topping.type'
++    _description = 'Lunch Topping Type'
++
++    name = fields.Char('Name', required=True)
++
++
++class LunchTopping(models.Model):
++    """"""
++    _name = 'lunch.topping'
++    _description = 'Lunch Toppings'
++
++    name = fields.Char('Name', required=True)
++    price = fields.Float('Price', digits=dp.get_precision('Account'), required=True)
++    category_id = fields.Many2one('lunch.product.category')
++    type_id = fields.Many2one('lunch.topping.type')
++
++    def name_get(self):
++        currency_id = self.env.user.company_id.currency_id
++        res = dict(super(LunchTopping, self).name_get())
++        for topping in self:
++            if currency_id.position == 'before':
++                price = '%s %s' % (currency_id.symbol, topping.price)
++            else:
++                price = '%s %s' % (topping.price, currency_id.symbol)
++            res[topping.id] = '%s %s' % (topping.name, price)
++        return list(res.items())
+ 
+ 
+ class LunchProduct(models.Model):
+@@ -22,12 +53,11 @@ class LunchProduct(models.Model):
+     _description = 'Lunch Product'
+ 
+     name = fields.Char('Name', required=True)
+-    category_id = fields.Many2one('lunch.product.category', 'Product Category')
++    category_id = fields.Many2one('lunch.product.category', 'Product Category', required=True)
+     description = fields.Text('Description')
+     price = fields.Float('Price', digits=dp.get_precision('Account'), required=True)
+     supplier_id = fields.Many2one('lunch.supplier', 'Vendor', required=True)
+     active = fields.Boolean(default=True)
+-    is_topping = fields.Boolean("This product is an extra garniture")
+ 
+     # image: all image fields are base64 encoded and PIL-supported
+     image = fields.Binary(
+
+--- a/addons/lunch/models/lunch_supplier.py
++++ b/addons/lunch/models/lunch_supplier.py
+@@ -49,6 +49,9 @@ class LunchSupplier(models.Model):
+ 
+     vat = fields.Char(related='partner_id.vat')
+ 
++    responsible_id = fields.Many2one('res.users', string="Responsible", domain=lambda self: [('groups_id', 'in', self.env.ref('lunch.group_lunch_manager').id)],
++                                 help="This is used to set a responsible for this particular vendor")
++
+     image = fields.Binary(related='partner_id.image', readonly=False)
+     image_medium = fields.Binary(related='partner_id.image_medium', readonly=False)
+     image_small = fields.Binary(related='partner_id.image_small', readonly=False)
+@@ -60,17 +63,17 @@ class LunchSupplier(models.Model):
+     automatic_email_send = fields.Boolean('Automatic Email Sending')
+     automatic_email_time = fields.Float('Hour')
+ 
+-    recurrency = fields.Selection([('once', 'Specific Day'), ('reccurent', 'Reccurent')], 'Recurrency', default='once')
+-    recurrency_from = fields.Float('From')
+-    recurrency_to = fields.Float('To')
++    recurrency = fields.Selection([('once', 'Specific Day'), ('reccurent', 'Reccurent')], 'Recurrency', default='reccurent')
++    recurrency_from = fields.Float('From', default=7)
++    recurrency_to = fields.Float('To', default=23)
+     recurrency_date = fields.Date('Day', default=fields.Date.today())
+     recurrency_date_from = fields.Datetime('from', compute='_compute_recurrency_date_from', store=True)
+     recurrency_date_to = fields.Datetime('to', compute='_compute_recurrency_date_to', store=True)
+-    recurrency_monday = fields.Boolean('Monday')
+-    recurrency_tuesday = fields.Boolean('Tuesday')
+-    recurrency_wednesday = fields.Boolean('Wednesday')
+-    recurrency_thursday = fields.Boolean('Thursday')
+-    recurrency_friday = fields.Boolean('Friday')
++    recurrency_monday = fields.Boolean('Monday', default=True)
++    recurrency_tuesday = fields.Boolean('Tuesday', default=True)
++    recurrency_wednesday = fields.Boolean('Wednesday', default=True)
++    recurrency_thursday = fields.Boolean('Thursday', default=True)
++    recurrency_friday = fields.Boolean('Friday', default=True)
+     recurrency_saturday = fields.Boolean('Saturday')
+     recurrency_sunday = fields.Boolean('Sunday')
+ 
+@@ -142,7 +145,7 @@ class LunchSupplier(models.Model):
+             time_to = float_to_time(supplier.recurrency_to)
+ 
+             if supplier.recurrency == 'once':
+-                supplier.available_today = (supplier.reccurrency_date_from <= now <= supplier.reccurrency_date_to)
++                supplier.available_today = (supplier.recurrency_date_from <= now <= supplier.recurrency_date_to)
+             else:
+                 fieldname = 'recurrency_%s' % (WEEKDAY_TO_NAME[now.weekday()])
+                 supplier.available_today = supplier[fieldname] and (time_from <= now.time() <= time_to)

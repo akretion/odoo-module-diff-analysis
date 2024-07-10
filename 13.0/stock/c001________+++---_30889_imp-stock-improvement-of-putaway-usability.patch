@@ -1,0 +1,253 @@
+PR: https://github.com/odoo/odoo/pull/30889
+
+From: bad6db24834c8be7c2b3a635cf21f912258953b4
+From: svs-odoo
+Date: 2019-02-25 09:55:32
+
+Structural Changes: 20
+Total Changes: 146
+
+[IMP] stock: improvement of putaway usability
+
+PutAwayStrategy model was deleted and FixedPutAwayStrategy model was
+renamed into PutAwayRule.
+Now, each location can contain multiple putaway rules, each rule
+applying either on product or on product category.
+
+The purpose is to:
+-   Add more visibility on putaway settings (with a stat
+    button on product, product category and location views, and a
+    submenu item in Product configuration menu).
+
+-   Change putaway model to avoid redundancy.
+
+Task #1935169
+
+closes odoo/odoo#30889
+
+================================= pseudo patch: =================================
+
+--- a/addons/stock/models/product.py
++++ b/addons/stock/models/product.py
+@@ -74,6 +74,7 @@ class Product(models.Model):
+     nbr_reordering_rules = fields.Integer('Reordering Rules', compute='_compute_nbr_reordering_rules')
+     reordering_min_qty = fields.Float(compute='_compute_nbr_reordering_rules')
+     reordering_max_qty = fields.Float(compute='_compute_nbr_reordering_rules')
++    putaway_rule_ids = fields.One2many('stock.putaway.rule', 'product_id', 'Putaway Rules')
+ 
+     @api.depends('stock_move_ids.product_qty', 'stock_move_ids.state')
+     def _compute_quantities(self):
+@@ -370,6 +371,15 @@ class Product(models.Model):
+         action['domain'] = [('product_id', '=', self.id)]
+         return action
+ 
++    def action_view_related_putaway_rules(self):
++        self.ensure_one()
++        domain = [
++            '|',
++                ('product_id', '=', self.id),
++                ('category_id', '=', self.product_tmpl_id.categ_id.id),
++        ]
++        return self.env['product.template']._get_action_view_related_putaway_rules(domain)
++
+     def action_open_product_lot(self):
+         self.ensure_one()
+         action = self.env.ref('stock.action_production_lot_form').read()[0]
+@@ -505,6 +515,17 @@ class ProductTemplate(models.Model):
+             }
+         return prod_available
+ 
++    @api.model
++    def _get_action_view_related_putaway_rules(self, domain):
++        return {
++            'name': _('Putaway Rules'),
++            'type': 'ir.actions.act_window',
++            'res_model': 'stock.putaway.rule',
++            'view_type': 'list',
++            'view_mode': 'list',
++            'domain': domain,
++        }
++
+     def _search_qty_available(self, operator, value):
+         domain = [('qty_available', operator, value)]
+         product_variant_ids = self.env['product.product'].search(domain)
+@@ -593,6 +614,15 @@ class ProductTemplate(models.Model):
+         action['context'] = {'search_default_internal_loc': 1}
+         return action
+ 
++    def action_view_related_putaway_rules(self):
++        self.ensure_one()
++        domain = [
++            '|',
++                ('product_id.product_tmpl_id', '=', self.id),
++                ('category_id', '=', self.categ_id.id),
++        ]
++        return self._get_action_view_related_putaway_rules(domain)
++
+     def action_view_orderpoints(self):
+         products = self.mapped('product_variant_ids')
+         action = self.env.ref('stock.product_open_orderpoint').read()[0]
+@@ -632,6 +662,7 @@ class ProductCategory(models.Model):
+     total_route_ids = fields.Many2many(
+         'stock.location.route', string='Total routes', compute='_compute_total_route_ids',
+         readonly=True)
++    putaway_rule_ids = fields.One2many('stock.putaway.rule', 'category_id', 'Putaway Rules')
+ 
+     @api.one
+     def _compute_total_route_ids(self):
+
+--- a/addons/stock/models/product_strategy.py
++++ b/addons/stock/models/product_strategy.py
+@@ -12,47 +12,59 @@ class RemovalStrategy(models.Model):
+     method = fields.Char("Method", required=True, help="FIFO, LIFO...")
+ 
+ 
+-class PutAwayStrategy(models.Model):
+-    _name = 'product.putaway'
+-    _description = 'Put Away Strategy'
++class StockPutawayRule(models.Model):
++    _name = 'stock.putaway.rule'
++    _order = 'sequence,product_id'
++    _description = 'Putaway Rule'
+ 
+-    name = fields.Char('Name', required=True)
++    def _default_category_id(self):
++        if self.env.context.get('active_model') == 'product.category':
++            return self.env.context.get('active_id')
++
++    def _default_location_id(self):
++        if self.env.context.get('active_model') == 'stock.location':
++            return self.env.context.get('active_id')
++
++    def _default_product_id(self):
++        if self.env.context.get('active_model') == 'product.template' and self.env.context.get('active_id'):
++            product_template = self.env['product.template'].browse(self.env.context.get('active_id'))
++            product_template = product_template.exists()
++            if product_template.product_variant_count == 1:
++                return product_template.product_variant_id
++        elif self.env.context.get('active_model') == 'product.product':
++            return self.env.context.get('active_id')
+ 
+-    fixed_location_ids = fields.One2many(
+-        'stock.fixed.putaway.strat', 'putaway_id',
+-        'Fixed Locations Per Product Category', domain=[('category_id', '!=', False)], copy=True)
+-    product_location_ids = fields.One2many(
+-        'stock.fixed.putaway.strat', 'putaway_id',
+-        'Fixed Locations Per Product', domain=[('product_id', '!=', False)], copy=True)
+-
+-    def putaway_apply(self, product):
+-        put_away = self._get_putaway_rule(product)
+-        if put_away:
+-            return put_away.fixed_location_id
+-        return self.env['stock.location']
+-
+-    def _get_putaway_rule(self, product):
+-        if self.product_location_ids:
+-            put_away = self.product_location_ids.filtered(lambda x: x.product_id == product)
+-            if put_away:
+-                return put_away[0]
+-        if self.fixed_location_ids:
+-            categ = product.categ_id
+-            while categ:
+-                put_away = self.fixed_location_ids.filtered(lambda x: x.category_id == categ)
+-                if put_away:
+-                    return put_away[0]
+-                categ = categ.parent_id
+-        return self.env['stock.location']
+-
+-
+-class FixedPutAwayStrategy(models.Model):
+-    _name = 'stock.fixed.putaway.strat'
+-    _order = 'sequence'
+-    _description = 'Fixed Putaway Strategy on Location'
+-
+-    product_id = fields.Many2one('product.product', 'Product')
+-    putaway_id = fields.Many2one('product.putaway', 'Put Away Method', required=True)
+-    category_id = fields.Many2one('product.category', 'Product Category')
+-    fixed_location_id = fields.Many2one('stock.location', 'Location', required=True)
++    def _domain_category_id(self):
++        active_model = self.env.context.get('active_model')
++        if active_model in ('product.template', 'product.product') and self.env.context.get('active_id'):
++            product = self.env[active_model].browse(self.env.context.get('active_id'))
++            product = product.exists()
++            if product:
++                return [('id', '=', product.categ_id.id)]
++        return []
++
++    def _domain_product_id(self):
++        if self.env.context.get('active_model') == 'product.template':
++            return [('product_tmpl_id', '=', self.env.context.get('active_id'))]
++        return []
++
++    product_id = fields.Many2one('product.product', 'Product',
++        default=_default_product_id, domain=_domain_product_id, ondelete='cascade')
++    category_id = fields.Many2one('product.category', 'Product Category',
++        default=_default_category_id, domain=_domain_category_id, ondelete='cascade')
++    location_in_id = fields.Many2one('stock.location', 'When product arrives in',
++        default=_default_location_id, required=True, ondelete='cascade')
++    location_out_id = fields.Many2one('stock.location', 'Store to',
++        required=True, ondelete='cascade')
+     sequence = fields.Integer('Priority', help="Give to the more specialized category, a higher priority to have them in top of the list.")
++
++    @api.onchange('location_in_id')
++    def _onchange_location_in(self):
++        if self.location_out_id:
++            child_location_count = self.env['stock.location'].search_count([
++                ('id', '=', self.location_out_id.id),
++                ('id', 'child_of', self.location_in_id.id),
++                ('id', '!=', self.location_in_id.id),
++            ])
++            if not child_location_count:
++                self.location_out_id = None
+
+--- a/addons/stock/models/stock_location.py
++++ b/addons/stock/models/stock_location.py
+@@ -60,7 +60,7 @@ class Location(models.Model):
+     scrap_location = fields.Boolean('Is a Scrap Location?', default=False, help='Check this box to allow using this location to put scrapped/damaged goods.')
+     return_location = fields.Boolean('Is a Return Location?', help='Check this box to allow using this location as a return location.')
+     removal_strategy_id = fields.Many2one('product.removal', 'Removal Strategy', help="Defines the default method used for suggesting the exact location (shelf) where to take the products from, which lot etc. for this location. This method can be enforced at the product category level, and a fallback is made on the parent locations if none is set here.")
+-    putaway_strategy_id = fields.Many2one('product.putaway', 'Put Away Strategy', help="Allows to suggest the exact location (shelf) where to store the product.")
++    putaway_rule_ids = fields.One2many('stock.putaway.rule', 'location_in_id', 'Putaway Rules')
+     barcode = fields.Char('Barcode', copy=False, oldname='loc_barcode')
+     quant_ids = fields.One2many('stock.quant', 'location_id')
+ 
+@@ -143,13 +143,24 @@ class Location(models.Model):
+         location_ids = self._search(expression.AND([domain, args]), limit=limit, access_rights_uid=name_get_uid)
+         return self.browse(location_ids).name_get()
+ 
+-    def get_putaway_strategy(self, product):
++    def _get_putaway_strategy(self, product):
+         ''' Returns the location where the product has to be put, if any compliant putaway strategy is found. Otherwise returns None.'''
+         current_location = self
+         putaway_location = self.env['stock.location']
+         while current_location and not putaway_location:
+-            if current_location.putaway_strategy_id:
+-                putaway_location = current_location.putaway_strategy_id.putaway_apply(product)
++            # Looking for a putaway about the product.
++            putaway_rules = self.putaway_rule_ids.filtered(lambda x: x.product_id == product)
++            if putaway_rules:
++                putaway_location = putaway_rules[0].location_out_id
++            # If not product putaway found, we're looking with category so.
++            else:
++                categ = product.categ_id
++                while categ:
++                    putaway_rules = self.putaway_rule_ids.filtered(lambda x: x.category_id == categ)
++                    if putaway_rules:
++                        putaway_location = putaway_rules[0].location_out_id
++                        break
++                    categ = categ.parent_id
+             current_location = current_location.location_id
+         return putaway_location
+ 
+
+--- a/addons/stock/models/stock_move.py
++++ b/addons/stock/models/stock_move.py
+@@ -817,7 +817,7 @@ class StockMove(models.Model):
+     def _prepare_move_line_vals(self, quantity=None, reserved_quant=None):
+         self.ensure_one()
+         # apply putaway
+-        location_dest_id = self.location_dest_id.get_putaway_strategy(self.product_id).id or self.location_dest_id.id
++        location_dest_id = self.location_dest_id._get_putaway_strategy(self.product_id).id or self.location_dest_id.id
+         vals = {
+             'move_id': self.id,
+             'product_id': self.product_id.id,

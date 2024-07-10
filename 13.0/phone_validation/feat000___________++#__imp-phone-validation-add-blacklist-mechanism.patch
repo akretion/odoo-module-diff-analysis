@@ -1,0 +1,334 @@
+PR: https://github.com/odoo/odoo/pull/
+
+From: 7e8a02cd6e9f08e5ff45db804b357bc3537ff1f6
+From: Thibault Delavallée
+Date: 2019-08-12 12:00:22
+
+Structural Changes: 4
+Total Changes: 235
+
+[IMP] phone_validation: add blacklist mechanism
+
+PURPOSE
+
+SMS are a powerful marketing tool. For instance it is perfect to announce a
+sale or to communicate a coupon code, to welcome a new customer in a fidelity
+program, ...
+
+Purpose of this task is to integrate SMS sending in batch in mass mailing. It
+will use same mailing objects but sending SMS instead of emails. Some metrics
+and flows will have to be slightly updated at the same time.
+
+SPECIFICATIONS
+
+Purpose of this commit is to add a blacklist mechanism for phone numbers
+used to send SMS like what already exists for email addresses when sending
+emails.
+
+Define a new phone.blacklist model, holding a number and the state of the
+blacklist (active field), as well as tools methods to access it. Make it
+as private as possible, accessing it in sudo once access are granted.
+
+Also clean phone validation tools: lessen number of tool functions and update
+caller to simplify code readability. Some fixes are also included in this
+commit, notably blank spaces cleaning in phone numbers.
+
+Improve phone.validation.mixin to add a tool method computing a sanitized
+number, in addition to formatting it to national / international.
+
+Define a new mail.thread.phone mixin computing the blacklist status of a
+record. This mixin
+
+  * inherit from phone.validation.mixin in order to have access to some
+    base phone number parsing capabilities;
+  * computes a sanitized phone number based on ´´_phone_get_number_fields´´.
+    It takes first sanitized value, trying each field returned by the
+    method. That means one sanitized phone number is available per record
+    even if several fields are available;
+  * compute blacklist state of records. It is based on phone.blacklist
+    model and give an easy-to-use field and API to manipulate blacklisted
+    records;
+  * give some API methods :
+
+    * ``_phone_set_blacklisted``: set recordset as blacklisted;
+    * ``_phone_reset_blacklisted``: reactivate recordset (even if not blacklisted
+        this method can be called safely);
+
+Put menus in technical in order to have access to it. Add a Phone / SMS
+menu below "Email" and use it to store SMS / Phone actions.
+
+Finally prepare tests addition by performing some light cleaning while adding
+blacklist tests. Purpose is to ease future tests related to SMS.
+
+LINKS
+
+Task 1997464
+PR #34424
+Original SMS addition: Task 1922163 (4287481)
+
+================================= pseudo patch: =================================
+
+--- a/addons/phone_validation/models/__init__.py
++++ b/addons/phone_validation/models/__init__.py
+@@ -1,5 +1,7 @@
+ # -*- coding: utf-8 -*-
+ # Part of Odoo. See LICENSE file for full copyright and licensing details.
+ 
+-from . import res_company
++from . import phone_blacklist
+ from . import phone_validation_mixin
++from . import mail_thread_phone
++from . import res_company
+
+--- a/None
++++ b/addons/phone_validation/models/mail_thread_phone.py
+@@ -0,0 +1,103 @@
++# -*- coding: utf-8 -*-
++# Part of Odoo. See LICENSE file for full copyright and licensing details.
++
++from odoo import api, fields, models, _
++from odoo.exceptions import UserError
++
++
++class PhoneMixin(models.AbstractModel):
++    """ Purpose of this mixin is to offer two services
++
++      * compute a sanitized phone number based on ´´_sms_get_number_fields´´.
++        It takes first sanitized value, trying each field returned by the
++        method (see ``MailThread._sms_get_number_fields()´´ for more details
++        about the usage of this method);
++      * compute blacklist state of records. It is based on phone.blacklist
++        model and give an easy-to-use field and API to manipulate blacklisted
++        records;
++
++    Main API methods
++
++      * ``_phone_set_blacklisted``: set recordset as blacklisted;
++      * ``_phone_reset_blacklisted``: reactivate recordset (even if not blacklisted
++        this method can be called safely);
++    """
++    _name = 'mail.thread.phone'
++    _description = 'Phone Blacklist Mixin'
++    _inherit = ['mail.thread', 'phone.validation.mixin']
++
++    phone_sanitized = fields.Char(
++        string='Sanitized Number', compute="_compute_phone_sanitized", compute_sudo=True, store=True,
++        help="Field used to store sanitized phone number. Helps speeding up searches and comparisons.")
++    phone_blacklisted = fields.Boolean(
++        string='Phone Blacklisted', compute="_compute_phone_blacklisted", compute_sudo=True, store=False,
++        search="_search_phone_blacklisted", groups="base.group_user",
++        help="If the email address is on the blacklist, the contact won't receive mass mailing anymore, from any list")
++
++    @api.depends(lambda self: self._phone_get_number_fields())
++    def _compute_phone_sanitized(self):
++        self._assert_phone_field()
++        number_fields = self._phone_get_number_fields()
++        for record in self:
++            for fname in number_fields:
++                sanitized = record.phone_get_sanitized_number(number_fname=fname)
++                if sanitized:
++                    break
++            record.phone_sanitized = sanitized
++
++    @api.depends('phone_sanitized')
++    def _compute_phone_blacklisted(self):
++        # TODO : Should remove the sudo as compute_sudo defined on methods.
++        # But if user doesn't have access to mail.blacklist, doen't work without sudo().
++        blacklist = set(self.env['phone.blacklist'].sudo().search([
++            ('number', 'in', self.mapped('phone_sanitized'))]).mapped('number'))
++        for record in self:
++            record.phone_blacklisted = record.phone_sanitized in blacklist
++
++    @api.model
++    def _search_phone_blacklisted(self, operator, value):
++        # Assumes operator is '=' or '!=' and value is True or False
++        self._assert_phone_field()
++        if operator != '=':
++            if operator == '!=' and isinstance(value, bool):
++                value = not value
++            else:
++                raise NotImplementedError()
++
++        if value:
++            query = """
++                SELECT m.id
++                    FROM phone_blacklist bl
++                    JOIN %s m
++                    ON m.phone_sanitized = bl.number AND bl.active
++            """
++        else:
++            query = """
++                SELECT m.id
++                    FROM %s m
++                    LEFT JOIN phone_blacklist bl
++                    ON m.phone_sanitized = bl.number AND bl.active
++                    WHERE bl.id IS NULL
++            """
++        self._cr.execute(query % self._table)
++        res = self._cr.fetchall()
++        if not res:
++            return [(0, '=', 1)]
++        return [('id', 'in', [r[0] for r in res])]
++
++    def _assert_phone_field(self):
++        if not hasattr(self, "_phone_get_number_fields"):
++            raise UserError(_('Invalid primary phone field on model %s') % self._name)
++        if not any(fname in self and self._fields[fname].type == 'char' for fname in self._phone_get_number_fields()):
++            raise UserError(_('Invalid primary phone field on model %s') % self._name)
++
++    def _phone_get_number_fields(self):
++        """ This method returns the fields to use to find the number to use to
++        send an SMS on a record. """
++        return []
++
++    def _phone_set_blacklisted(self):
++        return self.env['phone.blacklist'].sudo()._add([r.phone_sanitized for r in self])
++
++    def _phone_reset_blacklisted(self):
++        return self.env['phone.blacklist'].sudo()._remove([r.phone_sanitized for r in self])
+
+--- a/None
++++ b/addons/phone_validation/models/phone_blacklist.py
+@@ -0,0 +1,109 @@
++# -*- coding: utf-8 -*-
++# Part of Odoo. See LICENSE file for full copyright and licensing details.
++
++import logging
++
++from odoo import api, fields, models, _
++from odoo.addons.phone_validation.tools import phone_validation
++from odoo.exceptions import UserError
++
++_logger = logging.getLogger(__name__)
++
++
++class PhoneBlackList(models.Model):
++    """ Blacklist of phone numbers. Used to avoid sending unwanted messages to people. """
++    _name = 'phone.blacklist'
++    _inherit = ['mail.thread']
++    _description = 'Phone Blacklist'
++    _rec_name = 'number'
++
++    number = fields.Char(string='Phone Number', required=True, index=True, tracking=True, help='Number should be E164 formatted')
++    active = fields.Boolean(default=True, tracking=True)
++
++    _sql_constraints = [
++        ('unique_number', 'unique (number)', 'Number already exists')
++    ]
++
++    @api.model_create_multi
++    def create(self, values):
++        # First of all, extract values to ensure emails are really unique (and don't modify values in place)
++        to_create = []
++        done = set()
++        for value in values:
++            number = value['number']
++            sanitized = phone_validation.phone_sanitize_numbers_w_record([number], self.env.user)[number]['sanitized']
++            if not sanitized:
++                raise UserError(_('Invalid number %s') % number)
++            if sanitized in done:
++                continue
++            done.add(sanitized)
++            to_create.append(dict(value, number=sanitized))
++
++        """ To avoid crash during import due to unique email, return the existing records if any """
++        sql = '''SELECT number, id FROM phone_blacklist WHERE number = ANY(%s)'''
++        numbers = [v['number'] for v in to_create]
++        self._cr.execute(sql, (numbers,))
++        bl_entries = dict(self._cr.fetchall())
++        to_create = [v for v in to_create if v['number'] not in bl_entries]
++
++        results = super(PhoneBlackList, self).create(to_create)
++        return self.env['phone.blacklist'].browse(bl_entries.values()) | results
++
++    def write(self, values):
++        if 'number' in values:
++            number = values['number']
++            sanitized = phone_validation.phone_sanitize_numbers_w_record([number], self.env.user)[number]['sanitized']
++            if not sanitized:
++                raise UserError(_('Invalid number %s') % number)
++            values['number'] = sanitized
++        return super(PhoneBlackList, self).write(values)
++
++    def _search(self, args, offset=0, limit=None, order=None, count=False, access_rights_uid=None):
++        """ Override _search in order to grep search on sanitized number field """
++        if args:
++            new_args = []
++            for arg in args:
++                if isinstance(arg, (list, tuple)) and arg[0] == 'number' and isinstance(arg[2], str):
++                    number = arg[2]
++                    sanitized = phone_validation.phone_sanitize_numbers_w_record([number], self.env.user)[number]['sanitized']
++                    if sanitized:
++                        new_args.append([arg[0], arg[1], sanitized])
++                    else:
++                        new_args.append(arg)
++                else:
++                    new_args.append(arg)
++        else:
++            new_args = args
++        return super(PhoneBlackList, self)._search(new_args, offset=offset, limit=limit, order=order, count=count, access_rights_uid=access_rights_uid)
++
++    def add(self, number):
++        sanitized = phone_validation.phone_sanitize_numbers_w_record([number], self.env.user)[number]['sanitized']
++        return self._add([sanitized])
++
++    def _add(self, numbers):
++        """ Add or re activate a phone blacklist entry.
++
++        :param numbers: list of sanitized numbers """
++        records = self.env["phone.blacklist"].with_context(active_test=False).search([('number', 'in', numbers)])
++        todo = [n for n in numbers if n not in records.mapped('number')]
++        if records:
++            records.write({'active': True})
++        if todo:
++            records += self.create([{'number': n} for n in todo])
++        return records
++
++    def remove(self, number):
++        sanitized = phone_validation.phone_sanitize_numbers_w_record([number], self.env.user)[number]['sanitized']
++        return self._remove([sanitized])
++
++    def _remove(self, numbers):
++        """ Add de-activated or de-activate a phone blacklist entry.
++
++        :param numbers: list of sanitized numbers """
++        records = self.env["phone.blacklist"].with_context(active_test=False).search([('number', 'in', numbers)])
++        todo = [n for n in numbers if n not in records.mapped('number')]
++        if records:
++            records.write({'active': False})
++        if todo:
++            records += self.create([{'number': n, 'active': False} for n in todo])
++        return records
+
+--- a/addons/phone_validation/models/phone_validation_mixin.py
++++ b/addons/phone_validation/models/phone_validation_mixin.py
+@@ -9,6 +9,11 @@ class PhoneValidationMixin(models.AbstractModel):
+     _name = 'phone.validation.mixin'
+     _description = 'Phone Validation Mixin'
+ 
++    def _phone_get_country_field(self):
++        if 'country_id' in self:
++            return 'country_id'
++        return False
++
+     def _phone_get_country(self):
+         if 'country_id' in self and self.country_id:
+             return self.country_id
+@@ -31,3 +36,17 @@ class PhoneValidationMixin(models.AbstractModel):
+             force_format='INTERNATIONAL' if always_international else 'NATIONAL',
+             raise_exception=False
+         )
++
++    def phone_get_sanitized_numbers(self, number_fname='mobile', force_format='E164'):
++        res = dict.fromkeys(self.ids, False)
++        country_fname = self._phone_get_country_field()
++        for record in self:
++            number = record[number_fname]
++            res[record.id] = phone_validation.phone_sanitize_numbers_w_record([number], record, record_country_fname=country_fname, force_format=force_format)[number]['sanitized']
++        return res
++
++    def phone_get_sanitized_number(self, number_fname='mobile', force_format='E164'):
++        self.ensure_one()
++        country_fname = self._phone_get_country_field()
++        number = self[number_fname]
++        return phone_validation.phone_sanitize_numbers_w_record([number], self, record_country_fname=country_fname, force_format=force_format)[number]['sanitized']

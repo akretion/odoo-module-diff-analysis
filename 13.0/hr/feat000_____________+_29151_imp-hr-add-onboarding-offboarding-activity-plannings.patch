@@ -1,0 +1,229 @@
+PR: https://github.com/odoo/odoo/pull/29151
+
+From: d5fd84b89a51ef41ca0aa13cf7acc94e684d40ce
+From: RomainLibert
+Date: 2018-12-18 11:20:54
+
+Structural Changes: 5
+Total Changes: 75
+
+[IMP] hr: add onboarding/offboarding activity plannings
+
+Purpose
+=======
+
+Give the possibility to elaborate plans through Odoo. For instance, in HR,
+you could create an onboarding plan when a employee is created. Someone manages
+laptop and other equipment, someone check hr stuff, ... This feature is generic
+but in a first time we will apply it only on the hr module.
+
+Ease HR process in a company by creating plans: a plan is an assembly of Next
+Activities that will be launched together whenever you need it.
+
+Example of plan for an employee onboarding:
+
+Activity: Prepare materials
+Responsible: Alain
+Deadline: At the contract signature
+
+Activity: Manage Cars
+Responsible: Cécile
+Deadline: at the contract signature (both signature)
+
+Activity: Plan Training
+Responsible: Caroline
+Deadline: After signature
+
+Activity: Training
+Responsible: Employee
+Deadline: 1 week after the employement date
+
+Specifications
+==============
+
+On HR Configuration: Add a menu "Activity Plans"
+
+Activity plan object:
+ - Name
+ - Model (debug mode) (hr by default)
+ - Activity Template o2m
+    - Activity Type (only the one related to hr)
+    - Deadline (come from Activity Type)
+    - Responsible \/
+        0  Coach
+        0  Manager
+        0  Other
+        [Responsible_name] \/  (coach, manager or manually set if other)
+
+Add datas, 2 plans:
+
+Onboarding
+    - Name: Onboarding
+    - Plan lines:
+        Activity: Setup IT Materials
+        Responsible: [a user] (manager)
+        Deadline: At the contract signature
+
+        Activity: Plan Training
+        Responsible: [manager]
+        Deadline: After signature
+
+        Activity: Training
+        Responsible: [Employee]
+        Deadline: 1 week after the employement date
+
+Offboarding
+    - Name: Onboarding
+    - Plan lines:
+        Activity: Compute Out Delais
+        Responsible: [a user] (manager)
+        Deadline: today
+
+        Activity: Take Back HR Materials
+        Responsible: [manager]
+        Deadline: today
+
+        Activity: Manage Car
+        Responsible: [manager]
+        Deadline: today
+
+When to trigger it ?
+
+HR specific use case:
+
+1/ On employee, from the employee chatter:
+when you create an employee, Odoobot will log a note with the following message:
+"Congratulations ! May i recommand you to setup an onboarding plan?", with a link
+create a plan from it.
+
+2/ Add a button 'launch plan' to open a wizard to select the plan
+
+3/ When archive an employee
+Open a wizard with:
+    - Reason (selection)
+    - Action plan (m2o not required)
+
+Error if employee not linked to a user.
+
+Task : 1912681
+
+closes odoo/odoo#29151
+
+================================= pseudo patch: =================================
+
+--- a/addons/hr/models/__init__.py
++++ b/addons/hr/models/__init__.py
+@@ -7,3 +7,5 @@ from . import mail_alias
+ from . import mail_channel
+ from . import res_partner
+ from . import res_users
++
++from . import plan
+
+--- a/addons/hr/models/hr.py
++++ b/addons/hr/models/hr.py
+@@ -4,6 +4,7 @@ from random import choice
+ from string import digits
+ import base64
+ import logging
++from werkzeug import url_encode
+ 
+ from odoo import api, fields, models
+ from odoo import tools, _
+@@ -202,6 +203,12 @@ class Employee(models.Model):
+     color = fields.Integer('Color Index', default=0)
+     barcode = fields.Char(string="Badge ID", help="ID used for employee identification.", copy=False)
+     pin = fields.Char(string="PIN", help="PIN used to Check In/Out in Kiosk Mode (if enabled in Configuration).", copy=False)
++    departure_reason = fields.Selection([
++        ('fired', 'Fired'),
++        ('resigned', 'Resigned'),
++        ('retired', 'Retired')
++    ], string="Departure Reason")
++    departure_description = fields.Text(string="Additional Information")
+ 
+     _sql_constraints = [('barcode_uniq', 'unique (barcode)', "The Badge ID must be unique, this one is already assigned to another employee.")]
+ 
+@@ -256,6 +263,8 @@ class Employee(models.Model):
+             vals.update(self._sync_user(self.env['res.users'].browse(vals['user_id'])))
+         tools.image_resize_images(vals)
+         employee = super(Employee, self).create(vals)
++        url = '/web#%s' % url_encode({'action': 'hr.plan_wizard_action', 'active_id': employee.id, 'active_model': 'hr.employee'})
++        employee._message_log(_('<b>Congratulations !</b> May I recommand you to setup an <a href="%s">onboarding plan ?</a>') % (url))
+         if employee.department_id:
+             self.env['mail.channel'].sudo().search([
+                 ('subscription_department_ids', 'in', employee.department_id.id)
+@@ -285,7 +294,25 @@ class Employee(models.Model):
+         resources = self.mapped('resource_id')
+         super(Employee, self).unlink()
+         return resources.unlink()
+-    
++
++    def toggle_active(self):
++        res = super(Employee, self).toggle_active()
++        self.filtered(lambda employee: employee.active).write({
++            'departure_reason': False,
++            'departure_description': False,
++        })
++        if len(self) == 1 and not self.active:
++            return {
++                'type': 'ir.actions.act_window',
++                'name': _('Register Departure'),
++                'res_model': 'hr.departure.wizard',
++                'view_type': 'form',
++                'view_mode': 'form',
++                'target': 'new',
++                'context': {'active_id': self.id},
++            }
++        return res
++
+     @api.multi
+     def generate_random_barcode(self):
+         for i in self: i.barcode = "".join(choice(digits) for i in range(8))
+
+--- a/None
++++ b/addons/hr/models/plan.py
+@@ -0,0 +1,44 @@
++# -*- coding: utf-8 -*-
++# Part of Odoo. See LICENSE file for full copyright and licensing details.
++
++from odoo import fields, models, _
++from odoo.exceptions import UserError
++
++
++class PlanActivityType(models.Model):
++    _name = 'hr.plan.activity.type'
++    _description = 'Plan activity type'
++
++    activity_type_id = fields.Many2one('mail.activity.type', 'Activity Type',
++                                       domain=lambda self: [('res_model_id', '=', self.env['ir.model']._get('hr.employee').id)])
++    name = fields.Char(related='activity_type_id.name')
++    responsible = fields.Selection([
++        ('coach', 'Coach'),
++        ('manager', 'Manager'),
++        ('employee', 'Employee'),
++        ('other', 'Other')], default='employee', string='Responsible')
++    responsible_id = fields.Many2one('res.users', 'Responsible Person')
++
++    def get_responsible_id(self, employee_id):
++        if self.responsible == 'coach':
++            self.responsible_id = employee_id.coach_id.user_id
++            if not self.responsible_id:
++                raise UserError(_('No user linked to the coach of %s. Please contact an administrator.') % employee_id.name)
++        elif self.responsible == 'manager':
++            self.responsible_id = employee_id.parent_id.user_id
++            if not self.responsible_id:
++                raise UserError(_('No user linked to the manager of %s. Please contact an administrator.') % employee_id.name)
++        elif self.responsible == 'employee':
++            self.responsible_id = employee_id.user_id
++            if not self.responsible_id:
++                raise UserError(_('No user linked to the employee %s. Please contact an administrator.') % employee_id.name)
++        return self.responsible_id
++
++
++class Plan(models.Model):
++    _name = 'hr.plan'
++    _description = 'plan'
++
++    name = fields.Char('Name', required=True)
++    plan_activity_type_ids = fields.Many2many('hr.plan.activity.type', string='Activities')
++    active = fields.Boolean(default=True)
