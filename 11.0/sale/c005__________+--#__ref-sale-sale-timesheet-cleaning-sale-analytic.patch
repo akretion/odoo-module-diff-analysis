@@ -1,0 +1,394 @@
+PR: https://github.com/odoo/odoo/pull/
+
+From: 5cf4c350cb4647be294b21ba39dc4637225ad131
+From: Jérome Maes
+Date: 2017-09-13 06:41:30
+
+Structural Changes: 4
+Total Changes: 329
+
+[REF] sale,sale_timesheet: cleaning sale analytic
+
+The handling of analytic lines to sell is a little
+mess. We can reinvoice analytic lines from timesheet
+or expenses, or manual lines.
+
+This commit tries to clean the code, factorize it,
+make proper hook (see _sale_postprocess method)
+and move specific in its corresponding modules.
+
+Code was properly split, in order to make modules responsible
+for only their own features:
+- sale module handle the link of SO line to an analytic
+line, and increment the delivered qty accordingly.
+sale also provide the mecanism of determine magically
+the SO lines of an analytic line with an expensable product
+to reinvoice it at cost.
+- sale_timesheet identifies the so line concerned when
+timesheeting on a project directly. Also provide the domain
+of analytic line when setting the SO line on AAL.
+
+Cleaning is necessary for futher dev.
+
+================================= pseudo patch: =================================
+
+--- a/addons/sale/models/__init__.py
++++ b/addons/sale/models/__init__.py
+@@ -1,6 +1,7 @@
+ # -*- coding: utf-8 -*-
+ # Part of Odoo. See LICENSE file for full copyright and licensing details.
+ 
++from . import analytic
+ from . import account_invoice
+ from . import product_pricelist
+ from . import product_product
+@@ -8,7 +9,6 @@ from . import product_template
+ from . import res_company
+ from . import res_partner
+ from . import sale
+-from . import sale_analytic
+ from . import res_config_settings
+ from . import sale_layout
+ from . import sales_team
+
+--- a/None
++++ b/addons/sale/models/analytic.py
+@@ -0,0 +1,132 @@
++# -*- coding: utf-8 -*-
++# Part of Odoo. See LICENSE file for full copyright and licensing details.
++
++from odoo import api, fields, models, _
++from odoo.exceptions import UserError
++
++
++class AccountAnalyticLine(models.Model):
++    _inherit = "account.analytic.line"
++
++    so_line = fields.Many2one('sale.order.line', string='Sales Order Line')
++
++    @api.model
++    def create(self, values):
++        result = super(AccountAnalyticLine, self).create(values)
++        result._sale_postprocess(values)
++        return result
++
++    @api.multi
++    def write(self, values):
++        # get current so lines for which update qty wil be required
++        sale_order_lines = self.env['sale.order.line']
++        if 'so_line' in values:
++            sale_order_lines = self.sudo().mapped('so_line')
++        result = super(AccountAnalyticLine, self).write(values)
++        self._sale_postprocess(values, additional_so_lines=sale_order_lines)
++        return result
++
++    @api.multi
++    def unlink(self):
++        sale_order_lines = self.sudo().mapped('so_line')
++        res = super(AccountAnalyticLine, self).unlink()
++        sale_order_lines._analytic_compute_delivered_quantity()
++        return res
++
++    @api.model
++    def _sale_get_fields_delivered_qty(self):
++        """ Returns a list with the field impacting the delivered quantity on SO line. """
++        return ['so_line', 'unit_amount', 'product_uom_id']
++
++    @api.multi
++    def _sale_postprocess(self, values, additional_so_lines=None):
++        if 'so_line' not in values:  # allow to force a False value for so_line
++            self.with_context(sale_analytic_norecompute=True)._sale_determine_order_line()
++
++        if any(field_name in values for field_name in self._sale_get_fields_delivered_qty()):
++            if not self._context.get('sale_analytic_norecompute'):
++                so_lines = self.sudo().filtered(lambda aal: aal.so_line).mapped('so_line')
++                if additional_so_lines:
++                    so_lines |= additional_so_lines
++                so_lines.sudo()._analytic_compute_delivered_quantity()
++
++    # NOTE JEM: thoses method are used in vendor bills to reinvoice at cost (see test `test_cost_invoicing`)
++    # some cleaning are still necessary
++
++    @api.multi
++    def _sale_get_invoice_price(self, order):
++        self.ensure_one()
++        if self.product_id.expense_policy == 'sales_price':
++            return self.product_id.with_context(
++                partner=order.partner_id.id,
++                date_order=order.date_order,
++                pricelist=order.pricelist_id.id,
++                uom=self.product_uom_id.id
++            ).price
++        if self.unit_amount == 0.0:
++            return 0.0
++
++        # Prevent unnecessary currency conversion that could be impacted by exchange rate
++        # fluctuations
++        if self.currency_id and self.amount_currency and self.currency_id == order.currency_id:
++            return abs(self.amount_currency / self.unit_amount)
++
++        price_unit = abs(self.amount / self.unit_amount)
++        currency_id = self.company_id.currency_id
++        if currency_id and currency_id != order.currency_id:
++            price_unit = currency_id.compute(price_unit, order.currency_id)
++        return price_unit
++
++    @api.multi
++    def _sale_prepare_sale_order_line_values(self, order, price):
++        self.ensure_one()
++        last_so_line = self.env['sale.order.line'].search([('order_id', '=', order.id)], order='sequence desc', limit=1)
++        last_sequence = last_so_line.sequence + 1 if last_so_line else 100
++
++        fpos = order.fiscal_position_id or order.partner_id.property_account_position_id
++        taxes = fpos.map_tax(self.product_id.taxes_id, self.product_id, order.partner_id)
++
++        return {
++            'order_id': order.id,
++            'name': self.name,
++            'sequence': last_sequence,
++            'price_unit': price,
++            'tax_id': [x.id for x in taxes],
++            'discount': 0.0,
++            'product_id': self.product_id.id,
++            'product_uom': self.product_uom_id.id,
++            'product_uom_qty': 0.0,
++            'qty_delivered': self.unit_amount,
++        }
++
++    @api.multi
++    def _sale_determine_order_line(self):
++        """ Automatically set the SO line on the analytic line, for the expense/vendor bills flow. It retrives
++            an existing line, or create a new one (upselling expenses).
++        """
++        for analytic_line in self.sudo().filtered(lambda aal: not aal.so_line and aal.account_id and aal.product_id and aal.product_id.expense_policy != 'no'):
++            # determine SO : first SO open linked to AA
++            sale_order = self.env['sale.order'].search([('project_id', '=', analytic_line.account_id.id), ('state', '=', 'sale')], limit=1)
++            if not sale_order:
++                sale_order = self.env['sale.order'].search([('project_id', '=', analytic_line.account_id.id)], limit=1)
++            if not sale_order:
++                continue
++
++            price = analytic_line._sale_get_invoice_price(sale_order)
++            so_line = self.env['sale.order.line'].search([
++                ('order_id', '=', sale_order.id),
++                ('price_unit', '=', price),
++                ('product_id', '=', self.product_id.id)
++            ], limit=1)
++
++            if not so_line:
++                # generate a new SO line
++                if sale_order.state != 'sale':
++                    raise UserError(_('The Sales Order %s linked to the Analytic Account must be validated before registering expenses.') % sale_order.name)
++                so_line_values = analytic_line._sale_prepare_sale_order_line_values(sale_order, price)
++                if so_line_values:
++                    so_line = self.env['sale.order.line'].create(so_line_values)
++                    so_line._compute_tax_id()
++
++            if so_line:  # if so line found or created, then update AAL (this will trigger the recomputation of qty delivered on SO line)
++                analytic_line.write({'so_line': so_line.id})
+
+--- a/addons/sale/models/sale.py
++++ b/addons/sale/models/sale.py
+@@ -1087,3 +1087,51 @@ class SaleOrderLine(models.Model):
+             discount = (new_list_price - price) / new_list_price * 100
+             if discount > 0:
+                 self.discount = discount
++
++    ###########################
++    # Analytic Methods
++    ###########################
++
++    @api.multi
++    def _analytic_compute_delivered_quantity_domain(self):
++        """ Return the domain of the analytic lines to use to recompute the delivered quantity
++            on SO lines. This method is a hook: since analytic line are used for timesheet,
++            expense, ...  each use case should provide its part of the domain.
++        """
++        return [('so_line', 'in', self.ids), ('amount', '<=', 0.0)]
++
++    @api.multi
++    def _analytic_compute_delivered_quantity(self):
++        """ Compute and write the delivered quantity of current SO lines, based on their related
++            analytic lines.
++        """
++        # avoid recomputation if no SO lines concerned
++        if not self:
++            return False
++
++        # group anaytic lines by product uom and so line
++        domain = self._analytic_compute_delivered_quantity_domain()
++        data = self.env['account.analytic.line'].read_group(
++            domain,
++            ['so_line', 'unit_amount', 'product_uom_id'], ['product_uom_id', 'so_line'], lazy=False
++        )
++
++        # convert uom and sum all unit_amount of analytic lines to get the delivered qty of SO lines
++        value_to_write = {}
++        for item in data:
++            if not item['product_uom_id']:
++                continue
++            so_line = self.browse(item['so_line'][0])
++            value_to_write.setdefault(so_line, 0.0)
++            uom = self.env['product.uom'].browse(item['product_uom_id'][0])
++            if so_line.product_uom.category_id == uom.category_id:
++                qty = uom._compute_quantity(item['unit_amount'], so_line.product_uom)
++            else:
++                qty = item['unit_amount']
++            value_to_write[so_line] += qty
++
++        # write the delivered quantity
++        for so_line, qty in value_to_write.items():
++            so_line.write({'qty_delivered': qty})
++
++        return True
+
+--- a/addons/sale/models/sale_analytic.py
++++ b/None
+@@ -1,147 +0,0 @@
+-# -*- coding: utf-8 -*-
+-# Part of Odoo. See LICENSE file for full copyright and licensing details.
+-
+-from odoo import api, fields, models, _
+-from odoo.exceptions import UserError
+-
+-
+-class SaleOrderLine(models.Model):
+-    _inherit = "sale.order.line"
+-
+-    @api.multi
+-    def _compute_analytic(self, domain=None):
+-        lines = {}
+-        force_so_lines = self.env.context.get("force_so_lines")
+-        if not domain:
+-            if not self.ids and not force_so_lines:
+-                return True
+-            # To filter on analyic lines linked to an expense
+-            expense_type_id = self.env.ref('account.data_account_type_expenses', raise_if_not_found=False)
+-            expense_type_id = expense_type_id and expense_type_id.id
+-            domain = [('so_line', 'in', self.ids), ('amount', '<=', 0.0)]
+-
+-        data = self.env['account.analytic.line'].read_group(
+-            domain,
+-            ['so_line', 'unit_amount', 'product_uom_id'], ['product_uom_id', 'so_line'], lazy=False
+-        )
+-        # If the unlinked analytic line was the last one on the SO line, the qty was not updated.
+-        if force_so_lines:
+-            for line in force_so_lines:
+-                lines.setdefault(line, 0.0)
+-        for d in data:
+-            if not d['product_uom_id']:
+-                continue
+-            line = self.browse(d['so_line'][0])
+-            lines.setdefault(line, 0.0)
+-            uom = self.env['product.uom'].browse(d['product_uom_id'][0])
+-            if line.product_uom.category_id == uom.category_id:
+-                qty = uom._compute_quantity(d['unit_amount'], line.product_uom)
+-            else:
+-                qty = d['unit_amount']
+-            lines[line] += qty
+-
+-        for line, qty in lines.items():
+-            line.qty_delivered = qty
+-        return True
+-
+-
+-class AccountAnalyticLine(models.Model):
+-    _inherit = "account.analytic.line"
+-    so_line = fields.Many2one('sale.order.line', string='Sales Order Line')
+-
+-    def _get_invoice_price(self, order):
+-        if self.product_id.expense_policy == 'sales_price':
+-            return self.product_id.with_context(
+-                partner=order.partner_id.id,
+-                date_order=order.date_order,
+-                pricelist=order.pricelist_id.id,
+-                uom=self.product_uom_id.id
+-            ).price
+-        if self.unit_amount == 0.0:
+-            return 0.0
+-
+-        # Prevent unnecessary currency conversion that could be impacted by exchange rate
+-        # fluctuations
+-        if self.currency_id and self.amount_currency and self.currency_id == order.currency_id:
+-            return abs(self.amount_currency / self.unit_amount)
+-
+-        price_unit = abs(self.amount / self.unit_amount)
+-        currency_id = self.company_id.currency_id
+-        if currency_id and currency_id != order.currency_id:
+-            price_unit = currency_id.compute(price_unit, order.currency_id)
+-        return price_unit
+-
+-    def _get_sale_order_line_vals(self, order, price):
+-
+-        last_so_line = self.env['sale.order.line'].search([('order_id', '=', order.id)], order='sequence desc', limit=1)
+-        last_sequence = last_so_line.sequence + 1 if last_so_line else 100
+-
+-        fpos = order.fiscal_position_id or order.partner_id.property_account_position_id
+-        taxes = fpos.map_tax(self.product_id.taxes_id, self.product_id, order.partner_id)
+-
+-        return {
+-            'order_id': order.id,
+-            'name': self.name,
+-            'sequence': last_sequence,
+-            'price_unit': price,
+-            'tax_id': [x.id for x in taxes],
+-            'discount': 0.0,
+-            'product_id': self.product_id.id,
+-            'product_uom': self.product_uom_id.id,
+-            'product_uom_qty': 0.0,
+-            'qty_delivered': self.unit_amount,
+-        }
+-
+-    def _get_sale_order_line(self, vals=None):
+-        result = dict(vals or {})
+-        so_line = result.get('so_line', False) or self.so_line
+-        if not so_line and self.account_id and self.product_id and (self.product_id.expense_policy != 'no'):
+-            order_in_sale = self.env['sale.order'].search([('project_id', '=', self.account_id.id), ('state', '=', 'sale')], limit=1)
+-            order = order_in_sale or self.env['sale.order'].search([('project_id', '=', self.account_id.id)], limit=1)
+-            if not order:
+-                return result
+-            price = self._get_invoice_price(order)
+-            so_lines = self.env['sale.order.line'].search([
+-                ('order_id', '=', order.id),
+-                ('price_unit', '=', price),
+-                ('product_id', '=', self.product_id.id)])
+-
+-            if so_lines:
+-                result.update({'so_line': so_lines[0].id})
+-            else:
+-                if order.state != 'sale':
+-                    raise UserError(_('The Sales Order %s linked to the Analytic Account must be validated before registering expenses.') % order.name)
+-                order_line_vals = self._get_sale_order_line_vals(order, price)
+-                if order_line_vals:
+-                    so_line = self.env['sale.order.line'].create(order_line_vals)
+-                    so_line._compute_tax_id()
+-                    result.update({'so_line': so_line.id})
+-        return result
+-
+-    @api.multi
+-    def write(self, values):
+-        if self._context.get('create', False):
+-            return super(AccountAnalyticLine, self).write(values)
+-
+-        lines = super(AccountAnalyticLine, self).write(values)
+-        for line in self:
+-            res = line.sudo()._get_sale_order_line(vals=values)
+-            super(AccountAnalyticLine, line).write(res)
+-
+-        self.mapped('so_line').sudo()._compute_analytic()
+-        return lines
+-
+-    @api.model
+-    def create(self, values):
+-        line = super(AccountAnalyticLine, self).create(values)
+-        res = line.sudo()._get_sale_order_line(vals=values)
+-        line.with_context(create=True).write(res)
+-        line.mapped('so_line').sudo()._compute_analytic()
+-        return line
+-
+-    @api.multi
+-    def unlink(self):
+-        so_lines = self.sudo().mapped('so_line')
+-        res = super(AccountAnalyticLine, self).unlink()
+-        so_lines.with_context(force_so_lines=so_lines)._compute_analytic()
+-        return res
