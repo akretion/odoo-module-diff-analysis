@@ -1,0 +1,211 @@
+PR: https://github.com/odoo/odoo/pull/155569
+
+From: 0673ac34624abea3c3d13f7a930ba7f95ab1a445
+From: zel-odoo
+Date: 2024-03-18 14:11:34
+
+Structural Changes: 4
+Total Changes: 62
+
+[IMP] mail, *: get rid of writing to all member
+
+In `message_post()`, there is a LOC to write to all members of the
+channel on `is_pinned` and `last_interest_dt`, which cannot possibly
+scale well.
+
+This commit removes the writing to all members and instead uses:
+    1. add `channel.last_interest_dt` and only do writing to the channel
+    when doing the `message_post`.
+    2. remove writing to the `channel_member.is_pinned` and add
+    `channel_member.unpin_dt`. Making the `is_pinned` a computed field
+    instead.
+
+task-3624265
+
+closes odoo/odoo#155569
+
+Related: odoo/enterprise#58606
+Related: odoo/upgrade#5820
+Signed-off-by: Sébastien Theys (seb) <seb@odoo.com>
+
+================================= pseudo patch: =================================
+
+--- a/addons/mail/models/discuss/discuss_channel.py
++++ b/addons/mail/models/discuss/discuss_channel.py
+@@ -6,6 +6,7 @@ from collections import defaultdict
+ from hashlib import sha512
+ from secrets import choice
+ from markupsafe import Markup
++from datetime import timedelta
+ 
+ from odoo import _, api, fields, models, tools, Command
+ from odoo.addons.base.models.avatar_mixin import get_hsl_from_seed
+@@ -68,6 +69,7 @@ class Channel(models.Model):
+     rtc_session_ids = fields.One2many('discuss.channel.rtc.session', 'channel_id', groups="base.group_system")
+     is_member = fields.Boolean('Is Member', compute='_compute_is_member', search='_search_is_member')
+     member_count = fields.Integer(string="Member Count", compute='_compute_member_count', compute_sudo=True)
++    last_interest_dt = fields.Datetime("Last Interest", index=True, help="Contains the date and time of the last interesting event that happened in this channel. This updates itself when new message posted.")
+     group_ids = fields.Many2many(
+         'res.groups', string='Auto Subscription',
+         help="Members of those groups will automatically added as followers. "
+@@ -232,7 +234,7 @@ class Channel(models.Model):
+                 if cmd[0] != 0:
+                     raise ValidationError(_('Invalid value when creating a channel with memberships, only 0 is allowed.'))
+                 for field_name in cmd[2]:
+-                    if field_name not in ["partner_id", "guest_id", "is_pinned", "fold_state"]:
++                    if field_name not in ["partner_id", "guest_id", "unpin_dt", "last_interest_dt", "fold_state"]:
+                         raise ValidationError(
+                             _(
+                                 "Invalid field “%(field_name)s” when creating a channel with members.",
+@@ -660,11 +662,8 @@ class Channel(models.Model):
+         if (not self.env.user or self.env.user._is_public()) and self.is_member:
+             # sudo: discuss.channel - guests don't have access for creating mail.message
+             self = self.sudo()
+-        # sudo: discuss.channel.member - updating hard-coded fields/values for non-self members
+-        self.sudo().channel_member_ids.write({
+-            'is_pinned': True,
+-            'last_interest_dt': fields.Datetime.now(),
+-        })
++        # sudo: discuss.channel - write to discuss.channel is not accessible for most users
++        self.sudo().last_interest_dt = fields.Datetime.now()
+         # mail_post_autofollow=False is necessary to prevent adding followers
+         # when using mentions in channels. Followers should not be added to
+         # channels, and especially not automatically (because channel membership
+@@ -848,6 +847,7 @@ class Channel(models.Model):
+             'authorizedGroupFullName': self.group_public_id.full_name,
+             'allow_public_upload': self.allow_public_upload,
+             'model': "discuss.channel",
++            'last_interest_dt': fields.Datetime.to_string(self.last_interest_dt),
+         }
+ 
+     def _channel_info(self):
+@@ -900,7 +900,7 @@ class Channel(models.Model):
+                 info['message_needaction_counter'] = channel.message_needaction_counter
+                 member = member_of_current_user_by_channel.get(channel, self.env['discuss.channel.member']).with_prefetch([m.id for m in member_of_current_user_by_channel.values()])
+                 if member:
+-                    info['channelMembers'] = [('ADD', list(member._discuss_channel_member_format().values()))]
++                    info['channelMembers'] = [('ADD', list(member._discuss_channel_member_format(extra_fields={"last_interest_dt": True}).values()))]
+                     info['state'] = member.fold_state or 'closed'
+                     info['message_unread_counter'] = member.message_unread_counter
+                     info['custom_notifications'] = member.custom_notifications
+@@ -908,7 +908,6 @@ class Channel(models.Model):
+                     info['seen_message_id'] = member.seen_message_id.id
+                     info['custom_channel_name'] = member.custom_channel_name
+                     info['is_pinned'] = member.is_pinned
+-                    info['last_interest_dt'] = fields.Datetime.to_string(member.last_interest_dt)
+                     if member.rtc_inviting_session_id:
+                         info['rtcInvitingSession'] = member.rtc_inviting_session_id._mail_rtc_session_format()
+             # add members info
+@@ -996,7 +995,7 @@ class Channel(models.Model):
+                 member = self.env['discuss.channel.member'].search([('partner_id', '=', self.env.user.partner_id.id), ('channel_id', '=', channel.id)])
+                 vals = {'last_interest_dt': fields.Datetime.now()}
+                 if pin:
+-                    vals['is_pinned'] = True
++                    vals['unpin_dt'] = False
+                 if force_open:
+                     vals['fold_state'] = "open"
+                 member.write(vals)
+@@ -1008,7 +1007,8 @@ class Channel(models.Model):
+                     Command.create({
+                         'partner_id': partner_id,
+                         # only pin for the current user, so the chat does not show up for the correspondent until a message has been sent
+-                        'is_pinned': partner_id == self.env.user.partner_id.id
++                        # one more second to make sure that it works well with the default last_interest_dt (datetime.now())
++                        'unpin_dt': False if partner_id == self.env.user.partner_id.id else fields.Datetime.now() + timedelta(seconds=1),
+                     }) for partner_id in partners_to
+                 ],
+                 'channel_type': 'chat',
+@@ -1022,7 +1022,7 @@ class Channel(models.Model):
+         member = self.env['discuss.channel.member'].search(
+             [('partner_id', '=', self.env.user.partner_id.id), ('channel_id', '=', self.id), ('is_pinned', '!=', pinned)])
+         if member:
+-            member.write({'is_pinned': pinned})
++            member.write({'unpin_dt': False if pinned else fields.Datetime.now()})
+         if not pinned:
+             self.env['bus.bus']._sendone(self.env.user.partner_id, 'discuss.channel/unpin', {'id': self.id})
+         else:
+
+--- a/addons/mail/models/discuss/discuss_channel_member.py
++++ b/addons/mail/models/discuss/discuss_channel_member.py
+@@ -37,8 +37,9 @@ class ChannelMember(models.Model):
+         help="All Messages if not specified",
+     )
+     mute_until_dt = fields.Datetime("Mute notifications until", help="If set, the member will not receive notifications from the channel until this date.")
+-    is_pinned = fields.Boolean("Is pinned on the interface", default=True)
+-    last_interest_dt = fields.Datetime("Last Interest", default=fields.Datetime.now, help="Contains the date and time of the last interesting event that happened in this channel for this partner. This includes: creating, joining, pinning, and new message posted.")
++    is_pinned = fields.Boolean("Is pinned on the interface", compute="_compute_is_pinned", search="_search_is_pinned")
++    unpin_dt = fields.Datetime("Unpin date", index=True, help="Contains the date and time when the channel was unpinned by the user.")
++    last_interest_dt = fields.Datetime("Last Interest", index=True, default=fields.Datetime.now, help="Contains the date and time of the last interesting event that happened in this channel for this user. This includes: creating, joining, pinning")
+     last_seen_dt = fields.Datetime("Last seen date")
+     # RTC
+     rtc_session_ids = fields.One2many(string="RTC Sessions", comodel_name='discuss.channel.rtc.session', inverse_name='channel_member_id')
+@@ -77,6 +78,20 @@ class ChannelMember(models.Model):
+                 ("guest_id", "!=", current_guest.id) if current_guest else expression.TRUE_LEAF,
+             ]
+ 
++    def _search_is_pinned(self, operator, operand):
++        if (operator == "=" and operand) or (operator == "!=" and not operand):
++            return expression.OR([
++                [("unpin_dt", "=", False)],
++                [("last_interest_dt", ">=", self._field_to_sql(self._table, "unpin_dt"))],
++                [("channel_id.last_interest_dt", ">=", self._field_to_sql(self._table, "unpin_dt"))],
++            ])
++        else:
++            return [
++                ("unpin_dt", "!=", False),
++                ("last_interest_dt", "<", self._field_to_sql(self._table, "unpin_dt")),
++                ("channel_id.last_interest_dt", "<", self._field_to_sql(self._table, "unpin_dt")),
++            ]
++
+     @api.depends("channel_id.message_ids", "seen_message_id")
+     def _compute_message_unread(self):
+         if self.ids:
+@@ -112,6 +127,21 @@ class ChannelMember(models.Model):
+                 channel_name=member.channel_id.display_name,
+             )
+ 
++    @api.depends("last_interest_dt", "unpin_dt", "channel_id.last_interest_dt")
++    def _compute_is_pinned(self):
++        for member in self:
++            member.is_pinned = (
++                not member.unpin_dt
++                or (
++                    member.last_interest_dt
++                    and member.last_interest_dt >= member.unpin_dt
++                )
++                or (
++                    member.channel_id.last_interest_dt
++                    and member.channel_id.last_interest_dt >= member.unpin_dt
++                )
++            )
++
+     def init(self):
+         self.env.cr.execute("CREATE UNIQUE INDEX IF NOT EXISTS discuss_channel_member_partner_unique ON %s (channel_id, partner_id) WHERE partner_id IS NOT NULL" % self._table)
+         self.env.cr.execute("CREATE UNIQUE INDEX IF NOT EXISTS discuss_channel_member_guest_unique ON %s (channel_id, guest_id) WHERE guest_id IS NOT NULL" % self._table)
+@@ -182,7 +212,7 @@ class ChannelMember(models.Model):
+             notifications.append((member.partner_id, "mail.record/insert", {"Thread": channel_data}))
+         self.env["bus.bus"]._sendmany(notifications)
+ 
+-    def _discuss_channel_member_format(self, fields=None):
++    def _discuss_channel_member_format(self, fields=None, extra_fields=None):
+         if not fields:
+             fields = {
+                 "channel": {},
+@@ -192,6 +222,8 @@ class ChannelMember(models.Model):
+                 "persona": {},
+                 "seen_message_id": True,
+             }
++        if extra_fields:
++            fields.update(extra_fields)
+         members_formatted_data = {}
+         for member in self:
+             data = {}
+@@ -217,6 +249,8 @@ class ChannelMember(models.Model):
+                 data['fetched_message_id'] = {'id': member.fetched_message_id.id} if member.fetched_message_id else False
+             if 'seen_message_id' in fields:
+                 data['seen_message_id'] = {'id': member.seen_message_id.id} if member.seen_message_id else False
++            if fields.get("last_interest_dt"):
++                data['last_interest_dt'] = odoo.fields.Datetime.to_string(member.last_interest_dt)
+             members_formatted_data[member] = data
+         return members_formatted_data
+ 

@@ -1,0 +1,151 @@
+PR: https://github.com/odoo/odoo/pull/152467
+
+From: 8cc20fbe2dcf43c31a586a989dd47ebf41effd49
+From: aliya
+Date: 2024-03-07 21:53:28
+
+Structural Changes: 2
+Total Changes: 50
+
+[IMP] account: hash invoices on send & print
+
+Currently, if a journal has a hash lock on entries, the entries are hashed as
+soon as an entry is posted. However, for customer invoices, it can be very
+frustrating if users notice that they made a mistake as soon as they
+create an invoice. Also, the posted status is internal and the invoice
+becomes legal when we create the first PDF to send to the partner.
+
+This commit postpones hashing an entry until it's sent but only
+if it's a customer invoice/customer credit note.
+
+task-3695695
+
+Part-of: odoo/odoo#152467
+
+================================= pseudo patch: =================================
+
+--- a/addons/account/models/account_journal.py
++++ b/addons/account/models/account_journal.py
+@@ -101,8 +101,8 @@ class AccountJournal(models.Model):
+              "allowing finding the right account.", string='Suspense Account',
+         domain="[('deprecated', '=', False), ('account_type', '=', 'asset_current')]",
+     )
+-    restrict_mode_hash_table = fields.Boolean(string="Lock Posted Entries with Hash",
+-        help="If ticked, the accounting entry or invoice receives a hash as soon as it is posted and cannot be modified anymore.")
++    restrict_mode_hash_table = fields.Boolean(string="Lock Sent Entries with Hash",
++        help="If ticked, the accounting entry or invoice receives a hash as soon as it is sent and cannot be modified anymore.")
+     sequence = fields.Integer(help='Used to order Journals in the dashboard view', default=10)
+ 
+     invoice_reference_type = fields.Selection(string='Communication Type', required=True, selection=[('none', 'Open'), ('partner', 'Based on Customer'), ('invoice', 'Based on Invoice')], default='invoice', help='You can set here the default communication that will appear on customer invoices, once validated, to help the customer to refer to that particular invoice when making the payment.')
+@@ -540,7 +540,10 @@ class AccountJournal(models.Model):
+                     if bank_account.partner_id != company.partner_id:
+                         raise UserError(_("The partners of the journal's company and the related bank account mismatch."))
+             if 'restrict_mode_hash_table' in vals and not vals.get('restrict_mode_hash_table'):
+-                journal_entry = self.env['account.move'].sudo().search([('journal_id', '=', self.id), ('state', '=', 'posted'), ('secure_sequence_number', '!=', 0)], limit=1)
++                domain = self.env['account.move']._get_move_hash_domain(
++                    common_domain=[('journal_id', '=', self.id), ('secure_sequence_number', '!=', 0)]
++                )
++                journal_entry = self.env['account.move'].sudo().search_count(domain, limit=1)
+                 if journal_entry:
+                     field_string = self._fields['restrict_mode_hash_table'].get_description(self.env)['string']
+                     raise UserError(_("You cannot modify the field %s of a journal that already has accounting entries.", field_string))
+
+--- a/addons/account/models/account_move.py
++++ b/addons/account/models/account_move.py
+@@ -1447,11 +1447,11 @@ class AccountMove(models.Model):
+         for move in self:
+             move.has_reconciled_entries = len(move.line_ids._reconciled_lines()) > 1
+ 
+-    @api.depends('restrict_mode_hash_table', 'state')
++    @api.depends('restrict_mode_hash_table', 'state', 'is_move_sent')
+     def _compute_show_reset_to_draft_button(self):
+         for move in self:
+             move.show_reset_to_draft_button = (
+-                not move.restrict_mode_hash_table \
++                not self._is_move_restricted(move) \
+                 and (move.state == 'cancel' or (move.state == 'posted' and not move.need_cancel_request))
+             )
+ 
+@@ -2707,7 +2707,7 @@ class AccountMove(models.Model):
+             return True
+         self._sanitize_vals(vals)
+         for move in self:
+-            if (move.restrict_mode_hash_table and move.state == "posted" and set(vals).intersection(move._get_integrity_hash_fields())):
++            if (self._is_move_restricted(move) and set(vals).intersection(move._get_integrity_hash_fields())):
+                 raise UserError(_("You cannot edit the following fields due to restrict mode being activated on the journal: %s.", ', '.join(move._get_integrity_hash_fields())))
+             if (move.restrict_mode_hash_table and move.inalterable_hash and 'inalterable_hash' in vals) or (move.secure_sequence_number and 'secure_sequence_number' in vals):
+                 raise UserError(_('You cannot overwrite the values ensuring the inalterability of the accounting.'))
+@@ -2761,10 +2761,11 @@ class AccountMove(models.Model):
+                     posted_move._check_fiscalyear_lock_date()
+                     posted_move.line_ids._check_tax_lock_date()
+ 
+-                # Hash the move
+-                if vals.get('state') == 'posted':
++                # Hash the moves that fit the move hash domain
++                if vals.get('is_move_sent') or vals.get('state') == 'posted':
+                     self.flush_recordset()  # Ensure that the name is correctly computed before it is used to generate the hash
+-                    for move in self.filtered(lambda m: m.restrict_mode_hash_table and not(m.secure_sequence_number or m.inalterable_hash)).sorted(lambda m: (m.date, m.ref or '', m.id)):
++                    filter_domain = self._get_move_hash_domain(common_domain=[('inalterable_hash', '=', False)])
++                    for move in self.filtered_domain(filter_domain).sorted(lambda m: (m.date, m.ref or '', m.id)):
+                         new_number = move.journal_id.secure_sequence_id.next_by_id()
+                         res |= super(AccountMove, move).write({
+                             'secure_sequence_number': new_number,
+@@ -3228,6 +3229,22 @@ class AccountMove(models.Model):
+         #build and return the hash
+         return self._compute_hash(prev_move.inalterable_hash if prev_move else u'')
+ 
++    @api.model
++    def _get_move_hash_domain(self, common_domain=False):
++        # hash customer invoices/refunds on send, the rest on post
++        out_types = self.get_sale_types(include_receipts=True)
++        common_domain = (common_domain or []) + [('restrict_mode_hash_table', '=', True)]
++        return expression.AND(
++            [common_domain, expression.OR([
++                [('move_type', 'in', out_types), ('is_move_sent', '=', True)],
++                [('move_type', 'not in', out_types), ('state', '=', 'posted')],
++            ])]
++        )
++
++    @api.model
++    def _is_move_restricted(self, move):
++        return move.filtered_domain(self._get_move_hash_domain())
++
+     def _compute_hash(self, previous_hash):
+         """ Computes the hash of the browse_record given as self, based on the hash
+         of the previous record in the company's securisation sequence given as parameter"""
+@@ -4401,8 +4418,8 @@ class AccountMove(models.Model):
+                 # so we also check tax_cash_basis_origin_move_id, which stays unchanged
+                 # (we need both, as tax_cash_basis_origin_move_id did not exist in older versions).
+                 raise UserError(_('You cannot reset to draft a tax cash basis journal entry.'))
+-            if move.restrict_mode_hash_table and move.state == 'posted':
+-                raise UserError(_('You cannot modify a posted entry of this journal because it is in strict mode.'))
++            if self._is_move_restricted(move):
++                raise UserError(_('You cannot modify a sent entry of this journal because it is in strict mode.'))
+             # We remove all the analytics entries for this journal
+             move.mapped('line_ids.analytic_line_ids').unlink()
+ 
+
+--- a/addons/account/models/company.py
++++ b/addons/account/models/company.py
+@@ -5,6 +5,7 @@ import calendar
+ 
+ from odoo import fields, models, api, _
+ from odoo.exceptions import ValidationError, UserError, RedirectWarning
++from odoo.osv import expression
+ from odoo.tools.mail import is_html_empty
+ from odoo.tools.misc import format_date
+ from odoo.tools.float_utils import float_round, float_is_zero
+@@ -577,9 +578,10 @@ class ResCompany(models.Model):
+             # We need the `sudo()` to ensure that all the moves are searched, no matter the user's access rights.
+             # This is required in order to generate consistent hashs.
+             # It is not an issue, since the data is only used to compute a hash and not to return the actual values.
+-            all_moves_count = self.env['account.move'].sudo().search_count([('state', '=', 'posted'), ('journal_id', '=', journal.id)])
+-            moves = self.env['account.move'].sudo().search([('state', '=', 'posted'), ('journal_id', '=', journal.id),
+-                                            ('secure_sequence_number', '!=', 0)], order="secure_sequence_number ASC")
++            domain = self.env['account.move']._get_move_hash_domain(common_domain=[('journal_id', '=', journal.id)])
++            all_moves_count = self.env['account.move'].sudo().search_count(domain)
++            domain = expression.AND([domain, [('secure_sequence_number', '!=', 0)]])
++            moves = self.env['account.move'].sudo().search(domain, order="secure_sequence_number ASC")
+             if not moves:
+                 rslt.update({
+                     'msg_cover': _('There isn\'t any journal entry flagged for data inalterability yet for this journal.'),

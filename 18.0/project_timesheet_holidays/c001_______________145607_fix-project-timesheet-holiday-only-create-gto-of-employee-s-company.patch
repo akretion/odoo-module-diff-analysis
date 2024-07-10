@@ -1,0 +1,135 @@
+PR: https://github.com/odoo/odoo/pull/145607
+
+From: 9a22fec34c293b001c3bae557cb2965ade321b5b
+From: Xavier ALT
+Date: 2023-12-11 11:39:05
+
+Structural Changes: 1
+Total Changes: 52
+
+[FIX] project_timesheet_holiday: only create GTO of employee's company
+
+Following fdb692c25b50:
+
+- when creating/unarchiving an employee, we should only create global
+  time-off of the same company as the employee itself
+
+- when computing the working hours relative to the GTO, if we had both
+  calendar GTO and company GTO (not linked to a specific calendar), we
+  were not correctly creating calendar GTO; we should merge those
+  intervals intead of company GTO interval simply overwriting calendar
+  GTO intervals
+
+closes odoo/odoo#145607
+
+Task-id: 3619083
+X-original-commit: 8ec0c6c106352c19e5c7b5613be2f610fa6e0adb
+Signed-off-by: Xavier Bol (xbo) <xbo@odoo.com>
+
+================================= pseudo patch: =================================
+
+--- a/addons/project_timesheet_holidays/models/hr_employee.py
++++ b/addons/project_timesheet_holidays/models/hr_employee.py
+@@ -2,6 +2,7 @@
+ # Part of Odoo. See LICENSE file for full copyright and licensing details.
+ 
+ from odoo import api, fields, models
++from collections import defaultdict
+ 
+ 
+ class Employee(models.Model):
+@@ -24,7 +25,8 @@ class Employee(models.Model):
+         if 'active' in vals:
+             if vals.get('active'):
+                 # Create future holiday timesheets
+-                self._create_future_public_holidays_timesheets(self)
++                inactive_emp = self.filtered(lambda e: not e.active)
++                inactive_emp._create_future_public_holidays_timesheets(self)
+             else:
+                 # Delete future holiday timesheets
+                 self._delete_future_public_holidays_timesheets()
+@@ -42,12 +44,17 @@ class Employee(models.Model):
+     def _create_future_public_holidays_timesheets(self, employees):
+         lines_vals = []
+         today = fields.Datetime.today()
+-        global_leaves_wo_calendar = self.env['resource.calendar.leaves'].search([('calendar_id', '=', False), ('date_from', '>=', today)])
++        global_leaves_wo_calendar = defaultdict(lambda: self.env["resource.calendar.leaves"])
++        global_leaves_wo_calendar.update(dict(self.env['resource.calendar.leaves']._read_group(
++            [('calendar_id', '=', False), ('date_from', '>=', today)],
++            groupby=['company_id'],
++            aggregates=['id:recordset'],
++        )))
+         for employee in employees:
+             if not employee.active:
+                 continue
+             # First we look for the global time off that are already planned after today
+-            global_leaves = employee.resource_calendar_id.global_leave_ids.filtered(lambda l: l.date_from >= today) + global_leaves_wo_calendar
++            global_leaves = employee.resource_calendar_id.global_leave_ids.filtered(lambda l: l.date_from >= today) + global_leaves_wo_calendar[employee.company_id]
+             work_hours_data = global_leaves._work_time_per_day()
+             for global_time_off in global_leaves:
+                 for index, (day_date, work_hours_count) in enumerate(work_hours_data[employee.resource_calendar_id.id][global_time_off.id]):
+
+--- a/addons/project_timesheet_holidays/models/resource_calendar_leaves.py
++++ b/addons/project_timesheet_holidays/models/resource_calendar_leaves.py
+@@ -28,7 +28,7 @@ class ResourceCalendarLeaves(models.Model):
+                 (b) the resources which have a leave,
+                 (c) the oldest and
+                 (d) the latest leave dates
+-               ) for leaves in self.
++               ) for leaves in self (first for calendar's leaves, then for company's global leaves)
+             2) Search the attendances based on the characteristics retrieved for each calendar.
+                 The attendances found are the ones between the date_from of the oldest leave
+                 and the date_to of the most recent leave.
+@@ -41,8 +41,11 @@ class ResourceCalendarLeaves(models.Model):
+                 }
+         """
+         resource_calendars = resource_calendars or self._get_resource_calendars()
++        # to easily find the calendar with its id.
++        calendars_dict = {calendar.id: calendar for calendar in resource_calendars}
++
+         leaves_read_group = self.env['resource.calendar.leaves']._read_group(
+-            [('id', 'in', self.ids)],
++            [('id', 'in', self.ids), ('calendar_id', '!=', False)],
+             ['calendar_id'],
+             ['id:recordset', 'resource_id:recordset', 'date_from:min', 'date_to:max'],
+         )
+@@ -56,13 +59,33 @@ class ResourceCalendarLeaves(models.Model):
+                 'resources': resources,
+                 'leaves': leaves,
+             }
+-            if not calendar:
+-                for calendar_id in resource_calendars.ids:
++            cal_attendance_intervals_dict[calendar.id] = calendar_data
++
++        comp_leaves_read_group = self.env['resource.calendar.leaves']._read_group(
++            [('id', 'in', self.ids), ('calendar_id', '=', False)],
++            ['company_id'],
++            ['id:recordset', 'resource_id:recordset', 'date_from:min', 'date_to:max'],
++        )
++        for company, leaves, resources, date_from_min, date_to_max in comp_leaves_read_group:
++            for calendar_id in resource_calendars.ids:
++                if calendars_dict[calendar_id].company_id != company:
++                    continue  # only consider global leaves of the same company as the calendar
++                calendar_data = cal_attendance_intervals_dict.get(calendar_id)
++                if calendar_data is None:
++                    calendar_data = {
++                        'date_from': utc.localize(date_from_min),
++                        'date_to': utc.localize(date_to_max),
++                        'resources': resources,
++                        'leaves': leaves,
++                    }
+                     cal_attendance_intervals_dict[calendar_id] = calendar_data
+-            else:
+-                cal_attendance_intervals_dict[calendar.id] = calendar_data
+-        # to easily find the calendar with its id.
+-        calendars_dict = {calendar.id: calendar for calendar in resource_calendars}
++                else:
++                    calendar_data.update(
++                        date_from=min(utc.localize(date_from_min), calendar_data['date_from']),
++                        date_to=max(utc.localize(date_to_max), calendar_data['date_to']),
++                        resources=resources | calendar_data['resources'],
++                        leaves=leaves | calendar_data['leaves'],
++                    )
+ 
+         # dict of keys: calendar_id
+         #   and values: a dict of keys: leave.id
