@@ -1,0 +1,211 @@
+PR: https://github.com/odoo/odoo/pull/135502
+
+From: bc01c7bcec974ee095f5855f225667645ef40213
+From: svs-odoo
+Date: 2023-10-26 07:22:56
+
+Breaking data model changes score: 1, change matches:
+-    _inherit = ['portal.mixin', 'mail.thread', 'mail.activity.mixin', 'utm.mixin']
+
+Total Changes: 103
+
+[IMP] product,purchase,sale,*: product catalog
+
+This commit makes two major things:
+
+1. Move the product catalog from `sale` to `product`.
+It moves the product catalog's code from `sale` to `product` module in
+order to be able to use it in other modules.
+A mixin, `product.catalog.mixin`, was created for to make other models
+catalog compatible.
+
+2. It enables the product's catalog in `purchase`.
+In `purchase`, the catalog differs a little bit from `sale`:
+- If Unit of Measure is enable, the UoM for each product will appear in
+  the catalog;
+- If the product purchase's UoM or the purchase order line's UoM is
+  different than the default product's UoM, the former one will be
+  displayed (in bold so the user can know it's the UoM to refer);
+- When opening the product's catalog from a purchase order, the products
+  will be filtered by the PO's vendor;
+- Some data from the vendor list will be used if appliant: the minimum
+  quantity and the price;
+- If there is at least one product's packaging, a button will be
+  displayed to increase the qty by the packaging's one. If a packaging
+  is set on the purchase order line, this one will be used.
+
+task-3373589
+
+Part-of: odoo/odoo#135502
+
+================================= pseudo patch: =================================
+
+--- a/addons/sale/models/sale_order.py
++++ b/addons/sale/models/sale_order.py
+@@ -1,11 +1,12 @@
+ # Part of Odoo. See LICENSE file for full copyright and licensing details.
+-
++from collections import defaultdict
+ from datetime import timedelta
+ from itertools import groupby
+ 
+ from odoo import api, fields, models, SUPERUSER_ID, _
+ from odoo.exceptions import AccessError, UserError, ValidationError
+ from odoo.fields import Command
++from odoo.osv import expression
+ from odoo.tools import float_is_zero, format_amount, format_date, html_keep_url, is_html_empty
+ from odoo.tools.sql import create_index
+ 
+@@ -28,7 +29,7 @@ SALE_ORDER_STATE = [
+ 
+ class SaleOrder(models.Model):
+     _name = 'sale.order'
+-    _inherit = ['portal.mixin', 'mail.thread', 'mail.activity.mixin', 'utm.mixin']
++    _inherit = ['portal.mixin', 'product.catalog.mixin', 'mail.thread', 'mail.activity.mixin', 'utm.mixin']
+     _description = "Sales Order"
+     _order = 'date_order desc, id desc'
+     _check_company_auto = True
+@@ -1098,15 +1099,20 @@ class SaleOrder(models.Model):
+         lines_to_recompute._compute_discount()
+         self.show_update_pricelist = False
+ 
+-    def _get_product_catalog_domain(self):
+-        """Get the domain to search for products in the catalog.
++    def _default_order_line_values(self):
++        default_data = super()._default_order_line_values()
++        new_default_data = self.env['sale.order.line']._get_product_catalog_lines_data()
++        return {**default_data, **new_default_data}
+ 
+-        For a model that uses products that has to be hidden in the catalog, it must override this
+-        method and extend the appropriate domain.
+-        :returns: A list of tuples that represents a domain.
+-        :rtype: list
+-        """
+-        return  [('sale_ok', '=', True), ('company_id', 'in', [self.company_id.id, False]),]
++    def _get_action_add_from_catalog_extra_context(self):
++        return {
++            **super()._get_action_add_from_catalog_extra_context(),
++            'product_catalog_currency_id': self.currency_id.id,
++            'product_catalog_digits': self.order_line._fields['price_unit'].get_digits(self.env),
++        }
++
++    def _get_product_catalog_domain(self):
++        return expression.AND([super()._get_product_catalog_domain(), [('sale_ok', '=', True)]])
+ 
+     # INVOICING #
+ 
+@@ -1790,6 +1796,24 @@ class SaleOrder(models.Model):
+ 
+         return generated_invoices
+ 
++    def _get_product_catalog_order_data(self, products, **kwargs):
++        pricelist = self.pricelist_id._get_products_price(
++            quantity=1.0,
++            products=products,
++            currency=self.currency_id,
++            date=self.date_order,
++            **kwargs,
++        )
++        return {product_id: {'price': price} for product_id, price in pricelist.items()}
++
++    def _get_product_catalog_record_lines(self, product_ids):
++        grouped_lines = defaultdict(lambda: self.env['sale.order.line'])
++        for line in self.order_line:
++            if line.display_type or line.product_id.id not in product_ids:
++                continue
++            grouped_lines[line.product_id] |= line
++        return grouped_lines
++
+     def _get_product_documents(self):
+         self.ensure_one()
+ 
+@@ -1806,6 +1830,39 @@ class SaleOrder(models.Model):
+                 or (self.state == 'sale' and document.attached_on == 'sale_order')
+         )
+ 
++    def _update_order_line_info(self, product_id, quantity, **kwargs):
++        """ Update sale order line information for a given product or create a
++        new one if none exists yet.
++        :param int product_id: The product, as a `product.product` id.
++        :return: The unit price of the product, based on the pricelist of the
++                 sale order and the quantity selected.
++        :rtype: float
++        """
++        sol = self.order_line.filtered(lambda line: line.product_id.id == product_id)
++        if sol:
++            if quantity != 0:
++                sol.product_uom_qty = quantity
++            elif self.state in ['draft', 'sent']:
++                price_unit = self.pricelist_id._get_product_price(
++                    product=sol.product_id,
++                    quantity=1.0,
++                    currency=self.currency_id,
++                    date=self.date_order,
++                    **kwargs,
++                )
++                sol.unlink()
++                return price_unit
++            else:
++                sol.product_uom_qty = 0
++        elif quantity > 0:
++            sol = self.env['sale.order.line'].create({
++                'order_id': self.id,
++                'product_id': product_id,
++                'product_uom_qty': quantity,
++                'sequence': ((self.order_line and self.order_line[-1].sequence + 1) or 10),  # put it at the end of the order
++            })
++        return sol.price_unit
++
+     #=== HOOKS ===#
+ 
+     def add_option_to_order_with_taxcloud(self):
+
+--- a/addons/sale/models/sale_order_line.py
++++ b/addons/sale/models/sale_order_line.py
+@@ -1069,21 +1069,7 @@ class SaleOrderLine(models.Model):
+ 
+     def action_add_from_catalog(self):
+         order = self.env['sale.order'].browse(self.env.context.get('order_id'))
+-        kanban_view_id = self.env.ref('sale.sale_product_catalog_kanban_view').id
+-        search_view_id = self.env.ref('sale.sale_product_catalog_search_view').id
+-
+-        return {
+-            'type': 'ir.actions.act_window',
+-            'name': _('Products'),
+-            'res_model': 'product.product',
+-            'views': [(kanban_view_id, 'kanban'), (False, 'form')],
+-            'search_view_id': [search_view_id, 'search'],
+-            'domain': order._get_product_catalog_domain(),
+-            'context': {
+-                **self.env.context,
+-                **self._get_action_add_from_catalog_extra_context(order),
+-            },
+-        }
++        return order.action_add_from_catalog()
+ 
+     #=== BUSINESS METHODS ===#
+ 
+@@ -1183,14 +1169,7 @@ class SaleOrderLine(models.Model):
+         # True if the line is a computed line (reward, delivery, ...) that user cannot add manually
+         return False
+ 
+-    def _get_action_add_from_catalog_extra_context(self, order):
+-        return dict(
+-            product_catalog_order_id=order.id,
+-            product_catalog_currency_id=order.currency_id.id,
+-            product_catalog_digits=order.order_line._fields['price_unit'].get_digits(order.env),
+-        )
+-
+-    def _get_catalog_info(self):
++    def _get_product_catalog_lines_data(self, **kwargs):
+         """ Return information about sale order lines in `self`.
+ 
+         If `self` is empty, this method returns only the default value(s) needed for the product
+@@ -1230,6 +1209,7 @@ class SaleOrderLine(models.Model):
+                     quantity=1.0,
+                     currency=order.currency_id,
+                     date=order.date_order,
++                    **kwargs,
+                 ),
+                 'quantity': sum(
+                     self.mapped(

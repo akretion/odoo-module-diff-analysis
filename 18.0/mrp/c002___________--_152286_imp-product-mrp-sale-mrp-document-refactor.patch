@@ -1,0 +1,239 @@
+PR: https://github.com/odoo/odoo/pull/152286
+
+From: 85bf63d028ffff3dd7eeda186cc32f9ae7d09a60
+From: Martin Maes
+Date: 2024-05-28 17:29:17
+
+Breaking data model changes score: 4, change matches:
+-    _inherits = {
+-    ir_attachment_id = fields.Many2one('ir.attachment', string='Related attachment', required=True, ondelete='cascade')
+-    active = fields.Boolean('Active', default=True)
+-    priority = fields.Selection([
+
+Total Changes: 139
+
+[IMP] product,mrp,sale: mrp document refactor
+
+In https://github.com/odoo/odoo/pull/132739, the introduction of product documents generalized
+the previous document approach used in MRP.
+
+This commit removes the existing mrp_document model and merge it's data and behaviour with the
+product document one.
+
+In addition, a field attached_to_mrp added on the product document  will allow the user to
+access documents in spefic places, like in a production or a bill of materials.
+This commit also adds those documents to the respective chatters of the productions and bill
+of materials.
+
+closes odoo/odoo#152286
+
+Task-id: 3649991
+Closes: https://github.com/odoo/odoo/pull/152286
+Enterprise: https://github.com/odoo/enterprise/pull/55634
+Upgrade: https://github.com/odoo/upgrade/pull/5622
+Related: odoo/upgrade#5622
+Related: odoo/enterprise#55634
+Signed-off-by: William Henrotin (whe) <whe@odoo.com>
+
+================================= pseudo patch: =================================
+
+--- a/addons/mrp/models/__init__.py
++++ b/addons/mrp/models/__init__.py
+@@ -1,7 +1,8 @@
+ # -*- coding: utf-8 -*-
+ # Part of Odoo. See LICENSE file for full copyright and licensing details.
+ 
+-from . import mrp_document
++from . import ir_attachment
++from . import product_document
+ from . import res_config_settings
+ from . import mrp_bom
+ from . import mrp_routing
+
+--- a/None
++++ b/addons/mrp/models/ir_attachment.py
+@@ -0,0 +1,19 @@
++# Part of Odoo. See LICENSE file for full copyright and licensing details.
++
++from odoo import models
++
++
++class IrAttachment(models.Model):
++    _name = "ir.attachment"
++    _inherit = "ir.attachment"
++
++    def _post_add_create(self, **kwargs):
++        super()._post_add_create(**kwargs)
++        if self.res_model == "mrp.bom":
++            bom = self.env['mrp.bom'].browse(self.res_id)
++            self.res_model = bom.product_id._name if bom.product_id else bom.product_tmpl_id._name
++            self.res_id = bom.product_id.id if bom.product_id else bom.product_tmpl_id.id
++            self.env['product.document'].create({
++                'ir_attachment_id': self.id,
++                'attached_on_mrp': 'bom'
++            })
+
+--- a/addons/mrp/models/mrp_bom.py
++++ b/addons/mrp/models/mrp_bom.py
+@@ -476,6 +476,36 @@ class MrpBom(models.Model):
+ 
+         return self.env['product.product'].browse(product_id).standard_price
+ 
++    # -------------------------------------------------------------------------
++    # DOCUMENT
++    # -------------------------------------------------------------------------
++
++    def _get_mail_thread_data_attachments(self):
++        res = super()._get_mail_thread_data_attachments()
++        return res | self._get_extra_attachments()
++
++    def _get_extra_attachments(self):
++        final_domain = []
++        bom_domain = [('attached_on_mrp', '=', 'bom')]
++        is_byproduct = self.env.user.has_group('mrp.group_mrp_byproducts')
++        for bom in self:
++            product_subdomain = ['|',
++                '&', ('res_model', '=', 'product.product'), ('res_id', '=', bom.product_id.id),
++                '&', ('res_model', '=', 'product.template'), ('res_id', '=', bom.product_tmpl_id.id)]
++            if is_byproduct:
++                product_domain = OR([product_subdomain, [
++                    '|',
++                    '&', ('res_model', '=', 'product.product'), ('res_id', 'in', bom.byproduct_ids.product_id.ids),
++                    '&', ('res_model', '=', 'product.template'), ('res_id', 'in', bom.byproduct_ids.product_id.product_tmpl_id.ids)]])
++            else:
++                product_domain = product_subdomain
++            prod_final_domain = AND([bom_domain, product_domain])
++            final_domain = OR([final_domain, prod_final_domain]) if final_domain else prod_final_domain
++
++        attachements = self.env['product.document'].search(final_domain).ir_attachment_id
++        return attachements
++
++
+ class MrpBomLine(models.Model):
+     _name = 'mrp.bom.line'
+     _order = "sequence, id"
+@@ -548,10 +578,11 @@ class MrpBomLine(models.Model):
+     @api.depends('product_id')
+     def _compute_attachments_count(self):
+         for line in self:
+-            nbr_attach = self.env['mrp.document'].search_count([
++            nbr_attach = self.env['product.document'].search_count([
++                '&', '&', ('attached_on_mrp', '=', 'bom'), ('active', '=', 't'),
+                 '|',
+                 '&', ('res_model', '=', 'product.product'), ('res_id', '=', line.product_id.id),
+-                '&', ('res_model', '=', 'product.template'), ('res_id', '=', line.product_id.product_tmpl_id.id)])
++                '&', ('res_model', '=', 'product.template'), ('res_id', '=', line.product_tmpl_id.id)])
+             line.attachments_count = nbr_attach
+ 
+     @api.depends('child_bom_id')
+@@ -593,25 +624,35 @@ class MrpBomLine(models.Model):
+ 
+     def action_see_attachments(self):
+         domain = [
++            '&', ('attached_on_mrp', '=', 'bom'),
+             '|',
+             '&', ('res_model', '=', 'product.product'), ('res_id', '=', self.product_id.id),
+             '&', ('res_model', '=', 'product.template'), ('res_id', '=', self.product_id.product_tmpl_id.id)]
+-        attachment_view = self.env.ref('mrp.view_document_file_kanban_mrp')
++        attachments = self.env['product.document'].search(domain)
++        nbr_product_attach = len(attachments.filtered(lambda a: a.res_model == 'product.product'))
++        nbr_template_attach = len(attachments.filtered(lambda a: a.res_model == 'product.template'))
++        context = {'default_res_model': 'product.product',
++            'default_res_id': self.product_id.id,
++            'default_company_id': self.company_id.id,
++            'attached_on_bom': True,
++            'search_default_context_variant': not (nbr_product_attach == 0 and nbr_template_attach > 0) if self.env.user.has_group('product.group_product_variant') else False
++        }
++
+         return {
+             'name': _('Attachments'),
+             'domain': domain,
+-            'res_model': 'mrp.document',
++            'res_model': 'product.document',
+             'type': 'ir.actions.act_window',
+-            'view_id': attachment_view.id,
+-            'views': [(attachment_view.id, 'kanban'), (False, 'form')],
+             'view_mode': 'kanban,tree,form',
++            'target': 'current',
+             'help': _('''<p class="o_view_nocontent_smiling_face">
+                         Upload files to your product
+                     </p><p>
+                         Use this feature to store any files, like drawings or specifications.
+                     </p>'''),
+             'limit': 80,
+-            'context': "{'default_res_model': '%s','default_res_id': %d, 'default_company_id': %s}" % ('product.product', self.product_id.id, self.company_id.id)
++            'context': context,
++            'search_view_id': self.env.ref('product.product_document_search').ids
+         }
+ 
+     # -------------------------------------------------------------------------
+
+--- a/addons/mrp/models/mrp_document.py
++++ b/None
+@@ -1,38 +0,0 @@
+-# -*- coding: utf-8 -*-
+-# Part of Odoo. See LICENSE file for full copyright and licensing details.
+-
+-from odoo import fields, models
+-
+-
+-class MrpDocument(models.Model):
+-    """ Extension of ir.attachment only used in MRP to handle archivage
+-    and basic versioning.
+-    """
+-    _name = 'mrp.document'
+-    _description = "Production Document"
+-    _inherits = {
+-        'ir.attachment': 'ir_attachment_id',
+-    }
+-    _order = "priority desc, id desc"
+-
+-    def copy_data(self, default=None):
+-        vals_list = super().copy_data(default=default)
+-        ir_default = default
+-        if ir_default:
+-            ir_fields = list(self.env['ir.attachment']._fields)
+-            ir_default = {field: default[field] for field in default if field in ir_fields}
+-        for document, vals in zip(self, vals_list):
+-            vals['ir_attachment_id'] = document.ir_attachment_id.with_context(no_document=True).copy(ir_default).id
+-        return vals_list
+-
+-    ir_attachment_id = fields.Many2one('ir.attachment', string='Related attachment', required=True, ondelete='cascade')
+-    active = fields.Boolean('Active', default=True)
+-    priority = fields.Selection([
+-        ('0', 'Normal'),
+-        ('1', 'Low'),
+-        ('2', 'High'),
+-        ('3', 'Very High')], string="Priority") # used to order
+-
+-    def unlink(self):
+-        self.mapped('ir_attachment_id').unlink()
+-        return super(MrpDocument, self).unlink()
+
+--- a/None
++++ b/addons/mrp/models/product_document.py
+@@ -0,0 +1,24 @@
++
++# Part of Odoo. See LICENSE file for full copyright and licensing details.
++
++from odoo import fields, models
++
++
++class ProductDocument(models.Model):
++    _inherit = 'product.document'
++
++    def _default_attached_on_mrp(self):
++        return "bom" if self.env.context.get('attached_on_bom') else "hidden"
++
++    attached_on_mrp = fields.Selection(
++        selection=[
++            ('hidden', "Hidden"),
++            ('bom', "Bill of Materials")
++        ],
++        required=True,
++        string="MRP : Visible at",
++        help="Leave hidden if document only accessible on product form.\n"
++            "Select Bill of Materials to visualise this document as a product attachment when this product is in a bill of material.",
++        default=lambda self: self._default_attached_on_mrp(),
++        groups='mrp.group_mrp_user',
++    )

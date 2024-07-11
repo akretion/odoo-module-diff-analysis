@@ -1,0 +1,883 @@
+PR: https://github.com/odoo/odoo/pull/48422
+
+From: ed40fcd48c4b5768443818e0ac117dce0a07a28c
+From: Thibault Delavallée
+Date: 2021-01-21 11:00:40
+
+Breaking data model changes score: 0, change matches:
+
+Total Changes: 603
+
+[REF][MOV] crm: handle automatic lead assignment
+
+GLOBAL PURPOSE
+
+Ability to have salesmen belonging to several sales team is a core requirement
+of CRM. It is therefore moved from website_crm_score to crm along with cleaning
+and behavior improvement. Automatic lead assignment is also moved and cleaned.
+
+SPECIFICATIONS
+
+Move sales team automatic lead assignment from website_crm_score (enterprise)
+directly into sales_team. Some cleaning and renaming is performed while moving
+the code as it is old fashioned.
+
+Scoring feature is removed completely from lead assignment. Indeed we consider
+PLS is a better feature and provides more accurate results.
+
+Minimal scoring specific field on team is removed. Indeed it can also be
+integrated directly into domains linked to a sales team as this is a field
+directly available on lead using ``probability``. It allows to reduce fields
+of team model and move all logic in the team's domain itself.
+
+Overall behavior as been kept as close as possible from the original one.
+Purpose is to avoid too much undesired changes between versions.
+
+In this commit we also add tests for automatic lead assignment.
+
+ASSIGNMENT PROCESS DESCRIPTION
+
+1- LEAD TO TEAM ALLOCATION
+
+Allocate leads to teams given by self. This method sets ``team_id`` field
+on lead records that are unassigned (no team and no responsible). No
+salesperson is assigned in this process. Its purpose is simply to allocate
+leads within teams.
+
+Heuristic of this method is the following:
+  * first we randomize all teams;
+  * then for each team
+
+    * find unassigned leads, aka leads being
+
+      * without team, without user -> not assigned;
+      * not in a won stage, and not having False/0 (lost) or 100 (won)
+        probability) -> live leads;
+      * if set, a delay after creation can be applied (see BUNDLE_HOURS_DELAY)
+        parameter explanations here below;
+
+    * keep only leads matching the team's assignment domain (empty means
+      everything);
+    * assign maximum BUNDLE_SIZE leads to the team, then move to the next team.
+      This is done to ensure every team will have leads enough to fill its
+      capacity based on its domain;
+    * when setting a team on leads, leads belonging to the current batch
+      are also merged. Purpose is to clean database and avoid assigning
+      duplicates to same or different teams;
+
+  * for all teams that still have capacity (aka: a search on unassigned
+    available leads with team domain still give results), do another
+    assignment round. Each round teams are randomized so that team order
+    is not always the same;
+
+Note that leads are assigned in batch meaning a team could receive leads that
+could better fit another team. However this heuristics is based on hypothesis
+that team domains do not overlap. Indeed if a company has several teams they
+will probably target separate market segments: country-based, customer type or
+size, ... Having several teams using same assignment domain could lead to less
+fairness in assignment process but this should not be the target use case of this
+heuristic.
+
+Leads are allocated by batch. This can be configured using a config parameter.
+Batch size depends on cron frequency, lead pipeline size and members assignment
+maximum. Finding an optimal heuristic for this parameter is not easy as it
+depends on internal processes and organization. Higher batch size leads to
+better performances when running automatic assignment. It can also give unfair
+results if teams domain overlap or if pipeline is not big enough to fill all
+teams capacity.
+
+2- LEAD TO MEMBER ASSIGN
+
+Main processing method to assign leads to sales team members. It also converts
+them into opportunities. Its main purpose is therefore to distribute team
+workload on its members based on their capacity.
+
+Preparation
+
+  * prepare lead domain for each member. It is done using a logical AND with
+    team's domain and member's domain. Member domains further restricts team
+    domain;
+  * prepare a set of available leads for each member by searching for leads
+    matching domain with a sufficient limit to ensure all members will receive
+    leads;
+  * prepare a weighted population sample. Population are members that should
+    receive leads. Initial weight is the number of leads to assign to that
+    specific member. This is minimum value between
+
+    * remaining this month: assignment_max - number of lead already assigned
+      this month;
+    * days-based assignment: assignment_max with a ratio based on ``work_days``
+    * e.g. Michel Poilvache (max: 30 - currently assigned: 15) limit
+      for 2 work days: min(30-15, 30/15) -> 2 leads assigned
+    * e.g. Michel Tartopoil (max: 30 - currently assigned: 26) limit
+      for 10 work days: min(30-26, 30/3) -> 4 leads assigned
+
+Assign process then follows the following heuristic
+
+  * take a weighted random choice in population;
+  * find first available (not yet assigned) lead in its lead set;
+  * if found:
+
+    * convert it into an opportunity and assign member as salesperson;
+    * lessen member's weight so that other members have an higher
+      probability of being picked up next;
+
+  * if not found: consider this member is out of assignment process,
+    remove it from population so that it is not picked up anymore;
+
+Assignment is performed one lead at a time for fairness purpose. Indeed members
+may have overlapping domains within a given team. To ensure some fairness in
+process once a member receives a lead, a new choice is performed with updated
+weights. This is not optimal from performance point of view but increases
+probability leads are correctly distributed within the team.
+
+LINKS
+
+Task ID-2086889 (main task)
+Task ID-2357969 (scoring migration task)
+Community PR odoo/odoo#48422
+Enterprise PR odoo/enterprise#499
+Upgrade PR odoo/upgrade#996
+
+================================= pseudo patch: =================================
+
+--- a/addons/crm/models/crm_lead.py
++++ b/addons/crm/models/crm_lead.py
+@@ -1081,15 +1081,25 @@ class Lead(models.Model):
+                 - merge at least 1 opp with anything else (lead or opp) = 1 new opp
+             The resulting lead/opportunity will be the most important one (based on its confidence level)
+             updated with values from other opportunities to merge.
+-            :param user_id : the id of the saleperson. If not given, will be determined by `_merge_data`.
+-            :param team : the id of the Sales Team. If not given, will be determined by `_merge_data`.
+-            :return crm.lead record resulting of th merge
++
++        :param user_id : the id of the saleperson. If not given, will be determined by `_merge_data`.
++        :param team : the id of the Sales Team. If not given, will be determined by `_merge_data`.
++
++        :return crm.lead record resulting of th merge
+         """
++        return self._merge_opportunity(user_id=user_id, team_id=team_id, auto_unlink=auto_unlink)
++
++    def _merge_opportunity(self, user_id=False, team_id=False, auto_unlink=True, max_length=5):
++        """ Private merging method. This one allows to relax rules on record set
++        length allowing to merge more than 5 opportunities at once if requested.
++        This should not be called by action buttons.
++
++        See ``merge_opportunity`` for more details. """
+         if len(self.ids) <= 1:
+             raise UserError(_('Please select more than one element (lead or opportunity) from the list view.'))
+ 
+-        if len(self.ids) > 5 and not self.env.is_superuser():
+-            raise UserError(_("To prevent data loss, Leads and Opportunities can only be merged by groups of 5."))
++        if max_length and len(self.ids) > max_length and not self.env.is_superuser():
++            raise UserError(_("To prevent data loss, Leads and Opportunities can only be merged by groups of %(max_length)s."))
+ 
+         opportunities = self._sort_by_confidence_level(reverse=True)
+ 
+
+--- a/addons/crm/models/crm_team.py
++++ b/addons/crm/models/crm_team.py
+@@ -1,12 +1,20 @@
+ # -*- coding: utf-8 -*-
+ # Part of Odoo. See LICENSE file for full copyright and licensing details.
+ 
+-import ast
+ import datetime
++import logging
++import random
++import threading
+ 
+-from odoo import api, fields, models, _
++from ast import literal_eval
++
++from odoo import api, exceptions, fields, models, _
++from odoo.addons.crm.models.crm_lead import LEAD_ASSIGN_EVAL_CONTEXT
++from odoo.osv import expression
+ from odoo.tools.safe_eval import safe_eval
+ 
++_logger = logging.getLogger(__name__)
++
+ 
+ class Team(models.Model):
+     _name = 'crm.team'
+@@ -18,6 +26,15 @@ class Team(models.Model):
+     alias_id = fields.Many2one(
+         'mail.alias', string='Alias', ondelete="restrict", required=True,
+         help="The email address associated with this channel. New emails received will automatically create new leads assigned to the channel.")
++    # assignment
++    assignment_enabled = fields.Boolean('Lead Assign', compute='_compute_assignment_enabled')
++    assignment_auto_enabled = fields.Boolean('Auto Assignment', compute='_compute_assignment_enabled')
++    assignment_max = fields.Integer(
++        'Lead Capacity', compute='_compute_assignment_max',
++        help='Monthly leads for all salesmen belonging to the team')
++    assignment_domain = fields.Char(
++        'Assignment Domain', tracking=True,
++        help='Additional filter domain when fetching unassigned leads to allocate to the team.')
+     # statistics about leads / opportunities / both
+     lead_unassigned_count = fields.Integer(
+         string='# Unassigned Leads', compute='_compute_lead_unassigned_count')
+@@ -37,6 +54,20 @@ class Team(models.Model):
+         'res.users', related='alias_id.alias_user_id', inherited=True,
+         domain=lambda self: [('groups_id', 'in', self.env.ref('sales_team.group_sale_salesman_all_leads').id)])
+ 
++    @api.depends('crm_team_member_ids.assignment_max')
++    def _compute_assignment_max(self):
++        for team in self:
++            team.assignment_max = sum(member.assignment_max for member in team.crm_team_member_ids)
++
++    def _compute_assignment_enabled(self):
++        assign_enabled = self.env['ir.config_parameter'].sudo().get_param('crm.lead.auto.assignment', False)
++        auto_assign_enabled = False
++        if assign_enabled:
++            assign_cron = self.sudo().env.ref('crm.ir_cron_crm_lead_assign', raise_if_not_found=False)
++            auto_assign_enabled = assign_cron.active if assign_cron else False
++        self.assignment_enabled = assign_enabled
++        self.assignment_auto_enabled = auto_assign_enabled
++
+     def _compute_lead_unassigned_count(self):
+         leads_data = self.env['crm.lead'].read_group([
+             ('team_id', 'in', self.ids),
+@@ -50,7 +81,7 @@ class Team(models.Model):
+     @api.depends('crm_team_member_ids.lead_month_count')
+     def _compute_lead_all_assigned_month_count(self):
+         for team in self:
+-            team.lead_all_assigned_month_count = sum(s.lead_month_count for s in team.crm_team_member_ids)
++            team.lead_all_assigned_month_count = sum(member.lead_month_count for member in team.crm_team_member_ids)
+ 
+     def _compute_opportunities_data(self):
+         opportunity_data = self.env['crm.lead'].read_group([
+@@ -82,6 +113,15 @@ class Team(models.Model):
+         if not self.use_leads and not self.use_opportunities:
+             self.alias_name = False
+ 
++    @api.constrains('assignment_domain')
++    def _constrains_assignment_domain(self):
++        for team in self:
++            try:
++                domain = safe_eval(team.assignment_domain or '[]', LEAD_ASSIGN_EVAL_CONTEXT)
++                self.env['crm.lead'].search_count(domain)
++            except Exception:
++                raise Warning('Domain for %s is incorrectly formatted' % team.name)
++
+     # ------------------------------------------------------------
+     # ORM
+     # ------------------------------------------------------------
+@@ -107,12 +147,307 @@ class Team(models.Model):
+         if self.id:
+             if not self.use_leads and not self.use_opportunities:
+                 values['alias_name'] = False
+-            values['alias_defaults'] = defaults = ast.literal_eval(self.alias_defaults or "{}")
++            values['alias_defaults'] = defaults = literal_eval(self.alias_defaults or "{}")
+             has_group_use_lead = self.env.user.has_group('crm.group_use_lead')
+             defaults['type'] = 'lead' if has_group_use_lead and self.use_leads else 'opportunity'
+             defaults['team_id'] = self.id
+         return values
+ 
++    # ------------------------------------------------------------
++    # LEAD ASSIGNMENT
++    # ------------------------------------------------------------
++
++    @api.model
++    def _cron_assign_leads(self):
++        """ Cron method assigning leads. Leads are allocated to all teams and
++        assigned to their members. It is based on cron configuration to
++        deduce parameters of assignment to perform. Purpose of cron is to assign
++        leads to sales persons. Assigned workload is set to 2 times the workload
++        those sales people should perform between two cron iterations. Giving
++        more allows more flexibility in their organization. If their maximum
++        capacity is reached assign process won't give more leads to those people.
++
++        e.g. cron is active with interval_number 3, interval_type days. This
++        means cron runs every 3 days. Cron will assign leads for 6 work days
++        to salespersons each 3 days unless their maximum capacity is reached.
++
++        If cron runs on an hour-based schedule minimum assignment performed is
++        equivalent to 2 workdays. Max assignment performed is for 30 days as it
++        is better to run more often than planning for more than one month.
++
++        See ``CrmTeam.action_assign_leads()`` and its sub methods for more
++        details about assign process.
++        """
++        assign_cron = self.sudo().env.ref('crm.ir_cron_crm_lead_assign', raise_if_not_found=False)
++        work_days = 2
++        if assign_cron and assign_cron.active:
++            if assign_cron.interval_type == 'months':
++                work_days = 30  # maximum one month of work
++            elif assign_cron.interval_type == 'weeks':
++                work_days = 2 * assign_cron.interval_number * 7
++            elif assign_cron.interval_type == 'days':
++                work_days = 2 * assign_cron.interval_number * 1
++        work_days = 30 if work_days > 30 else work_days
++        self.env['crm.team'].search([])._action_assign_leads(work_days=work_days)
++        return True
++
++    def action_assign_leads(self, work_days=2):
++        """ Manual (direct) leads assignment. This method both
++
++          * assigns leads to teams given by self;
++          * assigns leads to salespersons belonging to self;
++
++        See sub methods for more details about assign process.
++
++        :param int work_days: number of work days to consider when assigning leads
++          to teams or salespersons. We consider that Member.assignment_max (or
++          its equivalent on team model) targets 30 work days. We make a ratio
++          between expected number of work days and maximum assignment for those
++          30 days to know lead count to assign.
++
++        :return action: a client notification giving some insights on assign
++          process;
++        """
++        teams_data, members_data = self._action_assign_leads(work_days=work_days)
++
++        # extract some statistics
++        assigned = sum(len(teams_data[team]['assigned']) + len(teams_data[team]['merged']) for team in self)
++        duplicates = sum(len(teams_data[team]['duplicates']) for team in self)
++        members = len(members_data.keys())
++        members_assigned = sum(len(member_data['assigned']) for member_data in members_data.values())
++
++        # format user notification
++        # 1- team allocation
++        if not assigned:
++            message = _("No new lead allocated to the teams.")
++        elif len(self) == 1:
++            message = _("%(assigned)s leads allocated to the team.",
++                        assigned=assigned)
++        else:
++            message = _("%(assigned)s leads allocated among %(team_count)s teams.",
++                        assigned=assigned, team_count=len(self))
++        # 2- salespersons assignment
++        if not members_assigned:
++            message += " " + _("No lead has been assigned to team members. Check your Sales Teams and Members configuration.")
++        else:
++            message += " " + _("%(members_assigned)s leads assigned to %(members)s salesmen.",
++                               members_assigned=members_assigned, members=members)
++        # 3- duplicates removal
++        if duplicates:
++            message += " " + _("%(duplicates)s duplicates leads were merged.",
++                               duplicates=duplicates)
++
++        return {
++            'type': 'ir.actions.client',
++            'tag': 'display_notification',
++            'params': {
++                'type': 'success',
++                'title': _("Leads Assigned"),
++                'message': message,
++                'next': {
++                    'type': 'ir.actions.act_window_close'
++                },
++            }
++        }
++
++    def _action_assign_leads(self, work_days=2):
++        """ Private method for lead assignment. This method both
++
++          * assigns leads to teams given by self;
++          * assigns leads to salespersons belonging to self;
++
++        See sub methods for more details about assign process.
++
++        :param int work_days: see ``CrmTeam.action_assign_leads()``;
++
++        :return teams_data, members_data: structure-based result of assignment
++          process. For more details about data see ``CrmTeam._allocate_leads()``
++          and ``CrmTeamMember._assign_and_convert_leads``;
++        """
++        if not self.env.user.has_group('sales_team.group_sale_manager') and not self.env.user.has_group('base.group_system'):
++            raise exceptions.UserError(_('Lead/Opportunities automatic assignment is limited to managers or administrators'))
++
++        _logger.info('### START Lead Assignment (%d teams, %d sales persons, %d work_days)' % (len(self), len(self.crm_team_member_ids), work_days))
++        teams_data = self._allocate_leads(work_days=work_days)
++        _logger.info('### Team repartition done. Starting salesmen assignment.')
++        members_data = self.crm_team_member_ids._assign_and_convert_leads(work_days=work_days)
++        _logger.info('### END Lead Assignment')
++        return teams_data, members_data
++
++    def _allocate_leads(self, work_days=2):
++        """ Allocate leads to teams given by self. This method sets ``team_id``
++        field on lead records that are unassigned (no team and no responsible).
++        No salesperson is assigned in this process. Its purpose is simply to
++        allocate leads within teams.
++
++        Heuristic of this method is the following:
++
++          * first we randomize all teams;
++          * then for each team
++
++            * find unassigned leads, aka leads being
++
++              * without team, without user -> not assigned;
++              * not in a won stage, and not having False/0 (lost) or 100 (won)
++                probability) -> live leads;
++              * if set, a delay after creation can be applied (see BUNDLE_HOURS_DELAY)
++                parameter explanations here below;
++
++            * keep only leads matching the team's assignment domain (empty means
++              everything);
++            * assign maximum BUNDLE_SIZE leads to the team, then move to the
++              next team. This is done to ensure every team will have leads
++              enough to fill its capacity based on its domain;
++            * when setting a team on leads, leads belonging to the current batch
++              are also merged. Purpose is to clean database and avoid assigning
++              duplicates to same or different teams;
++
++          * for all teams that still have capacity (aka: a search on unassigned
++            available leads with team domain still give results), do another
++            assignment round. Each round teams are randomized so that team order
++            is not always the same;
++
++        Note that leads are assigned in batch meaning a team could receive
++        leads that could better fit another team. However this heuristics is
++        based on hypothesis that team domains do not overlap. Indeed if a
++        company has several teams they will probably target separate market
++        segments: country-based, customer type or size, ... Having several
++        teams using same assignment domain could lead to less fairness in
++        assignment process but this should not be the target use case of this
++        heuristic.
++
++        Leads are allocated by batch. This can be configured using a config
++        parameter (see here below). Batch size depends on cron frequency,
++        lead pipeline size and members assignment maximum. Finding an optimal
++        heuristic for this parameter is not easy as it depends on internal
++        processes and organization. Higher batch size leads to better performances
++        when running automatic assignment. It can also give unfair results
++        if teams domain overlap or if pipeline is not big enough to fill all
++        teams capacity.
++
++        :config int crm.assignment.bundle: optional config parameter allowing
++          to set size of lead batch (BUNDLE_SIZE) allocated to a team at each
++          iteration (50 by default based on experience);
++        :config int crm.assignment.delay: optional config parameter giving a
++          delay before taking a lead into assignment process (BUNDLE_HOURS_DELAY)
++          given in hours. Purpose if to allow other crons or automated actions
++          to make their job. This option is mainly historic as its purpose was
++          to let automated actions prepare leads and score before PLS was added
++          into CRM. This is now not required anymore but still supported;
++
++        :param int work_days: see ``CrmTeam.action_assign_leads()``;
++
++        :return teams_data: dict() with each team assignment result:
++          team: {
++            'assigned': set of lead IDs directly assigned to the team (no
++              duplicate or merged found);
++            'merged': set of lead IDs merged and assigned to the team (main
++              leads being results of merge process);
++            'duplicates': set of lead IDs found as duplicates and merged into
++              other leads. Those leads are unlinked during assign process and
++              are already removed at return of this method;
++          }, ...
++        """
++        if not work_days or work_days > 30:
++            raise ValueError(
++                _('Leads team allocation should be done for at least 1 or maximum 30 work days, not %s.', work_days)
++            )
++
++        BUNDLE_HOURS_DELAY = int(self.env['ir.config_parameter'].sudo().get_param('crm.assignment.delay', default=0))
++        BUNDLE_SIZE = int(self.env['ir.config_parameter'].sudo().get_param('crm.assignment.bundle', default=50))
++        max_create_dt = fields.Datetime.now() - datetime.timedelta(hours=BUNDLE_HOURS_DELAY)
++
++        team_done = self.env['crm.team']
++        remaining_teams = self.env['crm.team'].browse(random.sample(self.ids, k=len(self.ids)))
++
++        # compute assign domain for each team before looping on them by bundle size
++        teams_domain = dict.fromkeys(remaining_teams, False)
++        for team in remaining_teams:
++            teams_domain[team] = safe_eval(team.assignment_domain or '[]', LEAD_ASSIGN_EVAL_CONTEXT)
++
++        teams_data = dict.fromkeys(remaining_teams, False)
++        for team in remaining_teams:
++            teams_data[team] = dict(assigned=set(), merged=set(), duplicates=set())
++
++        while remaining_teams:
++            for team in remaining_teams:
++                lead_domain = expression.AND([
++                    teams_domain[team],
++                    [('create_date', '<', max_create_dt)],
++                    ['&', ('team_id', '=', False), ('user_id', '=', False)],
++                    ['|', ('stage_id.is_won', '=', False), ('probability', 'not in', [False, 0, 100])]
++                ])
++                leads = self.env["crm.lead"].search(lead_domain, limit=BUNDLE_SIZE)
++
++                if len(leads) < BUNDLE_SIZE:
++                    team_done += team
++
++                # assign + deduplicate and concatenate results in teams_data to keep some history
++                assign_res = team._allocate_leads_deduplicate(leads)
++                _logger.info('Assigned %s leads to team %s' % (len(leads), team.id))
++                _logger.info('\tLeads: direct assign %s / merge result %s / duplicates merged: %s' % (
++                    assign_res['assigned'], assign_res['merged'], assign_res['duplicates']
++                ))
++                for key in ('assigned', 'merged', 'duplicates'):
++                    teams_data[team][key].update(assign_res[key])
++
++                # auto-commit except in testing mode. As this process may be time consuming or we
++                # may encounter errors, already commit what is allocated to avoid endless cron loops.
++                auto_commit = not getattr(threading.currentThread(), 'testing', False)
++                if auto_commit:
++                    self._cr.commit()
++
++            remaining_team_ids = (remaining_teams - team_done).ids
++            remaining_teams = self.env['crm.team'].browse(random.sample(remaining_team_ids, k=len(remaining_team_ids)))
++
++        # some final log
++        _logger.info('## Assigned %s leads' % sum(len(team_data['assigned']) + len(team_data['merged']) for team_data in teams_data.values()))
++
++        return teams_data
++
++    def _allocate_leads_deduplicate(self, leads):
++        """ Assign leads to sales team given by self by calling lead tool
++        method _handle_salesmen_assignment. In this method we deduplicate leads
++        allowing to reduce number of resulting leads before assigning them
++        to salesmen.
++
++        :param leads: recordset of leads to assign to current team;
++        """
++        self.ensure_one()
++
++        # classify leads
++        leads_assigned = self.env['crm.lead']  # direct team assign
++        leads_done_ids, leads_merged_ids, leads_dup_ids = set(), set(), set()  # classification
++        leads_dups_dict = dict()  # lead -> its duplicate
++        for lead in leads:
++            if lead.id not in leads_done_ids:
++                lead_duplicates = lead._get_lead_duplicates(email=lead.email_from)
++                if len(lead_duplicates) > 1:
++                    leads_dups_dict[lead] = lead_duplicates
++                    leads_done_ids.update((lead + lead_duplicates).ids)
++                else:
++                    leads_assigned += lead
++                    leads_done_ids.add(lead.id)
++
++        leads_assigned._handle_salesmen_assignment(user_ids=None, team_id=self.id)
++
++        for lead in leads.filtered(lambda lead: lead in leads_dups_dict):
++            lead_duplicates = leads_dups_dict[lead]
++            merged = lead_duplicates._merge_opportunity(user_id=False, team_id=self.id, max_length=0)
++            leads_dup_ids.update((lead_duplicates - merged).ids)
++            leads_merged_ids.add(merged.id)
++
++            # auto-commit except in testing mode
++            auto_commit = not getattr(threading.currentThread(), 'testing', False)
++            if auto_commit:
++                self._cr.commit()
++
++        return {
++            'assigned': set(leads_assigned.ids),
++            'merged': leads_merged_ids,
++            'duplicates': leads_dup_ids,
++        }
++
+     # ------------------------------------------------------------
+     # ACTIONS
+     # ------------------------------------------------------------
+@@ -174,4 +509,4 @@ class Team(models.Model):
+     def _graph_title_and_key(self):
+         if self.use_opportunities:
+             return ['', _('New Opportunities')] # no more title
+-        return super(Team,self)._graph_title_and_key()
++        return super(Team, self)._graph_title_and_key()
+
+--- a/addons/crm/models/crm_team_member.py
++++ b/addons/crm/models/crm_team_member.py
+@@ -2,11 +2,18 @@
+ # Part of Odoo. See LICENSE file for full copyright and licensing details.
+ 
+ import datetime
++import logging
++import math
++import threading
++import random
+ 
+ from odoo import api, exceptions, fields, models, _
+ from odoo.addons.crm.models.crm_lead import LEAD_ASSIGN_EVAL_CONTEXT
++from odoo.osv import expression
+ from odoo.tools import safe_eval
+ 
++_logger = logging.getLogger(__name__)
++
+ 
+ class Team(models.Model):
+     _inherit = 'crm.team.member'
+@@ -22,11 +29,7 @@ class Team(models.Model):
+     def _compute_lead_month_count(self):
+         for member in self:
+             if member.user_id.id and member.crm_team_id.id:
+-                limit_date = fields.Datetime.now() - datetime.timedelta(days=30)
+-                domain = [('user_id', '=', member.user_id.id),
+-                          ('team_id', '=', member.crm_team_id.id),
+-                          ('date_open', '>=', limit_date)]
+-                member.lead_month_count = self.env['crm.lead'].search_count(domain)
++                member.lead_month_count = self.env['crm.lead'].search_count(member._get_lead_month_domain())
+             else:
+                 member.lead_month_count = 0
+ 
+@@ -38,3 +41,154 @@ class Team(models.Model):
+                 self.env['crm.lead'].search(domain, limit=1)
+             except Exception:
+                 raise exceptions.UserError(_('Team membership assign domain is incorrectly formatted'))
++
++    def _get_lead_month_domain(self):
++        limit_date = fields.Datetime.now() - datetime.timedelta(days=30)
++        return [
++            ('user_id', '=', self.user_id.id),
++            ('team_id', '=', self.crm_team_id.id),
++            ('date_open', '>=', limit_date)
++        ]
++
++    # ------------------------------------------------------------
++    # LEAD ASSIGNMENT
++    # ------------------------------------------------------------
++
++    def _assign_and_convert_leads(self, work_days=2):
++        """ Main processing method to assign leads to sales team members. It also
++        converts them into opportunities. This method should be called after
++        ``_allocate_leads`` as this method assigns leads already allocated to
++        the member's team. Its main purpose is therefore to distribute team
++        workload on its members based on their capacity.
++
++        Preparation
++
++          * prepare lead domain for each member. It is done using a logical
++            AND with team's domain and member's domain. Member domains further
++            restricts team domain;
++          * prepare a set of available leads for each member by searching for
++            leads matching domain with a sufficient limit to ensure all members
++            will receive leads;
++          * prepare a weighted population sample. Population are members that
++            should received leads. Initial weight is the number of leads to
++            assign to that specific member. This is minimum value between
++            * remaining this month: assignment_max - number of lead already
++              assigned this month;
++            * days-based assignment: assignment_max with a ratio based on
++              ``work_days`` parameter (see ``CrmTeam.action_assign_leads()``)
++            * e.g. Michel Poilvache (max: 30 - currently assigned: 15) limit
++              for 2 work days: min(30-15, 30/15) -> 2 leads assigned
++            * e.g. Michel Tartopoil (max: 30 - currently assigned: 26) limit
++              for 10 work days: min(30-26, 30/3) -> 4 leads assigned
++
++        This method then follows the following heuristic
++
++          * take a weighted random choice in population;
++          * find first available (not yet assigned) lead in its lead set;
++          * if found:
++            * convert it into an opportunity and assign member as salesperson;
++            * lessen member's weight so that other members have an higher
++              probability of being picked up next;
++          * if not found: consider this member is out of assignment process,
++            remove it from population so that it is not picked up anymore;
++
++        Assignment is performed one lead at a time for fairness purpose. Indeed
++        members may have overlapping domains within a given team. To ensure
++        some fairness in process once a member receives a lead, a new choice is
++        performed with updated weights. This is not optimal from performance
++        point of view but increases probability leads are correctly distributed
++        within the team.
++
++        :param int work_days: see ``CrmTeam.action_assign_leads()``;
++
++        :return members_data: dict() with each member assignment result:
++          membership: {
++            'assigned': set of lead IDs directly assigned to the member;
++          }, ...
++
++        """
++        if not work_days or work_days > 30:
++            raise ValueError(
++                _('Leads assignment should be done for at least 1 or maximum 30 work days, not %s.', work_days)
++            )
++        # assignment_max is valid for "30 days" -> divide by requested work_days
++        # to have number of leads to assign
++        assign_ratio = work_days / 30.0
++
++        members_data, population, weights = dict(), list(), list()
++        members = self.filtered(lambda member: member.assignment_max > member.lead_month_count)
++        if not members:
++            return members_data
++
++        # prepare a global lead count based on total leads to assign to salespersons
++        lead_limit = sum(
++            min(
++                int(math.ceil(member.assignment_max * assign_ratio)),
++                (member.assignment_max - member.lead_month_count)
++            )
++            for member in members
++        )
++
++        # could probably be optimized
++        for member in members:
++            lead_domain = expression.AND([
++                safe_eval.safe_eval(member.assignment_domain or '[]', LEAD_ASSIGN_EVAL_CONTEXT),
++                ['&', '&', ('user_id', '=', False), ('date_open', '=', False), ('team_id', '=', member.crm_team_id.id)]
++            ])
++
++            leads = self.env["crm.lead"].search(lead_domain, order='probability DESC', limit=lead_limit)
++
++            to_assign = min(member.assignment_max - member.lead_month_count, round(member.assignment_max * assign_ratio))
++            members_data[member.id] = {
++                "team_member": member,
++                "max": member.assignment_max,
++                "to_assign": to_assign,
++                "leads": leads,
++                "assigned": self.env["crm.lead"],
++            }
++            population.append(member.id)
++            weights.append(to_assign)
++
++        leads_done_ids = set()
++        counter = 0
++        while population:
++            counter += 1
++            member_id = random.choices(population, weights=weights, k=1)[0]
++            member_index = population.index(member_id)
++            member_data = members_data[member_id]
++
++            lead = next((lead for lead in member_data['leads'] if lead.id not in leads_done_ids), False)
++            if lead:
++                leads_done_ids.add(lead.id)
++                members_data[member_id]["assigned"] += lead
++                weights[member_index] = weights[member_index] - 1
++
++                lead.with_context(mail_auto_subscribe_no_notify=True).convert_opportunity(
++                    lead.partner_id.id,
++                    user_ids=member_data['team_member'].user_id.ids
++                )
++
++                # auto-commit except in testing mode
++                auto_commit = not getattr(threading.currentThread(), 'testing', False)
++                if auto_commit:
++                    self._cr.commit()
++            else:
++                weights[member_index] = 0
++
++            if weights[member_index] <= 0:
++                population.pop(member_index)
++                weights.pop(member_index)
++
++            # failsafe
++            if counter > 100000:
++                population = list()
++
++        # log results and return
++        result_data = dict(
++            (member_info["team_member"], {"assigned": member_info["assigned"]})
++            for member_id, member_info in members_data.items()
++        )
++        _logger.info('Assigned %s leads to %s salesmen' % (len(leads_done_ids), len(self)))
++        for member, member_info in result_data.items():
++            _logger.info('-> member %s: assigned %d leads (%s)' % (member.id, len(member_info["assigned"]), member_info["assigned"]))
++        return result_data
+
+--- a/addons/crm/models/res_config_settings.py
++++ b/addons/crm/models/res_config_settings.py
+@@ -1,7 +1,9 @@
+ # -*- coding: utf-8 -*-
+ # Part of Odoo. See LICENSE file for full copyright and licensing details.
+ 
+-from odoo import api, fields, models
++from dateutil.relativedelta import relativedelta
++
++from odoo import api, exceptions, fields, models, _
+ 
+ 
+ class ResConfigSettings(models.TransientModel):
+@@ -9,7 +11,30 @@ class ResConfigSettings(models.TransientModel):
+ 
+     group_use_lead = fields.Boolean(string="Leads", implied_group='crm.group_use_lead')
+     group_use_recurring_revenues = fields.Boolean(string="Recurring Revenues", implied_group='crm.group_use_recurring_revenues')
++    # Membership
+     is_membership_multi = fields.Boolean(string='Multi Teams', config_parameter='sales_team.membership_multi')
++    # Lead assignment
++    crm_use_auto_assignment = fields.Boolean(
++        string='Rule-Based Assignment', config_parameter='crm.lead.auto.assignment')
++    crm_auto_assignment_action = fields.Selection([
++        ('manual', 'Manually'), ('auto', 'Repeatedly')],
++        string='Auto Assignment Action', compute='_compute_crm_auto_assignment_data',
++        readonly=False, store=True,
++        help='Manual assign allow to trigger assignment from team form view using an action button. Automatic configures a cron running repeatedly assignment in all teams.')
++    crm_auto_assignment_interval_type = fields.Selection([
++        ('minutes', 'Minutes'), ('hours', 'Hours'),
++        ('days', 'Days'), ('weeks', 'Weeks')],
++        string='Auto Assignment Interval Unit', compute='_compute_crm_auto_assignment_data',
++        readonly=False, store=True,
++        help='Interval type between each cron run (e.g. each 2 days or each 2 hours)')
++    crm_auto_assignment_interval_number = fields.Integer(
++        string="Repeat every", compute='_compute_crm_auto_assignment_data',
++        readonly=False, store=True,
++        help='Number of interval type between each cron run (e.g. each 2 days or each 4 days)')
++    crm_auto_assignment_run_datetime = fields.Datetime(
++        string="Auto Assignment Next Execution Date", compute='_compute_crm_auto_assignment_data',
++        readonly=False, store=True)
++    # IAP
+     module_crm_iap_lead = fields.Boolean("Generate new leads based on their country, industries, size, etc.")
+     module_crm_iap_lead_website = fields.Boolean("Create Leads/Opportunities from your website's traffic")
+     module_crm_iap_lead_enrich = fields.Boolean("Enrich your leads automatically with company data based on their email address.")
+@@ -24,6 +49,32 @@ class ResConfigSettings(models.TransientModel):
+     predictive_lead_scoring_fields = fields.Many2many('crm.lead.scoring.frequency.field', string='Lead Scoring Frequency Fields', compute="_compute_pls_fields", inverse="_inverse_pls_fields_str")
+     predictive_lead_scoring_fields_str = fields.Char(string='Lead Scoring Frequency Fields in String', config_parameter='crm.pls_fields')
+ 
++    @api.depends('crm_use_auto_assignment')
++    def _compute_crm_auto_assignment_data(self):
++        assign_cron = self.sudo().env.ref('crm.ir_cron_crm_lead_assign', raise_if_not_found=False)
++        for setting in self:
++            if setting.crm_use_auto_assignment and assign_cron:
++                setting.crm_auto_assignment_action = 'auto' if assign_cron.active else 'manual'
++                setting.crm_auto_assignment_interval_type = assign_cron.interval_type or 'days'
++                setting.crm_auto_assignment_interval_number = assign_cron.interval_number or 1
++                setting.crm_auto_assignment_run_datetime = assign_cron.nextcall
++            else:
++                setting.crm_auto_assignment_action = 'manual'
++                setting.crm_auto_assignment_interval_type = setting.crm_auto_assignment_run_datetime = False
++                setting.crm_auto_assignment_interval_number = 1
++
++    @api.onchange('crm_auto_assignment_interval_type', 'crm_auto_assignment_interval_number')
++    def _onchange_crm_auto_assignment_run_datetime(self):
++        if self.crm_auto_assignment_interval_number <= 0:
++            raise exceptions.UserError(_('Repeat frequency should be positive.'))
++        elif self.crm_auto_assignment_interval_number >= 100:
++            raise exceptions.UserError(_('Invalid repeat frequency. Consider changing frequency type instead of using large numbers.'))
++        self.crm_auto_assignment_run_datetime = self._get_crm_auto_assignmment_run_datetime(
++            self.crm_auto_assignment_run_datetime,
++            self.crm_auto_assignment_interval_type,
++            self.crm_auto_assignment_interval_number
++        )
++
+     @api.depends('predictive_lead_scoring_fields_str')
+     def _compute_pls_fields(self):
+         """ As config_parameters does not accept m2m field,
+@@ -62,14 +113,35 @@ class ResConfigSettings(models.TransientModel):
+     def set_values(self):
+         group_lead_before = self.env.ref('crm.group_use_lead') in self.env.user.groups_id
+         super(ResConfigSettings, self).set_values()
++        # update use leads / opportunities setting on all teams according to settings update
+         group_lead_after = self.env.ref('crm.group_use_lead') in self.env.user.groups_id
+         if group_lead_before != group_lead_after:
+             teams = self.env['crm.team'].search([])
+             teams.filtered('use_opportunities').use_leads = group_lead_after
+             for team in teams:
+                 team.alias_id.write(team._alias_get_creation_values())
++        # synchronize cron with settings
++        assign_cron = self.sudo().env.ref('crm.ir_cron_crm_lead_assign', raise_if_not_found=False)
++        if assign_cron:
++            assign_cron.active = self.crm_use_auto_assignment and self.crm_auto_assignment_action == 'auto'
++            assign_cron.interval_type = self.crm_auto_assignment_interval_type
++            assign_cron.interval_number = self.crm_auto_assignment_interval_number
++            # keep nextcall on cron as it is required whatever the setting
++            assign_cron.nextcall = self.crm_auto_assignment_run_datetime if self.crm_auto_assignment_run_datetime else assign_cron.nextcall
++        # TDE FIXME: re create cron if not found ?
++
++    def _get_crm_auto_assignmment_run_datetime(self, run_datetime, run_interval, run_interval_number):
++        if not run_interval:
++            return False
++        if run_interval == 'manual':
++            return run_datetime if run_datetime else False
++        return fields.Datetime.now() + relativedelta(**{run_interval: run_interval_number})
+ 
+     # ACTIONS
+     def action_reset_lead_probabilities(self):
+         if self.env.user._is_admin():
+             self.env['crm.lead'].sudo()._cron_update_automated_probabilities()
++
++    def action_crm_assign_leads(self):
++        self.ensure_one()
++        return self.env['crm.team'].search([]).action_assign_leads()

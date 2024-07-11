@@ -1,0 +1,188 @@
+PR: https://github.com/odoo/odoo/pull/72239
+
+From: 1e25946a76efe5c6634167f0cf3a39f74692a9fa
+From: Aurélien Warnon
+Date: 2021-11-23 11:12:04
+
+Breaking data model changes score: 0.4, change matches:
+-    source_id = fields.Many2one('utm.source', string='Source', required=True, ondelete='cascade',
++    source_id = fields.Many2one('utm.source', string='Source', required=True, ondelete='restrict',
+
+Total Changes: 382
+
+[IMP] utm: globally improve UTM records management across all apps
+
+PURPOSE
+
+This commit consolidates UTM usage across all applications.
+
+Global purpose is to avoid having undesired side-effects, such as unlinking an
+utm.source/utm.medium/utm.campaign and at the same time cascading the deletion
+to various records without noticing.
+
+SPECS
+
+ALLOW MORE PEOPLE TO CLEAN UTM RECORDS
+
+Currently, not even the system administrator can delete utm.mediums and
+utm.sources (he can only delete campaigns).
+
+These were considered as "technical records", but allowing some cleanup is
+a good idea since these records are often automatically generated and can
+create a lot of unnecessary noise in the database.
+
+That's why we now allow the following groups to delete all UTM records
+(sources, mediums and campaigns):
+- group_system
+- group_mass_mailing_user
+- group_social_manager (enterprise)
+
+PREVENT DELETION
+
+For some use cases, removing an utm.source/utm.medium/utm.campaign would
+cascade delete the related record, which was unintended / hidden side effect.
+
+These combinations were secured by preventing to unlink:
+- mailing.mailing source_id field
+  Trying to delete the utm.source will throw an error message
+- mailing.mailing medium_id field
+  Trying to delete the utm.medium will throw an error message
+- hr.recruitment.source source_id field
+  Trying to delete the utm.source will throw an error message
+
+ADDING CLEAN ERROR MESSAGES
+
+When trying to delete an UTM record that is linked with ondelete="restrict", we
+improved the error message to give a clear explication to the user, e.g:
+
+"You can't delete these UTM sources as they are linked to the following
+mailings in the Mass Mailing APP, and deleting the source would break the
+statistics: Newsletter"
+
+SPECIFY 'ondelete' strategy
+
+For a lot of uses of sources/mediums/campaigns, the 'ondelete' strategy was not
+specified, leading to the confusion of "is this really how we want to handle
+this?".
+
+A lot of ondelete="set null" have been added in various field definitions to
+ensure that this is the desired and logical strategy we want for that
+specific model.
+
+PREVENT REMOVING HARDCODED UTM RECORDS
+
+In some functional flows, UTM records are hardcoded using their direct
+record reference.
+This is notably the case for the recruitment process and its creation of
+aliases, and for the Email / SMS Marketing flows.
+
+As deleting them would break these flows, we prevent their deletion in a
+"api.ondelete" method.
+
+ENFORCE NEW RULES WITH TESTS
+
+A lot of python tests have been added to make sure we enforce the decisions
+taken here above.
+
+LINKS
+
+ENT PR odoo/enterprise#19048
+Task-2459480
+
+closes odoo/odoo#72239
+
+Signed-off-by: Thibault Delavallee (tde) <tde@openerp.com>
+
+================================= pseudo patch: =================================
+
+--- a/addons/mass_mailing/models/__init__.py
++++ b/addons/mass_mailing/models/__init__.py
+@@ -10,8 +10,10 @@ from . import mailing
+ from . import mail_mail
+ from . import mail_render_mixin
+ from . import mail_thread
++from . import res_company
+ from . import res_config_settings
+ from . import res_partner
+ from . import res_users
+-from . import utm
+-from . import res_company
++from . import utm_campaign
++from . import utm_medium
++from . import utm_source
+
+--- a/addons/mass_mailing/models/mailing.py
++++ b/addons/mass_mailing/models/mailing.py
+@@ -91,12 +91,12 @@ class MassMailing(models.Model):
+     attachment_ids = fields.Many2many('ir.attachment', 'mass_mailing_ir_attachments_rel',
+         'mass_mailing_id', 'attachment_id', string='Attachments')
+     keep_archives = fields.Boolean(string='Keep Archives')
+-    campaign_id = fields.Many2one('utm.campaign', string='UTM Campaign', index=True)
+-    source_id = fields.Many2one('utm.source', string='Source', required=True, ondelete='cascade',
++    campaign_id = fields.Many2one('utm.campaign', string='UTM Campaign', index=True, ondelete='set null')
++    source_id = fields.Many2one('utm.source', string='Source', required=True, ondelete='restrict',
+                                 help="This is the link source, e.g. Search Engine, another domain, or name of email list")
+     medium_id = fields.Many2one(
+         'utm.medium', string='Medium',
+-        compute='_compute_medium_id', readonly=False, store=True,
++        compute='_compute_medium_id', readonly=False, store=True, ondelete='restrict',
+         help="UTM Medium: delivery method (email, sms, ...)")
+     state = fields.Selection([('draft', 'Draft'), ('in_queue', 'In Queue'), ('sending', 'Sending'), ('done', 'Sent')],
+         string='Status', required=True, tracking=True, copy=False, default='draft', group_expand='_group_expand_states')
+
+--- a/addons/mass_mailing/models/utm.py
++++ b/addons/mass_mailing/models/utm_campaign.py
+
+--- a/None
++++ b/addons/mass_mailing/models/utm_medium.py
+@@ -0,0 +1,23 @@
++# -*- coding:utf-8 -*-
++# Part of Odoo. See LICENSE file for full copyright and licensing details.
++
++from odoo import _, api, models
++
++from odoo.exceptions import UserError
++
++
++class UtmMedium(models.Model):
++    _inherit = 'utm.medium'
++
++    @api.ondelete(at_uninstall=False)
++    def _unlink_except_linked_mailings(self):
++        """ Already handled by ondelete='restrict', but let's show a nice error message """
++        linked_mailings = self.env['mailing.mailing'].sudo().search([
++            ('medium_id', 'in', self.ids)
++        ])
++
++        if linked_mailings:
++            raise UserError(_(
++                "You cannot delete these UTM Mediums as they are linked to the following mailings in "
++                "Mass Mailing:\n%(mailing_names)s",
++                mailing_names=', '.join(['"%s"' % subject for subject in linked_mailings.mapped('subject')])))
+
+--- a/None
++++ b/addons/mass_mailing/models/utm_source.py
+@@ -0,0 +1,23 @@
++# -*- coding:utf-8 -*-
++# Part of Odoo. See LICENSE file for full copyright and licensing details.
++
++from odoo import _, api, models
++
++from odoo.exceptions import UserError
++
++
++class UtmSource(models.Model):
++    _inherit = 'utm.source'
++
++    @api.ondelete(at_uninstall=False)
++    def _unlink_except_linked_mailings(self):
++        """ Already handled by ondelete='restrict', but let's show a nice error message """
++        linked_mailings = self.env['mailing.mailing'].sudo().search([
++            ('source_id', 'in', self.ids)
++        ])
++
++        if linked_mailings:
++            raise UserError(_(
++                "You cannot delete these UTM Sources as they are linked to the following mailings in "
++                "Mass Mailing:\n%(mailing_names)s",
++                mailing_names=', '.join(['"%s"' % subject for subject in linked_mailings.mapped('subject')])))

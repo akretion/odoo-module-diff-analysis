@@ -1,0 +1,327 @@
+PR: https://github.com/odoo/odoo/pull/104223
+
+From: 77f9ff50db3cdb88397d0b1cc7042c772d0d417b
+From: Florian Charlier
+Date: 2023-06-30 21:37:50
+
+Breaking data model changes score: 3, change matches:
+-    sale_quotation_onboarding_state = fields.Selection(
+-    sale_onboarding_order_confirmation_state = fields.Selection(
+-    sale_onboarding_sample_quotation_state = fields.Selection(
+
+Total Changes: 234
+
+[REF] *: use onboarding module
+
+* = account{_payment}, base, onboarding, payment{_stripe},
+sale{_management}, web, website_sale
+
+Use the dedicated onboarding module introduced in 16.0 instead of
+the res.company model to store onboarding progress.
+
+It allows
+ * onboarding steps to be reused across panels
+ * to support steps that should be completed per-database or per-company
+ * to clean the res.company model from many fields and methods,
+ * to remove many views, controllers, actions
+
+Module-specific notes:
+* account: We also clean the remaining two steps that are not
+part of an accounting panel but make the most sense to be kept here.
+* account_payment: Following 8e4e8eb8, the payment provider step is
+added to the invoicing onboarding panel. We apply this change here too.
+Also impacts the website_sale_dashboard panel (see related ENT PR).
+(The "sale tax" one is currently used for to the website sale dashboard).
+* payment: Note that the step was already not part of an onboarding
+panel within this module.
+* website_sale: We clean
+  * a field not used (The website_sale dashboard onboarding panel used
+  the payment_provider_onboarding_state field).
+  * a method that was only called from website_sale_dashboard, so it is
+  moved there. See related ENT PR.
+
+Includes a few tests.
+
+Moving views/templates/styling, as well as cleaning residual onboarding-related fields and methods in base, including populate.
+
+This also includes restoring the "onboarding_complete" overlay panel
+animating it to disappear after a few seconds so that it doesn't hide
+text and block buttons to re-open steps.
+
+Task-3025136
+
+Part-of: odoo/odoo#104223
+
+================================= pseudo patch: =================================
+
+--- a/addons/sale/models/__init__.py
++++ b/addons/sale/models/__init__.py
+@@ -5,6 +5,8 @@ from . import analytic
+ from . import account_move
+ from . import account_move_line
+ from . import crm_team
++from . import onboarding_onboarding
++from . import onboarding_onboarding_step
+ from . import payment_provider
+ from . import payment_transaction
+ from . import product_product
+
+--- a/None
++++ b/addons/sale/models/onboarding_onboarding.py
+@@ -0,0 +1,12 @@
++# Part of Odoo. See LICENSE file for full copyright and licensing details.
++
++from odoo import api, models
++
++
++class Onboarding(models.Model):
++    _inherit = 'onboarding.onboarding'
++
++    # Sale Quotation Onboarding
++    @api.model
++    def action_close_panel_sale_quotation(self):
++        self.action_close_panel('sale.onboarding_onboarding_sale_quotation')
+
+--- a/None
++++ b/addons/sale/models/onboarding_onboarding_step.py
+@@ -0,0 +1,100 @@
++# Part of Odoo. See LICENSE file for full copyright and licensing details.
++
++import base64
++
++from odoo import _, api, Command, models
++from odoo.modules.module import get_resource_path
++from odoo.tools import file_open
++
++
++class OnboardingStep(models.Model):
++    _inherit = 'onboarding.onboarding.step'
++
++    @api.model
++    def action_open_step_sale_order_confirmation(self):
++        self.env.company.get_chart_of_accounts_or_fail()
++        action = {
++            'type': 'ir.actions.act_window',
++            'name': _('Choose how to confirm quotations'),
++            'res_model': 'sale.payment.provider.onboarding.wizard',
++            'view_mode': 'form',
++            'views': [(self.env.ref('payment.payment_provider_onboarding_wizard_form').id, 'form')],
++            'target': 'new',
++        }
++        return action
++
++    @api.model
++    def _get_sample_sales_order(self):
++        """ Get a sample quotation or create one if it does not exist. """
++        # use current user as partner
++        partner = self.env.user.partner_id
++        company_id = self.env.company.id
++        # is there already one?
++        sample_sales_order = self.env['sale.order'].search([
++            ('company_id', '=', company_id),
++            ('partner_id', '=', partner.id),
++            ('state', '=', 'draft'),
++        ], limit=1)
++        if not sample_sales_order:
++            # take any existing product or create one
++            product = self.env['product.product'].search([], limit=1)
++            if not product:
++                default_image_path = get_resource_path('product', 'static/img', 'product_product_13-image.jpg')
++                with file_open(default_image_path, 'rb') as default_image_stream:
++                    product = self.env['product.product'].create({
++                        'name': _('Sample Product'),
++                        'active': False,
++                        'image_1920': base64.b64encode(default_image_stream.read()),
++                    })
++                product.product_tmpl_id.active = False
++            sample_sales_order = self.env['sale.order'].create({
++                'partner_id': partner.id,
++                'order_line': [
++                    Command.create({
++                        'name': _('Sample Order Line'),
++                        'product_id': product.id,
++                        'product_uom_qty': 10,
++                        'price_unit': 123,
++                    })
++                ]
++            })
++        return sample_sales_order
++
++    @api.model
++    def action_open_step_sample_quotation(self):
++        """ Onboarding step for sending a sample quotation. Open a window to compose an email,
++            with the edi_invoice_template message loaded by default. """
++        sample_sales_order = self._get_sample_sales_order()
++        template = self.env.ref('sale.email_template_edi_sale', False)
++
++        self.env['mail.compose.message'].with_context(
++            mark_so_as_sent=True,
++            default_email_layout_xmlid='mail.mail_notification_layout_with_responsible_signature',
++            proforma=self.env.context.get('proforma', False),
++        ).create({
++            'res_ids': sample_sales_order.ids,
++            'template_id': template.id if template else False,
++            'model': sample_sales_order._name,
++            'composition_mode': 'comment',
++        })._action_send_mail()
++
++        self.action_validate_step('sale.onboarding_onboarding_step_sample_quotation')
++        sale_quotation_onboarding = self.env.ref('sale.onboarding_onboarding_sale_quotation', raise_if_not_found=False)
++        if sale_quotation_onboarding:
++            sale_quotation_onboarding.action_close()
++
++        view_id = self.env.ref('sale.view_order_form').id
++        action = self.env['ir.actions.actions']._for_xml_id('sale.action_orders')
++        action.update({
++            'view_mode': 'form',
++            'views': [[view_id, 'form']],
++            'target': 'main',
++        })
++        return action
++
++    @api.model
++    def action_validate_step_payment_provider(self):
++        validation_response = super().action_validate_step_payment_provider()
++        if self.env.company.sale_onboarding_payment_method:  # Set if the flow is/was done from the Sales panel
++            return self.action_validate_step('sale.onboarding_onboarding_step_sale_order_confirmation')
++        return validation_response
+
+--- a/addons/sale/models/res_company.py
++++ b/addons/sale/models/res_company.py
+@@ -1,11 +1,6 @@
+ # Part of Odoo. See LICENSE file for full copyright and licensing details.
+-import base64
+ 
+-from odoo import api, fields, models, _
+-from odoo.fields import Command
+-from odoo.modules.module import get_module_resource
+-
+-from odoo.addons.account.models.company import DASHBOARD_ONBOARDING_STATES, ONBOARDING_STEP_STATES
++from odoo import fields, models
+ 
+ 
+ class ResCompany(models.Model):
+@@ -39,18 +34,6 @@ class ResCompany(models.Model):
+     )
+ 
+     # sale onboarding
+-    sale_quotation_onboarding_state = fields.Selection(
+-        selection=DASHBOARD_ONBOARDING_STATES,
+-        string="State of the sale onboarding panel",
+-        default='not_done')
+-    sale_onboarding_order_confirmation_state = fields.Selection(
+-        selection=ONBOARDING_STEP_STATES,
+-        string="State of the onboarding confirmation order step",
+-        default='not_done')
+-    sale_onboarding_sample_quotation_state = fields.Selection(
+-        selection=ONBOARDING_STEP_STATES,
+-        string="State of the onboarding sample quotation step",
+-        default='not_done')
+     sale_onboarding_payment_method = fields.Selection(
+         selection=[
+             ('digital_signature', "Sign online"),
+@@ -60,104 +43,3 @@ class ResCompany(models.Model):
+             ('manual', "Manual Payment"),
+         ],
+         string="Sale onboarding selected payment method")
+-
+-    @api.model
+-    def action_close_sale_quotation_onboarding(self):
+-        """ Mark the onboarding panel as closed. """
+-        self.env.company.sale_quotation_onboarding_state = 'closed'
+-
+-    @api.model
+-    def action_open_sale_onboarding_payment_provider(self):
+-        """ Called by onboarding panel above the quotation list."""
+-        self.env.company.get_chart_of_accounts_or_fail()
+-        return self.env['ir.actions.actions']._for_xml_id('sale.action_open_sale_payment_provider_onboarding_wizard')
+-
+-    def _mark_payment_onboarding_step_as_done(self):
+-        """ Override of payment to mark the sale onboarding step as done.
+-
+-        The payment onboarding step of Sales is only marked as done if it was started from Sales.
+-        This prevents incorrectly marking the step as done if another module's payment onboarding
+-        step was marked as done.
+-
+-        :return: None
+-        """
+-        super()._mark_payment_onboarding_step_as_done()
+-        if self.sale_onboarding_payment_method:  # The onboarding step was started from Sales
+-            self.set_onboarding_step_done('sale_onboarding_order_confirmation_state')
+-
+-    def _get_sample_sales_order(self):
+-        """ Get a sample quotation or create one if it does not exist. """
+-        # use current user as partner
+-        partner = self.env.user.partner_id
+-        company_id = self.env.company.id
+-        # is there already one?
+-        sample_sales_order = self.env['sale.order'].search([
+-            ('company_id', '=', company_id),
+-            ('partner_id', '=', partner.id),
+-            ('state', '=', 'draft'),
+-        ], limit=1)
+-        if not sample_sales_order:
+-            # take any existing product or create one
+-            product = self.env['product.product'].search([], limit=1)
+-            if not product:
+-                default_image_path = get_module_resource('product', 'static/img', 'product_product_13-image.jpg')
+-                product = self.env['product.product'].create({
+-                    'name': _("Sample Product"),
+-                    'active': False,
+-                    'image_1920': base64.b64encode(open(default_image_path, 'rb').read())
+-                })
+-                product.product_tmpl_id.write({'active': False})
+-            sample_sales_order = self.env['sale.order'].create({
+-                'partner_id': partner.id,
+-                'order_line': [
+-                    Command.create({
+-                        'name': _("Sample Order Line"),
+-                        'product_id': product.id,
+-                        'product_uom_qty': 10,
+-                        'price_unit': 123,
+-                    })
+-                ]
+-            })
+-        return sample_sales_order
+-
+-    @api.model
+-    def action_open_sale_onboarding_sample_quotation(self):
+-        """ Onboarding step for sending a sample quotation. Open a window to compose an email,
+-            with the edi_invoice_template message loaded by default. """
+-        sample_sales_order = self._get_sample_sales_order()
+-        template = self.env.ref('sale.email_template_edi_sale', False)
+-
+-        self.env['mail.compose.message'].with_context(
+-            mark_so_as_sent=True,
+-            default_email_layout_xmlid='mail.mail_notification_layout_with_responsible_signature',
+-            proforma=self.env.context.get('proforma', False),
+-            force_email=True,
+-        ).create({
+-            'res_ids': sample_sales_order.ids,
+-            'template_id': template.id if template else False,
+-            'model': sample_sales_order._name,
+-            'composition_mode': 'comment',
+-        })._action_send_mail()
+-
+-        self.set_onboarding_step_done('sale_onboarding_sample_quotation_state')
+-
+-        self.action_close_sale_quotation_onboarding()
+-
+-        action = self.env['ir.actions.actions']._for_xml_id('sale.action_orders')
+-        action.update({
+-            'views': [[self.env.ref('sale.view_order_form').id, 'form']],
+-            'view_mode': 'form',
+-            'target': 'main',
+-        })
+-        return action
+-
+-    def _get_and_update_sale_quotation_onboarding_state(self):
+-        """ This method is called on the controller rendering method and ensures that the animations
+-            are displayed only one time. """
+-        steps = [
+-            'base_onboarding_company_state',
+-            'account_onboarding_invoice_layout_state',
+-            'sale_onboarding_order_confirmation_state',
+-            'sale_onboarding_sample_quotation_state',
+-        ]
+-        return self._get_and_update_onboarding_state('sale_quotation_onboarding_state', steps)

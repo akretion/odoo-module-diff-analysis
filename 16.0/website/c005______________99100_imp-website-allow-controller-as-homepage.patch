@@ -1,0 +1,248 @@
+PR: https://github.com/odoo/odoo/pull/99100
+
+From: 9c733d8c2214979ca77203942c139137caefebe8
+From: Romain Derie
+Date: 2022-09-08 22:56:54
+
+Breaking data model changes score: 1, change matches:
+-    homepage_id = fields.Many2one('website.page', string='Homepage')
+
+Total Changes: 55
+
+[IMP] website: allow controller as homepage
+
+Before this commit, only a website.page could be used as a custom
+homepage ('custom' meaning other than '/').
+
+But it is a real use case and requirement for our users to be able to
+select a controller as homepage.
+For instance, an ecommerce would want its homepage to be the shop and
+not a regular page from where you then have to navigate to the shop.
+
+Right now, this can (almost) be achieved by doing some technical
+advanced operations:
+- Move the 'Shop' menu first in the menu navbar of the website
+- Delete the specific '/' website.page for the website
+- Delete the generic '/' website.page (no website_id)
+
+That way, the system will redirect `/` to `/shop`, which is not ideal as
+it should remain `/` in the URL.
+
+That's because, until now, the homepage (`/` controller) serve order
+was:
+- Serve the website.page set as homepage (`website.homepage_id`),
+  happens when one did select another page as homepage through the page
+  properties dialog
+- Serve the website.page having `/` as URL (default)
+- Serve the first accessible menu if there no `/` page or other page set
+  as homepage, it acts as a last resort attempt to not serve a 404 and
+  to try serving relevant content (the first menu of a website is most
+  likely always better than a 404)
+- Serve 404
+
+This commit allows to introduce an URL as homepage, instead of only a
+website.page. It can be done through the website settings in the
+backend.
+
+There is 2 main points to keep in mind about serving the homepage:
+- make sure we don't serve a 404 as the website homepage. This is the
+  website entry point, serving a 404 is terrible. That's why we have
+  some fallback mechanism like serving the first menu.
+- We need to serve / before fallbacking to the first menu, as a lot of
+  site just remove the 'Home' first menu since it is a duplicate of the
+  logo, which also redirect to the homepage. In such cases, it doesn't
+  mean that the user want his first menu to be the homepage. We
+  shouldn't rely on such a behavior, it should just be used as a last
+  resort.
+
+With this commit, the homepage serve order is now:
+- If homepage URL is set (empty by default), serve the website.page
+  matching it
+- If homepage URL is set (empty by default), serve the controller
+  matching it
+- If homepage URL is not set, serve the `/` website.page
+- Serve the first accessible menu as last resort. It should be relevant
+  content, at least better than a 404
+- Serve 404
+
+Most DBs will just have a website.page with '/' as URL and keep the
+homepage_url setting empty.
+
+task-2969683
+
+closes odoo/odoo#99100
+
+Related: odoo/upgrade#3876
+Signed-off-by: Quentin Smetz (qsm) <qsm@odoo.com>
+
+================================= pseudo patch: =================================
+
+--- a/addons/website/models/res_config_settings.py
++++ b/addons/website/models/res_config_settings.py
+@@ -27,6 +27,8 @@ class ResConfigSettings(models.TransientModel):
+         'Website Domain',
+         related='website_id.domain',
+         readonly=False)
++    website_homepage_url = fields.Char(
++        related='website_id.homepage_url', readonly=False)
+     website_country_group_ids = fields.Many2many(
+         related='website_id.country_group_ids',
+         readonly=False)
+
+--- a/addons/website/models/website.py
++++ b/addons/website/models/website.py
+@@ -25,7 +25,7 @@ from odoo.addons.website.models.ir_http import sitemap_qs2dom
+ from odoo.addons.website.tools import similarity_score, text_from_html
+ from odoo.addons.portal.controllers.portal import pager
+ from odoo.addons.iap.tools import iap_tools
+-from odoo.exceptions import UserError, AccessError, MissingError
++from odoo.exceptions import AccessError, MissingError, UserError, ValidationError
+ from odoo.http import request
+ from odoo.modules.module import get_resource_path, get_manifest
+ from odoo.osv.expression import AND, OR, FALSE_DOMAIN, get_unaccent_wrapper
+@@ -132,7 +132,7 @@ class Website(models.Model):
+     cdn_filters = fields.Text('CDN Filters', default=lambda s: '\n'.join(DEFAULT_CDN_FILTERS), help="URL matching those filters will be rewritten using the CDN Base URL")
+     partner_id = fields.Many2one(related='user_id.partner_id', string='Public Partner', readonly=False)
+     menu_id = fields.Many2one('website.menu', compute='_compute_menu', string='Main Menu')
+-    homepage_id = fields.Many2one('website.page', string='Homepage')
++    homepage_url = fields.Char(help='E.g. /contactus or /shop')
+     custom_code_head = fields.Html('Custom <head> code', sanitize=False)
+     custom_code_footer = fields.Html('Custom end of <body> code', sanitize=False)
+ 
+@@ -261,6 +261,7 @@ class Website(models.Model):
+     def _handle_create_write(self, vals):
+         self._handle_favicon(vals)
+         self._handle_domain(vals)
++        self._handle_homepage_url(vals)
+ 
+     @api.model
+     def _handle_favicon(self, vals):
+@@ -274,6 +275,18 @@ class Website(models.Model):
+                 vals['domain'] = 'https://%s' % vals['domain']
+             vals['domain'] = vals['domain'].rstrip('/')
+ 
++    @api.model
++    def _handle_homepage_url(self, vals):
++        homepage_url = vals.get('homepage_url')
++        if homepage_url:
++            vals['homepage_url'] = homepage_url.rstrip('/')
++
++    @api.constrains('homepage_url')
++    def _check_homepage_url(self):
++        for website in self.filtered('homepage_url'):
++            if not website.homepage_url.startswith('/'):
++                raise ValidationError(_("The homepage URL should be relative and start with '/'."))
++
+     @api.ondelete(at_uninstall=False)
+     def _unlink_except_last_remaining_website(self):
+         website = self.search([('id', 'not in', self.ids)], limit=1)
+@@ -438,7 +451,7 @@ class Website(models.Model):
+ 
+         def configure_page(page_code, snippet_list, pages_views, cta_data):
+             if page_code == 'homepage':
+-                page_view_id = website.homepage_id.view_id
++                page_view_id = self.with_context(website_id=website.id).viewref('website.homepage')
+             else:
+                 page_view_id = self.env['ir.ui.view'].browse(pages_views[page_code])
+             rendered_snippets = []
+@@ -640,13 +653,12 @@ class Website(models.Model):
+             })
+         # prevent /-1 as homepage URL
+         homepage_page.url = '/'
+-        self.homepage_id = homepage_page
+ 
+         # Bootstrap default menu hierarchy, create a new minimalist one if no default
+         default_menu = self.env.ref('website.main_menu')
+         self.copy_menu_hierarchy(default_menu)
+         home_menu = self.env['website.menu'].search([('website_id', '=', self.id), ('url', '=', '/')])
+-        home_menu.page_id = self.homepage_id
++        home_menu.page_id = homepage_page
+ 
+     def copy_menu_hierarchy(self, top_menu):
+         def copy_menu(menu, t_menu):
+@@ -1379,7 +1391,7 @@ class Website(models.Model):
+             'user_id': self.user_id.id,
+             'company_id': self.company_id.id,
+             'default_lang_id': self.default_lang_id.id,
+-            'homepage_id': self.homepage_id.id,
++            'homepage_url': self.homepage_url,
+         }
+ 
+     def _get_cached(self, field):
+
+--- a/addons/website/models/website_menu.py
++++ b/addons/website/models/website_menu.py
+@@ -139,26 +139,28 @@ class Menu(models.Model):
+     # would be better to take a menu_id as argument
+     @api.model
+     def get_tree(self, website_id, menu_id=None):
++        website = self.env['website'].browse(website_id)
++
+         def make_tree(node):
+-            is_homepage = bool(node.page_id and self.env['website'].browse(website_id).homepage_id.id == node.page_id.id)
++            menu_url = node.page_id.url if node.page_id else node.url
+             menu_node = {
+                 'fields': {
+                     'id': node.id,
+                     'name': node.name,
+-                    'url': node.page_id.url if node.page_id else node.url,
++                    'url': menu_url,
+                     'new_window': node.new_window,
+                     'is_mega_menu': node.is_mega_menu,
+                     'sequence': node.sequence,
+                     'parent_id': node.parent_id.id,
+                 },
+                 'children': [],
+-                'is_homepage': is_homepage,
++                'is_homepage': menu_url == (website.homepage_url or '/'),
+             }
+             for child in node.child_id:
+                 menu_node['children'].append(make_tree(child))
+             return menu_node
+ 
+-        menu = menu_id and self.browse(menu_id) or self.env['website'].browse(website_id).menu_id
++        menu = menu_id and self.browse(menu_id) or website.menu_id
+         return make_tree(menu)
+ 
+     @api.model
+
+--- a/addons/website/models/website_page.py
++++ b/addons/website/models/website_page.py
+@@ -30,7 +30,7 @@ class Page(models.Model):
+     # This is needed to be able to control if page is a menu in page properties.
+     # TODO this should be reviewed entirely so that we use a transient model.
+     is_in_menu = fields.Boolean(compute='_compute_website_menu', inverse='_inverse_website_menu')
+-    is_homepage = fields.Boolean(compute='_compute_homepage', inverse='_set_homepage', string='Homepage')
++    is_homepage = fields.Boolean(compute='_compute_is_homepage', inverse='_set_is_homepage', string='Homepage')
+     is_visible = fields.Boolean(compute='_compute_visible', string='Is Visible')
+ 
+     # Page options
+@@ -43,19 +43,20 @@ class Page(models.Model):
+     website_id = fields.Many2one(related='view_id.website_id', store=True, readonly=False, ondelete='cascade')
+     arch = fields.Text(related='view_id.arch', readonly=False, depends_context=('website_id',))
+ 
+-    def _compute_homepage(self):
++    def _compute_is_homepage(self):
++        website = self.env['website'].get_current_website()
+         for page in self:
+-            page.is_homepage = page == self.env['website'].get_current_website().homepage_id
++            page.is_homepage = page.url == website.homepage_url
+ 
+-    def _set_homepage(self):
++    def _set_is_homepage(self):
++        website = self.env['website'].get_current_website()
+         for page in self:
+-            website = self.env['website'].get_current_website()
+             if page.is_homepage:
+-                if website.homepage_id != page:
+-                    website.write({'homepage_id': page.id})
++                if website.homepage_url != page.url:
++                    website.homepage_url = page.url
+             else:
+-                if website.homepage_id == page:
+-                    website.write({'homepage_id': None})
++                if website.homepage_url == page.url:
++                    website.homepage_url = ''
+ 
+     def _compute_visible(self):
+         for page in self:
