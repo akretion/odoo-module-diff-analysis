@@ -1,0 +1,204 @@
+PR: https://github.com/odoo/odoo/pull/
+
+From: 84f528bcff12e39b5ed172a4789aab27c9f89a19
+From: Mitali Patel
+Date: 2018-08-03 13:20:42
+
+Breaking data model changes score: 1, change matches:
+-    access_token = fields.Char(
+
+Total Changes: 66
+
+[IMP] Portal - Share link : Easily share the url of a document
+
+Purpose
+=======
+- Quickly share the url to someone else (a client, a colleague,...)
+- Ensure that the recipient can access at least
+  the portal view of the shared record.
+- Typically used when a client cannot retrieve the mail to access his order.
+  The share link can be used in this case.
+
+Specifications
+==============
+For any object inheriting form portal.mixin:
+    - Add a button SHARE (not visible in edit mode)
+    - When clicking on this button, a popup opens with :
+        - A warning message for tasks and projects only (see below)
+        - the link (like in gmail) that can be copied
+        - Recipients
+        - mail composer (with preselected template) ==> see below
+        - button [Send Link] [Copy Link] Discard
+        - After sharing document, put internal note like
+          "Document shared to xyz,...." with template message
+    - Anyone with the link, even anonymous user (not logged in) can have access
+      to the document with the access token provided in the url.
+
+Impacted models:
+    - account.invoice (Community)
+    - project.project (Community)
+    - project.task (Community)
+    - purchase.order (Community)
+    - sale.order (Community)
+    - helpdesk.ticket (Enterprise)
+
+Warning messages and access rules:
+    Allowed :
+        - SO canceled or draft will be accessible with the link
+          with access_token
+        - If the customer account is B2B (signup not enabled), the recipient
+          will anyway see the document as the user specifically wants the
+          recipient to see the document.
+    Restrictions :
+        - For Project and Task, if the privacy is not public, then, there is a
+          contradiction between the access_token mechanism
+          and the privacy of the document.
+        - A warning message will be displayed in the share wizard to inform the
+          user if the document cannot be visible by the recipients and to
+          ask him to set the privacy to 'Visible by following customer'.
+          The send button will, in that case, be hidden.
+        - To avoid to block the share for a new project, default privacy value
+          is now set to 'Visible by followong customer'
+
+Technical implementation
+========================
+- Move the access_token mechanism (field + methods + mail controller)
+  to the portal.mixin to be able to use it in a generic way for each object
+  inheriting the portal.mixin
+- Generalise a part of the _*model*_get_page_view_values method
+  into a single one in portal
+- Generalize the _*model*_check_access into the portal controller of the
+  portal module
+- Remove the init_column + default value for the access_token
+  > old records have an access_token,
+  > new one won't but it will be generated on demand via the get_access_token
+  Done for performance reasons
+- Add share button into action menu separately. + kanban view context menu
+  (except for task and project where button not in action menu but 'simple'
+  button for task and project because other modules already provide action
+  to send documents by email, which is not the case for project and task.)
+- Add a sign_token used to authentify the recipient in the portal view chatter,
+  if any. The message will be posted as if the user was logged in.
+- Set the _get_share_url as private for security reason
+- Add a redirect parameter to _get_share_url to get
+    If false : The direct portal view url
+    If True : The redirect url (mail/view/?)
+- Cleaning up unnecessary code
+
+- Bug fix :
+    - Before, if user was not logged and record had partner_id,
+      if partner id was null, post message was done as admin.
+      Now, the post message is done as public user.
+    - If the user had an uid but had no access_token, he could be able
+      to gain the access token of the record.
+      check_access_rights was missing in the get_access_action.
+
+Task ID : 30985
+Closes #25629
+
+================================= pseudo patch: =================================
+
+--- a/addons/account/models/account_invoice.py
++++ b/addons/account/models/account_invoice.py
+@@ -45,8 +45,6 @@ class AccountInvoice(models.Model):
+     _description = "Invoice"
+     _order = "date_invoice desc, number desc, id desc"
+ 
+-    def _get_default_access_token(self):
+-        return str(uuid.uuid4())
+ 
+     def _get_default_incoterm(self):
+         return self.env.user.company_id.incoterm_id
+@@ -243,9 +241,6 @@ class AccountInvoice(models.Model):
+         ], readonly=True, states={'draft': [('readonly', False)]}, index=True, change_default=True,
+         default=lambda self: self._context.get('type', 'out_invoice'),
+         track_visibility='always')
+-    access_token = fields.Char(
+-        'Security Token', copy=False,
+-        default=_get_default_access_token)
+ 
+     refund_invoice_id = fields.Many2one('account.invoice', string="Invoice for which this invoice is the credit note")
+     number = fields.Char(related='move_id.name', store=True, readonly=True, copy=False)
+@@ -428,10 +423,10 @@ class AccountInvoice(models.Model):
+         domain += [('journal_id', '=', self.journal_id.id), ('state', 'not in', ['draft', 'cancel'])]
+         return journal_sequence, domain
+ 
+-    def _compute_portal_url(self):
+-        super(AccountInvoice, self)._compute_portal_url()
++    def _compute_access_url(self):
++        super(AccountInvoice, self)._compute_access_url()
+         for order in self:
+-            order.portal_url = '/my/invoices/%s' % (order.id)
++            order.access_url = '/my/invoices/%s' % (order.id)
+ 
+     @api.depends('state', 'journal_id', 'date_invoice')
+     def _get_sequence_prefix(self):
+@@ -564,27 +559,6 @@ class AccountInvoice(models.Model):
+                     view_id = get_view_id('invoice_form', 'account.invoice.form').id
+         return super(AccountInvoice, self).fields_view_get(view_id=view_id, view_type=view_type, toolbar=toolbar, submenu=submenu)
+ 
+-    @api.model_cr_context
+-    def _init_column(self, column_name):
+-        """ Initialize the value of the given column for existing rows.
+-
+-            Overridden here because we need to generate different access tokens
+-            and by default _init_column calls the default method once and applies
+-            it for every record.
+-        """
+-        if column_name != 'access_token':
+-            super(AccountInvoice, self)._init_column(column_name)
+-        else:
+-            query = """UPDATE %(table_name)s
+-                          SET %(column_name)s = md5(md5(random()::varchar || id::varchar) || clock_timestamp()::varchar)::uuid::varchar
+-                        WHERE %(column_name)s IS NULL
+-                    """ % {'table_name': self._table, 'column_name': column_name}
+-            self.env.cr.execute(query)
+-
+-    def _generate_access_token(self):
+-        for invoice in self:
+-            invoice.access_token = self._get_default_access_token()
+-
+     @api.multi
+     def invoice_print(self):
+         """ Print the invoice and mark it as sent, so that we can see more
+@@ -946,40 +920,6 @@ class AccountInvoice(models.Model):
+ 
+         return groups
+ 
+-    @api.multi
+-    def get_access_action(self, access_uid=None):
+-        """ Instead of the classic form view, redirect to the online invoice for portal users. """
+-        self.ensure_one()
+-        user, record = self.env.user, self
+-        if access_uid:
+-            user = self.env['res.users'].sudo().browse(access_uid)
+-            record = self.sudo(user)
+-
+-        if user.share or self.env.context.get('force_website'):
+-            try:
+-                record.check_access_rule('read')
+-            except exceptions.AccessError:
+-                if self.env.context.get('force_website'):
+-                    return {
+-                        'type': 'ir.actions.act_url',
+-                        'url': '/my/invoices/%s' % self.id,
+-                        'target': 'self',
+-                        'res_id': self.id,
+-                    }
+-                else:
+-                    pass
+-            else:
+-                return {
+-                    'type': 'ir.actions.act_url',
+-                    'url': '/my/invoices/%s?access_token=%s' % (self.id, self.access_token),
+-                    'target': 'self',
+-                    'res_id': self.id,
+-                }
+-        return super(AccountInvoice, self).get_access_action(access_uid)
+-
+-    def get_mail_url(self):
+-        return self.get_share_url()
+-
+     @api.multi
+     def get_formview_id(self, access_uid=None):
+         """ Update form view id of action to open the invoice """

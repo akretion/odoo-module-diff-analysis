@@ -1,0 +1,279 @@
+PR: https://github.com/odoo/odoo/pull/
+
+From: d77ce4c2a92c1da48150e4e84b714dd93f64847d
+From: Lucas Lefèvre
+Date: 2019-02-14 15:28:54
+
+Breaking data model changes score: 1, change matches:
+-    is_absent_totay = fields.Boolean('Absent Today', compute='_compute_absent_employee', search='_search_absent_employee')
+
+Total Changes: 90
+
+[IMP] hr_*: introduce the employee profile
+
+General Purpose
+===============
+
+We want an 'Employee profile' gathering every data about an employee.
+The main form view is modified to become this employee profile.
+A user can also see his own profile through the Preferences menu.
+The new profile replaces the current Preferences view if the hr module is installed
+and the current user is linked to an employee.
+
+A user should be able to see and edit his own profile.
+
+*Problem*:
+Many fields on hr.employee are protected by groups="hr.group_hr_user".
+Therefore, a regular user cannot see or edit those fields.
+
+This protection must be bypassed to allow read/write access
+to the regular user's own data.
+A similar mechanism already exists for res.users (for Preferences)
+
+The better (least worst) solution found is to reuse this mechanism by adding related fields on res.users.
+
+Pros:
+- Don't change security access on hr.employee
+- Don't implement yet another custom security layer, risking to add new security breaches
+- A lot of fields are added by other modules on hr.employee.
+  It would have required to integrate them with the custom security layer.
+- Fields added by other modules on the user's preferences view (normal view, not the profile)
+  are automatically included in the employee's profile view.
+- Allow the hr.employee form view to be different than the user profile accessible
+  through the Preferences menu.
+  E.g. add custom buttons only relevant to the logged in user such as "Request a leave".
+Cons:
+- Each field from hr.employee that you want to appear on its profile
+  must be added as a related field on res.users
+- Those related fields must be added to user's preferences view (duplicate views)
+- They also must be added to SELF_[READABLE | WRITABLE]_FIELDS
+
+Note:
+When the front-end loads the views it gets the list of available fields
+for the user (according to its access rights). Later, when the front-end wants to
+populate the view with data, it only asks to read those available fields.
+However, in this case, we want the user to be able to read/write its own data,
+even if they are protected by groups (groups are kept on the related fields on res.users).
+The front-end need to be made  aware of those fields by sending all field definitions.
+
+hr_attendance
+=============
+
+This commit integrate attendance in the new employee profile.
+It also adds a stat button to this employee profile showing
+the number of hours worked last month.
+
+Remove the boolean computed field 'manual_attendance'.
+This field is just a shortcut to add/remove the employee's user
+in the "Manual Attendance" group.
+The checkbox is confusing on the employee's form and this should
+be done through the normal group management screens.
+
+hr_presence
+===========
+
+Display the presence status on the employee kanban template.
+The status is a colored chip which can be green (present),
+orange (to define) or red (absent).
+
+Currently, the presence status is only computed when accessing
+the report view. As this commits displays it on the employee kanban,
+it should be updated more frequently.
+The state should not be updated every time the kanban view is loaded
+since the computation is a bit heavy. Instead: add a cron to update
+status every 15 minutes.
+-> The status is accurate on the report view (status is still updated
+   when loading the view)
+-> The status in accurate at 15 minutes on the kanban view
+
+[ADD] hr_attendance_presence
+============================
+
+Bridge module between hr_attendance and hr_presence.
+
+This commit integrates hr_presence module in the employee
+profile and adds the presence status on the employee kanban view.
+But hr_attendance adds at the same place a similar status icon for
+checkin/checkout.
+This bridge module makes the status from hr_presence invisible as
+hr_attendance should be the main presence control mechanism.
+
+Also, this commit adds the ability (through a new setting option)
+for hr_presence to take into account checkin/checkout to determine
+the presence status.
+
+l10n_be_hr_payroll
+==================
+integration with employee profile
+
+================================= pseudo patch: =================================
+
+--- a/addons/hr_holidays/models/hr.py
++++ b/addons/hr_holidays/models/hr.py
+@@ -63,10 +63,14 @@ class Department(models.Model):
+ class Employee(models.Model):
+     _inherit = "hr.employee"
+ 
++    def _group_hr_user_domain(self):
++        group = self.env.ref('hr_holidays.group_hr_holidays_team_leader', raise_if_not_found=False)
++        return [('groups_id', 'in', group.ids)] if group else []
++
+     leave_manager_id = fields.Many2one(
+         'res.users', string='Time Off Responsible',
+-        domain=lambda self: [('groups_id', 'in', self.env.ref('hr_holidays.group_hr_holidays_team_leader').id)],
+-        help="User responsible of time off approval. Should be Team Leader or Department Manager.")
++        domain=_group_hr_user_domain,
++        help="User responsible of leaves approval. Should be Team Leader or Department Manager.")
+     remaining_leaves = fields.Float(
+         compute='_compute_remaining_leaves', string='Remaining Paid Time Off',
+         help='Total number of paid time off allocated to this employee, change this value to create allocation/time off request. '
+@@ -84,8 +88,10 @@ class Employee(models.Model):
+     leave_date_from = fields.Date('From Date', compute='_compute_leave_status')
+     leave_date_to = fields.Date('To Date', compute='_compute_leave_status')
+     leaves_count = fields.Float('Number of Time Off', compute='_compute_remaining_leaves')
++    allocation_count = fields.Float('Total number of days allocated.', compute='_compute_allocation_count')
++    allocation_used_count = fields.Float('Total number of days off used', compute='_compute_total_allocation_used')
+     show_leaves = fields.Boolean('Able to see Remaining Time Off', compute='_compute_show_leaves')
+-    is_absent_totay = fields.Boolean('Absent Today', compute='_compute_absent_employee', search='_search_absent_employee')
++    is_absent = fields.Boolean('Absent Today', compute='_compute_leave_status', search='_search_absent_employee')
+ 
+     def _get_remaining_leaves(self):
+         """ Helper to compute the remaining leaves for the current employees
+@@ -121,6 +127,22 @@ class Employee(models.Model):
+             employee.leaves_count = value
+             employee.remaining_leaves = value
+ 
++    @api.multi
++    def _compute_allocation_count(self):
++        for employee in self:
++            allocations = self.env['hr.leave.allocation'].search([
++                ('employee_id', '=', employee.id),
++                ('state', '=', 'validate'),
++                '|',
++                    ('date_to', '=', False),
++                    ('date_to', '>=', datetime.date.today()),
++            ])
++            employee.allocation_count = sum(allocations.mapped('number_of_days'))
++
++    def _compute_total_allocation_used(self):
++        for employee in self:
++            employee.allocation_used_count = employee.allocation_count - employee.remaining_leaves
++
+     @api.multi
+     def _compute_leave_status(self):
+         # Used SUPERUSER_ID to forcefully get status of other user's leave, to bypass record rule
+@@ -143,6 +165,7 @@ class Employee(models.Model):
+             employee.leave_date_to = leave_data.get(employee.id, {}).get('leave_date_to')
+             employee.current_leave_state = leave_data.get(employee.id, {}).get('current_leave_state')
+             employee.current_leave_id = leave_data.get(employee.id, {}).get('current_leave_id')
++            employee.is_absent = leave_data and leave_data.get(employee.id, {}).get('current_leave_state') not in ['cancel', 'refuse', 'draft']
+ 
+     @api.onchange('parent_id')
+     def _onchange_parent_id(self):
+@@ -161,34 +184,13 @@ class Employee(models.Model):
+             else:
+                 employee.show_leaves = False
+ 
+-    @api.multi
+-    def _compute_absent_employee(self):
+-        today_date = datetime.datetime.utcnow().date()
+-        today_start = fields.Datetime.to_string(today_date)  # get the midnight of the current utc day
+-        today_end = fields.Datetime.to_string(today_date + relativedelta(hours=23, minutes=59, seconds=59))
+-        data = self.env['hr.leave'].read_group([
+-            ('employee_id', 'in', self.ids),
+-            ('state', 'not in', ['cancel', 'refuse']),
+-            ('date_from', '<=', today_end),
+-            ('date_to', '>=', today_start)
+-        ], ['employee_id'], ['employee_id'])
+-        result = dict.fromkeys(self.ids, False)
+-        for item in data:
+-            if item['employee_id_count'] >= 1:
+-                result[item['employee_id'][0]] = True
+-        for employee in self:
+-            employee.is_absent_totay = result[employee.id]
+-
+     @api.multi
+     def _search_absent_employee(self, operator, value):
+-        today_date = datetime.datetime.utcnow().date()
+-        today_start = fields.Datetime.to_string(today_date)  # get the midnight of the current utc day
+-        today_end = fields.Datetime.to_string(today_date + relativedelta(hours=23, minutes=59, seconds=59))
+         holidays = self.env['hr.leave'].sudo().search([
+             ('employee_id', '!=', False),
+             ('state', 'not in', ['cancel', 'refuse']),
+-            ('date_from', '<=', today_end),
+-            ('date_to', '>=', today_start)
++            ('date_from', '<=', datetime.datetime.utcnow()),
++            ('date_to', '>=', datetime.datetime.utcnow())
+         ])
+         return [('id', 'in', holidays.mapped('employee_id').ids)]
+ 
+
+--- a/addons/hr_holidays/models/hr_leave.py
++++ b/addons/hr_holidays/models/hr_leave.py
+@@ -778,9 +778,9 @@ class HolidaysRequest(models.Model):
+     # ------------------------------------------------------------
+ 
+     def _get_responsible_for_approval(self):
+-        if self.state == 'confirm' and self.employee_id.leave_manager_id:
++        if self.state == 'confirm' and self.employee_id.leave_manager_id and self.employee_id.leave_manager_id.has_group('hr_holidays.group_hr_holidays_team_leader'):
+             return self.employee_id.leave_manager_id
+-        elif self.state == 'confirm' and self.employee_id.parent_id.user_id:
++        elif self.state == 'confirm' and self.employee_id.parent_id.user_id and self.employee_id.parent_id.user_id.has_group('hr_holidays.group_hr_holidays_team_leader'):
+             return self.employee_id.parent_id.user_id
+         elif self.department_id.manager_id.user_id:
+             return self.department_id.manager_id.user_id
+
+--- a/addons/hr_holidays/models/hr_leave_type.py
++++ b/addons/hr_holidays/models/hr_leave_type.py
+@@ -232,7 +232,7 @@ class HolidaysType(models.Model):
+         elif 'default_employee_id' in self._context:
+             employee_id = self._context['default_employee_id']
+         else:
+-            employee_id = self.env['hr.employee'].search([('user_id', '=', self.env.user.id)], limit=1).id
++            employee_id = self.env['hr.employee'].search([('user_id', '=', self.env.user.id), ('company_id', '=', self.env.user.company_id.id)], limit=1).id
+         return employee_id
+ 
+     @api.multi
+
+--- a/addons/hr_holidays/models/res_users.py
++++ b/addons/hr_holidays/models/res_users.py
+@@ -4,11 +4,37 @@
+ from odoo import api, fields, models
+ 
+ 
+-class ResUsers(models.Model):
++class User(models.Model):
+     _inherit = "res.users"
+ 
++    leave_manager_id = fields.Many2one(related='employee_id.leave_manager_id')
++    show_leaves = fields.Boolean(related='employee_id.show_leaves')
++    allocation_used_count = fields.Float(related='employee_id.allocation_used_count')
++    allocation_count = fields.Float(related='employee_id.allocation_count')
++    leave_date_to = fields.Date(related='employee_id.leave_date_to')
++    is_absent = fields.Boolean(related='employee_id.is_absent')
++
++    def __init__(self, pool, cr):
++        """ Override of __init__ to add access rights.
++            Access rights are disabled by default, but allowed
++            on some specific fields defined in self.SELF_{READ/WRITE}ABLE_FIELDS.
++        """
++
++        readable_fields = [
++            'leave_manager_id',
++            'show_leaves',
++            'allocation_used_count',
++            'allocation_count',
++            'leave_date_to',
++            'is_absent',
++        ]
++        init_res = super(User, self).__init__(pool, cr)
++        # duplicate list to avoid modifying the original reference
++        type(self).SELF_READABLE_FIELDS = type(self).SELF_READABLE_FIELDS + readable_fields
++        return init_res
++
+     def _compute_im_status(self):
+-        super(ResUsers, self)._compute_im_status()
++        super(User, self)._compute_im_status()
+         on_leave_user_ids = self._get_on_leave_ids()
+         for user in self:
+             if user.id in on_leave_user_ids:

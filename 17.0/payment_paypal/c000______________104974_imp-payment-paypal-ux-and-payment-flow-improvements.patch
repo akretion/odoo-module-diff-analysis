@@ -1,0 +1,141 @@
+PR: https://github.com/odoo/odoo/pull/104974
+
+From: e5c187ade8a4ac54f9dc220bb7d2a997e0143871
+From: Anita (anko)
+Date: 2023-02-17 13:09:43
+
+Breaking data model changes score: 2, change matches:
+-    paypal_seller_account = fields.Char(
+-    paypal_use_ipn = fields.Boolean(
+
+Total Changes: 47
+
+[IMP] payment(_paypal): UX and payment flow improvements
+
+UX was lacking comparing to other payment providers,
+important fields were not always shown or were checkboxes
+when they should be automatically true.
+
+In order to make payment flow easier and more intitive, unnecessary fields
+were removed, email is automatically filled. Now when user cancels transaction
+on paypal before paying, it automatically cancels transaction on Odoo. Additionaly, quick
+onboarding is only available if user already has paypal account and Stripe
+no longer installs ond configures paypal if Stripe's onboarding get canceled.
+
+task-2854184
+
+closes odoo/odoo#104974
+
+Related: odoo/upgrade#4025
+Related: odoo/documentation#3063
+Signed-off-by: Antoine Vandevenne (anv) <anv@odoo.com>
+
+================================= pseudo patch: =================================
+
+--- a/addons/payment_paypal/models/payment_provider.py
++++ b/addons/payment_paypal/models/payment_provider.py
+@@ -6,6 +6,7 @@ from odoo import _, fields, models
+ 
+ from odoo.addons.payment_paypal.const import SUPPORTED_CURRENCIES
+ 
++
+ _logger = logging.getLogger(__name__)
+ 
+ 
+@@ -13,16 +14,15 @@ class PaymentProvider(models.Model):
+     _inherit = 'payment.provider'
+ 
+     code = fields.Selection(
+-        selection_add=[('paypal', "Paypal")], ondelete={'paypal': 'set default'})
++        selection_add=[('paypal', "Paypal")], ondelete={'paypal': 'set default'}
++    )
+     paypal_email_account = fields.Char(
+         string="Email",
+         help="The public business email solely used to identify the account with PayPal",
+-        required_if_provider='paypal')
+-    paypal_seller_account = fields.Char(
+-        string="Merchant Account ID", groups='base.group_system')
++        required_if_provider='paypal',
++        default=lambda self: self.env.company.email,
++    )
+     paypal_pdt_token = fields.Char(string="PDT Identity Token", groups='base.group_system')
+-    paypal_use_ipn = fields.Boolean(
+-        string="Use IPN", help="Paypal Instant Payment Notification", default=True)
+ 
+     #=== COMPUTE METHODS ===#
+ 
+@@ -58,20 +58,3 @@ class PaymentProvider(models.Model):
+             return 'https://www.paypal.com/cgi-bin/webscr'
+         else:
+             return 'https://www.sandbox.paypal.com/cgi-bin/webscr'
+-
+-    def _paypal_send_configuration_reminder(self):
+-        render_template = self.env['ir.qweb']._render(
+-            'payment_paypal.mail_template_paypal_invite_user_to_configure',
+-            {'provider': self},
+-            raise_if_not_found=False,
+-        )
+-        if render_template:
+-            mail_body = self.env['mail.render.mixin']._replace_local_links(render_template)
+-            mail_values = {
+-                'body_html': mail_body,
+-                'subject': _("Add your PayPal account to Odoo"),
+-                'email_to': self.paypal_email_account,
+-                'email_from': self.create_uid.email_formatted,
+-                'author_id': self.create_uid.partner_id.id,
+-            }
+-            self.env['mail.mail'].sudo().create(mail_values).send()
+
+--- a/addons/payment_paypal/models/payment_transaction.py
++++ b/addons/payment_paypal/models/payment_transaction.py
+@@ -35,12 +35,17 @@ class PaymentTransaction(models.Model):
+             return res
+ 
+         base_url = self.provider_id.get_base_url()
++        cancel_url = urls.url_join(base_url, PaypalController._cancel_url)
++        cancel_url_params = {
++            'tx_ref': self.reference,
++            'access_token': payment_utils.generate_access_token(self.reference),
++        }
+         partner_first_name, partner_last_name = payment_utils.split_partner_name(self.partner_name)
+-        webhook_url = urls.url_join(base_url, PaypalController._webhook_url)
+         return {
+             'address1': self.partner_address,
+             'amount': self.amount,
+             'business': self.provider_id.paypal_email_account,
++            'cancel_url': f'{cancel_url}?{urls.url_encode(cancel_url_params)}',
+             'city': self.partner_city,
+             'country': self.partner_country_id.code,
+             'currency_code': self.currency_id.name,
+@@ -51,7 +56,7 @@ class PaymentTransaction(models.Model):
+             'item_number': self.reference,
+             'last_name': partner_last_name,
+             'lc': self.partner_lang,
+-            'notify_url': webhook_url if self.provider_id.paypal_use_ipn else None,
++            'notify_url': urls.url_join(base_url, PaypalController._webhook_url),
+             'return_url': urls.url_join(base_url, PaypalController._return_url),
+             'state': self.partner_state_id.name,
+             'zip_code': self.partner_zip,
+@@ -92,6 +97,10 @@ class PaymentTransaction(models.Model):
+         if self.provider_code != 'paypal':
+             return
+ 
++        if not notification_data:
++            self._set_canceled(_("The customer left the payment page."))
++            return
++
+         txn_id = notification_data.get('txn_id')
+         txn_type = notification_data.get('txn_type')
+         if not all((txn_id, txn_type)):
+@@ -106,11 +115,6 @@ class PaymentTransaction(models.Model):
+ 
+         payment_status = notification_data.get('payment_status')
+ 
+-        if payment_status in PAYMENT_STATUS_MAPPING['pending'] + PAYMENT_STATUS_MAPPING['done'] \
+-            and not (self.provider_id.paypal_pdt_token and self.provider_id.paypal_seller_account):
+-            # If a payment is made on an account waiting for configuration, send a reminder email
+-            self.provider_id._paypal_send_configuration_reminder()
+-
+         if payment_status in PAYMENT_STATUS_MAPPING['pending']:
+             self._set_pending(state_message=notification_data.get('pending_reason'))
+         elif payment_status in PAYMENT_STATUS_MAPPING['done']:

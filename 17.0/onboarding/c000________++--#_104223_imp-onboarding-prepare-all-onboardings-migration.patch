@@ -1,0 +1,434 @@
+PR: https://github.com/odoo/odoo/pull/104223
+
+From: 518a4e4c4308985e6beaed22521853cce87f8850
+From: Florian Charlier
+Date: 2023-06-30 21:37:50
+
+Breaking data model changes score: 10.4, change matches:
+-    step_ids = fields.One2many('onboarding.onboarding.step', 'onboarding_id', 'Onboarding steps')
++    step_ids = fields.Many2many('onboarding.onboarding.step', string='Onboarding steps')
++    is_per_company = fields.Boolean(
+-    onboarding_id = fields.Many2one(
++    onboarding_ids = fields.Many2many('onboarding.onboarding', string='Onboardings')
+-    progress_step_ids = fields.One2many('onboarding.progress.step', 'progress_id', 'Progress Steps Trackers')
++    progress_step_ids = fields.Many2many('onboarding.progress.step', string='Progress Steps Trackers')
+-    progress_id = fields.Many2one(
++    progress_ids = fields.Many2many('onboarding.progress', string='Related Onboarding Progress Tracker')
+-    onboarding_id = fields.Many2one(related='progress_id.onboarding_id', string='Onboarding')
+
+Total Changes: 351
+
+[IMP] onboarding: prepare all onboardings migration
+
+### enable onboarding step sharing
+
+Purpose: Allow to use the same step (and progress) for multiple
+onboardings.
+This is required for the migration of some onboardings such as the
+`account` invoicing and sale `quotation` onboardings which both use
+common steps (s.g., "Set up company data").
+
+This is done by mutating the onboarding - onboarding step relation and
+progress - progress step models relationships to m2m:
+* Progress step records are now linked to several progress records if
+the  step they track is used in several onboardings.
+* There will still be multiple progress step records for per-company
+tracking, if applicable.
+
+### Allow steps w/o onboarding
+
+This commit enables creating and tracking the completion of
+onboarding steps that are not included in an onboarding panel.
+
+Before this PR, such steps could already be defined and used.
+This is the case of the `payment_provider` step from the payment
+module, that could be included in an onboarding panel defined
+in website_sale_dashboard (both are migrated in later commits of
+this PR and related ENT).
+
+### Support changing is_per_company
+
+Having onboarding (steps) being immutably per-company or not
+per-company is not convenient. We are here taking advantage of the
+migration of onboardings (next commits) to have a working framework
+for these changes.
+
+The alternative solution of having to change all onboardings and linked
+steps together and ensuring all or none are per-company was in fact
+more complex to support and fragile as depending on python constraints
+on the many2many relationship.
+
+We also considered it wasn't worth the complexity to identify which
+onboarding_progress record could safely be removed when its last
+'per-company' step is updated to not per-company.
+In that case, all companies will have to close the panel independently,
+but the completion of each remaining step will not have to be done for
+each company.
+
+### Miscellaneous
+
+#### add safe close action
+
+This eases the handling closing an onboarding panel that
+may have been deleted. The code for each panel can
+therefore be simplified.
+
+#### add onboarding step form controller
+
+Extracted from `appointment` to be reused in other modules'
+onboardings.
+We are also cleaning the closing behavior which is no longer
+required as dialogs now do close on save/discard.
+
+Tests are added and updated.
+
+Task-3025136
+
+Part-of: odoo/odoo#104223
+
+================================= pseudo patch: =================================
+
+--- a/addons/onboarding/models/__init__.py
++++ b/addons/onboarding/models/__init__.py
+@@ -2,6 +2,6 @@
+ # Part of Odoo. See LICENSE file for full copyright and licensing details.
+ 
+ from . import onboarding_onboarding
+-from . import onboarding_step
++from . import onboarding_onboarding_step
+ from . import onboarding_progress
+ from . import onboarding_progress_step
+
+--- a/addons/onboarding/models/onboarding_onboarding.py
++++ b/addons/onboarding/models/onboarding_onboarding.py
+@@ -13,10 +13,11 @@ class Onboarding(models.Model):
+     name = fields.Char('Name of the onboarding', translate=True)
+     # One word identifier used to define the onboarding panel's route: `/onboarding/{route_name}`.
+     route_name = fields.Char('One word name', required=True)
+-    step_ids = fields.One2many('onboarding.onboarding.step', 'onboarding_id', 'Onboarding steps')
+-
+-    is_per_company = fields.Boolean('Should be done per company?', default=True)
++    step_ids = fields.Many2many('onboarding.onboarding.step', string='Onboarding steps')
+ 
++    is_per_company = fields.Boolean(
++        'Should be done per company?', compute='_compute_is_per_company', readonly=True, store=False,
++    )
+     panel_close_action_name = fields.Char(
+         'Closing action', help='Name of the onboarding model action to execute when closing the panel.')
+ 
+@@ -36,8 +37,19 @@ class Onboarding(models.Model):
+         ('route_name_uniq', 'UNIQUE (route_name)', 'Onboarding alias must be unique.'),
+     ]
+ 
++    @api.depends('progress_ids', 'progress_ids.company_id', 'step_ids', 'step_ids.is_per_company')
++    def _compute_is_per_company(self):
++        # Once an onboarding is made "per-company", there is no drawback to simply still consider
++        # it per-company even when if its last per-company step is unlinked. This allows to avoid
++        # handling the merging of existing progress (step) records.
++
++        onboardings_with_per_company_steps_or_progress = self.filtered(
++            lambda o: o.progress_ids.company_id or (True in o.step_ids.mapped('is_per_company')))
++        onboardings_with_per_company_steps_or_progress.is_per_company = True
++        (self - onboardings_with_per_company_steps_or_progress).is_per_company = False
++
+     @api.depends_context('company')
+-    @api.depends('progress_ids', 'progress_ids.is_onboarding_closed', 'progress_ids.onboarding_state')
++    @api.depends('progress_ids', 'progress_ids.is_onboarding_closed', 'progress_ids.onboarding_state', 'progress_ids.company_id')
+     def _compute_current_progress(self):
+         for onboarding in self:
+             current_progress_id = onboarding.progress_ids.filtered(
+@@ -51,28 +63,44 @@ class Onboarding(models.Model):
+                 onboarding.current_progress_id = False
+                 onboarding.is_onboarding_closed = False
+ 
++    def write(self, vals):
++        """Recompute progress step ids if new steps are added/removed."""
++        already_linked_steps = self.step_ids
++        res = super().write(vals)
++        if self.step_ids != already_linked_steps:
++            self.progress_ids._recompute_progress_step_ids()
++        return res
++
+     def action_close(self):
+         """Close the onboarding panel."""
+         self.current_progress_id.action_close()
+ 
+-    def action_toggle_visibility(self):
+-        self.current_progress_id.action_toggle_visibility()
++    @api.model
++    def action_close_panel(self, xmlid):
++        """Close the onboarding panel identified by its `xmlid`.
+ 
+-    def write(self, values):
+-        if 'is_per_company' in values:
+-            onboardings_per_company_update = self.filtered(
+-                lambda onboarding: onboarding.is_per_company != values['is_per_company'])
++        If not found, quietly do nothing.
++        """
++        if onboarding := self.env.ref(xmlid, raise_if_not_found=False):
++            onboarding.action_close()
+ 
+-        res = super().write(values)
++    def action_refresh_progress_ids(self):
++        """Re-initialize onboarding progress records (after step is_per_company change).
+ 
+-        if 'is_per_company' in values:
+-            # When changing this parameter, all progress (onboarding and steps) is reset.
+-            onboardings_per_company_update.progress_ids.unlink()
+-        return res
++        Meant to be called when `is_per_company` of linked steps is modified (or per-company
++        steps are added to an onboarding).
++        """
++        onboardings_to_refresh_progress = self.filtered(
++            lambda o: o.is_per_company and o.progress_ids and not o.progress_ids.company_id
++        )
++        onboardings_to_refresh_progress.progress_ids.unlink()
++        onboardings_to_refresh_progress._create_progress()
++
++    def action_toggle_visibility(self):
++        self.current_progress_id.action_toggle_visibility()
+ 
+     def _search_or_create_progress(self):
+-        """Create Progress record(s) as necessary for the context.
+-        """
++        """Create Progress record(s) as necessary for the context."""
+         onboardings_without_progress = self.filtered(lambda onboarding: not onboarding.current_progress_id)
+         onboardings_without_progress._create_progress()
+         return self.current_progress_id
+@@ -81,8 +109,12 @@ class Onboarding(models.Model):
+         return self.env['onboarding.progress'].create([
+             {
+                 'company_id': self.env.company.id if onboarding.is_per_company else False,
+-                'onboarding_id': onboarding.id
+-            } for onboarding in self
++                'onboarding_id': onboarding.id,
++                'progress_step_ids': onboarding.step_ids.progress_ids.filtered(
++                    lambda p: p.company_id.id in [False, self.env.company.id]
++                ),
++            }
++            for onboarding in self
+         ])
+ 
+     def _prepare_rendering_values(self):
+
+--- a/addons/onboarding/models/onboarding_step.py
++++ b/addons/onboarding/models/onboarding_onboarding_step.py
+@@ -1,8 +1,9 @@
+ # -*- coding: utf-8 -*-
+ # Part of Odoo. See LICENSE file for full copyright and licensing details.
+ 
+-from odoo import _, api, fields, models
++from odoo import _, api, Command, fields, models
+ from odoo.addons.onboarding.models.onboarding_progress import ONBOARDING_PROGRESS_STATES
++from odoo.exceptions import ValidationError
+ 
+ 
+ class OnboardingStep(models.Model):
+@@ -11,8 +12,7 @@ class OnboardingStep(models.Model):
+     _order = 'sequence asc, id asc'
+     _rec_name = 'title'
+ 
+-    onboarding_id = fields.Many2one(
+-        'onboarding.onboarding', string='Onboarding', readonly=True, required=True, ondelete='cascade')
++    onboarding_ids = fields.Many2many('onboarding.onboarding', string='Onboardings')
+ 
+     title = fields.Char('Title', translate=True)
+     description = fields.Char('Description', translate=True)
+@@ -21,14 +21,14 @@ class OnboardingStep(models.Model):
+         help="Text on the panel's button to start this step")
+     done_icon = fields.Char('Font Awesome Icon when completed', default='fa-star')
+     done_text = fields.Char(
+-        'Text to show when step is completed', default=_('Step Completed! - Click to review'), translate=True)
++        'Text to show when step is completed', default=_('Step Completed!'), translate=True)
+     step_image = fields.Binary("Step Image")
+     step_image_filename = fields.Char("Step Image Filename")
+     step_image_alt = fields.Char(
+         'Alt Text for the Step Image', default='Onboarding Step Image', translate=True,
+         help='Show when impossible to load the image')
+     panel_step_open_action_name = fields.Char(
+-        string='Opening action', required=True,
++        string='Opening action', required=False,
+         help='Name of the onboarding step model action to execute when opening the step, '
+              'e.g. action_open_onboarding_1_step_1')
+ 
+@@ -41,14 +41,16 @@ class OnboardingStep(models.Model):
+         'onboarding.progress.step', 'step_id', string='Onboarding Progress Step Records', readonly=True,
+         help='All related Onboarding Progress Step Records (across companies)')
+ 
++    is_per_company = fields.Boolean('Is per company', default=True)
+     sequence = fields.Integer(default=10)
+ 
+     @api.depends_context('company')
+     @api.depends('progress_ids', 'progress_ids.step_state')
+     def _compute_current_progress(self):
++        # When `is_per_company` is changed, `progress_ids` is updated (see `write`) which triggers this `_compute`.
+         existing_progress_steps = self.progress_ids.filtered_domain([
+             ('step_id', 'in', self.ids),
+-            ('progress_id.company_id', 'in', [False, self.env.company.id]),
++            ('company_id', 'in', [False, self.env.company.id]),
+         ])
+         for step in self:
+             if step in existing_progress_steps.step_id:
+@@ -60,6 +62,35 @@ class OnboardingStep(models.Model):
+                 step.current_progress_step_id = False
+                 step.current_step_state = 'not_done'
+ 
++    @api.constrains('onboarding_ids')
++    def check_step_on_onboarding_has_action(self):
++        if steps_without_action := self.filtered(lambda step: step.onboarding_ids and not step.panel_step_open_action_name):
++            raise ValidationError(_(
++                'An "Opening Action" is required for the following steps to be '
++                'linked to an onboarding panel: %(step_titles)s',
++                step_titles=steps_without_action.mapped('title'),
++            ))
++
++    def write(self, vals):
++        new_is_per_company = vals.get('is_per_company')
++        steps_changing_is_per_company = (
++            self.browse() if new_is_per_company is None
++            else self.filtered(lambda step: step.is_per_company != new_is_per_company)
++        )
++        already_linked_onboardings = self.onboarding_ids
++
++        res = super().write(vals)
++
++        # Progress is reset (to be done per-company or, for steps, to have a single record)
++        if steps_changing_is_per_company:
++            steps_changing_is_per_company.progress_ids.unlink()
++        self.onboarding_ids.action_refresh_progress_ids()
++
++        if self.onboarding_ids - already_linked_onboardings:
++            self.onboarding_ids.progress_ids._recompute_progress_step_ids()
++
++        return res
++
+     def action_set_just_done(self):
+         # Make sure progress records exist for the current context (company)
+         steps_without_progress = self.filtered(lambda step: not step.current_progress_step_id)
+@@ -80,21 +111,23 @@ class OnboardingStep(models.Model):
+         return super()._get_placeholder_filename(field)
+ 
+     def _create_progress_steps(self):
++        """Create progress step records as necessary to validate steps.
++
++        Only considers existing `onboarding.progress` records for the current
++        company or without company (depending on `is_per_company`).
++        """
+         onboarding_progress_records = self.env['onboarding.progress'].search([
+-            ('onboarding_id', 'in', self.onboarding_id.ids),
++            ('onboarding_id', 'in', self.onboarding_ids.ids),
+             ('company_id', 'in', [False, self.env.company.id])
+         ])
+-        progress_step_values = []
+-        for onboarding_progress_record in onboarding_progress_records:
+-            progress_step_values += [
+-                {
+-                    'onboarding_id': onboarding_progress_record.onboarding_id.id,
+-                    'progress_id': onboarding_progress_record.id,
+-                    'step_id': step_id.id,
+-                }
+-                for step_id
+-                in self.filtered(lambda step: self.onboarding_id == onboarding_progress_record.onboarding_id)
+-                if step_id not in onboarding_progress_record.progress_step_ids.step_id
+-            ]
+-
++        progress_step_values = [
++            {
++                'step_id': step_id.id,
++                'progress_ids': [
++                    Command.link(onboarding_progress_record.id)
++                    for onboarding_progress_record
++                    in onboarding_progress_records.filtered(lambda p: step_id in p.onboarding_id.step_ids)],
++                'company_id': self.env.company.id if step_id.is_per_company else False,
++            } for step_id in self
++        ]
+         return self.env['onboarding.progress.step'].create(progress_step_values)
+
+--- a/addons/onboarding/models/onboarding_progress.py
++++ b/addons/onboarding/models/onboarding_progress.py
+@@ -22,9 +22,10 @@ class OnboardingProgress(models.Model):
+     company_id = fields.Many2one('res.company')
+     onboarding_id = fields.Many2one(
+         'onboarding.onboarding', 'Related onboarding tracked', required=True, ondelete='cascade')
+-    progress_step_ids = fields.One2many('onboarding.progress.step', 'progress_id', 'Progress Steps Trackers')
++    progress_step_ids = fields.Many2many('onboarding.progress.step', string='Progress Steps Trackers')
+ 
+     def init(self):
++        """Make sure there aren't multiple records for the same onboarding and company."""
+         # not in _sql_constraint because COALESCE is not supported for PostgreSQL constraint
+         self.env.cr.execute("""
+             CREATE UNIQUE INDEX IF NOT EXISTS onboarding_progress_onboarding_company_uniq
+@@ -33,15 +34,19 @@ class OnboardingProgress(models.Model):
+ 
+     @api.depends('onboarding_id.step_ids', 'progress_step_ids', 'progress_step_ids.step_state')
+     def _compute_onboarding_state(self):
+-        progress_steps_data = self.env['onboarding.progress.step']._read_group(
+-            [('progress_id', 'in', self.ids), ('step_state', 'in', ['just_done', 'done'])],
+-            ['progress_id'], ['__count']
+-        )
+-        result = {progress.id: count for progress, count in progress_steps_data}
+         for progress in self:
+             progress.onboarding_state = (
+-                'not_done' if result.get(progress.id, 0) != len(progress.onboarding_id.step_ids)
+-                else 'done')
++                'not_done' if (
++                    len(progress.progress_step_ids.filtered(lambda p: p.step_state in {'just_done', 'done'}))
++                    != len(progress.onboarding_id.step_ids)
++                )
++                else 'done'
++            )
++
++    def _recompute_progress_step_ids(self):
++        """Update progress steps when a step (with existing progress) is added to an onboarding."""
++        for progress in self:
++            progress.progress_step_ids = progress.onboarding_id.step_ids.current_progress_step_id
+ 
+     def action_close(self):
+         self.is_onboarding_closed = True
+@@ -51,9 +56,11 @@ class OnboardingProgress(models.Model):
+             progress.is_onboarding_closed = not progress.is_onboarding_closed
+ 
+     def _get_and_update_onboarding_state(self):
+-        """Used to fetch the progress of an onboarding for rendering its panel and is expected to
+-        be called by the onboarding controller. It also has the responsibility of updating the
+-        'just_done' states into 'done' so that the 'just_done' states are only rendered once.
++        """Fetch the progress of an onboarding for rendering its panel.
++
++        This method is expected to only be called by the onboarding controller.
++        It also has the responsibility of updating the 'just_done' state into
++        'done' so that the 'just_done' states are only rendered once.
+         """
+         self.ensure_one()
+         onboarding_states_values = {}
+
+--- a/addons/onboarding/models/onboarding_progress_step.py
++++ b/addons/onboarding/models/onboarding_progress_step.py
+@@ -10,18 +10,21 @@ class OnboardingProgressStep(models.Model):
+     _description = 'Onboarding Progress Step Tracker'
+     _rec_name = 'step_id'
+ 
+-    progress_id = fields.Many2one(
+-        'onboarding.progress', 'Related Onboarding Progress Tracker', required=True, ondelete='cascade')
++    progress_ids = fields.Many2many('onboarding.progress', string='Related Onboarding Progress Tracker')
+     step_state = fields.Selection(
+         ONBOARDING_PROGRESS_STATES, string='Onboarding Step Progress', default='not_done')
+-    onboarding_id = fields.Many2one(related='progress_id.onboarding_id', string='Onboarding')
+     step_id = fields.Many2one(
+         'onboarding.onboarding.step', string='Onboarding Step', required=True, ondelete='cascade')
+ 
+-    _sql_constraints = [
+-        ('progress_step_uniq', 'unique (progress_id, step_id)',
+-         'There cannot be multiple records of the same onboarding step completion for the same Progress record.'),
+-    ]
++    company_id = fields.Many2one('res.company', ondelete='cascade')
++
++    def init(self):
++        """Make sure there aren't multiple records for the same onboarding step and company."""
++        # not in _sql_constraint because COALESCE is not supported for PostgreSQL constraint
++        self.env.cr.execute("""
++            CREATE UNIQUE INDEX IF NOT EXISTS onboarding_progress_step_company_uniq
++            ON onboarding_progress_step (step_id, COALESCE(company_id, 0))
++        """)
+ 
+     def action_consolidate_just_done(self):
+         was_just_done = self.filtered(lambda progress: progress.step_state == 'just_done')

@@ -1,0 +1,176 @@
+PR: https://github.com/odoo/odoo/pull/88276
+
+From: 0452d0701fcb8f4588b9b05dad9bbdd507539265
+From: Gorash
+Date: 2022-06-03 14:40:40
+
+Breaking data model changes score: 2, change matches:
+-    cache_time = fields.Integer(default=3600, help='Time to cache the page. (0 = no cache)')
+-    cache_key_expr = fields.Char(help='Expression (tuple) to evaluate the cached key. \nE.g.: "(request.params.get("currency"), )"')
+
+Total Changes: 88
+
+[IMP] website: remove cache from website.page
+
+The cache placed on the pages is no longer useful thanks to the use of
+the new directive t-cache.
+
+closes odoo/odoo#88276
+
+Related: odoo/enterprise#27582
+Related: odoo/documentation#2056
+Related: odoo/upgrade#3451
+Signed-off-by: Vincent Schippefilt (vsc) <vsc@odoo.com>
+
+================================= pseudo patch: =================================
+
+--- a/addons/website/models/ir_http.py
++++ b/addons/website/models/ir_http.py
+@@ -267,48 +267,12 @@ class Http(models.AbstractModel):
+                 path += '?' + request.httprequest.query_string.decode('utf-8')
+             return request.redirect(path, code=301)
+ 
+-        if page:
+-            # prefetch all menus (it will prefetch website.page too)
+-            menu_pages_ids = request.website._get_menu_page_ids()
+-            page.browse([page.id] + menu_pages_ids).mapped('view_id.name')
+-            request.website.menu_id
+-
+         if page and (request.website.is_publisher() or page.is_visible):
+-            need_to_cache = False
+-            cache_key = page._get_cache_key(request)
+-            if (
+-                page.cache_time  # cache > 0
+-                and request.httprequest.method == "GET"
+-                and request.env.user._is_public()    # only cache for unlogged user
+-                and 'nocache' not in request.httprequest.args  # allow bypass cache / debug
+-                and not request.session.debug
+-                and len(cache_key) and cache_key[-1] is not None  # nocache via expr
+-            ):
+-                need_to_cache = True
+-                try:
+-                    r = page._get_cache_response(cache_key)
+-                    if r['time'] + page.cache_time > time.time():
+-                        response = odoo.http.Response(r['content'], mimetype=r['contenttype'])
+-                        response._cached_template = r['template']
+-                        response._cached_page = page
+-                        return response
+-                except KeyError:
+-                    pass
+-
+             _, ext = os.path.splitext(req_page)
+             response = request.render(page.view_id.id, {
+                 'deletable': True,
+                 'main_object': page,
+             }, mimetype=_guess_mimetype(ext))
+-
+-            if need_to_cache and response.status_code == 200:
+-                r = response.render()
+-                page._set_cache_response(cache_key, {
+-                    'content': r,
+-                    'contenttype': response.headers['Content-Type'],
+-                    'time': time.time(),
+-                    'template': getattr(response, 'qcontext', {}).get('response_template')
+-                })
+             return response
+         return False
+ 
+
+--- a/addons/website/models/ir_ui_view.py
++++ b/addons/website/models/ir_ui_view.py
+@@ -105,14 +105,6 @@ class View(models.Model):
+ 
+             pages = view.page_ids
+ 
+-            # Disable cache of page if we guess some dynamic content (form with csrf, ...)
+-            if vals.get('arch'):
+-                to_invalidate = pages.filtered(
+-                    lambda p: p.cache_time and not p._can_be_cached(vals['arch'])
+-                )
+-                to_invalidate and _logger.info('Disable cache for page %s', to_invalidate)
+-                to_invalidate.cache_time = 0
+-
+             # No need of COW if the view is already specific
+             if view.website_id:
+                 super(View, view).write(vals)
+
+--- a/addons/website/models/website.py
++++ b/addons/website/models/website.py
+@@ -176,11 +176,6 @@ class Website(models.Model):
+     def _get_menu_ids(self):
+         return self.env['website.menu'].search([('website_id', '=', self.id)]).ids
+ 
+-    # self.env.uid for ir.rule groups on menu
+-    @tools.ormcache('self.env.uid', 'self.id')
+-    def _get_menu_page_ids(self):
+-        return self.env['website.menu'].search([('website_id', '=', self.id)]).page_id.ids
+-
+     @api.model_create_multi
+     def create(self, vals_list):
+         for vals in vals_list:
+
+--- a/addons/website/models/website_menu.py
++++ b/addons/website/models/website_menu.py
+@@ -98,10 +98,8 @@ class Menu(models.Model):
+         return menus
+ 
+     def write(self, values):
+-        res = super().write(values)
+-        if 'website_id' in values or 'sequence' in values or 'page_id' in values:
+-            self.clear_caches()
+-        return res
++        self.clear_caches()
++        return super().write(values)
+ 
+     def unlink(self):
+         self.clear_caches()
+
+--- a/addons/website/models/website_page.py
++++ b/addons/website/models/website_page.py
+@@ -31,9 +31,6 @@ class Page(models.Model):
+     is_homepage = fields.Boolean(compute='_compute_homepage', inverse='_set_homepage', string='Homepage')
+     is_visible = fields.Boolean(compute='_compute_visible', string='Is Visible')
+ 
+-    cache_time = fields.Integer(default=3600, help='Time to cache the page. (0 = no cache)')
+-    cache_key_expr = fields.Char(help='Expression (tuple) to evaluate the cached key. \nE.g.: "(request.params.get("currency"), )"')
+-
+     # Page options
+     header_overlay = fields.Boolean()
+     header_color = fields.Char()
+@@ -221,36 +218,6 @@ class Page(models.Model):
+         self.ensure_one()
+         return self.view_id.get_website_meta()
+ 
+-    @api.model
+-    def _get_cached_blacklist(self):
+-        return ('data-snippet="s_website_form"', 'data-no-page-cache=', )
+-
+-    def _can_be_cached(self, response):
+-        """ return False if at least one blacklisted's word is present in content """
+-        blacklist = self._get_cached_blacklist()
+-        return not any(black in str(response) for black in blacklist)
+-
+-    def _get_cache_key(self, req):
+-        # Always call me with super() AT THE END to have cache_key_expr appended as last element
+-        # It is the only way for end user to not use cache via expr.
+-        # E.g  (None if 'token' in request.params else 1,)  will bypass cache_time
+-        cache_key = (req.website.id, req.lang, req.httprequest.path)
+-        if self.cache_key_expr:  # e.g. (request.geoip.get('country_code'),)
+-            cache_key += safe_eval(self.cache_key_expr, {'request': req})
+-        return cache_key
+-
+-    def _get_cache_response(self, cache_key):
+-        """ Return the cached response corresponding to ``self`` and ``cache_key``.
+-        Raise a KeyError if the item is not in cache.
+-        """
+-        # HACK: we use the same LRU as ormcache to take advantage from its
+-        # distributed invalidation, but we don't explicitly use ormcache
+-        return self.pool._Registry__cache[('website.page', _cached_response, self.id, cache_key)]
+-
+-    def _set_cache_response(self, cache_key, response):
+-        """ Put in cache the given response. """
+-        self.pool._Registry__cache[('website.page', _cached_response, self.id, cache_key)] = response
+-
+     @api.model
+     def _search_get_detail(self, website, order, options):
+         with_description = options['displayDescription']

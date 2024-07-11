@@ -1,0 +1,160 @@
+PR: https://github.com/odoo/odoo/pull/106658
+
+From: 04c195945614e91254885fde7d48a06d1ad6f2cf
+From: Thibault Delavallée
+Date: 2022-11-28 14:52:59
+
+Breaking data model changes score: 1, change matches:
+-    _inherit = "mail.template"
+
+Total Changes: 88
+
+[MOV] account, mail: move model-specific template code to model
+
+PURPOSE
+
+Purpose of this task is to cleanup attachment management done in generic mail
+models overrides and move it in account as model overrides.
+
+SPECIFICATIONS
+
+Account_edi and various l10n submodules hold some custom code to generate and
+handle EDI attachments. It is used to add attachments linked using AccountMove
+specific 'edi_document_ids' field when sending emails based on templates.
+
+Currently MailTemplate is overridden in accounting modules to hold code related
+to AccountMove and AccountEdiDocument attachments manipulation. This is linked
+to EDI and report naming, not mail specific. This should therefore not be
+implemented at template level, but in those specific models.
+
+For that purpose we introduce a method in MailThread that allow to handle
+attachments when being in a template context. An override in account_edi
+allows to implement its specific behavior.
+
+By the way an old docstring in l10n_it_edi that was quite unrelated to the
+override is also removed, as it was more confusing than helping.
+
+Task-2792146 (Mail: Move model-dependent code from composer / template)
+Task-2710804 (Mail: Clean MailThread API)
+
+Part-of: odoo/odoo#106658
+
+================================= pseudo patch: =================================
+
+--- a/addons/account_edi/models/__init__.py
++++ b/addons/account_edi/models/__init__.py
+@@ -6,6 +6,5 @@ from . import account_edi_format
+ from . import account_edi_document
+ from . import account_payment
+ from . import ir_actions_report
+-from . import mail_template
+ from . import ir_attachment
+ from . import uom
+
+--- a/addons/account_edi/models/account_edi_document.py
++++ b/addons/account_edi/models/account_edi_document.py
+@@ -254,3 +254,25 @@ class AccountEdiDocument(models.Model):
+         # Mark the CRON to be triggered again asap since there is some remaining jobs to process.
+         if nb_remaining_jobs > 0:
+             self.env.ref('account_edi.ir_cron_edi_network')._trigger()
++
++    def _filter_edi_attachments_for_mailing(self):
++        """
++        Will either return the information about the attachment of the edi document for adding the attachment in the
++        mail, or the attachment id to be linked to the 'send & print' wizard.
++        Can be overridden where e.g. a zip-file needs to be sent with the individual files instead of the entire zip
++        IMPORTANT:
++        * If the attachment's id is returned, no new attachment will be created, the existing one on the move is linked
++        to the wizard (see _onchange_template_id in mail.compose.message).
++        * If the attachment's content is returned, a new one is created and linked to the wizard. Thus, when sending
++        the mail (clicking on 'send & print' in the wizard), a new attachment is added to the move (see
++        _action_send_mail in mail.compose.message).
++        :param document: an edi document
++        :return: dict {
++            'attachments': tuple with the name and base64 content of the attachment}
++            'attachment_ids': list containing the id of the attachment
++        }
++        """
++        self.ensure_one()
++        if not self.attachment_id:
++            return {}
++        return {'attachment_ids': self.attachment_id.ids}
+
+--- a/addons/account_edi/models/account_move.py
++++ b/addons/account_edi/models/account_move.py
+@@ -435,6 +435,21 @@ class AccountMove(models.Model):
+         self.edi_document_ids.write({'error': False, 'blocking_level': False})
+         self.action_process_edi_web_services()
+ 
++    ####################################################
++    # Mailing
++    ####################################################
++
++    def _process_attachments_for_template_post(self, mail_template):
++        """ Add Edi attachments to templates. """
++        result = super()._process_attachments_for_template_post(mail_template)
++        for move in self.filtered('edi_document_ids'):
++            move_result = result.setdefault(move.id, {})
++            for edi_doc in move.edi_document_ids:
++                edi_attachments = edi_doc._filter_edi_attachments_for_mailing()
++                move_result.setdefault('attachment_ids', []).extend(edi_attachments.get('attachment_ids', []))
++                move_result.setdefault('attachments', []).extend(edi_attachments.get('attachments', []))
++        return result
++
+ 
+ class AccountMoveLine(models.Model):
+     _inherit = 'account.move.line'
+
+--- a/addons/account_edi/models/mail_template.py
++++ b/None
+@@ -1,50 +0,0 @@
+-# -*- coding: utf-8 -*-
+-
+-from odoo import models
+-
+-
+-class MailTemplate(models.Model):
+-    _inherit = "mail.template"
+-
+-    def _get_edi_attachments(self, document):
+-        """
+-        Will either return the information about the attachment of the edi document for adding the attachment in the
+-        mail, or the attachment id to be linked to the 'send & print' wizard.
+-        Can be overridden where e.g. a zip-file needs to be sent with the individual files instead of the entire zip
+-        IMPORTANT:
+-        * If the attachment's id is returned, no new attachment will be created, the existing one on the move is linked
+-        to the wizard (see _onchange_template_id in mail.compose.message).
+-        * If the attachment's content is returned, a new one is created and linked to the wizard. Thus, when sending
+-        the mail (clicking on 'send & print' in the wizard), a new attachment is added to the move (see
+-        _action_send_mail in mail.compose.message).
+-        :param document: an edi document
+-        :return: dict:
+-            {'attachments': tuple with the name and base64 content of the attachment}
+-            OR
+-            {'attachment_ids': list containing the id of the attachment}
+-        """
+-        if not document.attachment_id:
+-            return {}
+-        return {'attachment_ids': [document.attachment_id.id]}
+-
+-    def generate_email(self, res_ids, fields):
+-        res = super().generate_email(res_ids, fields)
+-
+-        multi_mode = True
+-        if isinstance(res_ids, int):
+-            res_ids = [res_ids]
+-            multi_mode = False
+-
+-        if self.model not in ['account.move', 'account.payment']:
+-            return res
+-
+-        records = self.env[self.model].browse(res_ids)
+-        for record in records:
+-            record_data = (res[record.id] if multi_mode else res)
+-            for doc in record.edi_document_ids:
+-                record_data.setdefault('attachments', [])
+-                attachments = self._get_edi_attachments(doc)
+-                record_data['attachment_ids'] += attachments.get('attachment_ids', [])
+-                record_data['attachments'] += attachments.get('attachments', [])
+-
+-        return res

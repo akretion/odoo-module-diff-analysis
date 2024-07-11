@@ -1,0 +1,183 @@
+PR: https://github.com/odoo/odoo/pull/
+
+From: 5118d248ccf16fe4d2703c2a64e0267f783a56d1
+From: Kirti Choudhary
+Date: 2018-08-08 12:51:12
+
+Breaking data model changes score: 2.4, change matches:
+-    check_to_done = fields.Boolean(compute="_get_produced_qty", string="Check Produced Qty",
++    check_to_done = fields.Boolean(compute="_get_produced_qty", string="Check Produced Qty",
+-    mo_count = fields.Integer('# Manufacturing Orders', compute='_compute_mo_count')
+-    mo_count = fields.Integer('# Manufacturing Orders', compute='_compute_mo_count')
+
+Total Changes: 63
+
+[IMP] various: use uom in stat buttons
+
+In purchase we add a stat button that counts the number of purchase
+orders linked to the product.
+In this commit we change this count to count the quantity of products
+linked to a purchase order.
+
+We basically do the same thing with the stat button of sale (sale
+orders) and mrp (manufacturing orders).
+
+================================= pseudo patch: =================================
+
+--- a/addons/mrp/models/mrp_production.py
++++ b/addons/mrp/models/mrp_production.py
+@@ -62,6 +62,7 @@ class MrpProduction(models.Model):
+         'uom.uom', 'Product Unit of Measure',
+         oldname='product_uom', readonly=True, required=True,
+         states={'confirmed': [('readonly', False)]})
++    product_uom_qty = fields.Float(string='Total Quantity', compute='_compute_product_uom_qty', store=True)
+     picking_type_id = fields.Many2one(
+         'stock.picking.type', 'Operation Type',
+         default=_get_default_picking_type, required=True)
+@@ -83,7 +84,7 @@ class MrpProduction(models.Model):
+         states={'confirmed': [('readonly', False)]}, oldname="date_planned")
+     date_planned_finished = fields.Datetime(
+         'Deadline End', copy=False, default=fields.Datetime.now,
+-        index=True, 
++        index=True,
+         states={'confirmed': [('readonly', False)]})
+     date_start = fields.Datetime('Start Date', copy=False, index=True, readonly=True)
+     date_finished = fields.Datetime('End Date', copy=False, index=True, readonly=True)
+@@ -99,11 +100,11 @@ class MrpProduction(models.Model):
+              "work centers based on production planning.")
+     move_raw_ids = fields.One2many(
+         'stock.move', 'raw_material_production_id', 'Raw Materials', oldname='move_lines',
+-        copy=False, states={'done': [('readonly', True)], 'cancel': [('readonly', True)]}, 
++        copy=False, states={'done': [('readonly', True)], 'cancel': [('readonly', True)]},
+         domain=[('scrapped', '=', False)])
+     move_finished_ids = fields.One2many(
+         'stock.move', 'production_id', 'Finished Products',
+-        copy=False, states={'done': [('readonly', True)], 'cancel': [('readonly', True)]}, 
++        copy=False, states={'done': [('readonly', True)], 'cancel': [('readonly', True)]},
+         domain=[('scrapped', '=', False)])
+     finished_move_line_ids = fields.One2many(
+         'stock.move.line', compute='_compute_lines', inverse='_inverse_lines', string="Finished Product"
+@@ -146,7 +147,7 @@ class MrpProduction(models.Model):
+         default=lambda self: self.env['res.company']._company_default_get('mrp.production'),
+         required=True)
+ 
+-    check_to_done = fields.Boolean(compute="_get_produced_qty", string="Check Produced Qty", 
++    check_to_done = fields.Boolean(compute="_get_produced_qty", string="Check Produced Qty",
+         help="Technical Field to see if we can show 'Mark as Done' button")
+     qty_produced = fields.Float(compute="_get_produced_qty", string="Quantity Produced")
+     procurement_group_id = fields.Many2one(
+@@ -164,6 +165,14 @@ class MrpProduction(models.Model):
+     show_final_lots = fields.Boolean('Show Final Lots', compute='_compute_show_lots')
+     production_location_id = fields.Many2one('stock.location', "Production Location", related='product_id.property_stock_production')
+ 
++    @api.depends('product_uom_id', 'product_qty', 'product_id.uom_id')
++    def _compute_product_uom_qty(self):
++        for production in self:
++            if production.product_id.uom_id != production.product_uom_id:
++                production.product_uom_qty = production.product_uom_id._compute_quantity(production.product_qty, production.product_id.uom_id)
++            else:
++                production.product_uom_qty = production.product_qty
++
+     @api.depends('product_id.tracking')
+     def _compute_show_lots(self):
+         for production in self:
+@@ -648,7 +657,7 @@ class MrpProduction(models.Model):
+         action = self.env.ref('stock.action_stock_scrap').read()[0]
+         action['domain'] = [('production_id', '=', self.id)]
+         return action
+-    
++
+     @api.model
+     def get_empty_list_help(self, help):
+         self = self.with_context(
+
+--- a/addons/mrp/models/product.py
++++ b/addons/mrp/models/product.py
+@@ -1,7 +1,9 @@
+ # -*- coding: utf-8 -*-
+ # Part of Odoo. See LICENSE file for full copyright and licensing details.
+ 
++from datetime import timedelta
+ from odoo import api, fields, models
++from odoo.tools.float_utils import float_round
+ 
+ 
+ class ProductTemplate(models.Model):
+@@ -11,7 +13,7 @@ class ProductTemplate(models.Model):
+     bom_ids = fields.One2many('mrp.bom', 'product_tmpl_id', 'Bill of Materials')
+     bom_count = fields.Integer('# Bill of Material', compute='_compute_bom_count')
+     used_in_bom_count = fields.Integer('# of BoM Where is Used', compute='_compute_used_in_bom_count')
+-    mo_count = fields.Integer('# Manufacturing Orders', compute='_compute_mo_count')
++    mrp_product_qty = fields.Float('Manufactured', compute='_compute_mrp_product_qty')
+     produce_delay = fields.Float(
+         'Manufacturing Lead Time', default=0.0,
+         help="Average lead time in days to manufacture this product. In the case of multi-level BOM, the manufacturing lead times of the components will be added.")
+@@ -34,16 +36,18 @@ class ProductTemplate(models.Model):
+         return action
+ 
+     @api.one
+-    def _compute_mo_count(self):
+-        # TDE FIXME: directly use a read_group
+-        self.mo_count = sum(self.mapped('product_variant_ids').mapped('mo_count'))
++    def _compute_mrp_product_qty(self):
++        self.mrp_product_qty = float_round(sum(self.mapped('product_variant_ids').mapped('mrp_product_qty')), precision_rounding=self.uom_id.rounding)
+ 
+     @api.multi
+     def action_view_mos(self):
+-        product_ids = self.mapped('product_variant_ids').ids
+-        action = self.env.ref('mrp.act_product_mrp_production').read()[0]
+-        action['domain'] = [('product_id', 'in', product_ids)]
+-        action['context'] = {}
++        action = self.env.ref('mrp.mrp_production_report').read()[0]
++        action['domain'] = [('state', '=', 'done'), '&', ('product_tmpl_id', 'in', self.ids)]
++        action['context'] = {
++            'search_default_last_year_mo_order': 1,
++            'search_default_status': 1, 'search_default_scheduled_month': 1,
++            'graph_measure': 'product_uom_qty',
++        }
+         return action
+ 
+ 
+@@ -54,7 +58,7 @@ class ProductProduct(models.Model):
+     bom_line_ids = fields.One2many('mrp.bom.line', 'product_id', 'BoM Components')
+     bom_count = fields.Integer('# Bill of Material', compute='_compute_bom_count')
+     used_in_bom_count = fields.Integer('# BoM Where Used', compute='_compute_used_in_bom_count')
+-    mo_count = fields.Integer('# Manufacturing Orders', compute='_compute_mo_count')
++    mrp_product_qty = fields.Float('Manufactured', compute='_compute_mrp_product_qty')
+ 
+     def _compute_bom_count(self):
+         for product in self:
+@@ -72,11 +76,14 @@ class ProductProduct(models.Model):
+         action['domain'] = [('bom_line_ids.product_id', '=', self.id)]
+         return action
+ 
+-    def _compute_mo_count(self):
+-        read_group_res = self.env['mrp.production'].read_group([('product_id', 'in', self.ids)], ['product_id'], ['product_id'])
+-        mapped_data = dict([(data['product_id'][0], data['product_id_count']) for data in read_group_res])
++    def _compute_mrp_product_qty(self):
++        date_from = fields.Datetime.to_string(fields.datetime.now() - timedelta(days=365))
++        #TODO: state = done?
++        domain = [('state', '=', 'done'), ('product_id', 'in', self.ids), ('date_planned_start', '>', date_from)]
++        read_group_res = self.env['mrp.production'].read_group(domain, ['product_id', 'product_uom_qty'], ['product_id'])
++        mapped_data = dict([(data['product_id'][0], data['product_uom_qty']) for data in read_group_res])
+         for product in self:
+-            product.mo_count = mapped_data.get(product.id, 0)
++            product.mrp_product_qty = float_round(mapped_data.get(product.id, 0), precision_rounding=product.uom_id.rounding)
+ 
+     @api.multi
+     def action_view_bom(self):
+@@ -89,3 +96,14 @@ class ProductProduct(models.Model):
+         }
+         action['domain'] = ['|', ('product_id', 'in', self.ids), '&', ('product_id', '=', False), ('product_tmpl_id', 'in', template_ids)]
+         return action
++
++    @api.multi
++    def action_view_mos(self):
++        action = self.env.ref('mrp.mrp_production_report').read()[0]
++        action['domain'] = [('state', '=', 'done'), '&', ('product_id', 'in', self.ids)]
++        action['context'] = {
++            'search_default_last_year_mo_order': 1,
++            'search_default_status': 1, 'search_default_scheduled_month': 1,
++            'graph_measure': 'product_uom_qty',
++        }
++        return action

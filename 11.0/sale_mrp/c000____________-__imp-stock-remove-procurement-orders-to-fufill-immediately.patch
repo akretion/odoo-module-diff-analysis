@@ -1,0 +1,182 @@
+PR: https://github.com/odoo/odoo/pull/
+
+From: 0e4f3bb95991261c04c08e72b28430acfabdecd1
+From: Fabien Pinckaers
+Date: 2017-09-08 15:08:05
+
+Breaking data model changes score: 1, change matches:
+-    _inherit = 'procurement.order'
+
+Total Changes: 108
+
+[IMP] stock: remove procurement orders to fufill immediately
+
+This removes the procurement.order model. To fufill their needs SO, PO, MO and
+stock moves now call the _run method of the relevant procurement.group.
+
+This mecanism is now only used for stockable product, tasks now uses their own
+independent mecanism.
+
+The _run method will check all the applicable rules and create directly the
+needed model to fufill the need.
+
+The modules stock, purchase, mrp, extends the _run method to implement their
+specific strategy relevant for the rule type they define.
+
+If an exception happens the message will be logged as a mail messsage on the
+source model, for example, if a sales order cannot be fufilled the salesperson
+will now see directly the reason.
+
+OLD commit messages:
+[WIP] procurement: removing procurement.order in stock, sale, purchase, sale_stock. WIP
+fixup! [WIP] procurement: removing procurement.order in stock, sale, purchase, sale_stock. WIP
+[IMP] Basic tests
+[FIX] test not necessary anymore
+[FIX] remove unnecessary print statement
+[FIX] unnecessary test + why passing warehouse worked before?
+[IMP] purchase: one move by purchase order line
+[FIX] purchase: correct inventory tests and pass move_dest_ids among procurements
+[FIX] because of bad cherry-pick merge
+[IMP] make mrp pass by adding move_dest_ids there too
+[IMP] tests of sale_mrp, no need for cancelpropagation then
+[IMP] better to consistently use recordsets also for one2many
+[FIX] purchase_requisition
+[FIX] Exceptions should trigger errors, which should be caught in the tests
+[FIX] sale_mrp: remove usage of procurement.order and use sale order name instead of sol
+[FIX] stock_dropshipping: add sale_line_id on purchase_line_id
+[FIX] Remove pdb
+[IMP] add stock_dropshipping files
+[IMP] stock: search carrier through sale line instead of procurement group
+[IMP] add procrule test and preision needed when updating sol
+[FIX] sale_order_dates + [IMP] procurement exceptions by scheduler
+[FIX] No need to return task
+[IMP] move file as name changes and add corrections
+[FIX] Continue Run Schedulers wizard fix
+[FIX] name issues of takss
+[FIX] updating sale order line, but there is still a problem with the recompute
+
+================================= pseudo patch: =================================
+
+--- a/addons/sale_mrp/models/__init__.py
++++ b/addons/sale_mrp/models/__init__.py
+@@ -1,4 +1,4 @@
+ # -*- coding: utf-8 -*-
+ # Part of Odoo. See LICENSE file for full copyright and licensing details.
+ 
+-from . import procurement
+\ No newline at end of file
++from . import sale_mrp
+
+--- a/addons/sale_mrp/models/procurement.py
++++ b/None
+@@ -1,24 +0,0 @@
+-# -*- coding: utf-8 -*-
+-# Part of Odoo. See LICENSE file for full copyright and licensing details.
+-
+-from odoo import api, models
+-
+-
+-class ProcurementOrder(models.Model):
+-    _inherit = 'procurement.order'
+-
+-    @api.multi
+-    def make_mo(self):
+-        """ override method to set link in production created from sale order."""
+-        res = super(ProcurementOrder, self).make_mo()
+-        for procurement_id in res:
+-            production_id = res[procurement_id]
+-            if production_id:
+-                production = self.env['mrp.production'].browse(production_id)
+-                move = production._get_parent_move(production.move_finished_ids[0])
+-                sale_order = move.procurement_id.sale_line_id.order_id
+-                if sale_order:
+-                    production.message_post_with_view('mail.message_origin_link',
+-                            values={'self': production, 'origin': sale_order},
+-                            subtype_id=self.env.ref('mail.mt_note').id)
+-        return res
+
+--- a/None
++++ b/addons/sale_mrp/models/sale_mrp.py
+@@ -0,0 +1,82 @@
++# -*- coding: utf-8 -*-
++# Part of Odoo. See LICENSE file for full copyright and licensing details.
++
++from odoo import api, fields, models
++from odoo.tools import float_compare
++
++
++class SaleOrderLine(models.Model):
++    _inherit = 'sale.order.line'
++
++    @api.multi
++    def _get_delivered_qty(self):
++        self.ensure_one()
++
++        # In the case of a kit, we need to check if all components are shipped. Since the BOM might
++        # have changed, we don't compute the quantities but verify the move state.
++        bom = self.env['mrp.bom']._bom_find(product=self.product_id)
++        if bom and bom.type == 'phantom':
++            bom_delivered = all([move.state == 'done' for move in self.move_ids])
++            if bom_delivered:
++                return self.product_uom_qty
++            else:
++                return 0.0
++        return super(SaleOrderLine, self)._get_delivered_qty()
++
++    @api.multi
++    def _get_bom_component_qty(self, bom):
++        bom_quantity = self.product_uom._compute_quantity(self.product_uom_qty, bom.product_uom_id)
++        boms, lines = bom.explode(self.product_id, bom_quantity)
++        components = {}
++        for line, line_data in lines:
++            product = line.product_id.id
++            uom = line.product_uom_id
++            qty = line.product_qty
++            if components.get(product, False):
++                if uom.id != components[product]['uom']:
++                    from_uom = uom
++                    to_uom = self.env['product.uom'].browse(components[product]['uom'])
++                    qty = from_uom._compute_quantity(qty, to_uom_id=to_uom)
++                components[product]['qty'] += qty
++            else:
++                # To be in the uom reference of the product
++                to_uom = self.env['product.product'].browse(product).uom_id
++                if uom.id != to_uom.id:
++                    from_uom = uom
++                    qty = from_uom._compute_quantity(qty, to_uom_id=to_uom)
++                components[product] = {'qty': qty, 'uom': to_uom.id}
++        return components
++
++
++class AccountInvoiceLine(models.Model):
++    # TDE FIXME: what is this code ??
++    _inherit = "account.invoice.line"
++
++    def _get_anglo_saxon_price_unit(self):
++        price_unit = super(AccountInvoiceLine, self)._get_anglo_saxon_price_unit()
++        # in case of anglo saxon with a product configured as invoiced based on delivery, with perpetual
++        # valuation and real price costing method, we must find the real price for the cost of good sold
++        if self.product_id.invoice_policy == "delivery":
++            for s_line in self.sale_line_ids:
++                # qtys already invoiced
++                qty_done = sum([x.uom_id._compute_quantity(x.quantity, x.product_id.uom_id) for x in s_line.invoice_lines if x.invoice_id.state in ('open', 'paid')])
++                quantity = self.uom_id._compute_quantity(self.quantity, self.product_id.uom_id)
++                # Put moves in fixed order by date executed
++                moves = s_line.move_ids
++                moves.sorted(lambda x: x.date)
++                # Go through all the moves and do nothing until you get to qty_done
++                # Beyond qty_done we need to calculate the average of the price_unit
++                # on the moves we encounter.
++                bom = s_line.product_id.product_tmpl_id.bom_ids and s_line.product_id.product_tmpl_id.bom_ids[0]
++                if bom.type == 'phantom':
++                    average_price_unit = 0
++                    components = s_line._get_bom_component_qty(bom)
++                    for product_id in components:
++                        factor = components[product_id]['qty']
++                        prod_moves = [m for m in moves if m.product_id.id == product_id]
++                        prod_qty_done = factor * qty_done
++                        prod_quantity = factor * quantity
++                        average_price_unit += self._compute_average_price(prod_qty_done, prod_quantity, prod_moves)
++                    price_unit = average_price_unit or price_unit
++                    price_unit = self.product_id.uom_id._compute_price(price_unit, self.uom_id)
++        return price_unit

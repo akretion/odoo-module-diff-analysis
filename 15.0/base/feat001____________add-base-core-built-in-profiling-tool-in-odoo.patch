@@ -1,0 +1,217 @@
+PR: https://github.com/odoo/odoo/pull/
+
+From: 4444475ef477d986040dbc435e1b2286b52e51ce
+From: Xavier-Do
+Date: 2021-06-02 07:47:48
+
+Breaking data model changes score: 0, change matches:
+
+Total Changes: 53
+
+[ADD] base, core: built-in profiling tool in Odoo
+
+This commit adds tooling to profile performance and save execution by
+saving stack traces and queries to a file/database in specific format.
+
+----------
+Collectors
+----------
+
+For now, three different profiling modes (aka Collectors) are available
+even if a last once should be introduced by @Gorash to profile qweb
+execution.
+
+- SQLCollector (or 'sql'): Saves the current stack trace and the query
+every time Cursor.execute() is called. Any query executed on the thread
+will be collected, no matter the cursor.
+
+- PeriodicCollector (or 'traces_async'): Saves the stack trace every
+'interval' seconds using a parallel thread to profile the caller thread.
+The python implementation was optimized to minimize impact on
+performance while remaining portable and easy to enable/disable
+inside a odoo execution. Higher the frequency (lower the interval),
+more impactful the profiling will become on the execution and increase
+memory usage. From last experiments, 1ms looks to be a good minimum for
+short executions.
+
+- SyncCollector (or 'traces_sync'): Saves the stack trace every function
+call/return. This collector is obviously quite impactful on performance
+and can quickly overload the memory for long executions, but this is
+quite useful to understand the precise path followed by some short
+executions. Any time related information will be almost irrelevant with this
+collector.
+
+A base Collector defining minimal collectors features can easily be
+extended to create custom collectors if needed.
+
+----------------
+Profiler & Usage
+----------------
+
+Collectors are not supposed to be used by themselves, but should be
+given to a Profiler. The Profiler will synchronize collectors starts and
+stop, and manage saving them to a file of in a ir_profile in the
+database.
+
+Exemple of usage:
+```
+    with Profiler():
+        do_stuff()
+```
+
+This simple example will use the default collectors (sql and
+traces_async) and save them to the database. The database is defined
+automatically from current_thread 'dbname' if available.
+
+Example of usage:
+```
+    with Profiler(collectors=['sql'], db=False, path=/home/user/logs/do_stuff_profile/{time}):
+        do_stuff()
+```
+
+This more complex example disable the default behavior consisting
+to save to the database, gives a path where the profile will be saved
+and specify to only use the 'sql' collector. Note that
+collectors=[SQLCollector()] would have the same behavior since
+Collectors can be either a Collector instance or a string describing the
+desired collector. This allows to define custom params for the
+collectors and use custom collectors if needed.
+
+Note that it is always possible to get results after execution without
+saving it since they are available on the profiler.
+
+```
+    with Profiler(collectors=['sql'], db=False) as p:
+        do_stuff()
+    print(len([None for entry in p.collectors[0].entries if ...]))
+```
+
+Profiler will also save the stack below the profiler start point, and
+collectors will only collect the part of the stack over this stack.
+This is a good way to reduce collectors CPU and memory usage.
+
+Collected entries will be saved as follows:
+
+```
+    [{
+        'start': 2.0,
+        'context': {},
+        'stack': [
+            ['path_to_file', lno, 'func_name', 'line_content'],
+            ...
+        ],
+    },
+    ...
+    ]
+```
+SQLCollector will add three additional keys on each entry:
+- query      (query without parameters)
+- full_query (mogrified query with parameters)
+- time       (the 'exact' execution time of the query)
+
+----------------
+ExecutionContext
+----------------
+
+A last tool, ExecutionContext, allows to define some context on some block of code:
+
+Example of usage:
+```
+    def process_modules(modules)
+        for module in modules:
+          with ExecutionContext(module=module): # note the 'not linter frienldy but still convenient' 2 spaces indentation
+            do_stuff(module):
+```
+
+This context will automatically be added in the stack as a virtual frame between
+process_modules and do_stuff in order to split do_stuff from one single frame to
+one frame per module.
+
+----------
+Speedscope
+----------
+The saved data are in a simple json format easy to analyze, but can't be visualized in
+speedscope as they are. A utility class `Speedscope` can be used to generate a format
+readable by speedscope. The used format is actually the format defined by speedscope,
+meaning that all features should be available using it.
+
+The output format is evented, meaning that we need to transform a list of samples
+(a list of stack) to a list of event (going in/out a frame).
+This is the main task of the Speedscope, as well as combining samples from different
+sources, to display SQLCollector and PeriodicCollector results mixed together.
+
+When stored on an ir_profile, the default speedscope generation can easily be generated
+with the speedscope computed field.
+
+This class can be used as it is but will mainly be useful for the next commit.
+
+Special thanks to @rco-odoo for the in depth review and @Gorash for support.
+
+================================= pseudo patch: =================================
+
+--- a/odoo/addons/base/models/__init__.py
++++ b/odoo/addons/base/models/__init__.py
+@@ -33,6 +33,7 @@ from . import ir_demo_failure
+ from . import report_layout
+ from . import report_paperformat
+ 
++from . import ir_profile
+ from . import image_mixin
+ from . import avatar_mixin
+ 
+
+--- a/None
++++ b/odoo/addons/base/models/ir_profile.py
+@@ -0,0 +1,52 @@
++# -*- coding: utf-8 -*-
++# Part of Odoo. See LICENSE file for full copyright and licensing details.
++
++import json
++import base64
++import datetime
++
++from odoo import fields, models, api
++from odoo.exceptions import UserError
++from odoo.http import request
++from odoo.tools.profiler import make_session
++from odoo.tools.speedscope import Speedscope
++
++
++class IrProfile(models.Model):
++    _name = 'ir.profile'
++    _description = 'Profiling results'
++    _log_access = False  # avoid useless foreign key on res_user
++    _order = 'session desc, id desc'
++
++    create_date = fields.Datetime('Creation Date')
++
++    session = fields.Char('Session', index=True)
++    name = fields.Char('Description')
++    duration = fields.Float('Duration')
++
++    init_stack_trace = fields.Text('Initial stack trace', prefetch=False)
++
++    sql = fields.Text('Sql', prefetch=False)
++    traces_async = fields.Text('Traces Async', prefetch=False)
++    traces_sync = fields.Text('Traces Sync', prefetch=False)
++
++    speedscope = fields.Binary('Speedscope', compute='_compute_speedscope')
++
++    @api.autovacuum
++    def _gc_profile(self):
++        # remove profiles older than 30 days
++        domain = [('create_date', '<', fields.Datetime.now() - datetime.timedelta(days=30))]
++        return self.sudo().search(domain).unlink()
++
++    def _compute_speedscope(self):
++        for execution in self:
++            sp = Speedscope(init_stack_trace=json.loads(execution.init_stack_trace))
++            if execution.sql:
++                sp.add('sql', json.loads(execution.sql))
++            if execution.traces_async:
++                sp.add('frames', json.loads(execution.traces_async))
++            if execution.traces_sync:
++                sp.add('settrace', json.loads(execution.traces_sync))
++
++            result = json.dumps(sp.add_default().make())
++            execution.speedscope = base64.b64encode(result.encode('utf-8'))

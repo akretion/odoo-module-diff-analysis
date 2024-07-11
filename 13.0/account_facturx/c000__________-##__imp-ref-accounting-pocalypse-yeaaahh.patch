@@ -1,0 +1,335 @@
+PR: https://github.com/odoo/odoo/pull/
+
+From: beaa30a3d1843de43a45f419bfbc1bfa7613a920
+From: Laurent Smet
+Date: 2019-06-28 11:52:55
+
+Breaking data model changes score: 1, change matches:
+-    _inherit = 'account.invoice'
+
+Total Changes: 670
+
+[IMP/REF] accounting-pocalypse yeaaahh
+
+This commit merges the following models
+ * account.invoice and account.move
+ * account.invoice.line and account.move.line
+ * account.voucher and account.move
+ * account.voucher.line and account.move.line
+
+It was the opportunity for a big cleanup of the code, so it also restructures the whole account module, its different models/fields, the tests etc. for a better world and a better code readability.
+
+==== Rationale ====
+The rationale of this huge change is that we want journal entries / invoices to be easily edited, and changes reflected in the other model. It's a HUGE feature and very strategic for the fiduciary companies. For example, changing the account of a journal entry needs to be automatically reflected on the related invoice.
+
+The same reasoning applies to sale/purchase vouchers.
+
+==== Changes made in features =====
+When creating an invoice, you are now creating a journal entry directly.
+--> The object account.invoice no longer exists.
+In the same fashion when creating an invoice line, you're now adding journal items directly in the journal entry representing the invoice. If this invoice line has some tax, it may create additional journal items as well.
+--> The models account.invoice.line & account.invoice.tax no longer exist
+
+Identically, when creating a sale/purchase receipt with its lines, you are now creating a journal entry directly and there's no more usability difference between encoding a receipt or an invoice.
+--> The object account.voucher no longer exists.
+--> The object account.voucher.line no longer exists.
+--> The whole account_voucher module no longer exists.
+
+Positive side-effects coming from these changes are
+* draft invoices/bills/sale or purchase receipts now create a draft accounting entry. Validate these objects now simply post its journal entry. That means that draft invoices/bills/sale or purchase receipt can straightforwardly be included in reporting or budgets.
+* opening a journal entry in form view will now always open the correct view: if it's a sale/purchase journal entry we will have a customer invoice/vendor bill view or a sale/purchase receipt view, whatever the menu we're coming from.
+* code & business logic simplification. It is also condensed in a single place instead of being partially duplicated on invoices, vouchers and journal entries.
+
+There should be no feature loss, except the one allowing to group multiple journal items together based on the same product during the invoice validation.
+
+==== Changes made in models =====
+* account.invoice: model removed. Instead, now use account.move with following mapping
+
+field (account.invoice) 		field (account.move)
+-----------------------			--------------------
+name 					invoice_payment_ref
+number 					name
+reference 				ref
+comment 				narration
+user_id 				invoice_user_id
+amount_					total_company_signed amount_total_signed
+residual 				amount_residual
+state 					state + invoice_payment_state 		/!\ selection changed
+date_invoice 				invoice_date
+date_due 				invoice_date_due
+sent 					invoice_sent
+origin 					invoice_origin
+payment_term_id 			invoice_payment_term_id
+partner_bank_id 			invoice_partner_bank_id
+incoterm_id 				invoice_incoterm_id
+vendor_bill_id 				invoice_vendor_bill_id
+source_email 				invoice_source_email
+vendor_display_name 			invoice_vendor_display_name
+invoice_icon 				invoice_vendor_icon
+cash_rounding_id 			invoice_cash_rounding_id
+sequence_number_next 			invoice_sequence_number_next
+sequence_number_next_prefix 		invoice_sequence_number_next_prefix
+
+'invoices' subset of account.move can be accessed by using the selection field 'type' or one of the many helpers like is_invoice()
+
+* account.move: now has a valid state 'cancel' that has to be excluded from all business logic
+* account.move: field 'amount' renamed into 'amount_total'
+* account.move: field 'reverse_entry_id' renamed into 'reversed_entry_id'
+* account.move.line: now has a field 'display_type' that has to be excluded from all business logic, in order to support invoice layouting
+* account.invoice.line: model removed. Instead, now use account.move.line with following mapping
+
+field (account.invoice.line) 		field (account.move.line)
+----------------------------		-------------------------
+invoice_id 				move_id
+uom_id 					product_uom_id
+invoice_line_tax_ids 			tax_ids
+account_analytic_id 			analytic_account_id
+
+'invoice lines' subset of all account.move.line from a journal entry can be accessed by using the boolean field 'exclude_from_invoice_tab'
+
+* account.invoice.tax: model removed. Instead, now use account.move.line with following mapping
+
+field (account.invoice.tax) 		field (account.move.line)
+---------------------------		-------------------------
+invoice_id 				move_id
+account_analytic_id 			analytic_account_id
+amount 					price_unit
+base 					tax_base_amount
+
+'tax lines' subset of all account.move.line from a journal entry can be accessed by using the relational field 'tax_line_id'
+
+* account.invoice.confirm: model removed. Instead, now use the 'post()' function of account.move
+* account.invoice.refund: model removed. Instead, now use account.move.reversal to reverse the entries with the same options as we had for invoices
+* account.voucher: model removed. Instead, now use account.move of type in ['out_receipt', 'in_receipt]
+* account.voucher.line: model removed. Instead, now use account.move.line
+
+==== Changes made in functions ====
+* on account.move, method _run_post_draft_to_post() renamed into _autopost_draft_entries()
+* on account.move, method action_account_invoice_payment() renamed into action_invoice_register_payment()
+* on account.move, method action_invoice_reconcile_to_check() renamed into action_open_matching_suspense_moves()
+* on account.move, method _get_domain_edition_mode_available() renamed into _get_domain_matching_supsense_moves()
+* on account.move, method _get_intrastat_country_id() renamed into _get_invoice_intrastat_country_id()
+* on account.move.line, method _get_domain_for_edition_mode() renamed into _get_suspense_moves_domain()
+* in account.bank.statement, contextual key 'edition_mode' renamed into 'suspense_moves_mode'
+
+Was task 1917430
+
+================================= pseudo patch: =================================
+
+--- a/addons/account_facturx/models/__init__.py
++++ b/addons/account_facturx/models/__init__.py
+@@ -1,4 +1,4 @@
+ # -*- encoding: utf-8 -*-
+ 
+-from . import account_invoice
++from . import account_move
+ from . import ir_actions_report
+
+--- a/addons/account_facturx/models/account_invoice.py
++++ b/addons/account_facturx/models/account_move.py
+@@ -3,12 +3,11 @@
+ from odoo import api, models, fields, tools, _
+ from odoo.tools import DEFAULT_SERVER_DATE_FORMAT, float_repr
+ from odoo.tests.common import Form
+-from odoo.exceptions import UserError
++from odoo.exceptions import UserError, except_orm
+ 
+ from datetime import datetime
+ from lxml import etree
+ from PyPDF2 import PdfFileReader
+-from collections import namedtuple
+ 
+ import io
+ import base64
+@@ -20,9 +19,8 @@ _logger = logging.getLogger(__name__)
+ DEFAULT_FACTURX_DATE_FORMAT = '%Y%m%d'
+ 
+ 
+-class AccountInvoice(models.Model):
+-    _inherit = 'account.invoice'
+-    _name = 'account.invoice'
++class AccountMove(models.Model):
++    _inherit = 'account.move'
+ 
+     @api.multi
+     def _export_as_facturx_xml(self):
+@@ -58,17 +56,42 @@ class AccountInvoice(models.Model):
+         '''
+         amount_total_import = None
+ 
+-        # type must be present in the context to get the right behavior of the _default_journal method (account.invoice).
+-        # journal_id must be present in the context to get the right behavior of the _default_account method (account.invoice.line).
+-        journal_id = self._default_journal()
+-        self_ctx = self.with_context(journal_id=journal_id.id)
++        if self._context.get('default_journal_id'):
++            journal = self.env['account.journal'].browse(self.env.context['default_journal_id'])
++            default_type = 'out_invoice' if journal.type == 'sale' else 'in_invoice'
++        elif self._context.get('default_type'):
++            default_type = self._context['default_type']
++        else:
++            raise UserError(_("No information about the journal or the type of invoice is passed"))
++
++        # Total amount.
++        elements = tree.xpath('//ram:GrandTotalAmount', namespaces=tree.nsmap)
++        total_amount = elements and float(elements[0].text) or 0.0
++
++        # Refund type.
++        # There is two modes to handle refund in Factur-X:
++        # a) type_code == 380 for invoice, type_code == 381 for refund, all positive amounts.
++        # b) type_code == 380, negative amounts in case of refund.
++        # To handle both, we consider the 'a' mode and switch to 'b' if a negative amount is encountered.
++        elements = tree.xpath('//rsm:ExchangedDocument/ram:TypeCode', namespaces=tree.nsmap)
++        type_code = elements[0].text
++
++        if type_code == '381':
++            default_type = 'out_refund' if default_type == 'out_invoice' else 'in_refund'
++            refund_sign = -1
++        else:
++            # Handle 'b' refund mode.
++            if total_amount < 0:
++                default_type = 'out_refund' if default_type == 'out_invoice' else 'in_refund'
++            refund_sign = -1 if 'refund' in default_type else 1
++
++        # Write the type as the journal entry is already created.
++        self.type = default_type
+ 
+         # self could be a single record (editing) or be empty (new).
+-        view = journal_id.type == 'purchase' and 'account.invoice_supplier_form' or 'account.invoice_form'
+-        with Form(self_ctx, view=view) as invoice_form:
+-
++        with Form(self.with_context(default_type=default_type)) as invoice_form:
+             # Partner (first step to avoid warning 'Warning! You must first select a partner.').
+-            partner_type = journal_id.type == 'purchase' and 'SellerTradeParty' or 'BuyerTradeParty'
++            partner_type = invoice_form.journal_id.type == 'purchase' and 'SellerTradeParty' or 'BuyerTradeParty'
+             elements = tree.xpath('//ram:'+partner_type+'/ram:SpecifiedTaxRegistration/ram:ID', namespaces=tree.nsmap)
+             partner = elements and self.env['res.partner'].search([('vat', '=', elements[0].text)], limit=1)
+             if not partner:
+@@ -84,35 +107,21 @@ class AccountInvoice(models.Model):
+             # Reference.
+             elements = tree.xpath('//rsm:ExchangedDocument/ram:ID', namespaces=tree.nsmap)
+             if elements:
+-                invoice_form.reference = elements[0].text
++                invoice_form.ref = elements[0].text
+ 
+             # Name.
+             elements = tree.xpath('//ram:BuyerOrderReferencedDocument/ram:IssuerAssignedID', namespaces=tree.nsmap)
+             if elements:
+-                invoice_form.name = elements[0].text
++                invoice_form.invoice_payment_ref = elements[0].text
+ 
+             # Comment.
+             elements = tree.xpath('//ram:IncludedNote/ram:Content', namespaces=tree.nsmap)
+             if elements:
+-                invoice_form.comment = elements[0].text
+-
+-            # Refund type.
+-            # There is two modes to handle refund in Factur-X:
+-            # a) type_code == 380 for invoice, type_code == 381 for refund, all positive amounts.
+-            # b) type_code == 380, negative amounts in case of refund.
+-            # To handle both, we consider the 'a' mode and switch to 'b' if a negative amount is encountered.
+-            elements = tree.xpath('//rsm:ExchangedDocument/ram:TypeCode', namespaces=tree.nsmap)
+-            type_code = elements[0].text
+-            refund_sign = type_code == '380' and 1 or -1
++                invoice_form.narration = elements[0].text
+ 
+             # Total amount.
+             elements = tree.xpath('//ram:GrandTotalAmount', namespaces=tree.nsmap)
+             if elements:
+-                total_amount = float(elements[0].text)
+-
+-                # Handle 'b' refund mode.
+-                if total_amount < 0 and type_code == '380':
+-                    refund_sign = -1
+ 
+                 # Currency.
+                 if elements[0].attrib.get('currencyID'):
+@@ -129,16 +138,14 @@ class AccountInvoice(models.Model):
+             if elements:
+                 date_str = elements[0].text
+                 date_obj = datetime.strptime(date_str, DEFAULT_FACTURX_DATE_FORMAT)
+-                invoice_form.date_invoice = date_obj.strftime(DEFAULT_SERVER_DATE_FORMAT)
++                invoice_form.invoice_date = date_obj.strftime(DEFAULT_SERVER_DATE_FORMAT)
+ 
+             # Due date.
+             elements = tree.xpath('//ram:SpecifiedTradePaymentTerms/ram:DueDateDateTime/udt:DateTimeString', namespaces=tree.nsmap)
+             if elements:
+                 date_str = elements[0].text
+                 date_obj = datetime.strptime(date_str, DEFAULT_FACTURX_DATE_FORMAT)
+-                # Set to empty record set to avoid readonly on date_due, can not set to False or None in a Form
+-                invoice_form.payment_term_id = self.env['account.payment.term']
+-                invoice_form.date_due = date_obj.strftime(DEFAULT_SERVER_DATE_FORMAT)
++                invoice_form.invoice_date_due = date_obj.strftime(DEFAULT_SERVER_DATE_FORMAT)
+ 
+             # Invoice lines.
+             elements = tree.xpath('//ram:IncludedSupplyChainTradeLineItem', namespaces=tree.nsmap)
+@@ -188,19 +195,19 @@ class AccountInvoice(models.Model):
+ 
+                         # Taxes
+                         line_elements = element.xpath('.//ram:SpecifiedLineTradeSettlement/ram:ApplicableTradeTax/ram:RateApplicablePercent', namespaces=tree.nsmap)
+-                        invoice_line_form.invoice_line_tax_ids.clear()
++                        invoice_line_form.tax_ids.clear()
+                         for tax_element in line_elements:
+                             percentage = float(tax_element.text)
+ 
+                             tax = self.env['account.tax'].search([
+                                 ('company_id', '=', invoice_form.company_id.id),
+                                 ('amount_type', '=', 'percent'),
+-                                ('type_tax_use', '=', journal_id.type),
++                                ('type_tax_use', '=', invoice_form.journal_id.type),
+                                 ('amount', '=', percentage),
+                             ], limit=1)
+ 
+                             if tax:
+-                                invoice_line_form.invoice_line_tax_ids.add(tax)
++                                invoice_line_form.tax_ids.add(tax)
+             elif amount_total_import:
+                 # No lines in BASICWL.
+                 with invoice_form.invoice_line_ids.new() as invoice_line_form:
+@@ -208,12 +215,6 @@ class AccountInvoice(models.Model):
+                     invoice_line_form.quantity = 1
+                     invoice_line_form.price_unit = amount_total_import
+ 
+-            # Refund.
+-            if self_ctx.env.context['journal_type'] == 'purchase':
+-                invoice_form.type = 'in_refund' if refund_sign == -1 else 'in_invoice'
+-            else:
+-                invoice_form.type = 'out_refund' if refund_sign == -1 else 'out_invoice'
+-
+         return invoice_form.save()
+ 
+     @api.multi
+@@ -221,7 +222,7 @@ class AccountInvoice(models.Model):
+     def message_post(self, **kwargs):
+         # OVERRIDE
+         # /!\ 'default_res_id' in self._context is used to don't process attachment when using a form view.
+-        res = super(AccountInvoice, self).message_post(**kwargs)
++        res = super(AccountMove, self).message_post(**kwargs)
+ 
+         if 'no_new_invoice' not in self.env.context and len(self) == 1 and self.state == 'draft':
+             # Get attachments.
+@@ -280,7 +281,8 @@ class AccountInvoice(models.Model):
+ 
+                             self._import_facturx_invoice(tree)
+                             buffer.close()
+-
++            except except_orm as e:
++                raise e
+             except Exception as e:
+                 # Malformed pdf
+                 _logger.exception(e)
+
+--- a/addons/account_facturx/models/ir_actions_report.py
++++ b/addons/account_facturx/models/ir_actions_report.py
+@@ -13,9 +13,9 @@ class IrActionsReport(models.Model):
+     @api.multi
+     def _post_pdf(self, save_in_attachment, pdf_content=None, res_ids=None):
+         # OVERRIDE
+-        if self.model == 'account.invoice' and res_ids and len(res_ids) == 1:
+-            invoice = self.env['account.invoice'].browse(res_ids)
+-            if invoice.type in ('out_invoice', 'out_refund') and invoice.state != 'draft':
++        if self.model == 'account.move' and res_ids and len(res_ids) == 1:
++            invoice = self.env['account.move'].browse(res_ids)
++            if invoice.is_sale_document() and invoice.state != 'draft':
+                 xml_content = invoice._export_as_facturx_xml()
+ 
+                 # Add attachment.
