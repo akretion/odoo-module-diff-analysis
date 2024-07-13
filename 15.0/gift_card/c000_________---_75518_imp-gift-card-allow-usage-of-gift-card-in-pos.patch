@@ -1,0 +1,213 @@
+PR: https://github.com/odoo/odoo/pull/75518
+
+From: 809f0bbe1b05f15da15dac1bfaaa583fcffdbda4
+From: Robin Heinz
+Date: 2021-09-03 10:37:54
+
+Breaking data model changes score: 9, change matches:
+-    buy_line_id = fields.Many2one("sale.order.line", copy=False, readonly=True,
+-    redeem_line_ids = fields.One2many('sale.order.line', 'gift_card_id', string="Redeems")
+-    _inherit = "sale.order"
+-    gift_card_count = fields.Integer(compute="_compute_gift_card_count")
+-    _inherit = "sale.order.line"
+-    generated_gift_card_ids = fields.One2many('gift.card', "buy_line_id", string="Bought Gift Card")
+-    gift_card_id = fields.Many2one('gift.card', help="Deducted from this Gift Card", copy=False)
+
+Total Changes: 130
+
+[IMP] Gift Card: Allow usage of gift card in POS
+
+Split initial module gift card into 2 modules:
+    - gift card
+    - sales gift card
+
+This change is made to isolate the sale order from the gift card module.
+
+In order to create the gift card in the point of sale, we added 3 options
+in the pos config.
+Create and set: generate and set the amount of a new gift card.
+Use and set: We use an already existing card and set the amount of this one.
+Use: We use a gift card that already has a certain amount.
+
+When you pay with a gift cards, reports are generated. Those reports
+give you the code and the barcode of  the gift cards.
+You also get information such as expiration date and the amount.
+
+closes odoo/odoo#75518
+
+Task-id: 1737
+Related: odoo/upgrade#2799
+Signed-off-by: pimodoo <pimodoo@users.noreply.github.com>
+
+================================= pseudo patch: =================================
+
+--- a/addons/gift_card/models/__init__.py
++++ b/addons/gift_card/models/__init__.py
+@@ -3,4 +3,3 @@
+ 
+ from . import gift_card
+ from . import product
+-from . import sale_order
+
+--- a/addons/gift_card/models/gift_card.py
++++ b/addons/gift_card/models/gift_card.py
+@@ -13,10 +13,10 @@ class GiftCard(models.Model):
+ 
+     @api.model
+     def _generate_code(self):
+-        return str(uuid4())[4:-8]
++        return '044' + str(uuid4())[4:-8][3:]
+ 
+     name = fields.Char(compute='_compute_name')
+-    code = fields.Char(default=_generate_code, required=True, readonly=True, copy=False)
++    code = fields.Char(default=lambda x: x._generate_code(), required=True, readonly=True, copy=False)
+     partner_id = fields.Many2one('res.partner', help="If empty, all users can use it")
+     company_id = fields.Many2one('res.company', default=lambda self: self.env.company)
+     currency_id = fields.Many2one('res.currency', readonly=True, related='company_id.currency_id')
+@@ -29,10 +29,6 @@ class GiftCard(models.Model):
+         copy=False
+     )
+ 
+-    buy_line_id = fields.Many2one("sale.order.line", copy=False, readonly=True,
+-                                  help="Sale Order line where this gift card has been bought.")
+-    redeem_line_ids = fields.One2many('sale.order.line', 'gift_card_id', string="Redeems")
+-
+     _sql_constraints = [
+         ('unique_gift_card_code', 'UNIQUE(code)', 'The gift card code must be unique.'),
+         ('check_amount', 'CHECK(initial_amount >= 0)', 'The initial amount must be positive.')
+@@ -42,17 +38,6 @@ class GiftCard(models.Model):
+         for record in self:
+             record.name = _("Gift #%s", record.id)
+ 
+-    @api.depends("initial_amount", "redeem_line_ids")
+-    def _compute_balance(self):
+-        for record in self:
+-            balance = record.initial_amount
+-            confirmed_line = record.redeem_line_ids.filtered(lambda l: l.state == 'sale')
+-            if confirmed_line:
+-                balance -= sum(confirmed_line.mapped(
+-                    lambda line: line.currency_id._convert(line.price_unit, record.currency_id, record.env.company, line.create_date) * -1
+-                ))
+-            record.balance = balance
+-
+     @api.autovacuum
+     def _gc_mark_expired_gift_card(self):
+         self.env['gift.card'].search([
+@@ -66,3 +51,8 @@ class GiftCard(models.Model):
+     def can_be_used(self):
+         # expired state are computed once a day, so can be not synchro
+         return self.state == 'valid' and self.balance > 0 and self.expired_date >= fields.Date.today()
++
++    @api.depends("initial_amount")
++    def _compute_balance(self):
++        for record in self:
++            record.balance = record.initial_amount
+
+--- a/addons/gift_card/models/sale_order.py
++++ b/None
+@@ -1,105 +0,0 @@
+-# -*- coding: utf-8 -*-
+-# Part of Odoo. See LICENSE file for full copyright and licensing details.
+-
+-from odoo import _, api, fields, models
+-
+-
+-class SaleOrder(models.Model):
+-    _inherit = "sale.order"
+-
+-    gift_card_count = fields.Integer(compute="_compute_gift_card_count")
+-
+-    @api.depends("order_line.generated_gift_card_ids")
+-    def _compute_gift_card_count(self):
+-        for record in self:
+-            record.gift_card_count = len(record.order_line.mapped("generated_gift_card_ids"))
+-
+-    @api.constrains('state')
+-    def _constrains_state(self):
+-        # release gift card amount when order state become canceled
+-        for record in self.filtered(lambda so: so.state == 'cancel'):
+-            record.order_line.filtered(lambda ol: ol.gift_card_id).unlink()
+-
+-        # create and send gift card when order become confirmed
+-        for record in self.filtered(lambda so: so.state == 'sale'):
+-            for gift_card_order_line in record.order_line.filtered(lambda ol: ol.product_id.is_gift_card):
+-                gift_card_order_line._create_gift_cards()
+-            record.sudo()._send_gift_card_mail()
+-
+-    def _pay_with_gift_card(self, gift_card):
+-        error = False
+-
+-        if not gift_card.can_be_used():
+-            error = _('Invalid or Expired Gift Card.')
+-        elif gift_card in self.order_line.mapped("gift_card_id"):
+-            error = _('Gift Card already used.')
+-        elif gift_card.partner_id and gift_card.partner_id != self.env.user.partner_id:
+-            error = _('Gift Card are restricted for another user.')
+-
+-        amount = min(self.amount_total, gift_card.balance_converted(self.currency_id))
+-        if not error and amount > 0:
+-            pay_gift_card_id = self.env.ref('gift_card.pay_with_gift_card_product')
+-            gift_card.redeem_line_ids.filtered(lambda redeem: redeem.state != "sale").unlink()
+-            self.env["sale.order.line"].create({
+-                'product_id': pay_gift_card_id.id,
+-                'price_unit': - amount,
+-                'product_uom_qty': 1,
+-                'product_uom': pay_gift_card_id.uom_id.id,
+-                'gift_card_id': gift_card.id,
+-                'order_id': self.id
+-            })
+-        return error
+-
+-    def _send_gift_card_mail(self):
+-        template = self.env.ref('gift_card.mail_template_gift_card', raise_if_not_found=False)
+-        if template and self.gift_card_count:
+-            for gift in self.order_line.mapped("generated_gift_card_ids"):
+-                template.send_mail(gift.id, force_send=True, notif_layout='mail.mail_notification_light')
+-
+-    def _recompute_gift_card_lines(self):
+-        for record in self:
+-            lines_to_remove = self.env['sale.order.line']
+-            lines_to_update = []
+-
+-            gift_payment_lines = record.order_line.filtered('gift_card_id')
+-            to_pay = sum((self.order_line - gift_payment_lines).mapped('price_total'))
+-
+-            # consume older gift card first
+-            for gift_card_line in gift_payment_lines.sorted(lambda line: line.gift_card_id.expired_date):
+-                amount = min(to_pay, gift_card_line.gift_card_id.balance_converted(record.currency_id))
+-                if amount:
+-                    to_pay -= amount
+-                    if gift_card_line.price_unit != -amount or gift_card_line.product_uom_qty != 1:
+-                        lines_to_update.append(
+-                            fields.Command.update(gift_card_line.id, {'price_unit': -amount, 'product_uom_qty': 1})
+-                        )
+-                else:
+-                    lines_to_remove += gift_card_line
+-            lines_to_remove.unlink()
+-            record.update({'order_line': lines_to_update})
+-
+-
+-class SaleOrderLine(models.Model):
+-    _inherit = "sale.order.line"
+-
+-    generated_gift_card_ids = fields.One2many('gift.card', "buy_line_id", string="Bought Gift Card")
+-    gift_card_id = fields.Many2one('gift.card', help="Deducted from this Gift Card", copy=False)
+-
+-    def _is_not_sellable_line(self):
+-        return self.gift_card_id or super()._is_not_sellable_line()
+-
+-    def _create_gift_cards(self):
+-        return self.env['gift.card'].create(
+-            [self._build_gift_card() for _ in range(int(self.product_uom_qty))]
+-        )
+-
+-    def _build_gift_card(self):
+-        return {
+-            'initial_amount': self.order_id.currency_id._convert(
+-                self.price_unit,
+-                self.order_id.env.company.currency_id,
+-                self.order_id.env.company,
+-                fields.Date.today()
+-            ),
+-            'buy_line_id': self.id,
+-        }

@@ -1,0 +1,544 @@
+PR: https://github.com/odoo/odoo/pull/139225
+
+From: dc696c8ed4850a83b6af721002a90f2944891923
+From: william
+Date: 2023-10-25 18:10:57
+
+Breaking data model changes score: 1, change matches:
+-    plan_id = fields.Many2one(
+
+Total Changes: 284
+
+[IMP] analytic: allow cross analytics
+
+Purpose
+=======
+
+Make it possible to compare analytic values between plans by inputting
+up to one account per plan on each line.
+For instance, if we have 2 plans: "Country" and "Product Type", with the
+following accounts
+
+| Country | Product Type |
+| ------- | ------------ |
+| BE      | Drinks       |
+| LU      | Food         |
+
+And the following invoices:
+* 1000€ of drinks in Belgium
+* 2000€ of food in Belgium
+* 3000€ of food in Luxemburg
+
+We want to be able to display the following pivot tables:
+
+|     | Drinks | Food | Total |
+| --- | ------ | ---- | ----- |
+| BE  |   1000 | 2000 |  3000 |
+| LU  |      0 | 3000 |  3000 |
+| Tot |   1000 | 5000 |  6000 |
+
+|        | Total |
+| ------ | ----- |
+| Food   |  5000 |
+| * BE   |  2000 |
+| * LU   |  3000 |
+| Drinks |  1000 |
+| * BE   |  1000 |
+| Total  |  6000 |
+
+Implementation
+==============
+
+* `ir.fields` are added/removed dynamically on `account.analytic.line`
+* Each analytic plan corresponds to one field on `account.analytic.line`
+* The fields are added dynamically in the views.
+* `account.analytic.plan` doesn't have a `company_id` field anymore,
+  meaning that all the companies have access to all the plans. This
+  means that the applicability fields and lines are now company
+  dependent, and those can be used to know which fields/plans to display
+  for which company.
+* There can no longer be one "Project" plan per company, even if the
+  accounts of that project can still be owned by only one company.
+* There is now only one method to get the default (or "Project" plan),
+  which is `_get_plan_columns`
+
+task-3497653
+
+closes odoo/odoo#139225
+
+Related: odoo/upgrade#5306
+Related: odoo/enterprise#49226
+Signed-off-by: William André (wan) <wan@odoo.com>
+Co-authored-by: william <wan@odoo.com>
+Co-authored-by: h4818 <ayh@odoo.com>
+
+================================= pseudo patch: =================================
+
+--- a/addons/analytic/models/analytic_account.py
++++ b/addons/analytic/models/analytic_account.py
+@@ -34,18 +34,15 @@ class AccountAnalyticAccount(models.Model):
+         default=True,
+         tracking=True,
+     )
+-
+     plan_id = fields.Many2one(
+         'account.analytic.plan',
+         string='Plan',
+-        check_company=True,
+         required=True,
+     )
+     root_plan_id = fields.Many2one(
+         'account.analytic.plan',
+         string='Root Plan',
+-        check_company=True,
+-        compute="_compute_root_plan",
++        related="plan_id.root_id",
+         store=True,
+     )
+     color = fields.Integer(
+@@ -55,7 +52,7 @@ class AccountAnalyticAccount(models.Model):
+ 
+     line_ids = fields.One2many(
+         'account.analytic.line',
+-        'account_id',
++        'auto_account_id',  # magic link to the right column (plan) by using the context in the view
+         string="Analytic Lines",
+     )
+ 
+@@ -99,7 +96,7 @@ class AccountAnalyticAccount(models.Model):
+     def _check_company_consistency(self):
+         for company, accounts in groupby(self, lambda account: account.company_id):
+             if company and self.env['account.analytic.line'].search([
+-                ('account_id', 'in', [account.id for account in accounts]),
++                ('auto_account_id', 'in', [account.id for account in accounts]),
+                 '!', ('company_id', 'child_of', company.id),
+             ], limit=1):
+                 raise UserError(_("You can't set a different company on your analytic account since there are some analytic items linked to it."))
+@@ -142,43 +139,40 @@ class AccountAnalyticAccount(models.Model):
+ 
+     @api.depends('line_ids.amount')
+     def _compute_debit_credit_balance(self):
+-        analytic_line_obj = self.env['account.analytic.line']
+-        domain = [
+-            ('account_id', 'in', self.ids),
+-            ('company_id', 'in', [False] + self.env.companies.ids)
+-        ]
++        def convert(amount, from_currency):
++            return from_currency._convert(
++                from_amount=amount,
++                to_currency=self.env.company.currency_id,
++                company=self.env.company,
++                date=fields.Date.today(),
++            )
++
++        domain = [('company_id', 'in', [False] + self.env.companies.ids)]
+         if self._context.get('from_date', False):
+             domain.append(('date', '>=', self._context['from_date']))
+         if self._context.get('to_date', False):
+             domain.append(('date', '<=', self._context['to_date']))
+ 
+-        user_currency = self.env.company.currency_id
+-        credit_groups = analytic_line_obj._read_group(
+-            domain=domain + [('amount', '>=', 0.0)],
+-            groupby=['account_id', 'currency_id'],
+-            aggregates=['amount:sum'],
+-        )
+-        data_credit = defaultdict(float)
+-        for account, currency, amount_sum in credit_groups:
+-            data_credit[account.id] += currency._convert(
+-                amount_sum, user_currency, self.env.company, fields.Date.today())
+-
+-        debit_groups = analytic_line_obj._read_group(
+-            domain=domain + [('amount', '<', 0.0)],
+-            groupby=['account_id', 'currency_id'],
+-            aggregates=['amount:sum'],
+-        )
+-        data_debit = defaultdict(float)
+-        for account, currency, amount_sum in debit_groups:
+-            data_debit[account.id] += currency._convert(
+-                amount_sum, user_currency, self.env.company, fields.Date.today())
+-
+-        for account in self:
+-            account.debit = abs(data_debit.get(account.id, 0.0))
+-            account.credit = data_credit.get(account.id, 0.0)
+-            account.balance = account.credit - account.debit
+-
+-    @api.depends('plan_id', 'plan_id.parent_path')
+-    def _compute_root_plan(self):
+-        for account in self:
+-            account.root_plan_id = int(account.plan_id.parent_path[:-1].split('/')[0]) if account.plan_id.parent_path else None
++        for plan, accounts in self.grouped('plan_id').items():
++            credit_groups = self.env['account.analytic.line']._read_group(
++                domain=domain + [(plan._column_name(), 'in', self.ids), ('amount', '>=', 0.0)],
++                groupby=[plan._column_name(), 'currency_id'],
++                aggregates=['amount:sum'],
++            )
++            data_credit = defaultdict(float)
++            for account, currency, amount_sum in credit_groups:
++                data_credit[account.id] += convert(amount_sum, currency)
++
++            debit_groups = self.env['account.analytic.line']._read_group(
++                domain=domain + [(plan._column_name(), 'in', self.ids), ('amount', '<', 0.0)],
++                groupby=[plan._column_name(), 'currency_id'],
++                aggregates=['amount:sum'],
++            )
++            data_debit = defaultdict(float)
++            for account, currency, amount_sum in debit_groups:
++                data_debit[account.id] += convert(amount_sum, currency)
++
++            for account in accounts:
++                account.debit = -data_debit.get(account.id, 0.0)
++                account.credit = data_credit.get(account.id, 0.0)
++                account.balance = account.credit - account.debit
+
+--- a/addons/analytic/models/analytic_line.py
++++ b/addons/analytic/models/analytic_line.py
+@@ -1,8 +1,9 @@
+ # -*- coding: utf-8 -*-
+ # Part of Odoo. See LICENSE file for full copyright and licensing details.
++from lxml.builder import E
+ 
+-from odoo import api, fields, models, _
+-from odoo.exceptions import ValidationError
++from odoo import api, fields, models
++from odoo.osv.expression import OR
+ 
+ 
+ class AccountAnalyticLine(models.Model):
+@@ -42,12 +43,21 @@ class AccountAnalyticLine(models.Model):
+     )
+     account_id = fields.Many2one(
+         'account.analytic.account',
+-        'Analytic Account',
+-        required=True,
++        'Project Account',
+         ondelete='restrict',
+         index=True,
+         check_company=True,
+     )
++    # Magic column that represents all the plans at the same time, except for the compute
++    # where it is context dependent, and needs the id of the desired plan.
++    # Used as a syntactic sugar for search views, and magic field for one2many relation
++    auto_account_id = fields.Many2one(
++        comodel_name='account.analytic.account',
++        string='Analytic Account',
++        compute='_compute_auto_account',
++        inverse='_inverse_auto_account',
++        search='_search_auto_account',
++    )
+     partner_id = fields.Many2one(
+         'res.partner',
+         string='Partner',
+@@ -73,20 +83,58 @@ class AccountAnalyticLine(models.Model):
+         store=True,
+         compute_sudo=True,
+     )
+-    plan_id = fields.Many2one(
+-        'account.analytic.plan',
+-        related='account_id.plan_id',
+-        store=True,
+-        readonly=True,
+-        compute_sudo=True,
+-    )
+     category = fields.Selection(
+         [('other', 'Other')],
+         default='other',
+     )
+ 
+-    @api.constrains('company_id', 'account_id')
+-    def _check_company_id(self):
++    @api.depends_context('analytic_plan_id')
++    def _compute_auto_account(self):
++        plan = self.env['account.analytic.plan'].browse(self.env.context.get('analytic_plan_id'))
++        for line in self:
++            line.auto_account_id = bool(plan) and line[plan._column_name()]
++
++    def _inverse_auto_account(self):
+         for line in self:
+-            if line.account_id.company_id and line.company_id.id != line.account_id.company_id.id:
+-                raise ValidationError(_('The selected account belongs to another company than the one you\'re trying to create an analytic item for'))
++            line[line.auto_account_id.plan_id._column_name()] = line.auto_account_id
++
++    def _search_auto_account(self, operator, value):
++        project_plan, other_plans = self.env['account.analytic.plan']._get_all_plans()
++        return OR([
++            [(plan._column_name(), operator, value)]
++            for plan in project_plan + other_plans
++        ])
++
++    def _get_view(self, view_id=None, view_type='form', **options):
++        arch, view = super()._get_view(view_id, view_type, **options)
++        if self.env['account.analytic.plan'].check_access_rights('read', raise_exception=False):
++            project_plan, other_plans = self.env['account.analytic.plan']._get_all_plans()
++
++            # Find main account nodes
++            account_node = next(iter(arch.xpath('//field[@name="account_id"]')), None)
++            account_filter_node = next(iter(arch.xpath('//filter[@name="account_id"]')), None)
++
++            # Force domain on main account node as the fields_get doesn't do the trick
++            if account_node is not None and view_type == 'search':
++                account_node.attrib['domain'] = f"[('plan_id', 'child_of', {project_plan.id})]"
++
++            # If there is a main node, append the ones for other plans
++            if account_node is not None or account_filter_node is not None:
++                for plan in other_plans[::-1]:
++                    fname = plan._column_name()
++                    if account_node is not None:
++                        account_node.addnext(E.field(name=fname, domain=f"[('plan_id', 'child_of', {plan.id})]", optional="show"))
++                    if account_filter_node is not None:
++                        account_filter_node.addnext(E.filter(name=fname, context=f"{{'group_by': '{fname}'}}"))
++        return arch, view
++
++    def fields_get(self, allfields=None, attributes=None):
++        fields = super().fields_get(allfields, attributes)
++        if self.env['account.analytic.plan'].check_access_rights('read', raise_exception=False):
++            project_plan, other_plans = self.env['account.analytic.plan']._get_all_plans()
++            for plan in project_plan + other_plans:
++                fname = plan._column_name()
++                if fname in fields:
++                    fields[fname]['string'] = plan.name
++                    fields[fname]['domain'] = f"[('plan_id', 'child_of', {plan.id})]"
++        return fields
+
+--- a/addons/analytic/models/analytic_mixin.py
++++ b/addons/analytic/models/analytic_mixin.py
+@@ -55,7 +55,7 @@ class AnalyticMixin(models.AbstractModel):
+         account_ids = list(self.env['account.analytic.account']._name_search(name=value, operator=operator_name_search))
+ 
+         query = f"""
+-            SELECT id 
++            SELECT id
+             FROM {self._table}
+             WHERE analytic_distribution ?| array[%s]
+         """
+@@ -92,9 +92,10 @@ class AnalyticMixin(models.AbstractModel):
+                 return
+             decimal_precision = self.env['decimal.precision'].precision_get('Percentage Analytic')
+             distribution_by_root_plan = {}
+-            for analytic_account_id, percentage in (self.analytic_distribution or {}).items():
+-                root_plan = self.env['account.analytic.account'].browse(int(analytic_account_id)).root_plan_id
+-                distribution_by_root_plan[root_plan.id] = distribution_by_root_plan.get(root_plan.id, 0) + percentage
++            for analytic_account_ids, percentage in (self.analytic_distribution or {}).items():
++                for analytic_account in self.env['account.analytic.account'].browse(map(int, analytic_account_ids.split(","))):
++                    root_plan = analytic_account.root_plan_id
++                    distribution_by_root_plan[root_plan.id] = distribution_by_root_plan.get(root_plan.id, 0) + percentage
+ 
+             for plan_id in mandatory_plans_ids:
+                 if float_compare(distribution_by_root_plan.get(plan_id, 0), 100, precision_digits=decimal_precision) != 0:
+
+--- a/addons/analytic/models/analytic_plan.py
++++ b/addons/analytic/models/analytic_plan.py
+@@ -1,33 +1,43 @@
+ # -*- coding: utf-8 -*-
+ # Part of Odoo. See LICENSE file for full copyright and licensing details.
+ 
+-from odoo import api, fields, models, _
+ from random import randint
+ 
++from odoo import api, fields, models, _
++from odoo.exceptions import UserError
++from odoo.tools import ormcache
++
+ 
+ class AccountAnalyticPlan(models.Model):
+     _name = 'account.analytic.plan'
+     _description = 'Analytic Plans'
+     _parent_store = True
+     _rec_name = 'complete_name'
+-    _order = 'complete_name asc'
++    _order = 'sequence asc, id'
+ 
+     def _default_color(self):
+         return randint(1, 11)
+ 
+-    name = fields.Char(required=True, translate=True)
++    name = fields.Char(
++        required=True,
++        translate=True,
++        inverse='_inverse_name',
++    )
+     description = fields.Text(string='Description')
+     parent_id = fields.Many2one(
+         'account.analytic.plan',
+         string="Parent",
+         ondelete='cascade',
+-        check_company=True,
+         domain="['!', ('id', 'child_of', id)]",
+     )
+     parent_path = fields.Char(
+         index='btree',
+         unaccent=False,
+     )
++    root_id = fields.Many2one(
++        'account.analytic.plan',
++        compute='_compute_root_id',
++    )
+     children_ids = fields.One2many(
+         'account.analytic.plan',
+         'parent_id',
+@@ -43,11 +53,6 @@ class AccountAnalyticPlan(models.Model):
+         recursive=True,
+         store=True,
+     )
+-    company_id = fields.Many2one(
+-        'res.company',
+-        string='Company',
+-        default=lambda self: self.env.company,
+-    )
+     account_ids = fields.One2many(
+         'account.analytic.account',
+         'plan_id',
+@@ -65,6 +70,7 @@ class AccountAnalyticPlan(models.Model):
+         'Color',
+         default=_default_color,
+     )
++    sequence = fields.Integer(default=10)
+ 
+     default_applicability = fields.Selection(
+         selection=[
+@@ -74,15 +80,69 @@ class AccountAnalyticPlan(models.Model):
+         ],
+         string="Default Applicability",
+         required=True,
+-        default='optional',
++        default='optional',  # actually set in _auto_init because company dependent
+         readonly=False,
++        company_dependent=True,
+     )
+     applicability_ids = fields.One2many(
+         'account.analytic.applicability',
+         'analytic_plan_id',
+         string='Applicability',
++        domain="[('company_id', '=', current_company_id)]",
+     )
+ 
++    def _auto_init(self):
++        super()._auto_init()
++        def precommit():
++            self.env['ir.property']._set_default(
++                name='default_applicability',
++                model=self._name,
++                value='optional',
++            )
++        self.env.cr.precommit.add(precommit)
++
++    @ormcache()
++    def __get_all_plans(self):
++        project_plan = self.browse(int(self.env['ir.config_parameter'].sudo().get_param('analytic.project_plan', 0)))
++        if not project_plan:
++            raise UserError(_("A 'Project' plan needs to exist and its id needs to be set as `analytic.project_plan` in the system variables"))
++        other_plans = self.sudo().search([('parent_id', '=', False)]) - project_plan
++        return project_plan.id, other_plans.ids
++
++    def _get_all_plans(self):
++        return map(self.browse, self.__get_all_plans())
++
++    def _column_name(self):
++        self.ensure_one()
++        project_plan, _other_plans = self._get_all_plans()
++        return 'account_id' if self.root_id == project_plan else f"x_plan{self.root_id.id}_id"
++
++    def _inverse_name(self):
++        # Create a new field/column on analytic lines for this plan, and keep the name in sync.
++        for plan in self:
++            if not plan.parent_id:
++                prev = self.env['ir.model.fields'].search([
++                    ('name', '=', plan._column_name()),
++                    ('model', '=', 'account.analytic.line'),
++                ])
++                if prev:
++                    prev.field_description = plan.name
++                else:
++                    self.env['ir.model.fields'].with_context(update_custom_fields=True).create({
++                        'name': plan._column_name(),
++                        'field_description': plan.name,
++                        'state': 'manual',
++                        'model': 'account.analytic.line',
++                        'model_id': self.env['ir.model']._get_id('account.analytic.line'),
++                        'ttype': 'many2one',
++                        'relation': 'account.analytic.account',
++                    })
++
++    @api.depends('parent_id', 'parent_path')
++    def _compute_root_id(self):
++        for plan in self:
++            plan.root_id = int(plan.parent_path[:-1].split('/')[0]) if plan.parent_path else plan
++
+     @api.depends('name', 'parent_id.complete_name')
+     def _compute_complete_name(self):
+         for plan in self:
+@@ -133,22 +193,19 @@ class AccountAnalyticPlan(models.Model):
+     def get_relevant_plans(self, **kwargs):
+         """ Returns the list of plans that should be available.
+             This list is computed based on the applicabilities of root plans. """
+-        company_id = kwargs.get('company_id', self.env.company.id)
+         record_account_ids = kwargs.get('existing_account_ids', [])
+-        all_plans = self.search([
+-            *self._check_company_domain(company_id),
+-            ('account_ids', '!=', False),
+-        ])
+-        root_plans = self.browse({
+-            int(plan.parent_path.split('/')[0])
+-            for plan in all_plans
+-        }).filtered(lambda p: p._get_applicability(**kwargs) != 'unavailable')
++        project_plan, other_plans = self.env['account.analytic.plan']._get_all_plans()
++        root_plans = (project_plan + other_plans).filtered(lambda p: (
++            bool(p.account_ids)
++            and not p.parent_id
++            and p._get_applicability(**kwargs) != 'unavailable'
++        ))
+         # If we have accounts that are already selected (before the applicability rules changed or from a model),
+         # we want the plans that were unavailable to be shown in the list (and in optional, because the previous
+         # percentage could be different from 0)
+         forced_plans = self.env['account.analytic.account'].browse(record_account_ids).exists().mapped(
+             'root_plan_id') - root_plans
+-        return sorted([
++        return [
+             {
+                 "id": plan.id,
+                 "name": plan.name,
+@@ -157,7 +214,7 @@ class AccountAnalyticPlan(models.Model):
+                 "all_account_count": plan.all_account_count
+             }
+             for plan in root_plans + forced_plans
+-        ], key=lambda d: (d['applicability'], d['id']))
++        ]
+ 
+     def _get_applicability(self, **kwargs):
+         """ Returns the applicability of the best applicability line or the default applicability """
+@@ -175,16 +232,13 @@ class AccountAnalyticPlan(models.Model):
+                     score = score_rule
+             return applicability
+ 
+-    def _get_default(self):
+-        plan = self.env['account.analytic.plan'].sudo().search(
+-            [('company_id', '=', False)], limit=1)
+-        if plan:
+-            return plan
+-        else:
+-            return self.env['account.analytic.plan'].create({
+-                'name': 'Default',
+-                'company_id': False,
+-            })
++    def unlink(self):
++        # Remove the dynamic field created with the plan (see `_inverse_name`)
++        self.env['ir.model.fields'].search([
++            ('name', 'in', [plan._column_name() for plan in self]),
++            ('model', '=', 'account.analytic.line'),
++        ]).unlink()
++        return super().unlink()
+ 
+ 
+ class AccountAnalyticApplicability(models.Model):
+@@ -207,6 +261,11 @@ class AccountAnalyticApplicability(models.Model):
+         required=True,
+         string="Applicability",
+     )
++    company_id = fields.Many2one(
++        'res.company',
++        string='Company',
++        default=lambda self: self.env.company,
++    )
+ 
+     def _get_score(self, **kwargs):
+         """ Gives the score of an applicability with the parameters of kwargs """

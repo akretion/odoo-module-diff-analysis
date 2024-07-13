@@ -1,0 +1,291 @@
+PR: https://github.com/odoo/odoo/pull/137864
+
+From: 7dda6bb92715ea25b2818a62fec5e646f3678b81
+From: Arnold Moyaux
+Date: 2023-10-25 18:10:54
+
+Breaking data model changes score: 2, change matches:
+-    move_line_nosuggest_ids = fields.One2many(
+
+Total Changes: 81
+
+[REF] stock: quantity pocalypse
+
+The rational is:
+Currently we have 2 columns. One for reservation, the other
+for quantity picked.
+
+However in real time, either you follow the reservation and everything
+goes well. Otherwise you pick something else. In the case where you
+pick somewhere else than reserved, you would like to modify the
+reservation to have something similar and free the quantity you
+didn't pick and expect the system to not suggest the ones you took.
+
+In other hand, we always want to have the reserve quantity similar to
+the done.
+
+On top, having two columns could be confusing for the end user.
+
+The cons:
+*The qty_done column could be use during the picking, to
+remember if something has been pick or still to pick.
+* For some flow (put in pack), it's easier to write a part of the quantity to pack
+and still want to reserve the full amount of product.
+
+We goes back and choose a ligther interface over complex feature.
+
+Changes:
+Qty done and reserved qty are merged into a single column.
+A new checkbox on the move exists to mark it as picked or not
+Since the reservation always follow the quantity, it's now possible
+to have more reserved quantity than stock. However the system will
+never propose it and the inventory showing reserved > quantity should
+be a warning.
+The system should never modify a move that has been picked. We don't
+want to overide the user action.
+
+Regression:
+Not able to pick a single stock.move.line
+
+closes odoo/odoo#137864
+
+Related: odoo/enterprise#48709
+Related: odoo/upgrade#5310
+Signed-off-by: Arnold Moyaux (arm) <arm@odoo.com>
+
+================================= pseudo patch: =================================
+
+--- a/addons/mrp_subcontracting/models/mrp_production.py
++++ b/addons/mrp_subcontracting/models/mrp_production.py
+@@ -38,7 +38,7 @@ class MrpProduction(models.Model):
+             for move in production.move_raw_ids:
+                 move.move_line_ids = line_by_product.pop(move.product_id, self.env['stock.move.line'])
+             for product_id, lines in line_by_product.items():
+-                qty = sum(line.product_uom_id._compute_quantity(line.qty_done, product_id.uom_id) for line in lines)
++                qty = sum(line.product_uom_id._compute_quantity(line.quantity, product_id.uom_id) for line in lines)
+                 move = production._get_move_raw_values(product_id, qty, product_id.uom_id)
+                 move['additional'] = True
+                 production.move_raw_ids = [(0, 0, move)]
+@@ -58,6 +58,7 @@ class MrpProduction(models.Model):
+ 
+     def subcontracting_record_component(self):
+         self.ensure_one()
++        self.move_raw_ids.picked = True
+         if not self._get_subcontract_move():
+             raise UserError(_("This MO isn't related to a subcontracted move"))
+         if float_is_zero(self.qty_producing, precision_rounding=self.product_uom_id.rounding):
+@@ -67,13 +68,12 @@ class MrpProduction(models.Model):
+         for sml in self.move_raw_ids.move_line_ids:
+             if sml.tracking != 'none' and not sml.lot_id:
+                 raise UserError(_('You must enter a serial number for each line of %s', sml.product_id.display_name))
+-        if self.move_raw_ids and not any(self.move_raw_ids.mapped('quantity_done')):
++        if self.move_raw_ids and not any(self.move_raw_ids.mapped('quantity')):
+             raise UserError(_("You must indicate a non-zero amount consumed for at least one of your components"))
+         consumption_issues = self._get_consumption_issues()
+         if consumption_issues:
+             return self._action_generate_consumption_wizard(consumption_issues)
+-
+-        self.sudo()._update_finished_move() # Portal user may need sudo rights to update pickings
++        self.sudo()._update_finished_move()  # Portal user may need sudo rights to update pickings
+         self.subcontracting_has_been_recorded = True
+ 
+         quantity_issues = self._get_quantity_produced_issues()
+@@ -104,37 +104,30 @@ class MrpProduction(models.Model):
+         if subcontract_move_id:
+             quantity = self.qty_producing
+             if self.lot_producing_id:
+-                move_lines = subcontract_move_id.move_line_ids.filtered(lambda ml: ml.lot_id == self.lot_producing_id or not ml.lot_id)
++                move_lines = subcontract_move_id.move_line_ids.filtered(lambda ml: not ml.picked and ml.lot_id == self.lot_producing_id or not ml.lot_id)
+             else:
+-                move_lines = subcontract_move_id.move_line_ids.filtered(lambda ml: not ml.lot_id)
++                move_lines = subcontract_move_id.move_line_ids.filtered(lambda ml: not ml.picked and not ml.lot_id)
+             # Update reservation and quantity done
+             for ml in move_lines:
+                 rounding = ml.product_uom_id.rounding
+                 if float_compare(quantity, 0, precision_rounding=rounding) <= 0:
+                     break
+-                quantity_to_process = min(quantity, ml.reserved_uom_qty - ml.qty_done)
++                quantity_to_process = min(quantity, ml.quantity)
+                 quantity -= quantity_to_process
+ 
+-                new_quantity_done = (ml.qty_done + quantity_to_process)
+-
+                 # on which lot of finished product
+-                if float_compare(new_quantity_done, ml.reserved_uom_qty, precision_rounding=rounding) >= 0:
++                if float_compare(quantity_to_process, ml.quantity, precision_rounding=rounding) >= 0:
+                     ml.write({
+-                        'qty_done': new_quantity_done,
++                        'quantity': quantity_to_process,
++                        'picked': True,
+                         'lot_id': self.lot_producing_id and self.lot_producing_id.id,
+                     })
+                 else:
+-                    new_qty_reserved = ml.reserved_uom_qty - new_quantity_done
+-                    default = {
+-                        'reserved_uom_qty': new_quantity_done,
+-                        'qty_done': new_quantity_done,
+-                        'lot_id': self.lot_producing_id and self.lot_producing_id.id,
+-                    }
+                     ml.write({
+-                        'reserved_uom_qty': new_qty_reserved,
+-                        'qty_done': 0
++                        'quantity': quantity_to_process,
++                        'picked': True,
++                        'lot_id': self.lot_producing_id and self.lot_producing_id.id,
+                     })
+-                    ml.copy(default=default)
+ 
+             if float_compare(quantity, 0, precision_rounding=self.product_uom_id.rounding) > 0:
+                 self.env['stock.move.line'].create({
+@@ -143,18 +136,13 @@ class MrpProduction(models.Model):
+                     'product_id': self.product_id.id,
+                     'location_id': subcontract_move_id.location_id.id,
+                     'location_dest_id': subcontract_move_id.location_dest_id.id,
+-                    'reserved_uom_qty': 0,
+                     'product_uom_id': self.product_uom_id.id,
+-                    'qty_done': quantity,
++                    'quantity': quantity,
++                    'picked': True,
+                     'lot_id': self.lot_producing_id and self.lot_producing_id.id,
+                 })
+             if not self._get_quantity_to_backorder():
+-                ml_reserved = subcontract_move_id.move_line_ids.filtered(lambda ml:
+-                    float_is_zero(ml.qty_done, precision_rounding=ml.product_uom_id.rounding) and
+-                    not float_is_zero(ml.reserved_uom_qty, precision_rounding=ml.product_uom_id.rounding))
+-                ml_reserved.unlink()
+-                for ml in subcontract_move_id.move_line_ids:
+-                    ml.reserved_uom_qty = ml.qty_done
++                subcontract_move_id.move_line_ids.filtered(lambda ml: not ml.picked).unlink()
+                 subcontract_move_id._recompute_state()
+ 
+     def _subcontracting_filter_to_done(self):
+
+--- a/addons/mrp_subcontracting/models/stock_move.py
++++ b/addons/mrp_subcontracting/models/stock_move.py
+@@ -38,7 +38,7 @@ class StockMove(models.Model):
+         for move in self:
+             if not move.is_subcontract:
+                 continue
+-            if float_is_zero(move.quantity_done, precision_rounding=move.product_uom.rounding):
++            if float_is_zero(move.quantity, precision_rounding=move.product_uom.rounding):
+                 continue
+             productions = move._get_subcontract_production()
+             if not productions or (productions[:1].consumption == 'strict' and not productions[:1]._has_tracked_component()):
+@@ -110,10 +110,7 @@ class StockMove(models.Model):
+                 'show_lots_text': False,
+             })
+         elif self.env.user.has_group('base.group_portal'):
+-            if self.show_reserved:
+-                action['views'] = [(self.env.ref('mrp_subcontracting.mrp_subcontracting_view_stock_move_operations').id, 'form')]
+-            else:
+-                action['views'] = [(self.env.ref('mrp_subcontracting.mrp_subcontracting_view_stock_move_nosuggest_operations').id, 'form')]
++            action['views'] = [(self.env.ref('mrp_subcontracting.mrp_subcontracting_view_stock_move_operations').id, 'form')]
+         return action
+ 
+     def action_show_subcontract_details(self):
+@@ -135,10 +132,6 @@ class StockMove(models.Model):
+             'context': ctx
+         }
+ 
+-    def _set_quantities_to_reservation(self):
+-        move_untouchable = self.filtered(lambda m: m.is_subcontract and m._get_subcontract_production()._has_tracked_component())
+-        return super(StockMove, self - move_untouchable)._set_quantities_to_reservation()
+-
+     def _action_cancel(self):
+         for move in self:
+             if move.is_subcontract:
+@@ -225,11 +218,6 @@ class StockMove(models.Model):
+         vals['location_id'] = self.location_id.id
+         return vals
+ 
+-    def _should_bypass_set_qty_producing(self):
+-        if (self.production_id | self.raw_material_production_id)._get_subcontract_move():
+-            return False
+-        return super()._should_bypass_set_qty_producing()
+-
+     def _should_bypass_reservation(self, forced_location=False):
+         """ If the move is subcontracted then ignore the reservation. """
+         should_bypass_reservation = super()._should_bypass_reservation(forced_location=forced_location)
+@@ -239,7 +227,7 @@ class StockMove(models.Model):
+ 
+     def _update_subcontract_order_qty(self, new_quantity):
+         for move in self:
+-            move_quantity = move.quantity_done if move.from_immediate_transfer else move.product_uom_qty
++            move_quantity = move.product_uom_qty
+             quantity_to_remove = move_quantity - new_quantity
+             if float_is_zero(quantity_to_remove, precision_rounding=move.product_uom.rounding):
+                 continue
+
+--- a/addons/mrp_subcontracting/models/stock_picking.py
++++ b/addons/mrp_subcontracting/models/stock_picking.py
+@@ -13,10 +13,6 @@ class StockPicking(models.Model):
+     _name = 'stock.picking'
+     _inherit = 'stock.picking'
+ 
+-    # override existing field domains to prevent suboncontracting production lines from showing in Detailed Operations tab
+-    move_line_nosuggest_ids = fields.One2many(
+-        domain=['&', '|', ('location_dest_id.usage', '!=', 'production'), ('move_id.picking_code', '!=', 'outgoing'),
+-                     '|', ('reserved_qty', '=', 0.0), '&', ('reserved_qty', '!=', 0.0), ('qty_done', '!=', 0.0)])
+     move_line_ids_without_package = fields.One2many(
+         domain=['&', '|', ('location_dest_id.usage', '!=', 'production'), ('move_id.picking_code', '!=', 'outgoing'),
+                      '|', ('package_level_id', '=', False), ('picking_type_entire_packs', '=', False)])
+@@ -49,7 +45,7 @@ class StockPicking(models.Model):
+             productions = move._get_subcontract_production()
+             recorded_productions = productions.filtered(lambda p: p._has_been_recorded())
+             recorded_qty = sum(recorded_productions.mapped('qty_producing'))
+-            sm_done_qty = sum(productions._get_subcontract_move().mapped('quantity_done'))
++            sm_done_qty = sum(productions._get_subcontract_move().filtered(lambda m: m.picked).mapped('quantity'))
+             rounding = self.env['decimal.precision'].precision_get('Product Unit of Measure')
+             if float_compare(recorded_qty, sm_done_qty, precision_digits=rounding) >= 0:
+                 continue
+@@ -59,7 +55,7 @@ class StockPicking(models.Model):
+             if len(production) > 1:
+                 raise UserError(_("There shouldn't be multiple productions to record for the same subcontracted move."))
+             # Manage additional quantities
+-            quantity_done_move = move.product_uom._compute_quantity(move.quantity_done, production.product_uom_id)
++            quantity_done_move = move.product_uom._compute_quantity(move.quantity, production.product_uom_id)
+             if float_compare(production.product_qty, quantity_done_move, precision_rounding=production.product_uom_id.rounding) == -1:
+                 change_qty = self.env['change.production.qty'].create({
+                     'mo_id': production.id,
+@@ -67,14 +63,15 @@ class StockPicking(models.Model):
+                 })
+                 change_qty.with_context(skip_activity=True).change_prod_qty()
+             # Create backorder MO for each move lines
+-            amounts = [move_line.qty_done for move_line in move.move_line_ids]
++            amounts = [move_line.quantity for move_line in move.move_line_ids]
+             len_amounts = len(amounts)
+             productions = production._split_productions({production: amounts}, set_consumed_qty=True)
+-            productions.move_finished_ids.move_line_ids.write({'qty_done': 0})
++            productions.move_finished_ids.move_line_ids.write({'quantity': 0})
+             for production, move_line in zip(productions, move.move_line_ids):
+                 if move_line.lot_id:
+                     production.lot_producing_id = move_line.lot_id
+                 production.qty_producing = production.product_qty
++                production._set_qty_producing()
+             productions[:len_amounts].subcontracting_has_been_recorded = True
+ 
+         for picking in self:
+@@ -138,7 +135,7 @@ class StockPicking(models.Model):
+             'bom_id': bom.id,
+             'location_src_id': subcontract_move.picking_id.partner_id.with_company(subcontract_move.company_id).property_stock_subcontractor.id,
+             'location_dest_id': subcontract_move.picking_id.partner_id.with_company(subcontract_move.company_id).property_stock_subcontractor.id,
+-            'product_qty': subcontract_move.from_immediate_transfer and subcontract_move.quantity_done or subcontract_move.product_qty,
++            'product_qty': subcontract_move.product_qty or subcontract_move.quantity,
+             'picking_type_id': warehouse.subcontracting_type_id.id,
+             'date_start': subcontract_move.date - relativedelta(days=bom.produce_delay)
+         }
+@@ -150,13 +147,11 @@ class StockPicking(models.Model):
+             # do not create extra production for move that have their quantity updated
+             if move.move_orig_ids.production_id:
+                 continue
+-            quantity = move.from_immediate_transfer and move.quantity_done or move.product_qty
++            quantity = move.product_qty or move.quantity
+             if float_compare(quantity, 0, precision_rounding=move.product_uom.rounding) <= 0:
+                 # If a subcontracted amount is decreased, don't create a MO that would be for a negative value.
+                 continue
+             mo = self.env['mrp.production'].with_company(move.company_id).create(self._prepare_subcontract_mo_vals(move, bom))
+-            self.env['stock.move'].create(mo._get_moves_raw_values())
+-            self.env['stock.move'].create(mo._get_moves_finished_values())
+             mo.date_finished = move.date  # Avoid to have the picking late depending of the MO
+             mo.action_confirm()
+ 

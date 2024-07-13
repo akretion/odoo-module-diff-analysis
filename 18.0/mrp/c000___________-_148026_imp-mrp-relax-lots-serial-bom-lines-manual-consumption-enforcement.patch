@@ -1,0 +1,162 @@
+PR: https://github.com/odoo/odoo/pull/148026
+
+From: 1305c7262fff762c00159377a9ce1ca09d423625
+From: ABE-Mark45
+Date: 2024-03-19 11:11:48
+
+Breaking data model changes score: 3, change matches:
+-    manual_consumption_readonly = fields.Boolean(
+-    use_auto_consume_components_lots = fields.Boolean(related='picking_type_id.use_auto_consume_components_lots')
+-    use_auto_consume_components_lots = fields.Boolean(
+
+Total Changes: 35
+
+[IMP] mrp: relax lots/serial bom lines manual consumption enforcement
+
+Previous to this commit, manual consumption was enabled by default for
+tracked products without the user being able to deactive it. We now want
+to relax this so that users can choose whether or not they want tracked
+produces to be manual consumption so that it suits their needs/workflows
+better (i.e. speed it up).
+
+Due to this relaxing, `manual_consumption_readonly` and
+`use_auto_consume_components_lots` are no longer needed, so they are
+removed.
+
+Relevant tests were adapted due to these changes. This includes:
+* adapting tests that were creating a new move line for tracked
+  components rather than using the existing mls (i.e. ml had no lot_id
+  assigned to them)
+* removed already dead code
+
+ENT PR: odoo/enterprise#54326
+task-3573667
+
+closes odoo/odoo#148026
+
+Related: odoo/upgrade#5547
+Signed-off-by: William Henrotin (whe) <whe@odoo.com>
+
+================================= pseudo patch: =================================
+
+--- a/addons/mrp/models/mrp_bom.py
++++ b/addons/mrp/models/mrp_bom.py
+@@ -521,12 +521,10 @@ class MrpBomLine(models.Model):
+     attachments_count = fields.Integer('Attachments Count', compute='_compute_attachments_count')
+     tracking = fields.Selection(related='product_id.tracking')
+     manual_consumption = fields.Boolean(
+-        'Manual Consumption', default=False, compute='_compute_manual_consumption',
++        'Manual Consumption', default=False,
+         readonly=False, store=True, copy=True,
+         help="When activated, then the registration of consumption for that component is recorded manually exclusively.\n"
+              "If not activated, and any of the components consumption is edited manually on the manufacturing order, Odoo assumes manual consumption also.")
+-    manual_consumption_readonly = fields.Boolean(
+-        'Manual Consumption Readonly', compute='_compute_manual_consumption_readonly')
+ 
+     _sql_constraints = [
+         ('bom_qty_zero', 'CHECK (product_qty>=0)', 'All product quantities must be greater or equal to 0.\n'
+@@ -534,16 +532,6 @@ class MrpBomLine(models.Model):
+             'You should install the mrp_byproduct module if you want to manage extra products on BoMs!'),
+     ]
+ 
+-    @api.depends('product_id', 'tracking', 'operation_id')
+-    def _compute_manual_consumption(self):
+-        for line in self:
+-            line.manual_consumption = (line.tracking != 'none' or line.operation_id)
+-
+-    @api.depends('tracking', 'operation_id')
+-    def _compute_manual_consumption_readonly(self):
+-        for line in self:
+-            line.manual_consumption_readonly = (line.tracking != 'none' or line.operation_id)
+-
+     @api.depends('product_id', 'bom_id')
+     def _compute_child_bom_id(self):
+         products = self.product_id
+
+--- a/addons/mrp/models/mrp_production.py
++++ b/addons/mrp/models/mrp_production.py
+@@ -88,7 +88,6 @@ class MrpProduction(models.Model):
+         domain="[('code', '=', 'mrp_operation')]",
+         required=True, check_company=True, index=True)
+     use_create_components_lots = fields.Boolean(related='picking_type_id.use_create_components_lots')
+-    use_auto_consume_components_lots = fields.Boolean(related='picking_type_id.use_auto_consume_components_lots')
+     location_src_id = fields.Many2one(
+         'stock.location', 'Components Location',
+         compute='_compute_locations', store=True, check_company=True,
+@@ -795,7 +794,7 @@ class MrpProduction(models.Model):
+ 
+     @api.onchange('qty_producing', 'lot_producing_id')
+     def _onchange_producing(self):
+-        self._set_qty_producing()
++        self._set_qty_producing(False)
+ 
+     @api.onchange('lot_producing_id')
+     def _onchange_lot_producing(self):
+@@ -1191,7 +1190,7 @@ class MrpProduction(models.Model):
+             'warehouse_id': source_location.warehouse_id.id,
+             'group_id': self.procurement_group_id.id,
+             'propagate_cancel': self.propagate_cancel,
+-            'manual_consumption': self.env['stock.move']._determine_is_manual_consumption(product_id, self, bom_line),
++            'manual_consumption': self.env['stock.move']._determine_is_manual_consumption(bom_line),
+         }
+         return data
+ 
+@@ -1203,7 +1202,7 @@ class MrpProduction(models.Model):
+             origin = '%s,%s' % (origin, self.name)
+         return origin
+ 
+-    def _set_qty_producing(self):
++    def _set_qty_producing(self, pick_manual_consumption_moves=True):
+         if self.product_id.tracking == 'serial':
+             qty_producing_uom = self.product_uom_id._compute_quantity(self.qty_producing, self.product_id.uom_id, rounding_method='HALF-UP')
+             if qty_producing_uom != 1:
+@@ -1219,7 +1218,7 @@ class MrpProduction(models.Model):
+ 
+             new_qty = float_round((self.qty_producing - self.qty_produced) * move.unit_factor, precision_rounding=move.product_uom.rounding)
+             move._set_quantity_done(new_qty)
+-            if not move.manual_consumption:
++            if not move.manual_consumption or pick_manual_consumption_moves:
+                 move.picked = True
+ 
+     def _should_postpone_date_finished(self, date_finished):
+@@ -2093,6 +2092,7 @@ class MrpProduction(models.Model):
+         productions_auto = set()
+         for production in self:
+             if not float_is_zero(production.qty_producing, precision_rounding=production.product_uom_id.rounding):
++                production.move_raw_ids.filtered('manual_consumption').picked = True
+                 continue
+             if production._auto_production_checks():
+                 productions_auto.add(production.id)
+
+--- a/addons/mrp/models/stock_move.py
++++ b/addons/mrp/models/stock_move.py
+@@ -605,12 +605,11 @@ class StockMove(models.Model):
+ 
+     def _is_manual_consumption(self):
+         self.ensure_one()
+-        return self._determine_is_manual_consumption(self.product_id, self.raw_material_production_id, self.bom_line_id)
++        return self._determine_is_manual_consumption(self.bom_line_id)
+ 
+     @api.model
+-    def _determine_is_manual_consumption(self, product, production, bom_line):
+-        return (product.product_tmpl_id.tracking != 'none' and not production.use_auto_consume_components_lots) or \
+-               (product.product_tmpl_id.tracking == 'none' and bom_line and bom_line.manual_consumption)
++    def _determine_is_manual_consumption(self, bom_line):
++        return bom_line and bom_line.manual_consumption
+ 
+     def _get_relevant_state_among_moves(self):
+         res = super()._get_relevant_state_among_moves()
+
+--- a/addons/mrp/models/stock_picking.py
++++ b/addons/mrp/models/stock_picking.py
+@@ -21,10 +21,6 @@ class StockPickingType(models.Model):
+         help="Allow to create new lot/serial numbers for the components",
+         default=False,
+     )
+-    use_auto_consume_components_lots = fields.Boolean(
+-        string="Consume Reserved Lots/Serial Numbers automatically",
+-        help="Allow automatic consumption of tracked components that are reserved",
+-    )
+ 
+     auto_print_done_production_order = fields.Boolean(
+         "Auto Print Done Production Order",

@@ -1,0 +1,186 @@
+PR: https://github.com/odoo/odoo/pull/
+
+From: 2ddc35a5300e89981c0572ae6749aee946f34e9d
+From: Josse Colpaert
+Date: 2016-07-04 14:22:37
+
+Breaking data model changes score: 2, change matches:
+-    product_uom = fields.Many2one('product.uom', 'Product Unit of Measure', required=True)
+-    subproduct_type = fields.Selection([
+
+Total Changes: 81
+
+[REF][NEWPIE] mrp: new MRP
+
+This commit contains the core of the new MRP. It contains a whole refactoring
+of the MRP application, with improved and new features, written in new API.
+Among other here are the main manufacturing workflow improvements :
+
+ - Picking type not only for pickings but also for manufacturing orders
+ - Properties replaced by picking type
+ - BoM can only be produced with its routing (no other)
+ - Either produce without routing with only production orders, or produce with
+   routing
+ - By default, there is an order in the work orders (serially), but you can
+   override it to be able to work in parallel
+ - Time clocking on work orders and block time on work centers with reporting
+   on OEE, performance, losses, ...
+ - Real-time adaptation of timings on operations
+ - Lots/serial numbers can be inputted like in the pickings on manufacturing
+   orders.  It is also possible to input them in the work orders.
+ - Material availability independent of production order state (possibility to
+   start production when only part of it is there)
+ - Work sheets on work orders
+ - Put messages on work orders to make your workers pay attention to something
+ - Full traceability link to see for each produced piece of stock, the
+   consumed pieces, ...
+ - Separate scrap object (a scrap is not done based on an original move
+   anymore)
+ - Separate unbuild system (if you want to unbuild into its original
+   components)
+
+Thanks to all people that helped during this development, notably but not
+limited to Chirag A Dodiya (cod@odoo.com), Gaurav Panchal (gan@odoo.com),
+Jignesh Rathod (jir@odoo.com), Mansi Trivedi (mtr@odoo.com), Pariket Trivedi
+(ptr@odoo.com).
+
+================================= pseudo patch: =================================
+
+--- a/addons/mrp_byproduct/models/mrp_production.py
++++ b/addons/mrp_byproduct/models/mrp_production.py
+@@ -8,69 +8,35 @@ class Production(models.Model):
+     _description = 'Production'
+     _inherit = 'mrp.production'
+ 
++
+     @api.multi
+-    def action_confirm(self):
+-        """ Confirms production order and calculates quantity based on subproduct_type.
++    def _generate_moves(self):
++        """ Generates moves and work orders
+         @return: Newly generated picking Id.
+         """
++        # TDE FIXME: was action_confirm ?? -> refactored
+         Move = self.env['stock.move']
+-        picking_id = super(Production, self).action_confirm()
++        res = super(Production, self)._generate_moves()
+         UoM = self.env['product.uom']
+-        for production in self:
+-            if not production.bom_id:
+-                continue
++        for production in self.filtered(lambda production: production.bom_id):
+             source = production.product_id.property_stock_production.id
+             for sub_product in production.bom_id.sub_products:
+-                product_uom_factor = UoM._compute_qty_obj(production.product_uom, production.product_qty, production.bom_id.product_uom)
++                product_uom_factor = UoM._compute_qty_obj(production.product_uom_id, production.product_qty, production.bom_id.product_uom_id)
+                 qty1 = sub_product.product_qty
+-                if sub_product.subproduct_type == 'variable' and production.product_qty:
+-                    qty1 *= product_uom_factor / (production.bom_id.product_qty or 1.0)
++                qty1 *= product_uom_factor / production.bom_id.product_qty
+                 data = {
+                     'name': 'PROD:%s' % production.name,
+-                    'date': production.date_planned,
++                    'date': production.date_planned_start,
+                     'product_id': sub_product.product_id.id,
+                     'product_uom_qty': qty1,
+-                    'product_uom': sub_product.product_uom.id,
++                    'product_uom': sub_product.product_uom_id.id,
+                     'location_id': source,
+                     'location_dest_id': production.location_dest_id.id,
+-                    'move_dest_id': production.move_prod_id.id,
+                     'production_id': production.id,
+                     'origin': production.name,
++                    'unit_factor': qty1 / production.product_qty,
+                     'subproduct_id': sub_product.id
+                 }
+                 move = Move.create(data)
+                 move.action_confirm()
+-        return picking_id
+-
+-    @api.model
+-    def _get_subproduct_factor(self, move):
+-        """Compute the factor to compute the quantity of products to produce. By default,
+-            it's always equal to the quantity encoded in the production order or the production wizard, but with
+-            the module mrp_byproduct installed it can differ for byproducts having type 'variable'.
+-        :param move: Record set of stock move that needs to be produced, identify the product to produce.
+-        :return: The factor to apply to the quantity that we should produce for the given production order and stock move.
+-        """
+-        subproduct_record = move.subproduct_id
+-        if subproduct_record.subproduct_type == 'variable':
+-            if subproduct_record.bom_id.product_qty:
+-                subproduct_factor = subproduct_record.product_qty / subproduct_record.bom_id.product_qty
+-                return subproduct_factor
+-        return super(Production, self)._get_subproduct_factor(move)
+-
+-    @api.model
+-    def _calculate_produce_line_qty(self, move, quantity):
+-        """ Compute the quantity and remainig quantity of products to produce.
+-        :param move: stock.move record that needs to be produced, identify the product to produce.
+-        :param quantity: quantity to produce, in the uom of the production order.
+-        :return: The quantity and remaining quantity of product produce.
+-        """
+-        if move.subproduct_id.subproduct_type == 'variable':
+-            subproduct_factor = self._get_subproduct_factor(move)
+-            # Needed when producing more than maximum quantity
+-            qty = min(subproduct_factor * quantity, move.product_qty)
+-            remaining_qty = subproduct_factor * quantity - qty
+-            return qty, remaining_qty
+-        elif move.subproduct_id.subproduct_type == 'fixed':
+-            return move.product_qty, 0
+-        # no subproduct
+-        return super(Production, self)._calculate_produce_line_qty(move, quantity)
++        return res
+
+--- a/addons/mrp_byproduct/models/mrp_subproduct.py
++++ b/addons/mrp_byproduct/models/mrp_subproduct.py
+@@ -13,32 +13,23 @@ class MrpSubProduct(models.Model):
+     product_qty = fields.Float(
+         'Product Qty',
+         default=1.0, digits_compute=dp.get_precision('Product Unit of Measure'), required=True)
+-    product_uom = fields.Many2one('product.uom', 'Product Unit of Measure', required=True)
+-    subproduct_type = fields.Selection([
+-        ('fixed', 'Fixed'),
+-        ('variable', 'Variable')], string='Quantity Type',
+-        default='variable', required=True,
+-        help="Define how the quantity of byproducts will be set on the production orders using this BoM.\n"
+-             "'Fixed' depicts a situation where the quantity of created byproduct is always equal to the "
+-             " quantity set on the BoM, regardless of how many are created in the production order.\n"
+-             "By opposition, 'Variable' means that the quantity will be computed as (quantity of byproduct "
+-             "set on the BoM / quantity of manufactured product set on the BoM * quantity of manufactured "
+-             "product in the production order.)")
++    product_uom_id = fields.Many2one('product.uom', 'Unit of Measure', required=True)
+     bom_id = fields.Many2one('mrp.bom', 'BoM', ondelete='cascade')
++    operation_id = fields.Many2one('mrp.routing.workcenter', 'Produced at Operation')
+ 
+     @api.onchange('product_id')
+     def onchange_product_id(self):
+         """ Changes UoM if product_id changes. """
+         if self.product_id:
+-            self.product_uom = self.product_id.uom_id.id
++            self.product_uom_id = self.product_id.uom_id.id
+ 
+-    @api.onchange('product_uom')
++    @api.onchange('product_uom_id')
+     def onchange_uom(self):
+         res = {}
+-        if self.product_uom and self.product_id and self.product_uom.category_id != self.product_id.uom_id.category_id:
++        if self.product_uom_id and self.product_id and self.product_uom_id.category_id != self.product_id.uom_id.category_id:
+             res['warning'] = {
+                 'title': _('Warning'),
+                 'message': _('The Product Unit of Measure you chose has a different category than in the product form.')
+             }
+-            self.product_uom = self.product_id.uom_id.id
++            self.product_uom_id = self.product_id.uom_id.id
+         return res
+
+--- a/addons/mrp_byproduct/models/stock_move.py
++++ b/addons/mrp_byproduct/models/stock_move.py
+@@ -1,7 +1,7 @@
+ # -*- coding: utf-8 -*-
+ # Part of Odoo. See LICENSE file for full copyright and licensing details.
+ 
+-from openerp import fields, models
++from odoo import fields, models
+ 
+ 
+ class Stok_Move(models.Model):

@@ -1,0 +1,985 @@
+PR: https://github.com/odoo/odoo/pull/98914
+
+From: 7e3403068fc3fbc40182b3cfeb80e97a9300e8ff
+From: gawa-odoo
+Date: 2022-09-20 10:36:01
+
+Breaking data model changes score: 21, change matches:
+-    sequence = fields.Integer(string='Sequence', help="Gives the sequence order when displaying a list of analytic distribution")
+-    analytic_id = fields.Many2one('account.analytic.account', string='Analytic Account')
+-    analytic_tag_ids = fields.Many2many('account.analytic.tag', string='Analytic Tags')
+-    account_id = fields.Many2one('account.account', string='Account', ondelete='cascade', help="Select an accounting account which will use analytic account specified in analytic default (e.g. create new customer invoice or Sales order if we select this account, it will automatically take this as an analytic account)")
+-    user_id = fields.Many2one('res.users', string='User', ondelete='cascade', help="Select a user which will use analytic account specified in analytic default.")
+-    company_id = fields.Many2one('res.company', string='Company', ondelete='cascade', help="Select a company which will use analytic account specified in analytic default (e.g. create new customer invoice or Sales order if we select this company, it will automatically take this as an analytic account)")
+-    date_start = fields.Date(string='Start Date', help="Default start date for this Analytic Account.")
+-    date_stop = fields.Date(string='End Date', help="Default end date for this Analytic Account.")
+-    _inherit = 'account.analytic.account'
+-    invoice_count = fields.Integer("Invoice Count", compute='_compute_invoice_count')
+-    vendor_bill_count = fields.Integer("Vendor Bill Count", compute='_compute_vendor_bill_count')
+-    _inherit = 'account.analytic.tag'
+-    move_id = fields.Many2one('account.move.line', string='Journal Item', ondelete='cascade', index=True, check_company=True)
+-    analytic_account_id = fields.Many2one(
+-    analytic_tag_ids = fields.Many2many(
+-    analytic_account_id = fields.Many2one('account.analytic.account', string='Analytic Account', ondelete='set null', check_company=True)
+-    analytic_tag_ids = fields.Many2many('account.analytic.tag', string='Analytic Tags', check_company=True,
+-    group_analytic_tags = fields.Boolean(string='Analytic Tags', implied_group='analytic.group_analytic_tags')
+
+Total Changes: 601
+
+[REF] *: Analytic Apocalypse
+
+The goal of this commit is to get rid of the analytic tags as they were confusing, serving tag purposes as well as distribution on analytic accounts.
+
+Everywhere analytic tags were used as a distribution have been replaced with a new widget that will dispatch distribution on analytic accounts. If there was an analytic account field next to the tags, it has been included in the distribution.
+
+Analytic tags that were used simply as information tags have been removed.
+
+To fill the new widget, there are now 2 kind of rules that will help fill and prefill it.
+The first are applicability: previous groups have been removed, and have by replaced by plans. Each account is required to have a plan. These plans define when they are available in the widget: a default applicability per plan and applicability lines that can specify rules following the context of the widget.
+
+The second one are distribution models, that will replace previous default rules but follow the same principles. The accounts (and so the plans) that will be given by the distribution model can override the applicability rules from before.
+
+closes odoo/odoo#98914
+
+Related: odoo/upgrade#3885
+Related: odoo/enterprise#30743
+Signed-off-by: William André (wan) <wan@odoo.com>
+Co-authored-by: Habib (ayh) <ayh@odoo.com>
+
+================================= pseudo patch: =================================
+
+--- a/addons/account/models/__init__.py
++++ b/addons/account/models/__init__.py
+@@ -12,13 +12,15 @@ from . import account_payment_term
+ from . import account_move
+ from . import account_move_line
+ from . import account_move_line_tax_details
+-from . import account_analytic_default
+ from . import account_partial_reconcile
+ from . import account_full_reconcile
+ from . import account_payment
+ from . import account_payment_method
+ from . import account_bank_statement
+ from . import chart_template
++from . import account_analytic_account
++from . import account_analytic_distribution_model
++from . import account_analytic_plan
+ from . import account_analytic_line
+ from . import account_journal_dashboard
+ from . import product
+
+--- a/None
++++ b/addons/account/models/account_analytic_account.py
+@@ -0,0 +1,64 @@
++# -*- coding: utf-8 -*-
++
++from odoo import api, fields, models
++
++
++class AccountAnalyticAccount(models.Model):
++    _inherit = 'account.analytic.account'
++
++    invoice_count = fields.Integer(
++        "Invoice Count",
++        compute='_compute_invoice_count',
++    )
++    vendor_bill_count = fields.Integer(
++        "Vendor Bill Count",
++        compute='_compute_vendor_bill_count',
++    )
++
++    @api.depends('line_ids')
++    def _compute_invoice_count(self):
++        sale_types = self.env['account.move'].get_sale_types(include_receipts=True)
++        domain = [
++            ('move_line_id.move_id.move_type', 'in', sale_types),
++            ('account_id', 'in', self.ids)
++        ]
++        groups = self.env['account.analytic.line']._read_group(domain, ['move_line_id.move_id:count_distinct'], ['account_id'])
++        moves_count_mapping = dict((g['account_id'][0], g['account_id_count']) for g in groups)
++        for account in self:
++            account.invoice_count = moves_count_mapping.get(account.id, 0)
++
++    @api.depends('line_ids')
++    def _compute_vendor_bill_count(self):
++        purchase_types = self.env['account.move'].get_purchase_types(include_receipts=True)
++        domain = [
++            ('move_line_id.move_id.move_type', 'in', purchase_types),
++            ('account_id', 'in', self.ids)
++        ]
++        groups = self.env['account.analytic.line']._read_group(domain, ['move_line_id.move_id:count_distinct'], ['account_id'])
++        moves_count_mapping = dict((g['account_id'][0], g['account_id_count']) for g in groups)
++        for account in self:
++            account.vendor_bill_count = moves_count_mapping.get(account.id, 0)
++
++    def action_view_invoice(self):
++        self.ensure_one()
++        result = {
++            "type": "ir.actions.act_window",
++            "res_model": "account.move",
++            "domain": [('line_ids.analytic_distribution_stored_char', '=ilike', f'%"{self.id}":%'), ('move_type', 'in', self.env['account.move'].get_sale_types())],
++            "context": {"create": False},
++            "name": "Customer Invoices",
++            'view_mode': 'tree,form',
++        }
++        return result
++
++    def action_view_vendor_bill(self):
++        self.ensure_one()
++        result = {
++            "type": "ir.actions.act_window",
++            "res_model": "account.move",
++            "domain": [('line_ids.analytic_distribution_stored_char', '=ilike', f'%"{self.id}":%'), ('move_type', 'in', self.env['account.move'].get_purchase_types())],
++            "context": {"create": False},
++            "name": "Vendor Bills",
++            'view_mode': 'tree,form',
++        }
++        return result
+
+--- a/addons/account/models/account_analytic_default.py
++++ b/None
+@@ -1,68 +0,0 @@
+-# -*- coding: utf-8 -*-
+-# Part of Odoo. See LICENSE file for full copyright and licensing details.
+-
+-from odoo import api, fields, models, _
+-from odoo.exceptions import ValidationError
+-
+-
+-class AccountAnalyticDefault(models.Model):
+-    _name = "account.analytic.default"
+-    _description = "Analytic Distribution"
+-    _rec_name = "analytic_id"
+-    _order = "sequence"
+-
+-    sequence = fields.Integer(string='Sequence', help="Gives the sequence order when displaying a list of analytic distribution")
+-    analytic_id = fields.Many2one('account.analytic.account', string='Analytic Account')
+-    analytic_tag_ids = fields.Many2many('account.analytic.tag', string='Analytic Tags')
+-    product_id = fields.Many2one('product.product', string='Product', ondelete='cascade', help="Select a product which will use analytic account specified in analytic default (e.g. create new customer invoice or Sales order if we select this product, it will automatically take this as an analytic account)")
+-    partner_id = fields.Many2one('res.partner', string='Partner', ondelete='cascade', help="Select a partner which will use analytic account specified in analytic default (e.g. create new customer invoice or Sales order if we select this partner, it will automatically take this as an analytic account)")
+-    account_id = fields.Many2one('account.account', string='Account', ondelete='cascade', help="Select an accounting account which will use analytic account specified in analytic default (e.g. create new customer invoice or Sales order if we select this account, it will automatically take this as an analytic account)")
+-    user_id = fields.Many2one('res.users', string='User', ondelete='cascade', help="Select a user which will use analytic account specified in analytic default.")
+-    company_id = fields.Many2one('res.company', string='Company', ondelete='cascade', help="Select a company which will use analytic account specified in analytic default (e.g. create new customer invoice or Sales order if we select this company, it will automatically take this as an analytic account)")
+-    date_start = fields.Date(string='Start Date', help="Default start date for this Analytic Account.")
+-    date_stop = fields.Date(string='End Date', help="Default end date for this Analytic Account.")
+-
+-    @api.constrains('analytic_id', 'analytic_tag_ids')
+-    def _check_account_or_tags(self):
+-        if any(not default.analytic_id
+-               and not any(tag.analytic_distribution_ids for tag in default.analytic_tag_ids)
+-               for default in self
+-               ):
+-            raise ValidationError(_('An analytic default requires an analytic account or an analytic tag used for analytic distribution.'))
+-
+-    @api.model
+-    def account_get(self, product_id=None, partner_id=None, account_id=None, user_id=None, date=None, company_id=None):
+-        domain = []
+-        if product_id:
+-            domain += ['|', ('product_id', '=', product_id)]
+-        domain += [('product_id', '=', False)]
+-        if partner_id:
+-            domain += ['|', ('partner_id', '=', partner_id)]
+-        domain += [('partner_id', '=', False)]
+-        if account_id:
+-            domain += ['|', ('account_id', '=', account_id)]
+-        domain += [('account_id', '=', False)]
+-        if company_id:
+-            domain += ['|', ('company_id', '=', company_id)]
+-        domain += [('company_id', '=', False)]
+-        if user_id:
+-            domain += ['|', ('user_id', '=', user_id)]
+-        domain += [('user_id', '=', False)]
+-        if date:
+-            domain += ['|', ('date_start', '<=', date), ('date_start', '=', False)]
+-            domain += ['|', ('date_stop', '>=', date), ('date_stop', '=', False)]
+-        best_index = -1
+-        res = self.env['account.analytic.default']
+-        for rec in self.search(domain):
+-            index = 0
+-            if rec.product_id: index += 1
+-            if rec.partner_id: index += 1
+-            if rec.account_id: index += 1
+-            if rec.company_id: index += 1
+-            if rec.user_id: index += 1
+-            if rec.date_start: index += 1
+-            if rec.date_stop: index += 1
+-            if index > best_index:
+-                res = rec
+-                best_index = index
+-        return res
+
+--- a/None
++++ b/addons/account/models/account_analytic_distribution_model.py
+@@ -0,0 +1,37 @@
++# -*- coding: utf-8 -*-
++
++from odoo import fields, models
++
++
++class AccountAnalyticDistributionModel(models.Model):
++    _inherit = 'account.analytic.distribution.model'
++
++    account_prefix = fields.Char(
++        string='Financial Accounts Prefix',
++        help="Prefix that defines which accounts from the financial accounting this model should apply on.",
++    )
++    product_id = fields.Many2one(
++        'product.product',
++        string='Product',
++        ondelete='cascade',
++        help="Select a product for which the analytic distribution will be used (e.g. create new customer invoice or Sales order if we select this product, it will automatically take this as an analytic account)",
++    )
++    product_categ_id = fields.Many2one(
++        'product.category',
++        string='Product Category',
++        ondelete='cascade',
++        help="Select a product category which will use analytic account specified in analytic default (e.g. create new customer invoice or Sales order if we select this product, it will automatically take this as an analytic account)",
++    )
++
++    def _create_domain(self, fname, value):
++        if not fname == 'account_prefix':
++            return super()._create_domain(fname, value)
++
++    def _check_score(self, key, value):
++        if key == 'account_prefix':
++            if value.startswith(self.account_prefix):
++                return 1
++            else:
++                return -1
++        else:
++            return super()._check_score(key, value)
+
+--- a/addons/account/models/account_analytic_line.py
++++ b/addons/account/models/account_analytic_line.py
+@@ -1,129 +1,61 @@
+ # -*- coding: utf-8 -*-
+ 
+ from odoo import api, fields, models, _
+-from odoo.exceptions import UserError
+-
+-
+-class AccountAnalyticAccount(models.Model):
+-    _inherit = 'account.analytic.account'
+-
+-    invoice_count = fields.Integer("Invoice Count", compute='_compute_invoice_count')
+-    vendor_bill_count = fields.Integer("Vendor Bill Count", compute='_compute_vendor_bill_count')
+-
+-    @api.constrains('company_id')
+-    def _check_company_consistency(self):
+-        analytic_accounts = self.filtered('company_id')
+-
+-        if not analytic_accounts:
+-            return
+-
+-        self.flush_recordset(['company_id'])
+-        self.env['account.move.line'].flush_model(['analytic_account_id', 'company_id'])
+-        self._cr.execute('''
+-            SELECT line.id
+-            FROM account_move_line line
+-            JOIN account_analytic_account account ON account.id = line.analytic_account_id
+-            WHERE line.analytic_account_id IN %s
+-            AND line.company_id != account.company_id
+-        ''', [tuple(analytic_accounts.ids)])
+-
+-        if self._cr.fetchone():
+-            raise UserError(_("You can't set a different company on your analytic account since there are some journal items linked to it."))
+-
+-    @api.depends('line_ids')
+-    def _compute_invoice_count(self):
+-        sale_types = self.env['account.move'].get_sale_types()
+-        domain = [
+-            ('move_id.state', '=', 'posted'),
+-            ('move_id.move_type', 'in', sale_types),
+-            ('analytic_account_id', 'in', self.ids)
+-        ]
+-        groups = self.env['account.move.line']._read_group(domain, ['move_id:count_distinct'], ['analytic_account_id'])
+-        moves_count_mapping = dict((g['analytic_account_id'][0], g['move_id']) for g in groups)
+-        for account in self:
+-            account.invoice_count = moves_count_mapping.get(account.id, 0)
+-
+-    @api.depends('line_ids')
+-    def _compute_vendor_bill_count(self):
+-        purchase_types = self.env['account.move'].get_purchase_types()
+-        domain = [
+-            ('move_id.state', '=', 'posted'),
+-            ('move_id.move_type', 'in', purchase_types),
+-            ('analytic_account_id', 'in', self.ids)
+-        ]
+-        groups = self.env['account.move.line']._read_group(domain, ['move_id:count_distinct'], ['analytic_account_id'])
+-        moves_count_mapping = dict((g['analytic_account_id'][0], g['move_id']) for g in groups)
+-        for account in self:
+-            account.vendor_bill_count = moves_count_mapping.get(account.id, 0)
+-
+-    def action_view_invoice(self):
+-        self.ensure_one()
+-        result = {
+-            "type": "ir.actions.act_window",
+-            "res_model": "account.move",
+-            "domain": [('id', 'in', self.line_ids.move_id.move_id.ids), ('move_type', 'in', self.env['account.move'].get_sale_types())],
+-            "context": {"create": False},
+-            "name": "Customer Invoices",
+-            'view_mode': 'tree,form',
+-        }
+-        return result
+-
+-    def action_view_vendor_bill(self):
+-        self.ensure_one()
+-        result = {
+-            "type": "ir.actions.act_window",
+-            "res_model": "account.move",
+-            "domain": [('id', 'in', self.line_ids.move_id.move_id.ids), ('move_type', 'in', self.env['account.move'].get_purchase_types())],
+-            "context": {"create": False},
+-            "name": "Vendor Bills",
+-            'view_mode': 'tree,form',
+-        }
+-        return result
+-
+-class AccountAnalyticTag(models.Model):
+-    _inherit = 'account.analytic.tag'
+-
+-    @api.constrains('company_id')
+-    def _check_company_consistency(self):
+-        analytic_tags = self.filtered('company_id')
+-
+-        if not analytic_tags:
+-            return
+-
+-        self.flush_recordset(['company_id'])
+-        self.env['account.move.line'].flush_model(['company_id'])
+-        self._cr.execute('''
+-            SELECT line.id
+-            FROM account_analytic_tag_account_move_line_rel tag_rel
+-            JOIN account_analytic_tag tag ON tag.id = tag_rel.account_analytic_tag_id
+-            JOIN account_move_line line ON line.id = tag_rel.account_move_line_id
+-            WHERE tag_rel.account_analytic_tag_id IN %s
+-            AND line.company_id != tag.company_id
+-        ''', [tuple(analytic_tags.ids)])
+-
+-        if self._cr.fetchone():
+-            raise UserError(_("You can't set a different company on your analytic tags since there are some journal items linked to it."))
+ 
+ 
+ class AccountAnalyticLine(models.Model):
+     _inherit = 'account.analytic.line'
+     _description = 'Analytic Line'
+ 
+-    product_id = fields.Many2one('product.product', string='Product', check_company=True)
+-    general_account_id = fields.Many2one('account.account', string='Financial Account', ondelete='restrict', readonly=True,
+-                                         related='move_id.account_id', store=True, domain="[('deprecated', '=', False), ('company_id', '=', company_id)]",
+-                                         compute_sudo=True)
+-    move_id = fields.Many2one('account.move.line', string='Journal Item', ondelete='cascade', index=True, check_company=True)
++    product_id = fields.Many2one(
++        'product.product',
++        string='Product',
++        check_company=True,
++    )
++    general_account_id = fields.Many2one(
++        'account.account',
++        string='Financial Account',
++        ondelete='restrict',
++        domain="[('deprecated', '=', False), ('company_id', '=', company_id)]",
++        readonly=True,
++        related='move_line_id.account_id',
++        store=True,
++        compute_sudo=True,
++    )
++    journal_id = fields.Many2one(
++        'account.journal',
++        string='Financial Journal',
++        check_company=True,
++        readonly=True,
++        related='move_line_id.journal_id',
++        store=True,
++    )
++    partner_id = fields.Many2one(
++        readonly=False,
++        compute="_compute_partner_id",
++        store=True,
++    )
++    move_line_id = fields.Many2one(
++        'account.move.line',
++        string='Journal Item',
++        ondelete='cascade',
++        index=True,
++        check_company=True,
++    )
+     code = fields.Char(size=8)
+     ref = fields.Char(string='Ref.')
+     category = fields.Selection(selection_add=[('invoice', 'Customer Invoice'), ('vendor_bill', 'Vendor Bill')])
+ 
++    @api.depends('move_line_id')
++    def _compute_partner_id(self):
++        for line in self:
++            line.partner_id = line.move_line_id.partner_id or line.partner_id
++
+     @api.onchange('product_id', 'product_uom_id', 'unit_amount', 'currency_id')
+     def on_change_unit_amount(self):
+         if not self.product_id:
+             return {}
+ 
+-        result = 0.0
+         prod_accounts = self.product_id.product_tmpl_id.with_company(self.company_id)._get_product_accounts()
+         unit = self.product_uom_id
+         account = prod_accounts['expense']
+
+--- a/None
++++ b/addons/account/models/account_analytic_plan.py
+@@ -0,0 +1,35 @@
++# -*- coding: utf-8 -*-
++
++from odoo import fields, models
++
++
++class AccountAnalyticApplicability(models.Model):
++    _inherit = 'account.analytic.applicability'
++    _description = "Analytic Plan's Applicabilities"
++
++    account_prefix = fields.Char(
++        string='Financial Accounts Prefix',
++        help="Prefix that defines which accounts from the financial accounting this applicability should apply on.",
++    )
++    product_categ_id = fields.Many2one(
++        'product.category',
++        string='Product Category'
++    )
++
++    def _get_score(self, **kwargs):
++        score = super(AccountAnalyticApplicability, self)._get_score(**kwargs)
++        if score == -1:
++            return -1
++        product = self.env['product.product'].browse(kwargs.get('product', None))
++        account = self.env['account.account'].browse(kwargs.get('account', None))
++        if account and self.account_prefix:
++            if account.code.startswith(self.account_prefix):
++                score += 1
++            else:
++                return -1
++        if product and self.product_categ_id:
++            if product.categ_id == self.product_categ_id:
++                score += 1
++            else:
++                return -1
++        return score
+
+--- a/addons/account/models/account_move.py
++++ b/addons/account/models/account_move.py
+@@ -1203,12 +1203,6 @@ class AccountMove(models.Model):
+                         taxes = None
+                         if grouping_dict.get('tax_ids'):
+                             taxes = self.env['account.tax'].browse(grouping_dict['tax_ids'][0][2])
+-                        analytic_account = None
+-                        if grouping_dict.get('analytic_account_id'):
+-                            analytic_account = self.env['account.analytic.account'].browse(grouping_dict['analytic_account_id'])
+-                        analytic_tags = None
+-                        if grouping_dict.get('analytic_tag_ids'):
+-                            analytic_tags = self.env['account.analytic.tag'].browse(grouping_dict['analytic_tag_ids'][0][2])
+ 
+                         kwargs['base_lines'].append(self.env['account.tax']._convert_to_tax_base_line_dict(
+                             None,
+@@ -1218,8 +1212,7 @@ class AccountMove(models.Model):
+                             price_unit=values['price_subtotal'],
+                             quantity=1.0,
+                             account=self.env['account.account'].browse(grouping_dict['account_id']),
+-                            analytic_account=analytic_account,
+-                            analytic_tags=analytic_tags,
++                            analytic_distribution=values.get('analytic_distribution'),
+                             price_subtotal=values['price_subtotal'],
+                             is_refund=move.move_type in ('out_refund', 'in_refund'),
+                             handle_price_include=False,
+@@ -1520,7 +1513,7 @@ class AccountMove(models.Model):
+     def _inverse_partner_id(self):
+         for invoice in self:
+             if invoice.is_invoice(True):
+-                for line in invoice.line_ids:
++                for line in invoice.line_ids + invoice.invoice_line_ids:
+                     if line.partner_id != invoice.commercial_partner_id:
+                         line.partner_id = invoice.commercial_partner_id
+                         line._inverse_partner_id()
+@@ -2789,8 +2782,7 @@ class AccountMove(models.Model):
+                             'partner_id': base_line['partner'].id,
+                             'currency_id': base_line['currency'].id,
+                             'account_id': cash_discount_account.id,
+-                            'analytic_account_id': base_line['analytic_account'].id,
+-                            'analytic_tag_ids': [Command.set(base_line['analytic_tags'].ids)],
++                            'analytic_distribution': base_line['analytic_distribution'],
+                         }
+                         base_detail = resulting_delta_base_details.setdefault(frozendict(grouping_dict), {
+                             'balance': 0.0,
+@@ -2841,8 +2833,7 @@ class AccountMove(models.Model):
+                         'account_id': tax_detail['account_id'],
+                         'partner_id': tax_detail['partner_id'],
+                         'currency_id': tax_detail['currency_id'],
+-                        'analytic_account_id': tax_detail['analytic_account_id'],
+-                        'analytic_tag_ids': tax_detail['analytic_tag_ids'],
++                        'analytic_distribution': tax_detail['analytic_distribution'],
+                         'tax_repartition_line_id': tax_rep.id,
+                         'tax_ids': tax_detail['tax_ids'],
+                         'tax_tag_ids': tax_detail['tax_tag_ids'],
+@@ -3245,7 +3236,7 @@ class AccountMove(models.Model):
+                 move.date = move._get_accounting_date(move.invoice_date or move.date, affects_tax_report)
+ 
+         # Create the analytic lines in batch is faster as it leads to less cache invalidation.
+-        to_post.mapped('line_ids').create_analytic_lines()
++        to_post.mapped('line_ids')._create_analytic_lines()
+         to_post.write({
+             'state': 'posted',
+             'posted_before': True,
+
+--- a/addons/account/models/account_move_line.py
++++ b/addons/account/models/account_move_line.py
+@@ -6,7 +6,7 @@ from functools import lru_cache
+ 
+ from odoo import api, fields, models, Command, _
+ from odoo.exceptions import ValidationError, UserError
+-from odoo.tools import frozendict, formatLang, format_date
++from odoo.tools import frozendict, formatLang, format_date, float_is_zero
+ from odoo.tools.sql import create_index
+ from odoo.addons.web.controllers.utils import clean_action
+ 
+@@ -15,6 +15,7 @@ INTEGRITY_HASH_LINE_FIELDS = ('debit', 'credit', 'account_id', 'partner_id')
+ 
+ class AccountMoveLine(models.Model):
+     _name = "account.move.line"
++    _inherit = 'analytic.mixin'
+     _description = "Journal Item"
+     _order = "date desc, move_name desc, sequence, id"
+     _check_company_auto = True
+@@ -346,24 +347,9 @@ class AccountMoveLine(models.Model):
+ 
+     # === Analytic fields === #
+     analytic_line_ids = fields.One2many(
+-        comodel_name='account.analytic.line', inverse_name='move_id',
++        comodel_name='account.analytic.line', inverse_name='move_line_id',
+         string='Analytic lines',
+     )
+-    analytic_account_id = fields.Many2one(
+-        comodel_name='account.analytic.account',
+-        string='Analytic Account',
+-        compute="_compute_analytic_account_id", store=True, readonly=False,
+-        index='btree_not_null',
+-        check_company=True,
+-        copy=True,
+-    )
+-    analytic_tag_ids = fields.Many2many(
+-        comodel_name='account.analytic.tag',
+-        string='Analytic Tags',
+-        compute="_compute_analytic_tag_ids", store=True, readonly=False,
+-        check_company=True,
+-        copy=True,
+-    )
+ 
+     # === Early Pay fields === #
+     discount_date = fields.Date(
+@@ -893,7 +879,7 @@ class AccountMoveLine(models.Model):
+ 
+         return tax_ids
+ 
+-    @api.depends('tax_ids', 'currency_id', 'partner_id', 'account_id', 'group_tax_id', 'analytic_tag_ids', 'analytic_account_id')
++    @api.depends('tax_ids', 'currency_id', 'partner_id', 'account_id', 'group_tax_id', 'analytic_distribution')
+     def _compute_tax_key(self):
+         for line in self:
+             if line.tax_repartition_line_id:
+@@ -902,8 +888,7 @@ class AccountMoveLine(models.Model):
+                     'group_tax_id': line.group_tax_id.id,
+                     'account_id': line.account_id.id,
+                     'currency_id': line.currency_id.id,
+-                    'analytic_tag_ids': [(6, 0, line.analytic_tag_ids.ids or [])],
+-                    'analytic_account_id': line.analytic_account_id.id,
++                    'analytic_distribution': line.analytic_distribution,
+                     'tax_ids': [(6, 0, line.tax_ids.ids)],
+                     'tax_tag_ids': [(6, 0, line.tax_tag_ids.ids)],
+                     'partner_id': line.partner_id.id,
+@@ -912,7 +897,7 @@ class AccountMoveLine(models.Model):
+             else:
+                 line.tax_key = frozendict({'id': line.id})
+ 
+-    @api.depends('tax_ids', 'currency_id', 'partner_id', 'analytic_tag_ids', 'analytic_account_id', 'balance', 'partner_id', 'move_id.partner_id', 'price_unit')
++    @api.depends('tax_ids', 'currency_id', 'partner_id', 'analytic_distribution', 'balance', 'partner_id', 'move_id.partner_id', 'price_unit')
+     def _compute_all_tax(self):
+         for line in self:
+             sign = line.move_id.direction_sign
+@@ -955,8 +940,7 @@ class AccountMoveLine(models.Model):
+                     'group_tax_id': tax['group'] and tax['group'].id or False,
+                     'account_id': tax['account_id'] or line.account_id.id,
+                     'currency_id': line.currency_id.id,
+-                    'analytic_tag_ids': [(6, 0, tax['analytic'] and line.analytic_tag_ids.ids or [])],
+-                    'analytic_account_id': tax['analytic'] and line.analytic_account_id.id,
++                    'analytic_distribution': tax['analytic'] and line.analytic_distribution,
+                     'tax_ids': [(6, 0, tax['tax_ids'])],
+                     'tax_tag_ids': [(6, 0, tax['tag_ids'])],
+                     'partner_id': line.move_id.partner_id.id or line.partner_id.id,
+@@ -981,8 +965,7 @@ class AccountMoveLine(models.Model):
+             if line.display_type == 'epd' and line.company_id.early_pay_discount_computation == 'mixed':
+                 line.epd_key = frozendict({
+                     'account_id': line.account_id.id,
+-                    'analytic_account_id': line.analytic_account_id.id,
+-                    'analytic_tag_ids': [Command.set(line.analytic_tag_ids.ids)],
++                    'analytic_distribution': line.analytic_distribution,
+                     'tax_ids': [Command.set(line.tax_ids.ids)],
+                     'tax_tag_ids': [Command.set(line.tax_tag_ids.ids)],
+                     'move_id': line.move_id.id,
+@@ -990,7 +973,7 @@ class AccountMoveLine(models.Model):
+             else:
+                 line.epd_key = False
+ 
+-    @api.depends('move_id.needed_terms', 'account_id', 'analytic_account_id', 'analytic_tag_ids', 'tax_ids', 'tax_tag_ids', 'company_id')
++    @api.depends('move_id.needed_terms', 'account_id', 'analytic_distribution', 'tax_ids', 'tax_tag_ids', 'company_id')
+     def _compute_epd_needed(self):
+         for line in self:
+             line.epd_dirty = True
+@@ -1013,8 +996,7 @@ class AccountMoveLine(models.Model):
+                     frozendict({
+                         'move_id': line.move_id.id,
+                         'account_id': line.account_id.id,
+-                        'analytic_account_id': line.analytic_account_id.id,
+-                        'analytic_tag_ids': [Command.set(line.analytic_tag_ids.ids)],
++                        'analytic_distribution': line.analytic_distribution,
+                         'tax_ids': [Command.set(line.tax_ids.ids)],
+                         'tax_tag_ids': [Command.set(line.tax_tag_ids.ids)],
+                         'display_type': 'epd',
+@@ -1076,35 +1058,19 @@ class AccountMoveLine(models.Model):
+             else:
+                 line.term_key = False
+ 
+-    @api.depends('product_id', 'account_id', 'partner_id', 'date')
+-    def _compute_analytic_account_id(self):
+-        for record in self:
+-            if record.display_type == 'product' or not record.move_id.is_invoice(include_receipts=True):
+-                rec = self.env['account.analytic.default'].account_get(
+-                    product_id=record.product_id.id,
+-                    partner_id=record.partner_id.commercial_partner_id.id or record.move_id.partner_id.commercial_partner_id.id,
+-                    account_id=record.account_id.id,
+-                    user_id=record.env.uid,
+-                    date=record.date,
+-                    company_id=record.move_id.company_id.id
+-                )
+-                if rec:
+-                    record.analytic_account_id = rec.analytic_id
+-
+-    @api.depends('product_id', 'account_id', 'partner_id', 'date')
+-    def _compute_analytic_tag_ids(self):
+-        for record in self:
+-            if record.display_type == 'product' or not record.move_id.is_invoice(include_receipts=True):
+-                rec = self.env['account.analytic.default'].account_get(
+-                    product_id=record.product_id.id,
+-                    partner_id=record.partner_id.commercial_partner_id.id or record.move_id.partner_id.commercial_partner_id.id,
+-                    account_id=record.account_id.id,
+-                    user_id=record.env.uid,
+-                    date=record.date,
+-                    company_id=record.move_id.company_id.id
+-                )
+-                if rec:
+-                    record.analytic_tag_ids = rec.analytic_tag_ids
++    @api.depends('account_id', 'partner_id', 'product_id')
++    def _compute_analytic_distribution_stored_char(self):
++        for line in self:
++            distribution = self.env['account.analytic.distribution.model']._get_distributionjson({
++                "product_id": line.product_id.id,
++                "product_categ_id": line.product_id.categ_id.id,
++                "partner_id": line.partner_id.id,
++                "partner_category_id": line.partner_id.category_id.ids,
++                "account_prefix": line.account_id.code,
++                "company_id": line.company_id.id,
++            })
++            line.analytic_distribution_stored_char = distribution or line.analytic_distribution_stored_char
++            line._compute_analytic_distribution()
+ 
+     # -------------------------------------------------------------------------
+     # INVERSE METHODS
+@@ -1134,6 +1100,16 @@ class AccountMoveLine(models.Model):
+         for line in self:
+             line.balance = line.debit - line.credit
+ 
++    @api.onchange('analytic_distribution')
++    def _inverse_analytic_distribution(self):
++        """ Unlink and recreate analytic_lines when modifying the distribution."""
++        super()._inverse_analytic_distribution()
++        lines_to_modify = self.env['account.move.line'].browse([
++            line.id for line in self if line.parent_state == "posted"
++        ])
++        lines_to_modify.analytic_line_ids.unlink()
++        lines_to_modify._create_analytic_lines()
++
+     # -------------------------------------------------------------------------
+     # ONCHANGE METHODS
+     # -------------------------------------------------------------------------
+@@ -2334,88 +2310,60 @@ class AccountMoveLine(models.Model):
+     # ANALYTIC
+     # -------------------------------------------------------------------------
+ 
+-    def _prepare_analytic_line(self):
+-        """ Prepare the values used to create() an account.analytic.line upon validation of an account.move.line having
+-            an analytic account. This method is intended to be extended in other modules.
+-            :return list of values to create analytic.line
+-            :rtype list
++    def _create_analytic_lines(self):
++        """ Create analytic items upon validation of an account.move.line having an analytic distribution.
+         """
+-        result = []
+-        for move_line in self:
+-            amount = (move_line.credit or 0.0) - (move_line.debit or 0.0)
+-            default_name = move_line.name or (move_line.ref or '/' + ' -- ' + (move_line.partner_id and move_line.partner_id.name or '/'))
+-            category = 'other'
+-            if move_line.move_id.is_sale_document():
+-                category = 'invoice'
+-            elif move_line.move_id.is_purchase_document():
+-                category = 'vendor_bill'
+-            result.append({
+-                'name': default_name,
+-                'date': move_line.date,
+-                'account_id': move_line.analytic_account_id.id,
+-                'group_id': move_line.analytic_account_id.group_id.id,
+-                'tag_ids': [(6, 0, move_line._get_analytic_tag_ids())],
+-                'unit_amount': move_line.quantity,
+-                'product_id': move_line.product_id and move_line.product_id.id or False,
+-                'product_uom_id': move_line.product_uom_id and move_line.product_uom_id.id or False,
+-                'amount': amount,
+-                'general_account_id': move_line.account_id.id,
+-                'ref': move_line.ref,
+-                'move_id': move_line.id,
+-                'user_id': move_line.move_id.invoice_user_id.id or self._uid,
+-                'partner_id': move_line.partner_id.id,
+-                'company_id': move_line.analytic_account_id.company_id.id or move_line.move_id.company_id.id,
+-                'category': category,
+-            })
+-        return result
++        analytic_line_vals = []
++        for line in self:
++            analytic_line_vals.extend(line._prepare_analytic_lines())
++
++        self.env['account.analytic.line'].create(analytic_line_vals)
+ 
+-    def _prepare_analytic_distribution_line(self, distribution):
++    def _prepare_analytic_lines(self):
++        self.ensure_one()
++        analytic_line_vals = []
++        self._compute_analytic_distribution()
++        if self.analytic_distribution:
++            # distribution_on_each_plan corresponds to the proportion that is distributed to each plan to be able to
++            # give the real amount when we achieve a 100% distribution
++            distribution_on_each_plan = {}
++
++            for account_id, distribution in self.analytic_distribution.items():
++                line_values = self._prepare_analytic_distribution_line(float(distribution), account_id, distribution_on_each_plan)
++                if not float_is_zero(line_values.get("amount"), precision_digits=self.env.company.currency_id.decimal_places):
++                    analytic_line_vals.append(line_values)
++        return analytic_line_vals
++
++    def _prepare_analytic_distribution_line(self, distribution, account_id, distribution_on_each_plan):
+         """ Prepare the values used to create() an account.analytic.line upon validation of an account.move.line having
+             analytic tags with analytic distribution.
+         """
+         self.ensure_one()
+-        amount = -self.balance * distribution.percentage / 100.0
++        account_id = int(account_id)
++        account = self.env['account.analytic.account'].browse(account_id)
++        distribution_plan = distribution_on_each_plan.get(account.root_plan_id, 0) + distribution
++        if self.env.company.currency_id.compare_amounts(distribution_plan, 100) == 0:
++            amount = -self.balance * (100 - distribution_on_each_plan.get(account.root_plan_id, 0)) / 100.0
++        else:
++            amount = -self.balance * distribution / 100.0
++        distribution_on_each_plan[account.root_plan_id] = distribution_plan
+         default_name = self.name or (self.ref or '/' + ' -- ' + (self.partner_id and self.partner_id.name or '/'))
+         return {
+             'name': default_name,
+             'date': self.date,
+-            'account_id': distribution.account_id.id,
+-            'group_id': distribution.account_id.group_id.id,
++            'account_id': account_id,
+             'partner_id': self.partner_id.id,
+-            'tag_ids': [(6, 0, [distribution.tag_id.id] + self._get_analytic_tag_ids())],
+             'unit_amount': self.quantity,
+             'product_id': self.product_id and self.product_id.id or False,
+             'product_uom_id': self.product_uom_id and self.product_uom_id.id or False,
+             'amount': amount,
+             'general_account_id': self.account_id.id,
+             'ref': self.ref,
+-            'move_id': self.id,
++            'move_line_id': self.id,
+             'user_id': self.move_id.invoice_user_id.id or self._uid,
+-            'company_id': distribution.account_id.company_id.id or self.company_id.id or self.env.company.id,
++            'company_id': account.company_id.id or self.company_id.id or self.env.company.id,
+         }
+ 
+-    def _get_analytic_tag_ids(self):
+-        self.ensure_one()
+-        return self.analytic_tag_ids.filtered(lambda r: not r.active_analytic_distribution).ids
+-
+-    def create_analytic_lines(self):
+-        """ Create analytic items upon validation of an account.move.line having an analytic account or an analytic distribution.
+-        """
+-        lines_to_create_analytic_entries = self.env['account.move.line']
+-        analytic_line_vals = []
+-        for obj_line in self:
+-            for tag in obj_line.analytic_tag_ids.filtered('active_analytic_distribution'):
+-                for distribution in tag.analytic_distribution_ids:
+-                    analytic_line_vals.append(obj_line._prepare_analytic_distribution_line(distribution))
+-            if obj_line.analytic_account_id:
+-                lines_to_create_analytic_entries |= obj_line
+-
+-        # create analytic entries in batch
+-        if lines_to_create_analytic_entries:
+-            analytic_line_vals += lines_to_create_analytic_entries._prepare_analytic_line()
+-
+-        self.env['account.analytic.line'].create(analytic_line_vals)
+-
+     # -------------------------------------------------------------------------
+     # MISC
+     # -------------------------------------------------------------------------
+@@ -2485,8 +2433,7 @@ class AccountMoveLine(models.Model):
+             quantity=self.quantity if is_invoice else 1.0,
+             discount=self.discount if is_invoice else 0.0,
+             account=self.account_id,
+-            analytic_account=self.analytic_account_id,
+-            analytic_tags=self.analytic_tag_ids,
++            analytic_distribution=self.analytic_distribution,
+             price_subtotal=sign * self.amount_currency,
+             is_refund=self.is_refund,
+             rate=(abs(self.amount_currency) / abs(self.balance)) if self.balance else 1.0
+@@ -2509,8 +2456,7 @@ class AccountMoveLine(models.Model):
+             tax_repartition_line=self.tax_repartition_line_id,
+             group_tax=self.group_tax_id,
+             account=self.account_id,
+-            analytic_account=self.analytic_account_id,
+-            analytic_tags=self.analytic_tag_ids,
++            analytic_distribution=self.analytic_distribution,
+             tax_amount=sign * self.amount_currency,
+         )
+ 
+
+--- a/addons/account/models/account_move_line_tax_details.py
++++ b/addons/account/models/account_move_line_tax_details.py
+@@ -182,8 +182,8 @@ class AccountMoveLine(models.Model):
+                     )
+                     AND (
+                         NOT tax.analytic
+-                        OR (base_line.analytic_account_id IS NULL AND account_move_line.analytic_account_id IS NULL)
+-                        OR base_line.analytic_account_id = account_move_line.analytic_account_id
++                        OR (base_line.analytic_distribution_stored_char IS NULL AND account_move_line.analytic_distribution_stored_char IS NULL)
++                        OR base_line.analytic_distribution_stored_char = account_move_line.analytic_distribution_stored_char
+                     )
+                 LEFT JOIN affecting_base_tax_ids tax_line_tax_ids ON tax_line_tax_ids.id = account_move_line.id
+                 JOIN affecting_base_tax_ids base_line_tax_ids ON base_line_tax_ids.id = base_line.id
+
+--- a/addons/account/models/account_reconcile_model.py
++++ b/addons/account/models/account_reconcile_model.py
+@@ -37,6 +37,7 @@ class AccountReconcileModelPartnerMapping(models.Model):
+ 
+ class AccountReconcileModelLine(models.Model):
+     _name = 'account.reconcile.model.line'
++    _inherit = 'analytic.mixin'
+     _description = 'Rules for the reconciliation model'
+     _order = 'sequence, id'
+     _check_company_auto = True
+@@ -72,9 +73,6 @@ class AccountReconcileModelLine(models.Model):
+     * Fixed: The fixed value of the writeoff. The amount will count as a debit if it is negative, as a credit if it is positive.
+     * From Label: There is no need for regex delimiter, only the regex is needed. For instance if you want to extract the amount from\nR:9672938 10/07 AX 9415126318 T:5L:NA BRT: 3358,07 C:\nYou could enter\nBRT: ([\d,]+)""")
+     tax_ids = fields.Many2many('account.tax', string='Taxes', ondelete='restrict', check_company=True)
+-    analytic_account_id = fields.Many2one('account.analytic.account', string='Analytic Account', ondelete='set null', check_company=True)
+-    analytic_tag_ids = fields.Many2many('account.analytic.tag', string='Analytic Tags', check_company=True,
+-                                        relation='account_reconcile_model_analytic_tag_rel')
+ 
+     @api.onchange('tax_ids')
+     def _onchange_tax_ids(self):
+@@ -138,8 +136,7 @@ class AccountReconcileModelLine(models.Model):
+             'name': self.label,
+             'account_id': self.account_id.id,
+             'partner_id': partner.id,
+-            'analytic_account_id': self.analytic_account_id.id,
+-            'analytic_tag_ids': [Command.set(self.analytic_tag_ids.ids)],
++            'analytic_distribution': self.analytic_distribution,
+             'tax_ids': [Command.set(taxes.ids)],
+             'reconcile_model_id': self.model_id.id,
+         }
+@@ -484,8 +481,7 @@ class AccountReconcileModel(models.Model):
+                 'balance': balance,
+                 'debit': balance > 0 and balance or 0,
+                 'credit': balance < 0 and -balance or 0,
+-                'analytic_account_id': tax.analytic and base_line_dict['analytic_account_id'],
+-                'analytic_tag_ids': tax.analytic and base_line_dict['analytic_tag_ids'],
++                'analytic_distribution': tax.analytic and base_line_dict['analytic_distribution'],
+                 'tax_repartition_line_id': tax_res['tax_repartition_line_id'],
+                 'tax_ids': [(6, 0, tax_res['tax_ids'])],
+                 'tax_tag_ids': [(6, 0, tax_res['tag_ids'])],
+@@ -534,8 +530,7 @@ class AccountReconcileModel(models.Model):
+                 'credit': balance < 0 and -balance or 0,
+                 'account_id': line.account_id.id,
+                 'currency_id': currency.id,
+-                'analytic_account_id': line.analytic_account_id.id,
+-                'analytic_tag_ids': [(6, 0, line.analytic_tag_ids.ids)],
++                'analytic_distribution': line.analytic_distribution,
+                 'reconcile_model_id': self.id,
+                 'journal_id': line.journal_id.id,
+                 'tax_ids': [],
+
+--- a/addons/account/models/account_tax.py
++++ b/addons/account/models/account_tax.py
+@@ -719,7 +719,7 @@ class AccountTax(models.Model):
+     def _convert_to_tax_base_line_dict(
+             self, base_line,
+             partner=None, currency=None, product=None, taxes=None, price_unit=None, quantity=None,
+-            discount=None, account=None, analytic_account=None, analytic_tags=None, price_subtotal=None,
++            discount=None, account=None, analytic_distribution=None, price_subtotal=None,
+             is_refund=False, rate=None,
+             handle_price_include=None,
+             extra_context=None,
+@@ -734,8 +734,7 @@ class AccountTax(models.Model):
+             'quantity': quantity or 0.0,
+             'discount': discount or 0.0,
+             'account': account or self.env['account.account'],
+-            'analytic_account': analytic_account or self.env['account.analytic.account'],
+-            'analytic_tags': analytic_tags or self.env['account.analytic.tag'],
++            'analytic_distribution': analytic_distribution,
+             'price_subtotal': price_subtotal or 0.0,
+             'is_refund': is_refund,
+             'rate': rate or 1.0,
+@@ -747,7 +746,7 @@ class AccountTax(models.Model):
+     def _convert_to_tax_line_dict(
+             self, tax_line,
+             partner=None, currency=None, taxes=None, tax_tags=None, tax_repartition_line=None,
+-            group_tax=None, account=None, analytic_account=None, analytic_tags=None, tax_amount=None,
++            group_tax=None, account=None, analytic_distribution=None, tax_amount=None,
+     ):
+         return {
+             'record': tax_line,
+@@ -758,8 +757,7 @@ class AccountTax(models.Model):
+             'tax_repartition_line': tax_repartition_line or self.env['account.tax.repartition.line'],
+             'group_tax': group_tax or self.env['account.tax'],
+             'account': account or self.env['account.account'],
+-            'analytic_account': analytic_account or self.env['account.analytic.account'],
+-            'analytic_tags': analytic_tags or self.env['account.analytic.tag'],
++            'analytic_distribution': analytic_distribution,
+             'tax_amount': tax_amount or 0.0,
+         }
+ 
+@@ -783,8 +781,7 @@ class AccountTax(models.Model):
+             'tax_ids': [Command.set(tax_vals['tax_ids'])],
+             'tax_tag_ids': [Command.set(tax_vals['tag_ids'])],
+             'tax_id': tax_vals['group'].id if tax_vals['group'] else tax_vals['id'],
+-            'analytic_tag_ids': [Command.set(line_vals['analytic_tags'].ids if tax_vals['analytic'] else [])],
+-            'analytic_account_id': line_vals['analytic_account'].id if tax_vals['analytic'] else False,
++            'analytic_distribution': line_vals['analytic_distribution'] if tax_vals['analytic'] else {},
+         }
+ 
+     @api.model
+@@ -805,8 +802,7 @@ class AccountTax(models.Model):
+             'tax_ids': [Command.set(line_vals['taxes'].ids)],
+             'tax_tag_ids': [Command.set(line_vals['tax_tags'].ids)],
+             'tax_id': (line_vals['group_tax'] or tax).id,
+-            'analytic_tag_ids': [Command.set(line_vals['analytic_tags'].ids if tax.analytic else [])],
+-            'analytic_account_id': line_vals['analytic_account'].id if tax.analytic else False,
++            'analytic_distribution': line_vals['analytic_distribution'] if tax.analytic else {},
+         }
+ 
+     @api.model
+
+--- a/addons/account/models/res_config_settings.py
++++ b/addons/account/models/res_config_settings.py
+@@ -70,7 +70,6 @@ class ResConfigSettings(models.TransientModel):
+         domain="[('reconcile', '=', True), ('account_type', '=', 'asset_current')]",
+         help="Intermediary account used when moving from a liquidity account to another.")
+     module_account_accountant = fields.Boolean(string='Accounting')
+-    group_analytic_tags = fields.Boolean(string='Analytic Tags', implied_group='analytic.group_analytic_tags')
+     group_warning_account = fields.Boolean(string="Warnings in Invoices", implied_group='account.group_warning_account')
+     group_cash_rounding = fields.Boolean(string="Cash Rounding", implied_group='account.group_cash_rounding')
+     # group_show_line_subtotals_tax_excluded and group_show_line_subtotals_tax_included are opposite,
