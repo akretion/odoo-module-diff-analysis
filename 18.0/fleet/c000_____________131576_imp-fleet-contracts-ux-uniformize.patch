@@ -1,0 +1,145 @@
+PR: https://github.com/odoo/odoo/pull/131576
+
+From: c61b216409cf414cfe26ae1209bd150d072af75d
+From: Flotchet
+Date: 2024-02-07 16:30:32
+
+Breaking data model changes score: 2, change matches:
+-    contract_renewal_name = fields.Text(compute='_compute_contract_reminder', string='Name of contract to renew soon')
+-    contract_renewal_total = fields.Text(compute='_compute_contract_reminder', string='Total of contracts due or overdue minus one')
+
+Total Changes: 78
+
+[IMP] fleet: Contracts ux uniformize
+
+Adapt the UI to adopt the same flow as payroll.contract
+
+change the the default responsible for the contract to the
+fleet manager and not the current user.
+
+Now we only check the last contract and not all of them to warn
+the user about the contract expiration because it's a contract
+is active there is no problem even if one of them is expired.
+
+task - 3395095
+
+closes odoo/odoo#131576
+
+Related: odoo/upgrade#5376
+Signed-off-by: Bertrand Dossogne (bedo) <bedo@odoo.com>
+
+================================= pseudo patch: =================================
+
+--- a/addons/fleet/models/fleet_vehicle.py
++++ b/addons/fleet/models/fleet_vehicle.py
+@@ -95,8 +95,6 @@ class FleetVehicle(models.Model):
+         string='Has Contracts to renew')
+     contract_renewal_overdue = fields.Boolean(compute='_compute_contract_reminder', search='_search_get_overdue_contract_reminder',
+         string='Has Contracts Overdue')
+-    contract_renewal_name = fields.Text(compute='_compute_contract_reminder', string='Name of contract to renew soon')
+-    contract_renewal_total = fields.Text(compute='_compute_contract_reminder', string='Total of contracts due or overdue minus one')
+     contract_state = fields.Selection(
+         [('futur', 'Incoming'),
+          ('open', 'In Progress'),
+@@ -196,40 +194,36 @@ class FleetVehicle(models.Model):
+     def _compute_contract_reminder(self):
+         params = self.env['ir.config_parameter'].sudo()
+         delay_alert_contract = int(params.get_param('hr_fleet.delay_alert_contract', default=30))
++        current_date = fields.Date.context_today(self)
++        data = self.env['fleet.vehicle.log.contract']._read_group(
++            domain=[('vehicle_id', 'in', self.ids), ('state', '!=', 'closed')],
++            groupby=['vehicle_id', 'state'],
++            aggregates=['expiration_date:max'])
++
++        prepared_data = {}
++        for vehicle_id, state, expiration_date in data:
++            if prepared_data.get(vehicle_id.id):
++                if prepared_data[vehicle_id.id]['expiration_date'] < expiration_date:
++                    prepared_data[vehicle_id.id]['expiration_date'] = expiration_date
++                if prepared_data[vehicle_id.id]['state'] == 'futur' and state == 'open':
++                    prepared_data[vehicle_id.id]['state'] = state
++            else:
++                prepared_data[vehicle_id.id] = {
++                    'state': state,
++                    'expiration_date': expiration_date,
++                }
++
+         for record in self:
+-            overdue = False
+-            due_soon = False
+-            total = 0
+-            name = ''
+-            state = ''
+-            for element in record.log_contracts:
+-                if element.state in ('open', 'expired') and element.expiration_date:
+-                    current_date_str = fields.Date.context_today(record)
+-                    due_time_str = element.expiration_date
+-                    current_date = fields.Date.from_string(current_date_str)
+-                    due_time = fields.Date.from_string(due_time_str)
+-                    diff_time = (due_time - current_date).days
+-                    if diff_time < 0:
+-                        overdue = True
+-                        total += 1
+-                    if diff_time < delay_alert_contract:
+-                        due_soon = True
+-                        total += 1
+-                    if overdue or due_soon:
+-                        log_contract = self.env['fleet.vehicle.log.contract'].search([
+-                            ('vehicle_id', '=', record.id),
+-                            ('state', 'in', ('open', 'expired'))
+-                            ], limit=1, order='expiration_date asc')
+-                        if log_contract:
+-                            # we display only the name of the oldest overdue/due soon contract
+-                            name = log_contract.name
+-                            state = log_contract.state
+-
+-            record.contract_renewal_overdue = overdue
+-            record.contract_renewal_due_soon = due_soon
+-            record.contract_renewal_total = total - 1  # we remove 1 from the real total for display purposes
+-            record.contract_renewal_name = name
+-            record.contract_state = state
++            vehicle_data = prepared_data.get(record.id)
++            if vehicle_data:
++                diff_time = (vehicle_data['expiration_date'] - current_date).days
++                record.contract_renewal_overdue = diff_time < 0
++                record.contract_renewal_due_soon = not record.contract_renewal_overdue and (diff_time < delay_alert_contract)
++                record.contract_state = vehicle_data['state']
++            else:
++                record.contract_renewal_overdue = False
++                record.contract_renewal_due_soon = False
++                record.contract_state = ""
+ 
+     def _get_analytic_name(self):
+         # This function is used in fleet_account and is overrided in l10n_be_hr_payroll_fleet
+
+--- a/addons/fleet/models/fleet_vehicle_log_contract.py
++++ b/addons/fleet/models/fleet_vehicle_log_contract.py
+@@ -25,7 +25,11 @@ class FleetVehicleLogContract(models.Model):
+     currency_id = fields.Many2one('res.currency', related='company_id.currency_id')
+     name = fields.Char(string='Name', compute='_compute_contract_name', store=True, readonly=False)
+     active = fields.Boolean(default=True)
+-    user_id = fields.Many2one('res.users', 'Responsible', default=lambda self: self.env.user, index=True)
++    user_id = fields.Many2one(
++        comodel_name='res.users',
++        string='Responsible',
++        default=lambda self: self.env['fleet.vehicle'].browse(self._context.get('active_id')).manager_id,
++        index=True)
+     start_date = fields.Date(
+         'Contract Start Date', default=fields.Date.context_today,
+         help='Date when the coverage of the contract begins')
+@@ -39,11 +43,11 @@ class FleetVehicleLogContract(models.Model):
+     purchaser_id = fields.Many2one(related='vehicle_id.driver_id', string='Driver')
+     ins_ref = fields.Char('Reference', size=64, copy=False)
+     state = fields.Selection(
+-        [('futur', 'Incoming'),
+-         ('open', 'In Progress'),
++        [('futur', 'New'),
++         ('open', 'Running'),
+          ('expired', 'Expired'),
+-         ('closed', 'Closed')
+-        ], 'Status', default='open', readonly=True,
++         ('closed', 'Cancelled')
++        ], 'Status', default='open',
+         help='Choose whether the contract is still valid or not',
+         tracking=True,
+         copy=False)

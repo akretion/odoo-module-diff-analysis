@@ -1,0 +1,1095 @@
+PR: https://github.com/odoo/odoo/pull/
+
+From: 4f6ec1cd2a9253bb0c6c17d304490c7809facf8a
+From: Joren Van Onder
+Date: 2018-08-13 17:51:10
+
+Breaking data model changes score: 5, change matches:
++    website_country_group_ids = fields.Many2many(related='website_id.country_group_ids')
++    country_group_ids = fields.Many2many('res.country.group', 'website_country_group_rel', 'website_id', 'country_group_id',
++    theme_ids = fields.Many2many('ir.module.module', 'website_theme', 'website_id', 'ir_module_module_id')
+-    website_ids = fields.Many2many('website', string='Websites')
+
+Total Changes: 629
+
+[IMP] website,*: support multiple websites
+
+This implements support to administer multiple websites. Although the
+core functionality already existed, managing multiple websites was
+fairly technical.
+
+In the interest of database updates and migration this attempts to
+keep duplicated data to a minimum. To do this the usual generic
+records are rendered unless some website-specific record exists that
+replaces it. Copy-on-write (COW) is used to create these
+website-specific records. Through this mechanism creating a
+website-specific record is delayed until necessary. A COW mechanism
+has been implemented on 4 models: ir.ui.view, website.page,
+website.menu and ir.attachment. These COW mechanisms are activated
+when editing data through the website (aka frontend). These frontend
+edits (e.g. with web_editor) will be website-specific, possibly
+creating a website-specific record when necessary. When editing data
+in the backend nothing special will happen, even when editing a
+generic record. Note that because of this mechanism also facilitates
+the ability to create new, uncustomized websites because the generic
+data is kept.
+
+Support is provided for a website to have any theme. Themes are fairly
+complex to handle. Standalone themes can depend on other standalone
+themes (e.g. theme_beauty depends on theme_loftspace) and themes
+usually modify some data of the themes they depend on. Because a theme
+can be installed on multiple websites, using website_id m2o fields
+does not work well. It would require duplicate data, making updates
+and migration harder. Because of this, data for themes (ir.ui.view and
+ir.attachment specifically) have a theme_id m2o. website has a
+theme_ids m2m that identifies all theme modules currently installed on
+it. Through these fields we figure out what to render. A theme is only
+fully uninstalled when it's no longer active on any website. The
+advantage of this approach is that upgrading or migrating theme data
+is no different from the single-website case.
+
+The website.published.mixin class was modified to handle multiple
+websites. A wizard was added in the backend to easily manage this for
+multiple website.
+
+Although not used anywhere in this commit, a 'website_id' variable has
+been added in the evaluation context of ir.rule. It allows to easily
+make any model multi-website aware, all that's needed is a custom
+website_id m2o field on a model and a custom record rule.
+
+================================= pseudo patch: =================================
+
+--- a/addons/website/models/__init__.py
++++ b/addons/website/models/__init__.py
+@@ -10,5 +10,6 @@ from . import website
+ from . import ir_ui_view
+ from . import res_company
+ from . import res_partner
++from . import res_users
+ from . import res_config_settings
+ from . import res_users
+
+--- a/addons/website/models/ir_attachment.py
++++ b/addons/website/models/ir_attachment.py
+@@ -1,8 +1,10 @@
+ # -*- coding: utf-8 -*-
+ # Part of Odoo. See LICENSE file for full copyright and licensing details.
+ 
++import logging
+ from odoo import api, fields, models
+ 
++_logger = logging.getLogger(__name__)
+ 
+ class Attachment(models.Model):
+ 
+@@ -14,3 +16,50 @@ class Attachment(models.Model):
+     @api.model
+     def get_serving_groups(self):
+         return super(Attachment, self).get_serving_groups() + ['website.group_website_designer']
++
++    key = fields.Char(help='Technical field used to resolve multiple attachments in a multi-website environment.')
++    theme_id = fields.Many2one('ir.module.module')
++
++    @api.multi
++    def unlink(self):
++        self |= self.search([('key', 'in', self.filtered('key').mapped('key'))])
++        return super(Attachment, self).unlink()
++
++    @api.multi
++    def _get_theme_specific_attachment(self, theme_name):
++        self.ensure_one()
++        attachment = self
++        module_being_updated = self.env['ir.module.module'].search([('name', '=', theme_name)])
++        xml_id = self.env['ir.model.data'].search([('model', '=', 'ir.attachment'), ('res_id', '=', attachment.id)])
++        if xml_id and xml_id.module != theme_name:
++            _logger.info('%s is updating attachment %s (ID: %s)', theme_name, xml_id.complete_name, attachment.id)
++
++            # check if a previously copied attachment for this theme already exists
++            theme_specific_attachment = self.env['ir.attachment'].search([('key', '=', attachment.key), ('theme_id', '=', module_being_updated.id)])
++            if theme_specific_attachment:
++                attachment = theme_specific_attachment
++                _logger.info('diverting write to %s (ID: %s)', attachment.name, attachment.id)
++            else:
++                attachment.with_context(no_cow=True).key = xml_id.complete_name
++                attachment = attachment.copy({
++                    'theme_id': module_being_updated.id,
++                    'key': xml_id.complete_name,
++                })
++                _logger.info('created new theme-specific attachment %s (ID: %s)', attachment.name, attachment.id)
++
++        return attachment
++
++    @api.multi
++    def write(self, vals):
++        if not self._context.get('no_cow'):
++            for attachment in self:
++                currently_updating = self._context.get('install_mode_data', {}).get('module', '')
++                if currently_updating.startswith('theme_'):
++                    attachment = attachment._get_theme_specific_attachment(currently_updating)
++
++                super(Attachment, attachment).write(vals)
++        else:
++            super(Attachment, self).write(vals)
++
++        return True
++>>>>>>> [IMP] website,*: support multiple websites
+
+--- a/addons/website/models/ir_http.py
++++ b/addons/website/models/ir_http.py
+@@ -117,9 +117,16 @@ class Http(models.AbstractModel):
+     @classmethod
+     def _serve_page(cls):
+         req_page = request.httprequest.path
++        page_domain = [('url', '=', req_page), '|', ('website_id', '=', False), ('website_id', '=', request.website.id)]
+ 
+-        domain = [('url', '=', req_page), '|', ('website_ids', 'in', request.website.id), ('website_ids', '=', False)]
+-        pages = request.env['website.page'].search(domain)
++        published_domain = page_domain + [('website_published', '=', True)]
++        pages = request.env['website.page'].search(published_domain)
++
++        if not pages:
++            # Since there are no published pages, try to find a page
++            # that could potentially be published.
++            unpublished_domain = page_domain + [('website_published', '=', False)]
++            pages = request.env['website.page'].search(unpublished_domain)
+ 
+         if not request.website.is_publisher():
+             pages = pages.filtered('is_visible')
+@@ -239,7 +246,7 @@ class Http(models.AbstractModel):
+         env = env or request.env
+         obj = None
+         if xmlid:
+-            obj = env.ref(xmlid, False)
++            obj = cls._xmlid_to_obj(env, xmlid)
+         elif id and model in env:
+             obj = env[model].browse(int(id))
+         if obj and 'website_published' in obj._fields:
+@@ -251,6 +258,15 @@ class Http(models.AbstractModel):
+             default_mimetype=default_mimetype, access_token=access_token, share_id=share_id, share_token=share_token,
+             force_ext=force_ext, env=env)
+ 
++    @classmethod
++    def _xmlid_to_obj(cls, env, xmlid):
++        website_id = env['website'].get_current_website()
++        if website_id and website_id.installed_theme_id:
++            obj = env['ir.attachment'].search([('key', '=', xmlid), ('theme_id', '=', website_id.installed_theme_id.id)])
++            if obj:
++                return obj[0]
++
++        return super(Http, cls)._xmlid_to_obj(env, xmlid)
+ 
+ class ModelConverter(ModelConverter):
+ 
+
+--- a/None
++++ b/addons/website/models/ir_rule.py
+@@ -0,0 +1,12 @@
++# coding: utf-8
++from odoo import api, models
++
++
++class IrRule(models.Model):
++    _inherit = 'ir.rule'
++
++    @api.model
++    def _eval_context(self):
++        res = super(IrRule, self)._eval_context()
++        res['website_id'] = self._context.get('website_id')
++        return res
+
+--- a/addons/website/models/ir_ui_view.py
++++ b/addons/website/models/ir_ui_view.py
+@@ -4,9 +4,10 @@
+ import logging
+ from itertools import groupby
+ 
+-from odoo import api, fields, models
++from odoo import api, fields, models, _
+ from odoo import tools
+ from odoo.addons.http_routing.models.ir_http import url_for
++from odoo.osv import expression
+ from odoo.http import request
+ from odoo.tools import pycompat
+ 
+@@ -22,6 +23,7 @@ class View(models.Model):
+     website_id = fields.Many2one('website', ondelete='cascade', string="Website")
+     page_ids = fields.One2many('website.page', compute='_compute_page_ids', store=False)
+     first_page_id = fields.Many2one('website.page', string='Website Page', help='First page linked to this view', compute='_compute_first_page_id')
++    theme_id = fields.Many2one('ir.module.module')
+ 
+     @api.one
+     def _compute_first_page_id(self):
+@@ -33,12 +35,112 @@ class View(models.Model):
+             [('view_id', '=', self.id)]
+         )
+ 
++    @api.multi
++    def write(self, vals):
++        '''COW for ir.ui.view. This way editing websites does not impact other
++        websites. Also this way newly created websites will only
++        contain the default views.
++        '''
++        if not self._context.get('no_cow'):
++            current_website_id = self._context.get('website_id')
++            for view in self:
++                currently_updating = self._context.get('install_mode_data', {}).get('module', '')
++                if 'theme_' in currently_updating:
++                    current_website_id = False
++                    view = view._get_theme_specific_view(currently_updating)
++
++                # if generic view in multi-website context
++                if current_website_id and not view.website_id:
++                    new_website_specific_view = view.copy({'website_id': current_website_id})
++                    view._create_website_specific_pages_for_view(new_website_specific_view,
++                                                                 view.env['website'].browse(current_website_id))
++
++                    # trigger COW on inheriting views
++                    for inherit_child in view.inherit_children_ids:
++                        inherit_child.write({'inherit_id': new_website_specific_view.id})
++
++                    new_website_specific_view.write(vals)
++                else:
++                    super(View, view).write(vals)
++        else:
++            super(View, self).write(vals)
++
++        return True
++
+     @api.multi
+     def unlink(self):
++        '''This implements COU (copy-on-unlink). When deleting a generic page
++        website-specific pages will be created so only the current
++        website is affected.
++        '''
++        current_website_id = self._context.get('website_id')
++
++        if current_website_id and not self._context.get('no_cow'):
++            for view in self.filtered(lambda view: not view.website_id):
++                for website in self.env['website'].search([('id', '!=', current_website_id)]):
++                    # reuse the COW mechanism to create
++                    # website-specific copies, it will take
++                    # care of creating pages and menus.
++                    view.with_context(website_id=website.id).write({'key': '%s [website %s]' % (view.key, website.id)})
++
++        self |= self.with_context(active_test=False).search([('key', 'in', self.filtered('key').mapped('key'))])
+         result = super(View, self).unlink()
+         self.clear_caches()
+         return result
+ 
++    @api.multi
++    def _get_theme_specific_view(self, theme_name):
++        self.ensure_one()
++        view = self
++        module_being_updated = self.env['ir.module.module'].search([('name', '=', theme_name)])
++        xml_id = self.env['ir.model.data'].search([('model', '=', 'ir.ui.view'), ('res_id', '=', view.id)])
++        if xml_id and xml_id.module != theme_name:
++            _logger.info('%s is updating view %s (ID: %s)', theme_name, xml_id.complete_name, view.id)
++
++            # check if a previously copied view for this theme already exists
++            theme_specific_view = self.env['ir.ui.view'].search([('key', '=', view.key), ('theme_id', '=', module_being_updated.id)])
++            if theme_specific_view:
++                view = theme_specific_view
++                _logger.info('diverting write to %s (ID: %s)', view.name, view.id)
++            else:
++                view = view.copy({'theme_id': module_being_updated.id})
++                _logger.info('created new theme-specific view %s (ID: %s)', view.name, view.id)
++
++        return view
++
++    def _create_website_specific_pages_for_view(self, new_view, website):
++        for page in self.page_ids:
++            # create new pages for this view
++            new_page = page.copy({
++                'view_id': new_view.id,
++            })
++            for menu in page.menu_ids:
++                # trigger COW
++                menu.write({'page_id': new_page.id})
++
++    @api.model
++    def get_related_views(self, key, bundles=False):
++        '''Make this only return most specific views for website.'''
++        # get_related_views can be called through website=False routes
++        # (e.g. /web_editor/get_assets_editor_resources), so website
++        # dispatch_parameters may not be added. Manually set
++        # website_id.
++        self = self.with_context(website_id=self.env['website'].get_current_website().id)
++        views = super(View, self).get_related_views(key, bundles=bundles)
++        current_website_id = self._context.get('website_id')
++        most_specific_views = self.env['ir.ui.view']
++
++        if not current_website_id:
++            return views
++
++        for view in views:
++            if view.website_id and view.website_id.id == current_website_id:
++                most_specific_views |= view
++            elif not view.website_id and not any(view.key == view2.key and view2.website_id and view2.website_id.id == current_website_id for view2 in views):
++                most_specific_views |= view
++
++        return most_specific_views
++
+     @api.multi
+     def _sort_suitability_key(self):
+         """ Key function to sort views by descending suitability
+@@ -79,16 +181,48 @@ class View(models.Model):
+         # assume it's already a view object (WTF?)
+         return view_id
+ 
++    @api.model
++    def _get_inheriting_views_arch_website(self, view_id):
++        return self.env['website'].browse(self._context.get('website_id'))
++
+     @api.model
+     def _get_inheriting_views_arch_domain(self, view_id, model):
+         domain = super(View, self)._get_inheriting_views_arch_domain(view_id, model)
+-        return ['|', ('website_id', '=', False), ('website_id', '=', self.env.context.get('website_id'))] + domain
++        current_website = self._get_inheriting_views_arch_website(view_id)
++
++        website_views_domain = [('theme_id', '=', False), '|', ('website_id', '=', False), ('website_id', '=', current_website.id)]
++        # when rendering for the website we have to include inactive views
++        # we will prefer inactive website-specific views over active generic ones
++        if current_website:
++            domain = [leaf for leaf in domain if 'active' not in leaf]
++            if current_website.theme_ids:
++                theme_views_domain = [('theme_id', 'in', current_website.theme_ids.ids)]
++                website_views_domain = expression.OR([website_views_domain, theme_views_domain])
++
++        return expression.AND([website_views_domain, domain])
++
++    @api.model
++    def get_inheriting_views_arch(self, view_id, model):
++        if not self._context.get('website_id'):
++            return super(View, self).get_inheriting_views_arch(view_id, model)
++
++        inheriting_views = super(View, self.with_context(active_test=False)).get_inheriting_views_arch(view_id, model)
++
++        # prefer inactive website-specific views over active generic ones
++        inheriting_views = self.browse([view[1] for view in inheriting_views]).filter_duplicate().filtered('active')
++
++        return [(view.arch, view.id) for view in inheriting_views]
+ 
+     @api.model
+     @tools.ormcache_context('self._uid', 'xml_id', keys=('website_id',))
+     def get_view_id(self, xml_id):
+         if 'website_id' in self._context and not isinstance(xml_id, pycompat.integer_types):
+-            domain = [('key', '=', xml_id), '|', ('website_id', '=', self._context['website_id']), ('website_id', '=', False)]
++            current_website = self.env['website'].browse(self._context.get('website_id'))
++            key_domain = [('key', '=', xml_id)]
++            theme_views_domain = [('theme_id', 'in', current_website.theme_ids.ids)]
++            website_views_domain = [('theme_id', '=', False), '|', ('website_id', '=', False), ('website_id', '=', current_website.id)]
++            domain = expression.AND([expression.OR([theme_views_domain, website_views_domain]), key_domain])
++
+             view = self.search(domain, order='website_id', limit=1)
+             if not view:
+                 _logger.warning("Could not find view object with xml_id '%s'", xml_id)
+@@ -125,6 +259,7 @@ class View(models.Model):
+         qcontext = super(View, self)._prepare_qcontext()
+ 
+         if request and getattr(request, 'is_frontend', False):
++            Website = self.env['website']
+             editable = request.website.is_publisher()
+             translatable = editable and self._context.get('lang') != request.env['ir.http']._get_default_lang().code
+             editable = not translatable and editable
+@@ -132,6 +267,17 @@ class View(models.Model):
+             if 'main_object' not in qcontext:
+                 qcontext['main_object'] = self
+ 
++            domain_based_info = {'website_id': '', 'name': _('Domain Based')}
++            force_website_id = request.session.get('force_website_id', False)
++            if force_website_id:
++                selected_website = Website.browse(force_website_id)
++                qcontext['multi_website_selected_website'] = {'website_id': selected_website.id, 'name': selected_website.name}
++            else:
++                qcontext['multi_website_selected_website'] = domain_based_info
++
++            qcontext['multi_website_websites'] = [{'website_id': website.id, 'name': website.name} for website in Website.search([])]
++            qcontext['multi_website_websites'] += [domain_based_info]
++
+             qcontext.update(dict(
+                 self._context.copy(),
+                 website=request.website,
+
+--- a/addons/website/models/res_company.py
++++ b/addons/website/models/res_company.py
+@@ -16,3 +16,19 @@ class Company(models.Model):
+     def google_map_link(self, zoom=8):
+         partner = self.sudo().partner_id
+         return partner and partner.google_map_link(zoom) or None
++
++    @api.multi
++    def _get_public_user(self):
++        self.ensure_one()
++        public_users = self.env.ref('base.group_public').with_context(active_test=False).users
++        public_users_for_website = public_users.filtered(lambda user: user.company_id == self)
++
++        if public_users_for_website:
++            return public_users_for_website[0]
++        else:
++            return self.env.ref('base.public_user').copy({
++                'name': 'Public user for %s' % self.name,
++                'login': 'public_company_%s' % self.id,
++                'company_id': self.id,
++                'company_ids': [(6, 0, [self.id])],
++            })
+
+--- a/addons/website/models/res_config_settings.py
++++ b/addons/website/models/res_config_settings.py
+@@ -16,6 +16,9 @@ class ResConfigSettings(models.TransientModel):
+     website_id = fields.Many2one('website', string="website",
+                                  default=_default_website, required=True, ondelete='cascade')
+     website_name = fields.Char('Website Name', related='website_id.name')
++    website_domain = fields.Char('Website Domain', related='website_id.domain')
++    website_country_group_ids = fields.Many2many(related='website_id.country_group_ids')
++    website_company_id = fields.Many2one(related='website_id.company_id', string='Website Company')
+     language_ids = fields.Many2many(related='website_id.language_ids', relation='res.lang')
+     language_count = fields.Integer(string='Number of languages', compute='_compute_language_count', readonly=True)
+     website_default_lang_id = fields.Many2one(
+@@ -34,6 +37,7 @@ class ResConfigSettings(models.TransientModel):
+     cdn_filters = fields.Text(related='website_id.cdn_filters')
+     module_website_version = fields.Boolean("A/B Testing")
+     module_website_links = fields.Boolean(string="Link Trackers")
++    auth_signup_uninvited = fields.Selection(string="Customer Account", related='website_id.auth_signup_uninvited')
+ 
+     favicon = fields.Binary('Favicon', related='website_id.favicon')
+     # Set as global config parameter since methods using it are not website-aware. To be changed
+@@ -42,10 +46,15 @@ class ResConfigSettings(models.TransientModel):
+     has_google_analytics = fields.Boolean("Google Analytics", config_parameter='website.has_google_analytics')
+     has_google_analytics_dashboard = fields.Boolean("Embedded Google Analytics", config_parameter='website.has_google_analytics_dashboard')
+     has_google_maps = fields.Boolean("Google Maps", config_parameter='website.has_google_maps')
+-    auth_signup_uninvited = fields.Selection([
+-        ('b2b', 'On invitation (B2B)'),
+-        ('b2c', 'Free sign up (B2C)'),
+-    ], string='Customer Account', default='b2b', config_parameter='auth_signup.invitation_scope')
++
++    social_twitter = fields.Char(related='website_id.social_twitter')
++    social_facebook = fields.Char(related='website_id.social_facebook')
++    social_github = fields.Char(related='website_id.social_github')
++    social_linkedin = fields.Char(related='website_id.social_linkedin')
++    social_youtube = fields.Char(related='website_id.social_youtube')
++    social_googleplus = fields.Char(related='website_id.social_googleplus')
++
++    group_multi_website = fields.Boolean("Multi-website", implied_group="website.group_multi_website")
+ 
+     @api.onchange('has_google_analytics')
+     def onchange_has_google_analytics(self):
+@@ -83,3 +92,11 @@ class ResConfigSettings(models.TransientModel):
+         action['res_id'] = literal_eval(self.env['ir.config_parameter'].sudo().get_param('base.template_portal_user_id', 'False'))
+         action['views'] = [[self.env.ref('base.view_users_form').id, 'form']]
+         return action
++
++    def website_go_to(self):
++        self.website_id._fix_to_session()
++        return {
++            'type': 'ir.actions.act_url',
++            'url': '/',
++            'target': 'self',
++        }
+
+--- a/addons/website/models/res_partner.py
++++ b/addons/website/models/res_partner.py
+@@ -3,7 +3,7 @@
+ 
+ import werkzeug
+ 
+-from odoo import api, models
++from odoo import api, fields, models
+ 
+ 
+ def urlplus(url, params):
+@@ -11,9 +11,10 @@ def urlplus(url, params):
+ 
+ 
+ class Partner(models.Model):
+-
+     _inherit = "res.partner"
+ 
++    website_id = fields.Many2one('website', string='Registration Website')
++
+     @api.multi
+     def google_map_img(self, zoom=8, width=298, height=298):
+         google_maps_api_key = self.env['ir.config_parameter'].sudo().get_param('google_maps_api_key')
+
+--- a/addons/website/models/res_users.py
++++ b/addons/website/models/res_users.py
+@@ -1,7 +1,11 @@
+ # -*- coding: utf-8 -*-
+ # Part of Odoo. See LICENSE file for full copyright and licensing details.
++import logging
+ 
+-from odoo import api, fields, models
++from odoo import api, fields, models, _
++from odoo.exceptions import ValidationError
++
++_logger = logging.getLogger(__name__)
+ 
+ 
+ class ResUsers(models.Model):
+@@ -11,10 +15,46 @@ class ResUsers(models.Model):
+         selection=lambda self: self._get_group_selection('base.module_category_website'),
+         string='Website Editor', compute='_compute_groups_id', inverse='_inverse_groups_id',
+         category_xml_id='base.module_category_website')
++    has_group_multi_website = fields.Boolean(
++        'Multi-Website',
++        compute='_compute_groups_id', inverse='_inverse_groups_id',
++        group_xml_id='website.group_multi_website')
+ 
++    _sql_constraints = [
++        # this is done in Python because a SQL constraint like UNIQUE
++        # (login, website_id) allows ('abc', NULL) and
++        # ('abc', NULL) to coexist because of how SQL handles NULLs.
++        ('login_key', 'CHECK (1=1)', 'You can not have two users with the same login!')
++    ]
++    
+     @api.multi
+     def _has_unsplash_key_rights(self):
+         self.ensure_one()
+         if self.has_group('website.group_website_designer'):
+             return True
+         return super(ResUsers, self)._has_unsplash_key_rights()
++
++    @api.constrains('login', 'website_id')
++    def _check_login(self):
++        for user in self:
++            if self.search([('id', '!=', user.id), ('login', '=', user.login),
++                            '|', ('website_id', '=', False),
++                                 ('website_id', '=', user.website_id.id)]):
++                raise ValidationError(_('You can not have two users with the same login!'))
++
++    @api.model
++    def _get_login_domain(self, login):
++        current_website_id = self.env['website'].get_current_website().id
++        multi_website_domain = ['|', ('website_id', '=', False), ('website_id', '=', current_website_id)]
++        return super(ResUsers, self)._get_login_domain(login) + multi_website_domain
++
++    @api.model
++    def _signup_create_user(self, values):
++        new_user = super(ResUsers, self)._signup_create_user(values)
++        new_user.website_id = self.env['website'].get_current_website()
++        return new_user
++
++    @api.model
++    def _get_signup_invitation_scope(self):
++        current_website = self.env['website'].get_current_website()
++        return current_website.auth_signup_uninvited or super(ResUsers, self)._get_signup_invitation_scope()
+
+--- a/addons/website/models/website.py
++++ b/addons/website/models/website.py
+@@ -15,6 +15,7 @@ from odoo.addons.website.models.ir_http import sitemap_qs2dom
+ from odoo.addons.portal.controllers.portal import pager
+ from odoo.tools import pycompat
+ from odoo.http import request
++from odoo.osv import expression
+ from odoo.osv.expression import FALSE_DOMAIN
+ from odoo.tools.translate import _
+ 
+@@ -44,26 +45,46 @@ class Website(models.Model):
+         def_lang = self.env['res.lang'].search([('code', '=', lang_code)], limit=1)
+         return def_lang.id if def_lang else self._active_languages()[0]
+ 
++    def _default_social_twitter(self):
++        return self.env.ref('base.main_company').social_twitter
++
++    def _default_social_facebook(self):
++        return self.env.ref('base.main_company').social_facebook
++
++    def _default_social_github(self):
++        return self.env.ref('base.main_company').social_github
++
++    def _default_social_linkedin(self):
++        return self.env.ref('base.main_company').social_linkedin
++
++    def _default_social_youtube(self):
++        return self.env.ref('base.main_company').social_youtube
++
++    def _default_social_googleplus(self):
++        return self.env.ref('base.main_company').social_googleplus
++
+     name = fields.Char('Website Name')
+     domain = fields.Char('Website Domain')
++    country_group_ids = fields.Many2many('res.country.group', 'website_country_group_rel', 'website_id', 'country_group_id',
++                                         string='Country Groups', help='Used when multiple websites have the same domain.')
+     company_id = fields.Many2one('res.company', string="Company", default=lambda self: self.env.ref('base.main_company').id)
+     language_ids = fields.Many2many('res.lang', 'website_lang_rel', 'website_id', 'lang_id', 'Languages', default=_active_languages)
+     default_lang_id = fields.Many2one('res.lang', string="Default Language", default=_default_language, required=True)
+     default_lang_code = fields.Char(related='default_lang_id.code', string="Default language code", store=True)
+     auto_redirect_lang = fields.Boolean('Autoredirect Language', default=True, help="Should users be redirected to their browser's language")
+ 
+-    social_twitter = fields.Char(related="company_id.social_twitter")
+-    social_facebook = fields.Char(related="company_id.social_facebook")
+-    social_github = fields.Char(related="company_id.social_github")
+-    social_linkedin = fields.Char(related="company_id.social_linkedin")
+-    social_youtube = fields.Char(related="company_id.social_youtube")
+-    social_googleplus = fields.Char(related="company_id.social_googleplus")
++    social_twitter = fields.Char('Twitter Account', default=_default_social_twitter)
++    social_facebook = fields.Char('Facebook Account', default=_default_social_facebook)
++    social_github = fields.Char('GitHub Account', default=_default_social_github)
++    social_linkedin = fields.Char('LinkedIn Account', default=_default_social_linkedin)
++    social_youtube = fields.Char('Youtube Account', default=_default_social_youtube)
++    social_googleplus = fields.Char('Google+ Account', default=_default_social_googleplus)
+ 
+     google_analytics_key = fields.Char('Google Analytics Key')
+     google_management_client_id = fields.Char('Google Client ID')
+     google_management_client_secret = fields.Char('Google Client Secret')
+ 
+-    user_id = fields.Many2one('res.users', string='Public User', required=True, default=lambda self: self.env.ref('base.public_user').id)
++    user_id = fields.Many2one('res.users', string='Public User', required=True)
+     cdn_activated = fields.Boolean('Activate CDN for assets')
+     cdn_url = fields.Char('CDN Base URL', default='')
+     cdn_filters = fields.Text('CDN Filters', default=lambda s: '\n'.join(DEFAULT_CDN_FILTERS), help="URL matching those filters will be rewritten using the CDN Base URL")
+@@ -71,29 +92,73 @@ class Website(models.Model):
+     menu_id = fields.Many2one('website.menu', compute='_compute_menu', string='Main Menu')
+     homepage_id = fields.Many2one('website.page', string='Homepage')
+     favicon = fields.Binary(string="Website Favicon", help="This field holds the image used to display a favicon on the website.")
++    installed_theme_id = fields.Many2one('ir.module.module')
++    theme_ids = fields.Many2many('ir.module.module', 'website_theme', 'website_id', 'ir_module_module_id')
++    auth_signup_uninvited = fields.Selection([
++        ('b2b', 'On invitation (B2B)'),
++        ('b2c', 'Free sign up (B2C)'),
++    ], string='Customer Account', default='b2b')
+ 
+     @api.multi
+     def _compute_menu(self):
+         Menu = self.env['website.menu']
+         for website in self:
+-            website.menu_id = Menu.search([('parent_id', '=', False), ('website_id', '=', website.id)], order='id', limit=1).id
++            website.menu_id = Menu.search([('parent_id', '=', False), ('website_id', 'in', (website.id, False))], order='id', limit=1).id
+ 
+     # cf. Wizard hack in website_views.xml
+     def noop(self, *args, **kwargs):
+         pass
+ 
++    @api.model
++    def create(self, vals):
++        if 'user_id' not in vals:
++            company = self.env['res.company'].browse(vals.get('company_id'))
++            vals['user_id'] = company._get_public_user().id if company else self.env.ref('base.public_user').id
++
++        res = super(Website, self).create(vals)
++        res._bootstrap_homepage()
++        return res
++
+     @api.multi
+     def write(self, values):
+         self._get_languages.clear_cache(self)
++        if 'company_id' in values and 'user_id' not in values:
++            company = self.env['res.company'].browse(values['company_id'])
++            values['user_id'] = company._get_public_user().id
++
+         result = super(Website, self).write(values)
+         if 'cdn_activated' in values or 'cdn_url' in values or 'cdn_filters' in values:
+             # invalidate the caches from static node at compile time
+             self.env['ir.qweb'].clear_caches()
+         return result
+ 
++    @api.onchange('company_id')
++    def _onchange_company_id(self):
++        self.social_twitter = self.company_id.social_twitter
++        self.social_facebook = self.company_id.social_facebook
++        self.social_github = self.company_id.social_github
++        self.social_linkedin = self.company_id.social_linkedin
++        self.social_youtube = self.company_id.social_youtube
++        self.social_googleplus = self.company_id.social_googleplus
++
+     #----------------------------------------------------------
+     # Page Management
+     #----------------------------------------------------------
++    def _bootstrap_homepage(self):
++        standard_homepage = self.env.ref('website.homepage', raise_if_not_found=False)
++        if not standard_homepage:
++            return
++
++        new_homepage_view = '''<t name="Homepage" t-name="website.homepage%s">
++    <t t-call="website.layout">
++%s
++    </t>
++</t>''' % (self.id, self.env['ir.ui.view'].render_template('website.default_homepage', values={'website': self}).decode())
++        standard_homepage.with_context(website_id=self.id).arch_db = new_homepage_view
++
++        self.homepage_id = self.env['website.page'].search([('website_id', '=', self.id),
++                                                            ('key', '=', standard_homepage.key)])
++
+     @api.model
+     def new_page(self, name=False, add_menu=False, template='website.default_page', ispage=True, namespace=None):
+         """ Create a new website page, and assign it a xmlid based on the given one
+@@ -130,8 +195,8 @@ class Website(models.Model):
+         if ispage:
+             page = self.env['website.page'].create({
+                 'url': page_url,
+-                'website_ids': [(6, None, [self.get_current_website().id])],
+-                'view_id': view.id
++                'website_id': self.get_current_website().id,
++                'view_id': view.id,
+             })
+             result['view_id'] = view.id
+         if add_menu:
+@@ -154,7 +219,7 @@ class Website(models.Model):
+         """
+         website_id = self.get_current_website().id
+         inc = 0
+-        domain_static = ['|', ('website_ids', '=', False), ('website_ids', 'in', website_id)]
++        domain_static = ['|', ('website_id', '=', False), ('website_id', '=', website_id)]
+         page_temp = page_url
+         while self.env['website.page'].with_context(active_test=False).sudo().search([('url', '=', page_temp)] + domain_static):
+             inc += 1
+@@ -177,7 +242,7 @@ class Website(models.Model):
+         #Look for unique key
+         key_copy = string
+         inc = 0
+-        domain_static = ['|', ('website_ids', '=', False), ('website_ids', 'in', website_id)]
++        domain_static = ['|', ('website_id', '=', False), ('website_id', '=', website_id)]
+         while self.env['website.page'].with_context(active_test=False).sudo().search([('key', '=', key_copy)] + domain_static):
+             inc += 1
+             key_copy = string + (inc and "-%s" % inc or "")
+@@ -208,7 +273,7 @@ class Website(models.Model):
+ 
+         # search for website_page with link
+         website_page_search_dom = [
+-            '|', ('website_ids', 'in', website_id), ('website_ids', '=', False), ('view_id.arch_db', 'ilike', url)
++            '|', ('website_id', '=', False), ('website_id', '=', website_id), ('view_id.arch_db', 'ilike', url)
+         ]
+         pages = self.env['website.page'].search(website_page_search_dom)
+         page_key = _('Page')
+@@ -276,7 +341,7 @@ class Website(models.Model):
+ 
+         # search for website_page with link
+         website_page_search_dom = [
+-            '|', ('website_ids', 'in', website_id), ('website_ids', '=', False), ('view_id.arch_db', 'ilike', key),
++            '|', ('website_id', '=', False), ('website_id', '=', website_id), ('view_id.arch_db', 'ilike', key),
+             ('id', '!=', page.id),
+         ]
+         pages = self.env['website.page'].search(website_page_search_dom)
+@@ -376,19 +441,38 @@ class Website(models.Model):
+ 
+     @api.model
+     def get_current_website(self):
++        if request and request.session.get('force_website_id'):
++            return self.browse(request.session['force_website_id'])
++
+         domain_name = request and request.httprequest.environ.get('HTTP_HOST', '').split(':')[0] or None
+-        website_id = self._get_current_website_id(domain_name)
++
++        country = request.session.geoip.get('country_code') if request and request.session.geoip else False
++        country_id = False
++        if country:
++            country_id = request.env['res.country'].search([('code', '=', country)], limit=1).id
++
++        website_id = self._get_current_website_id(domain_name, country_id)
+         if request:
+             request.context = dict(request.context, website_id=website_id)
+         return self.browse(website_id)
+ 
+-    @tools.cache('domain_name')
+-    def _get_current_website_id(self, domain_name):
+-        """ Reminder : cached method should be return record, since they will use a closed cursor. """
+-        website = self.search([('domain', '=', domain_name)], limit=1)
+-        if not website:
+-            website = self.search([], limit=1)
+-        return website.id
++    @tools.cache('domain_name', 'country_id')
++    def _get_current_website_id(self, domain_name, country_id):
++        # sort on country_group_ids so that we fall back on a generic website (empty country_group_ids)
++        websites = self.search([('domain', '=', domain_name)]).sorted('country_group_ids')
++
++        if not websites:
++            return self.search([], limit=1).id
++        elif len(websites) == 1:
++            return websites.id
++        else:  # > 1 website with the same domain
++            country_specific_websites = websites.filtered(lambda website: country_id in website.country_group_ids.mapped('country_ids').ids)
++            return country_specific_websites[0].id if country_specific_websites else websites[0].id
++
++    def _fix_to_session(self):
++        # call on empty recordset to clear
++        if request:
++            request.session['force_website_id'] = self.id
+ 
+     @api.model
+     def is_publisher(self):
+@@ -545,7 +629,7 @@ class Website(models.Model):
+ 
+     @api.multi
+     def get_website_pages(self, domain=[], order='name', limit=None):
+-        domain += ['|', ('website_ids', 'in', self.get_current_website().id), ('website_ids', '=', False)]
++        domain += ['|', ('website_id', '=', False), ('website_id', '=', self.get_current_website().id)]
+         pages = request.env['website.page'].search(domain, order='name', limit=limit)
+         return pages
+ 
+@@ -599,9 +683,48 @@ class WebsitePublishedMixin(models.AbstractModel):
+ 
+     _name = "website.published.mixin"
+ 
+-    website_published = fields.Boolean('Visible in Website', copy=False)
++    website_published = fields.Boolean('Visible on current website',
++                                       compute='_compute_website_published',
++                                       inverse='_inverse_website_published',
++                                       search='_search_website_published')  # todo jov evaluate places where this is used, we can probably replace some with is_published
++    is_published = fields.Boolean('Is published')
++    website_id = fields.Many2one('website', string='Website', help='Restrict publishing to this website.')
+     website_url = fields.Char('Website URL', compute='_compute_website_url', help='The full URL to access the document through the website.')
+ 
++    @api.multi
++    @api.depends('is_published', 'website_id')
++    def _compute_website_published(self):
++        current_website_id = self._context.get('website_id')
++        for record in self:
++            if current_website_id:
++                record.website_published = record.is_published and (not record.website_id or record.website_id.id == current_website_id)
++            else:
++                record.website_published = record.is_published
++
++    @api.multi
++    def _inverse_website_published(self):
++        current_website_id = self._context.get('website_id')
++        for record in self:
++            record.is_published = record.website_published
++            if record.website_published and current_website_id:
++                record.write({'website_id': current_website_id})
++
++    def _search_website_published(self, operator, value):
++        if not isinstance(value, bool) or operator not in ('=', '!='):
++            logger.warning('unsupported search on website_published: %s, %s', operator, value)
++            return [()]
++
++        if operator in expression.NEGATIVE_TERM_OPERATORS:
++            value = not value
++
++        current_website_id = self._context.get('website_id')
++        if current_website_id:
++            is_published = [('is_published', '=', True)]
++            on_current_website = expression.OR([[('website_id', '=', False)], [('website_id', '=', current_website_id)]])
++            return (['!'] if value is False else []) + expression.AND([is_published, on_current_website])
++        else:  # should be in the backend, return things that are published anywhere
++            return [('is_published', '=', value)]
++
+     @api.multi
+     def _compute_website_url(self):
+         for record in self:
+@@ -627,9 +750,9 @@ class Page(models.Model):
+     _inherits = {'ir.ui.view': 'view_id'}
+     _inherit = 'website.published.mixin'
+     _description = 'Page'
++    _order = 'website_id'
+ 
+     url = fields.Char('Page URL')
+-    website_ids = fields.Many2many('website', string='Websites')
+     view_id = fields.Many2one('ir.ui.view', string='View', required=True, ondelete="cascade")
+     website_indexed = fields.Boolean('Page Indexed', default=True)
+     date_publish = fields.Datetime('Publishing Date')
+@@ -642,6 +765,9 @@ class Page(models.Model):
+     header_overlay = fields.Boolean()
+     header_color = fields.Char()
+ 
++    # don't use mixin website_id but use website_id on ir.ui.view instead
++    website_id = fields.Many2one(related='view_id.website_id', store=True)
++
+     @api.one
+     def _compute_homepage(self):
+         self.is_homepage = self == self.env['website'].get_current_website().homepage_id
+@@ -660,10 +786,20 @@ class Page(models.Model):
+     def _compute_visible(self):
+         self.is_visible = self.website_published and (not self.date_publish or self.date_publish < fields.Datetime.now())
+ 
++    @api.multi
++    def _is_most_specific_page(self, page_to_test):
++        '''This will test if page_to_test is the most specific page in self.'''
++        pages_for_url = self.filtered(lambda page: page.url == page_to_test.url)
++
++        # this works because pages are _order'ed by website_id
++        most_specific_page = pages_for_url[0]
++
++        return most_specific_page == page_to_test
++
+     @api.model
+     def get_page_info(self, id, website_id):
+-        domain = ['|', ('website_ids', 'in', website_id), ('website_ids', '=', False), ('id', '=', id)]
+-        item = self.search_read(domain, fields=['id', 'name', 'url', 'website_published', 'website_indexed', 'date_publish', 'menu_ids', 'is_homepage'], limit=1)
++        domain = ['|', ('website_id', '=', False), ('website_id', '=', website_id), ('id', '=', id)]
++        item = self.search_read(domain, fields=['id', 'name', 'url', 'website_published', 'website_indexed', 'date_publish', 'menu_ids', 'is_homepage', 'website_id'], limit=1)
+         return item
+ 
+     @api.multi
+@@ -709,11 +845,15 @@ class Page(models.Model):
+                     'website_id': website.id,
+                 })
+ 
+-        page.write({
++        # Edits via the page manager shouldn't trigger the COW
++        # mechanism and generate new pages. The user manages page
++        # visibility manually with is_published here.
++        page.with_context(no_cow=True).write({
+             'key': page_key,
+             'name': data['name'],
+             'url': url,
+-            'website_published': data['website_published'],
++            'is_published': data['website_published'],
++            'website_id': website.id if data['restrict_to_current_website'] else False,
+             'website_indexed': data['website_indexed'],
+             'date_publish': data['date_publish'] or None,
+             'is_homepage': data['is_homepage'],
+@@ -733,17 +873,18 @@ class Page(models.Model):
+     @api.multi
+     @api.returns('self', lambda value: value.id)
+     def copy(self, default=None):
+-        view = self.env['ir.ui.view'].browse(self.view_id.id)
+-        # website.page's ir.ui.view should have a different key than the one it
+-        # is copied from.
+-        # (eg: website_version: an ir.ui.view record with the same key is
+-        # expected to be the same ir.ui.view but from another version)
+-        new_view = view.copy({'key': view.key + '.copy', 'name': '%s %s' % (view.name,  _('(copy)'))})
+-        default = {
+-            'name': '%s %s' % (self.name,  _('(copy)')),
+-            'url': self.env['website'].get_unique_path(self.url),
+-            'view_id': new_view.id,
+-        }
++        if default and not default.get('view_id'):
++            view = self.env['ir.ui.view'].browse(self.view_id.id)
++            # website.page's ir.ui.view should have a different key than the one it
++            # is copied from.
++            # (eg: website_version: an ir.ui.view record with the same key is
++            # expected to be the same ir.ui.view but from another version)
++            new_view = view.copy({'key': view.key + '.copy', 'name': '%s %s' % (view.name,  _('(copy)'))})
++            default = {
++                'name': '%s %s' % (self.name,  _('(copy)')),
++                'url': self.env['website'].get_unique_path(self.url),
++                'view_id': new_view.id,
++            }
+         return super(Page, self).copy(default=default)
+ 
+     @api.model
+@@ -758,47 +899,30 @@ class Page(models.Model):
+             if menu:
+                 # If the page being cloned has a menu, clone it too
+                 new_menu = menu.copy()
+-                new_menu.write({'url': new_page.url, 'name': '%s %s' % (menu.name,  _('(copy)')), 'page_id': new_page.id})
++                new_menu.write({'url': new_page.url, 'name': '%s %s' % (menu.name, _('(copy)')), 'page_id': new_page.id})
+ 
+         return new_page.url + '?enable_editor=1'
+ 
+     @api.multi
+     def unlink(self):
+-        """ When a website_page is deleted, the ORM does not delete its ir_ui_view.
+-            So we got to delete it ourself, but only if the ir_ui_view is not used by another website_page.
+-        """
+-        # Handle it's ir_ui_view
++        # When a website_page is deleted, the ORM does not delete its
++        # ir_ui_view. So we got to delete it ourself, but only if the
++        # ir_ui_view is not used by another website_page.
+         for page in self:
+             # Other pages linked to the ir_ui_view of the page being deleted (will it even be possible?)
+             pages_linked_to_iruiview = self.search(
+                 [('view_id', '=', self.view_id.id), ('id', '!=', self.id)]
+             )
+-            if len(pages_linked_to_iruiview) == 0:
++            if len(pages_linked_to_iruiview) == 0 and not page.view_id.inherit_children_ids:
+                 # If there is no other pages linked to that ir_ui_view, we can delete the ir_ui_view
+-                self.env['ir.ui.view'].search([('id', '=', self.view_id.id)]).unlink()
+-        # And then delete the website_page itself
++                page.view_id.unlink()
+         return super(Page, self).unlink()
+ 
+-    @api.model
+-    def delete_page(self, page_id):
+-        """ Delete a page, given its identifier
+-            :param page_id : website.page identifier
+-        """
+-        # If we are deleting a page (that could possibly be a menu with a page)
+-        page = self.env['website.page'].browse(int(page_id))
+-        if page:
+-            # Check if it is a menu with a page and also delete menu if so
+-            menu = self.env['website.menu'].search([('page_id', '=', page.id)], limit=1)
+-            if menu:
+-                menu.unlink()
+-            page.unlink()
+-
+     @api.multi
+     def write(self, vals):
+         if 'url' in vals and not vals['url'].startswith('/'):
+             vals['url'] = '/' + vals['url']
+-        result = super(Page, self).write(vals)
+-        return result
++        return super(Page, self).write(vals)
+ 
+ 
+ class Menu(models.Model):
+@@ -815,15 +939,47 @@ class Menu(models.Model):
+ 
+     name = fields.Char('Menu', required=True, translate=True)
+     url = fields.Char('Url', default='')
+-    page_id = fields.Many2one('website.page', 'Related Page')
++    page_id = fields.Many2one('website.page', 'Related Page', ondelete='cascade')
+     new_window = fields.Boolean('New Window')
+     sequence = fields.Integer(default=_default_sequence)
+-    website_id = fields.Many2one('website', 'Website')  # TODO: support multiwebsite once done for ir.ui.views
++    website_id = fields.Many2one('website', 'Website')
+     parent_id = fields.Many2one('website.menu', 'Parent Menu', index=True, ondelete="cascade")
+     child_id = fields.One2many('website.menu', 'parent_id', string='Child Menus')
+     parent_path = fields.Char(index=True)
+     is_visible = fields.Boolean(compute='_compute_visible', string='Is Visible')
+ 
++    @api.multi
++    def unlink(self):
++        '''This implements COU (copy-on-unlink). When deleting a generic menu
++        item website-specific menu items will be created.'''
++        current_website_id = self._context.get('website_id')
++
++        if current_website_id and not self._context.get('no_cow'):
++            for menu in self.filtered(lambda menu: not menu.website_id):
++                for website in self.env['website'].search([('id', '!=', current_website_id)]):
++                    # reuse the COW mechanism to create website-specific copies
++                    menu.with_context(website_id=website.id).write({})
++
++        return super(Menu, self).unlink()
++
++    @api.multi
++    def write(self, vals):
++        '''This implements COW (copy-on-write). This way editing websites does
++        not impact other websites and newly created websites will only
++        contain the default menus.
++        '''
++        current_website_id = self._context.get('website_id')
++
++        if current_website_id and not self.website_id and not self._context.get('no_cow'):
++            new_website_specific_menu = self.copy({'website_id': current_website_id})
++
++            for child in self.child_id:
++                child.write({'parent_id': new_website_specific_menu.id})
++
++            return new_website_specific_menu.write(vals)
++
++        return super(Menu, self).write(vals)
++
+     @api.one
+     def _compute_visible(self):
+         visible = True
+@@ -846,6 +1002,21 @@ class Menu(models.Model):
+                     url = '/%s' % self.url
+         return url
+ 
++    def get_children_for_current_website(self):
++        most_specific_child_menus = self.env['website.menu']
++        website_id = self._context.get('website_id')
++
++        if not website_id:
++            return self.child_id
++
++        for child in self.child_id:
++            if child.website_id and child.website_id.id == website_id:
++                most_specific_child_menus |= child
++            elif not child.website_id and not any(child.clean_url() == child2.clean_url() and child2.website_id.id == website_id for child2 in self.child_id):
++                most_specific_child_menus |= child
++
++        return most_specific_child_menus
++
+     # would be better to take a menu_id as argument
+     @api.model
+     def get_tree(self, website_id, menu_id=None):
+@@ -862,7 +1033,7 @@ class Menu(models.Model):
+                 children=[],
+                 is_homepage=is_homepage,
+             )
+-            for child in node.child_id:
++            for child in node.get_children_for_current_website():
+                 menu_node['children'].append(make_tree(child))
+             return menu_node
+         if menu_id:

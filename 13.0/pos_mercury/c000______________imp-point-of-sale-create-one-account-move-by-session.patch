@@ -1,0 +1,192 @@
+PR: https://github.com/odoo/odoo/pull/
+
+From: b234e97f87c577a7cd85230c4f42277b39e8c842
+From: Joseph Caburnay
+Date: 2019-08-09 13:57:11
+
+Breaking data model changes score: 2, change matches:
+-    _inherit = "account.bank.statement.line"
+-    _inherit = 'account.journal'
+
+Total Changes: 62
+
+[IMP] point_of_sale: create one account move by session
+
+Main goal of this task is to create single accounting entry
+(AE) when closing a pos.session instead of individual AE for
+each order in the session.
+
+This significantly minimizes the number of created journal
+entries by point_of_sale which also results to faster closing
+of session when there is large numbers (order of thousands)
+of orders. It also eases the reconciliation of payments because
+on one hand, cash payments are automatically reconciled and on
+the other, other payments are combine in a receivable line
+based on the payment method.
+
+**Important points to note**
+
+1. Two new models (pos.payment.method and pos.payment) are
+introduced replacing the functionalities of account.journal
+(and account.bank.statement) and
+account.bank.statement.line, which served before as payment
+methods and payments.
+
+2. The creation of single AE relies on the receivable_account_id
+defined in each pos.payment.method. This receivable_account_id
+is supposed to be different from the account module's receivable
+account, thus, a new receivable account for pos is introduced
+in each localization.
+
+3. A simple example below can illustrate this change.
+
+Given the following orders:
+
+    +---------+----------+----------+-----+-------+-------+
+    | order   | payments | product  | qty | price | total |
+    +---------+----------+----------+-----+-------+-------+
+    | order 1 | cash     | product1 |  10 |    10 |   100 |
+    |         |          | product2 |   5 |    20 |   100 |
+    +---------+----------+----------+-----+-------+-------+
+    | order 2 | bank     | product2 |   7 |    20 |   140 |
+    |         |          | product3 |   1 |    30 |    30 |
+    +---------+----------+----------+-----+-------+-------+
+    | order 3 | bank     | product1 |   1 |    10 |    10 |
+    |         |          | product2 |   3 |    20 |    60 |
+    |         |          | product3 |   5 |    30 |   150 |
+    +---------+----------+----------+-----+-------+-------+
+
+Instead of generating 3 accounting entries, a single
+accounting entry (linked to the pos.session) will be created.
+This accounting entry will have the following lines:
+
+    +---------------------+---------+------------+
+    | account             | balance | reconciled |
+    +---------------------+---------+------------+
+    | sale                |    -590 |    -       |
+    | pos receivable cash |     200 |    yes     |
+    | pos receivable bank |     390 |    no      |
+    +---------------------+---------+------------+
+    | Total balance       |     0.0 |            |
+    +---------------------+---------+------------+
+
+Note that the cash receivable line is already reconciled
+because it can assumed that the payment is already received.
+The unreconciled receivable line can be reconciled manually
+using the reconciliation widget.
+
+More examples can be seen in the tests.
+
+TASK-ID: 1862388
+
+================================= pseudo patch: =================================
+
+--- a/addons/pos_mercury/models/pos_mercury.py
++++ b/addons/pos_mercury/models/pos_mercury.py
+@@ -26,8 +26,8 @@ class PosMercuryConfiguration(models.Model):
+     merchant_pwd = fields.Char(string='Merchant Password', required=True, help='Password of the merchant to authenticate him on the payment provider server')
+ 
+ 
+-class AccountBankStatementLine(models.Model):
+-    _inherit = "account.bank.statement.line"
++class PoSPayment(models.Model):
++    _inherit = "pos.payment"
+ 
+     mercury_card_number = fields.Char(string='Card Number', help='The last 4 numbers of the card used to pay')
+     mercury_prefixed_card_number = fields.Char(string='Card Number Prefix', compute='_compute_prefixed_card_number', help='The card number used for the payment.')
+@@ -45,8 +45,8 @@ class AccountBankStatementLine(models.Model):
+                 line.mercury_prefixed_card_number = ""
+ 
+ 
+-class AccountJournal(models.Model):
+-    _inherit = 'account.journal'
++class PoSPaymentMethod(models.Model):
++    _inherit = 'pos.payment.method'
+ 
+     pos_mercury_config_id = fields.Many2one('pos_mercury.configuration', string='Mercury Credentials', help='The configuration of Mercury used for this journal')
+ 
+@@ -55,46 +55,20 @@ class PosOrder(models.Model):
+     _inherit = "pos.order"
+ 
+     @api.model
+-    def _payment_fields(self, ui_paymentline):
+-        fields = super(PosOrder, self)._payment_fields(ui_paymentline)
++    def _payment_fields(self, order, ui_paymentline):
++        fields = super(PosOrder, self)._payment_fields(order, ui_paymentline)
+ 
+         fields.update({
+-            'card_number': ui_paymentline.get('mercury_card_number'),
+-            'card_brand': ui_paymentline.get('mercury_card_brand'),
+-            'card_owner_name': ui_paymentline.get('mercury_card_owner_name'),
+-            'ref_no': ui_paymentline.get('mercury_ref_no'),
+-            'record_no': ui_paymentline.get('mercury_record_no'),
+-            'invoice_no': ui_paymentline.get('mercury_invoice_no')
++            'mercury_card_number': ui_paymentline.get('mercury_card_number'),
++            'mercury_card_brand': ui_paymentline.get('mercury_card_brand'),
++            'mercury_card_owner_name': ui_paymentline.get('mercury_card_owner_name'),
++            'mercury_ref_no': ui_paymentline.get('mercury_ref_no'),
++            'mercury_record_no': ui_paymentline.get('mercury_record_no'),
++            'mercury_invoice_no': ui_paymentline.get('mercury_invoice_no')
+         })
+ 
+         return fields
+ 
+-    def add_payment(self, data):
+-        statement_id = super(PosOrder, self).add_payment(data)
+-        statement_lines = self.env['account.bank.statement.line'].search([('statement_id', '=', statement_id),
+-                                                                         ('pos_statement_id', '=', self.id),
+-                                                                         ('journal_id', '=', data['journal'])])
+-        statement_lines = statement_lines.filtered(lambda line: float_compare(line.amount, data['amount'],
+-                                                                              precision_rounding=line.journal_currency_id.rounding) == 0)
+-
+-        # we can get multiple statement_lines when there are >1 credit
+-        # card payments with the same amount. In that case it doesn't
+-        # matter which statement line we pick, just pick one that
+-        # isn't already used.
+-        for line in statement_lines:
+-            if not line.mercury_card_brand:
+-                line.mercury_card_brand = data.get('card_brand')
+-                line.mercury_card_number = data.get('card_number')
+-                line.mercury_card_owner_name = data.get('card_owner_name')
+-
+-                line.mercury_ref_no = data.get('ref_no')
+-                line.mercury_record_no = data.get('record_no')
+-                line.mercury_invoice_no = data.get('invoice_no')
+-
+-                break
+-
+-        return statement_id
+-
+ 
+ class AutoVacuum(models.AbstractModel):
+     _inherit = 'ir.autovacuum'
+
+--- a/addons/pos_mercury/models/pos_mercury_transaction.py
++++ b/addons/pos_mercury/models/pos_mercury_transaction.py
+@@ -25,20 +25,20 @@ class MercuryTransaction(models.Model):
+ 
+         return pos_session
+ 
+-    def _get_pos_mercury_config_id(self, config, journal_id):
+-        journal = config.journal_ids.filtered(lambda r: r.id == journal_id)
++    def _get_pos_mercury_config_id(self, config, payment_method_id):
++        payment_method = config.current_session_id.payment_method_ids.filtered(lambda pm: pm.id == payment_method_id)
+ 
+-        if journal and journal.pos_mercury_config_id:
+-            return journal.pos_mercury_config_id
++        if payment_method and payment_method.pos_mercury_config_id:
++            return payment_method.pos_mercury_config_id
+         else:
+-            raise UserError(_("No Mercury configuration associated with the journal."))
++            raise UserError(_("No Mercury configuration associated with the payment method."))
+ 
+     def _setup_request(self, data):
+         # todo: in master make the client include the pos.session id and use that
+         pos_session = self._get_pos_session()
+ 
+         config = pos_session.config_id
+-        pos_mercury_config = self._get_pos_mercury_config_id(config, data['journal_id'])
++        pos_mercury_config = self._get_pos_mercury_config_id(config, data['payment_method_id'])
+ 
+         data['operator_id'] = pos_session.user_id.login
+         data['merchant_id'] = pos_mercury_config.sudo().merchant_id

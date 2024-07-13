@@ -1,0 +1,94 @@
+PR: https://github.com/odoo/odoo/pull/35659
+
+From: 9920f20e4c7753bc17bea71dea3a90f7de687196
+From: Raphael Collet
+Date: 2019-08-20 12:43:59
+
+Breaking data model changes score: 2, change matches:
+-    order_line_ids = fields.Many2many('sale.order.line', store=False, search='_search_order_line_ids')
+
+Total Changes: 26
+
+[IMP] models: ORM speedup
+
+This branch is the combination of several optimizations in the ORM:
+
+* store field values once in the cache: the cache reflects more
+faithfully the database, only fields that explicitly depend on the
+context have an extra indirection in the cache;
+
+* delay recomputations by default: use method `recompute` to explicitly
+flush out pending recomputations;
+
+* delay updates in method `write`: updates are stored in a data
+structure that can be flushed efficiently to the database with method
+`flush` (which also flush out recomputations);
+
+* make method `modified` take advantage of inverse fields to inverse
+dependencies;
+
+* filter records by evaluating a domain on records in Python;
+
+* a computed field with `readonly=False` behaves like a normal field
+with an onchange method;
+
+* computed fields are computed in superuser mode by default.
+
+Work done by Toufik Ben Jaa, Raphael Collet, Denis Ledoux and Fabien
+Pinckaers.
+
+closes odoo/odoo#35659
+
+Signed-off-by: Denis Ledoux <beledouxdenis@users.noreply.github.com>
+
+================================= pseudo patch: =================================
+
+--- a/addons/sale_coupon/models/sale_coupon_program.py
++++ b/addons/sale_coupon/models/sale_coupon_program.py
+@@ -47,7 +47,6 @@ class SaleCouponProgram(models.Model):
+     coupon_ids = fields.One2many('sale.coupon', 'program_id', string="Generated Coupons", copy=False)
+     coupon_count = fields.Integer(compute='_compute_coupon_count')
+     order_count = fields.Integer(compute='_compute_order_count')
+-    order_line_ids = fields.Many2many('sale.order.line', store=False, search='_search_order_line_ids')
+     company_id = fields.Many2one('res.company', string="Company", default=lambda self: self.env.company)
+     currency_id = fields.Many2one(string="Currency", related='company_id.currency_id', readonly=True)
+     validity_duration = fields.Integer(default=1,
+@@ -61,11 +60,7 @@ class SaleCouponProgram(models.Model):
+             if self.search(domain):
+                 raise ValidationError(_('The program code must be unique!'))
+ 
+-    def _search_order_line_ids(self, operator, arg):
+-        # just a hack to enable the invalidation of 'order_count'
+-        return []
+-
+-    @api.depends('order_line_ids.product_id')
++    # The api.depends is handled in `def modified` of `sale_coupon/models/sale_order.py`
+     def _compute_order_count(self):
+         product_data = self.env['sale.order.line'].read_group([('product_id', 'in', self.mapped('discount_line_product_id').ids)], ['product_id'], ['product_id'])
+         mapped_data = dict([(m['product_id'][0], m['product_id_count']) for m in product_data])
+
+--- a/addons/sale_coupon/models/sale_order.py
++++ b/addons/sale_coupon/models/sale_order.py
+@@ -425,3 +425,22 @@ class SaleOrderLine(models.Model):
+             # If company_id is set, always filter taxes by the company
+             taxes = line.tax_id.filtered(lambda r: not line.company_id or r.company_id == line.company_id)
+             line.tax_id = fpos.map_tax(taxes, line.product_id, line.order_id.partner_shipping_id) if fpos else taxes
++
++    # Invalidation of `sale.coupon.program.order_count`
++    # `test_program_rules_validity_dates_and_uses`,
++    # Overriding modified is quite hardcore as you need to know how works the cache and the invalidation system,
++    # but at least the below works and should be efficient.
++    # Another possibility is to add on product.product a one2many to sale.order.line 'order_line_ids',
++    # and then add the depends @api.depends('discount_line_product_id.order_line_ids'),
++    # but I am not sure this will as efficient as the below.
++    def modified(self, fnames, modified=None, create=False):
++        super(SaleOrderLine, self).modified(fnames, modified=modified)
++        if 'product_id' in fnames:
++            Program = self.env['sale.coupon.program']
++            field_order_count = Program._fields['order_count']
++            programs = self.env.cache.get_records(Program, field_order_count)
++            if programs:
++                products = self.filtered('is_reward_line').mapped('product_id')
++                for program in programs:
++                    if program.discount_line_product_id in products:
++                        self.env.cache.invalidate([(field_order_count, program.ids)])

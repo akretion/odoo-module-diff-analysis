@@ -1,0 +1,151 @@
+PR: https://github.com/odoo/odoo/pull/
+
+From: d9ffbe9e89423ebf18fb8e03f5abd8fb7c2f5c65
+From: Debauche Stéphane
+Date: 2021-07-14 08:32:59
+
+Breaking data model changes score: 2, change matches:
+-    sms_template_id = fields.Many2one(
+-    sms_template_id = fields.Many2one(
+
+Total Changes: 69
+
+[IMP] event: merge the SMS template and the mail template into one field
+
+Purpose
+=======
+A new module "Event Social" will be added in the enterprise PR. This
+new module will use a new template type, the "Social Post Template"
+adding one more column in the communication tab...
+
+We want to have only one column to select the template (Mail, SMS or
+Post template) and therefor we need to use a reference field.
+
+Technical
+=========
+As we can not set a domain on a reference field, we added a context key
+and in the `_name_search` of the `mail/sms.template` we filter with the
+domain we want if the key exists.
+
+Links
+=====
+Task-2127615
+See odoo/odoo/pull/46304
+See odoo/enterprise/pull/7701
+See odoo/upgrade/pull/848
+
+================================= pseudo patch: =================================
+
+--- a/addons/event_sms/models/__init__.py
++++ b/addons/event_sms/models/__init__.py
+@@ -3,3 +3,4 @@
+ 
+ from . import event_mail
+ from . import event_registration
++from . import sms_template
+
+--- a/addons/event_sms/models/event_mail.py
++++ b/addons/event_sms/models/event_mail.py
+@@ -7,29 +7,35 @@ from odoo import api, fields, models
+ class EventTypeMail(models.Model):
+     _inherit = 'event.type.mail'
+ 
+-    notification_type = fields.Selection(selection_add=[
+-        ('sms', 'SMS')
+-    ], ondelete={'sms': 'set default'})
+-    sms_template_id = fields.Many2one(
+-        'sms.template', string='SMS Template',
+-        domain=[('model', '=', 'event.registration')], ondelete='restrict',
+-        help='This field contains the template of the SMS that will be automatically sent')
+-
+     @api.model
+-    def _get_event_mail_fields_whitelist(self):
+-        return super(EventTypeMail, self)._get_event_mail_fields_whitelist() + ['sms_template_id']
++    def _selection_template_model(self):
++        return super(EventTypeMail, self)._selection_template_model() + [('sms.template', 'SMS')]
++
++    notification_type = fields.Selection(selection_add=[('sms', 'SMS')], ondelete={'sms': 'set default'})
++
++    @api.depends('notification_type')
++    def _compute_template_model_id(self):
++        sms_model = self.env['ir.model']._get('sms.template')
++        sms_mails = self.filtered(lambda mail: mail.notification_type == 'sms')
++        sms_mails.template_model_id = sms_model
++        super(EventTypeMail, self - sms_mails)._compute_template_model_id()
+ 
+ 
+ class EventMailScheduler(models.Model):
+     _inherit = 'event.mail'
+ 
+-    notification_type = fields.Selection(selection_add=[
+-        ('sms', 'SMS')
+-    ], ondelete={'sms': 'set default'})
+-    sms_template_id = fields.Many2one(
+-        'sms.template', string='SMS Template',
+-        domain=[('model', '=', 'event.registration')], ondelete='restrict',
+-        help='This field contains the template of the SMS that will be automatically sent')
++    @api.model
++    def _selection_template_model(self):
++        return super(EventMailScheduler, self)._selection_template_model() + [('sms.template', 'SMS')]
++
++    notification_type = fields.Selection(selection_add=[('sms', 'SMS')], ondelete={'sms': 'set default'})
++
++    @api.depends('notification_type')
++    def _compute_template_model_id(self):
++        sms_model = self.env['ir.model']._get('sms.template')
++        sms_mails = self.filtered(lambda mail: mail.notification_type == 'sms')
++        sms_mails.template_model_id = sms_model
++        super(EventMailScheduler, self - sms_mails)._compute_template_model_id()
+ 
+     def execute(self):
+         for scheduler in self:
+@@ -39,12 +45,12 @@ class EventMailScheduler(models.Model):
+                 if scheduler.mail_done:
+                     continue
+                 # no template -> ill configured, skip and avoid crash
+-                if not scheduler.sms_template_id:
++                if not scheduler.template_ref:
+                     continue
+                 # Do not send SMS if the communication was scheduled before the event but the event is over
+                 if scheduler.scheduled_date <= now and (scheduler.interval_type != 'before_event' or scheduler.event_id.date_end > now):
+                     self.env['event.registration']._message_sms_schedule_mass(
+-                        template=scheduler.sms_template_id,
++                        template=scheduler.template_ref,
+                         active_domain=[('event_id', '=', scheduler.event_id.id), ('state', '!=', 'cancel')],
+                         mass_keep_log=True
+                     )
+@@ -69,7 +75,7 @@ class EventMailRegistration(models.Model):
+         )
+         for reg_mail in todo:
+             reg_mail.registration_id._message_sms_schedule_mass(
+-                template=reg_mail.scheduler_id.sms_template_id,
++                template=reg_mail.scheduler_id.template_ref,
+                 mass_keep_log=True
+             )
+         todo.write({'mail_sent': True})
+
+--- a/None
++++ b/addons/event_sms/models/sms_template.py
+@@ -0,0 +1,22 @@
++# -*- coding: utf-8 -*-
++# Part of Odoo. See LICENSE file for full copyright and licensing details.
++
++from odoo import api, models
++from odoo.osv import expression
++
++
++class SmsTemplate(models.Model):
++    _inherit = 'sms.template'
++
++    @api.model
++    def _name_search(self, name, args=None, operator='ilike', limit=100, name_get_uid=None):
++        """Context-based hack to filter reference field in a m2o search box to emulate a domain the ORM currently does not support.
++
++        As we can not specify a domain on a reference field, we added a context
++        key `filter_template_on_event` on the template reference field. If this
++        key is set, we add our domain in the `args` in the `_name_search`
++        method to filtrate the SMS templates.
++        """
++        if self.env.context.get('filter_template_on_event'):
++            args = expression.AND([[('model', '=', 'event.registration')], args])
++        return super(SmsTemplate, self)._name_search(name, args, operator, limit, name_get_uid)

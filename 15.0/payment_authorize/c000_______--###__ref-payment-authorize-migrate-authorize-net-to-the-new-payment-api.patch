@@ -1,0 +1,1355 @@
+PR: https://github.com/odoo/odoo/pull/
+
+From: 660dc0ebaf819ad25b8e584598f44d3038814536
+From: Kevin Baptiste
+Date: 2021-03-30 07:25:51
+
+Breaking data model changes score: 5, change matches:
+-    _inherit = 'payment.acquirer'
+-    _inherit = 'payment.transaction'
+-    _inherit = 'payment.token'
+-    provider = fields.Selection(string='Provider', related='acquirer_id.provider', readonly=False)
+-    save_token = fields.Selection(string='Save Cards', related='acquirer_id.save_token', readonly=False)
+
+Total Changes: 1185
+
+[REF] payment_authorize: migrate Authorize.Net to the new payment API
+
+This commit also drops the payment with redirection flow in favor of
+the direct payment flow only, while preserving the currently used APIs.
+
+See the merge commit for more details.
+
+task-2333030
+
+Co-authored-by: Adrien Horgnies <aho@odoo.com>
+
+================================= pseudo patch: =================================
+
+--- a/addons/payment_authorize/models/__init__.py
++++ b/addons/payment_authorize/models/__init__.py
+@@ -1,2 +1,5 @@
+-# -*- coding: utf-8 -*-
+-from . import payment
++# Part of Odoo. See LICENSE file for full copyright and licensing details.
++
++from . import payment_acquirer
++from . import payment_token
++from . import payment_transaction
+
+--- a/addons/payment_authorize/models/authorize_request.py
++++ b/addons/payment_authorize/models/authorize_request.py
+@@ -1,20 +1,19 @@
+-# -*- coding: utf-8 -*-
++# Part of Odoo. See LICENSE file for full copyright and licensing details.
++
+ import json
+ import logging
+-import requests
+-
++import pprint
+ from uuid import uuid4
+ 
+-from odoo import _
+-from odoo.exceptions import UserError
++from odoo.addons.payment import utils as payment_utils
+ 
+-from odoo.addons.payment.models.payment_acquirer import _partner_split_name
++import requests
+ 
+ _logger = logging.getLogger(__name__)
+ 
+ 
+-class AuthorizeAPI():
+-    """Authorize.net Gateway API integration.
++class AuthorizeAPI:
++    """ Authorize.net Gateway API integration.
+ 
+     This class allows contacting the Authorize.net API with simple operation
+     requests. It implements a *very limited* subset of the complete API
+@@ -23,12 +22,12 @@ class AuthorizeAPI():
+         - Transaction authorization/capture/voiding
+     """
+ 
+-    AUTH_ERROR_STATUS = 3
++    AUTH_ERROR_STATUS = '3'
+ 
+     def __init__(self, acquirer):
+         """Initiate the environment with the acquirer data.
+ 
+-        :param record acquirer: payment.acquirer account that will be contacted
++        :param recordset acquirer: payment.acquirer account that will be contacted
+         """
+         if acquirer.state == 'test':
+             self.url = 'https://apitest.authorize.net/xml/v1/request.api'
+@@ -39,87 +38,48 @@ class AuthorizeAPI():
+         self.name = acquirer.authorize_login
+         self.transaction_key = acquirer.authorize_transaction_key
+ 
+-    def _authorize_request(self, data):
+-        _logger.info('_authorize_request: Sending values to URL %s, values:\n%s', self.url, data)
+-        resp = requests.post(self.url, json.dumps(data))
+-        resp.raise_for_status()
+-        resp = json.loads(resp.content)
+-        _logger.info("_authorize_request: Received response:\n%s", resp)
+-        messages = resp.get('messages')
+-        if messages and messages.get('resultCode') == 'Error':
+-            return {
+-                'err_code': messages.get('message')[0].get('code'),
+-                'err_msg': messages.get('message')[0].get('text')
+-            }
+-
+-        return resp
+-
+-    # Customer profiles
+-    def create_customer_profile(self, partner, opaqueData):
+-        """Create a payment and customer profile in the Authorize.net backend.
+-
+-        Creates a customer profile for the partner/credit card combination and links
+-        a corresponding payment profile to it. Note that a single partner in the Odoo
+-        database can have multiple customer profiles in Authorize.net (i.e. a customer
+-        profile is created for every res.partner/payment.token couple).
+-
+-        :param record partner: the res.partner record of the customer
+-        :param str cardnumber: cardnumber in string format (numbers only, no separator)
+-        :param str expiration_date: expiration date in 'YYYY-MM' string format
+-        :param str card_code: three- or four-digit verification number
+-
+-        :return: a dict containing the profile_id and payment_profile_id of the
+-                 newly created customer profile and payment profile
+-        :rtype: dict
+-        """
+-        values = {
+-            'createCustomerProfileRequest': {
++    def _make_request(self, operation, data=None):
++        request = {
++            operation: {
+                 'merchantAuthentication': {
+                     'name': self.name,
+-                    'transactionKey': self.transaction_key
++                    'transactionKey': self.transaction_key,
+                 },
+-                'profile': {
+-                    'description': ('ODOO-%s-%s' % (partner.id, uuid4().hex[:8]))[:20],
+-                    'email': partner.email or '',
+-                    'paymentProfiles': {
+-                        'customerType': 'business' if partner.is_company else 'individual',
+-                        'billTo': {
+-                            'firstName': '' if partner.is_company else _partner_split_name(partner.name)[0],
+-                            'lastName':  _partner_split_name(partner.name)[1],
+-                            'address': (partner.street or '' + (partner.street2 if partner.street2 else '')) or None,
+-                            'city': partner.city,
+-                            'state': partner.state_id.name or None,
+-                            'zip': partner.zip or '',
+-                            'country': partner.country_id.name or None,
+-                            'phoneNumber': partner.phone or '',
+-                        },
+-                        'payment': {
+-                            'opaqueData': {
+-                                'dataDescriptor': opaqueData.get('dataDescriptor'),
+-                                'dataValue': opaqueData.get('dataValue')
+-                            }
+-                        }
+-                    }
+-                },
+-                'validationMode': 'liveMode' if self.state == 'enabled' else 'testMode'
++                **(data or {})
+             }
+         }
+ 
+-        response = self._authorize_request(values)
++        _logger.info("sending request to %s:\n%s", self.url, pprint.pformat(request))
++        response = requests.post(self.url, json.dumps(request), timeout=60)
++        response.raise_for_status()
++        response = json.loads(response.content)
++        _logger.info("response received:\n%s", pprint.pformat(response))
+ 
+-        if response and response.get('err_code'):
+-            raise UserError(_(
+-                "Authorize.net Error:\nCode: %s\nMessage: %s",
+-                response.get('err_code'), response.get('err_msg'),
+-            ))
++        messages = response.get('messages')
++        if messages and messages.get('resultCode') == 'Error':
++            return {
++                'err_code': messages.get('message')[0].get('code'),
++                'err_msg': messages.get('message')[0].get('text')
++            }
+ 
+-        return {
+-            'profile_id': response.get('customerProfileId'),
+-            'payment_profile_id': response.get('customerPaymentProfileIdList')[0]
+-        }
++        return response
+ 
+-    def create_customer_profile_from_tx(self, partner, transaction_id):
+-        """Create an Auth.net payment/customer profile from an existing transaction.
++    def _format_response(self, response, operation):
++        if response and response.get('err_code'):
++            return {
++                'x_response_code': self.AUTH_ERROR_STATUS,
++                'x_response_reason_text': response.get('err_msg')
++            }
++        else:
++            return {
++                'x_response_code': response.get('transactionResponse', {}).get('responseCode'),
++                'x_trans_id': response.get('transactionResponse', {}).get('transId'),
++                'x_type': operation,
++            }
++
++    # Customer profiles
++    def create_customer_profile(self, partner, transaction_id):
++        """ Create an Auth.net payment/customer profile from an existing transaction.
+ 
+         Creates a customer profile for the partner/credit card combination and links
+         a corresponding payment profile to it. Note that a single partner in the Odoo
+@@ -127,7 +87,7 @@ class AuthorizeAPI():
+         profile is created for every res.partner/payment.token couple).
+ 
+         Note that this function makes 2 calls to the authorize api, since we need to
+-        obtain a partial cardnumber to generate a meaningful payment.token name.
++        obtain a partial card number to generate a meaningful payment.token name.
+ 
+         :param record partner: the res.partner record of the customer
+         :param str transaction_id: id of the authorized transaction in the
+@@ -138,26 +98,18 @@ class AuthorizeAPI():
+                  last digits of the card number
+         :rtype: dict
+         """
+-        values = {
+-            'createCustomerProfileFromTransactionRequest': {
+-                "merchantAuthentication": {
+-                    "name": self.name,
+-                    "transactionKey": self.transaction_key
+-                },
+-                'transId': transaction_id,
+-                'customer': {
+-                    'merchantCustomerId': ('ODOO-%s-%s' % (partner.id, uuid4().hex[:8]))[:20],
+-                    'email': partner.email or ''
+-                }
++        response = self._make_request('createCustomerProfileFromTransactionRequest', {
++            'transId': transaction_id,
++            'customer': {
++                'merchantCustomerId': ('ODOO-%s-%s' % (partner.id, uuid4().hex[:8]))[:20],
++                'email': partner.email or ''
+             }
+-        }
+-
+-        response = self._authorize_request(values)
++        })
+ 
+         if not response.get('customerProfileId'):
+             _logger.warning(
+-                'Unable to create customer payment profile, data missing from transaction. Transaction_id: %s - Partner_id: %s'
+-                % (transaction_id, partner)
++                'Unable to create customer payment profile, data missing from transaction. Transaction_id: %s - Partner_id: %s',
++                transaction_id, partner,
+             )
+             return False
+ 
+@@ -166,126 +118,118 @@ class AuthorizeAPI():
+             'payment_profile_id': response.get('customerPaymentProfileIdList')[0]
+         }
+ 
+-        values = {
+-            'getCustomerPaymentProfileRequest': {
+-                "merchantAuthentication": {
+-                    "name": self.name,
+-                    "transactionKey": self.transaction_key
+-                },
+-                'customerProfileId': res['profile_id'],
+-                'customerPaymentProfileId': res['payment_profile_id'],
+-            }
+-        }
+-
+-        response = self._authorize_request(values)
++        response = self._make_request('getCustomerPaymentProfileRequest', {
++            'customerProfileId': res['profile_id'],
++            'customerPaymentProfileId': res['payment_profile_id'],
++        })
+ 
+         res['name'] = response.get('paymentProfile', {}).get('payment', {}).get('creditCard', {}).get('cardNumber')
+         return res
+ 
+-    # Transaction management
+-    def auth_and_capture(self, token, amount, reference):
++    def delete_customer_profile(self, profile_id):
++        """Delete a customer profile
++
++        :param str profile_id: the id of the customer profile in the Authorize.net backend
++
++        :return: a dict containing the response code
++        :rtype: dict
++        """
++        response = self._make_request("deleteCustomerProfileRequest", {'customerProfileId': profile_id})
++        return self._format_response(response, 'deleteCustomerProfile')
++
++    #=== Transaction management ===#
++
++    def authorize(self, amount, reference, token=None, opaque_data=None):
++        """ Authorize (without capture) a payment for the given amount.
++
++        :param float amount: The amount to pay
++        :param str reference: The "invoiceNumber" in Authorize.net backend
++        :param recordset token: The token of the payment method to charge, as a `payment.token`
++                                record
++        :param dict opaque_data: The payment details obfuscated by Authorize.Net
++        :return: a dict containing the response code, transaction id and transaction type
++        :rtype: dict
++        """
++        tx_data = self._prepare_tx_data(token=token, opaque_data=opaque_data)
++        response = self._make_request('createTransactionRequest', {
++            'transactionRequest': {
++                'transactionType': 'authOnlyTransaction',
++                'amount': str(amount),
++                **tx_data,
++                'order': {
++                    'invoiceNumber': reference[:20],
++                    'description': reference[:255],
++                },
++                'customerIP': payment_utils.get_customer_ip_address(),
++            }
++        })
++        return self._format_response(response, 'auth_only')
++
++    def auth_and_capture(self, amount, reference, token=None, opaque_data=None):
+         """Authorize and capture a payment for the given amount.
+ 
+         Authorize and immediately capture a payment for the given payment.token
+         record for the specified amount with reference as communication.
+ 
+-        :param record token: the payment.token record that must be charged
+         :param str amount: transaction amount (up to 15 digits with decimal point)
+         :param str reference: used as "invoiceNumber" in the Authorize.net backend
++        :param record token: the payment.token record that must be charged
++        :param str opaque_data: the transaction opaque_data obtained from Authorize.net
+ 
+         :return: a dict containing the response code, transaction id and transaction type
+         :rtype: dict
+         """
+-        values = {
+-            'createTransactionRequest': {
+-                "merchantAuthentication": {
+-                    "name": self.name,
+-                    "transactionKey": self.transaction_key
++        tx_data = self._prepare_tx_data(token=token, opaque_data=opaque_data)
++        response = self._make_request('createTransactionRequest', {
++            'transactionRequest': {
++                'transactionType': 'authCaptureTransaction',
++                'amount': str(amount),
++                **tx_data,
++                'order': {
++                    'invoiceNumber': reference[:20],
++                    'description': reference[:255],
+                 },
+-                'transactionRequest': {
+-                    'transactionType': 'authCaptureTransaction',
+-                    'amount': str(amount),
+-                    'profile': {
+-                        'customerProfileId': token.authorize_profile,
+-                        'paymentProfile': {
+-                            'paymentProfileId': token.acquirer_ref,
+-                        }
+-                    },
+-                    'order': {
+-                        'invoiceNumber': reference[:20],
+-                        'description': reference[:255],
+-                    }
+-                }
+-
+-            }
+-        }
+-        response = self._authorize_request(values)
+-
+-        if response and response.get('err_code'):
+-            return {
+-                'x_response_code': self.AUTH_ERROR_STATUS,
+-                'x_response_reason_text': response.get('err_msg')
++                'customerIP': payment_utils.get_customer_ip_address(),
+             }
++        })
+ 
+-        result = {
+-            'x_response_code': response.get('transactionResponse', {}).get('responseCode'),
+-            'x_trans_id': response.get('transactionResponse', {}).get('transId'),
+-            'x_type': 'auth_capture'
+-        }
++        result = self._format_response(response, 'auth_capture')
+         errors = response.get('transactionResponse', {}).get('errors')
+         if errors:
+             result['x_response_reason_text'] = '\n'.join([e.get('errorText') for e in errors])
+         return result
+ 
+-    def authorize(self, token, amount, reference):
+-        """Authorize a payment for the given amount.
+-
+-        Authorize (without capture) a payment for the given payment.token
+-        record for the specified amount with reference as communication.
+-
+-        :param record token: the payment.token record that must be charged
+-        :param str amount: transaction amount (up to 15 digits with decimal point)
+-        :param str reference: used as "invoiceNumber" in the Authorize.net backend
+-
+-        :return: a dict containing the response code, transaction id and transaction type
+-        :rtype: dict
++    def _prepare_tx_data(self, token=None, opaque_data=False):
+         """
+-        values = {
+-            'createTransactionRequest': {
+-                "merchantAuthentication": {
+-                    "name": self.name,
+-                    "transactionKey": self.transaction_key
+-                },
+-                'transactionRequest': {
+-                    'transactionType': 'authOnlyTransaction',
+-                    'amount': str(amount),
+-                    'profile': {
+-                        'customerProfileId': token.authorize_profile,
+-                        'paymentProfile': {
+-                            'paymentProfileId': token.acquirer_ref,
+-                        }
+-                    },
+-                    'order': {
+-                        'invoiceNumber': reference[:20],
+-                        'description': reference[:255],
++        :param token: The token of the payment method to charge, as a `payment.token` record
++        :param dict opaque_data: The payment details obfuscated by Authorize.Net
++        """
++        assert (token or opaque_data) and not (token and opaque_data), "Exactly one of token or opaque_data must be specified"
++        if token:
++            token.ensure_one()
++            return {
++                'profile': {
++                    'customerProfileId': token.authorize_profile,
++                    'paymentProfile': {
++                        'paymentProfileId': token.acquirer_ref,
+                     }
+-                }
+-
++                },
+             }
+-        }
+-        response = self._authorize_request(values)
+-
+-        if response and response.get('err_code'):
++        else:
+             return {
+-                'x_response_code': self.AUTH_ERROR_STATUS,
+-                'x_response_reason_text': response.get('err_msg')
++                'payment': {
++                    'opaqueData': opaque_data,
++                }
+             }
+ 
+-        return {
+-            'x_response_code': response.get('transactionResponse', {}).get('responseCode'),
+-            'x_trans_id': response.get('transactionResponse', {}).get('transId'),
+-            'x_type': 'auth_only'
+-        }
++    def _get_transaction_details(self, transaction_id):
++        """ Return detailed information about a specific transaction. Useful to issue refunds.
++
++        :param str transaction_id: transaction id
++        :return: a dict containing the transaction details
++        :rtype: dict
++        """
++        return self._make_request('getTransactionDetailsRequest', {'transId': transaction_id})
+ 
+     def capture(self, transaction_id, amount):
+         """Capture a previously authorized payment for the given amount.
+@@ -300,102 +244,83 @@ class AuthorizeAPI():
+         :return: a dict containing the response code, transaction id and transaction type
+         :rtype: dict
+         """
+-        values = {
+-            'createTransactionRequest': {
+-                "merchantAuthentication": {
+-                    "name": self.name,
+-                    "transactionKey": self.transaction_key
+-                },
+-                'transactionRequest': {
+-                    'transactionType': 'priorAuthCaptureTransaction',
+-                    'amount': str(amount),
+-                    'refTransId': transaction_id,
+-                }
++        response = self._make_request('createTransactionRequest', {
++            'transactionRequest': {
++                'transactionType': 'priorAuthCaptureTransaction',
++                'amount': str(amount),
++                'refTransId': transaction_id,
+             }
+-        }
+-
+-        response = self._authorize_request(values)
+-
+-        if response and response.get('err_code'):
+-            return {
+-                'x_response_code': self.AUTH_ERROR_STATUS,
+-                'x_response_reason_text': response.get('err_msg')
+-            }
+-
+-        return {
+-            'x_response_code': response.get('transactionResponse', {}).get('responseCode'),
+-            'x_trans_id': response.get('transactionResponse', {}).get('transId'),
+-            'x_type': 'prior_auth_capture'
+-        }
++        })
++        return self._format_response(response, 'prior_auth_capture')
+ 
+     def void(self, transaction_id):
+         """Void a previously authorized payment.
+ 
+         :param str transaction_id: the id of the authorized transaction in the
+                                    Authorize.net backend
+-
+         :return: a dict containing the response code, transaction id and transaction type
+         :rtype: dict
+         """
+-        values = {
+-            'createTransactionRequest': {
+-                "merchantAuthentication": {
+-                    "name": self.name,
+-                    "transactionKey": self.transaction_key
+-                },
+-                'transactionRequest': {
+-                    'transactionType': 'voidTransaction',
+-                    'refTransId': transaction_id
+-                }
++        response = self._make_request('createTransactionRequest', {
++            'transactionRequest': {
++                'transactionType': 'voidTransaction',
++                'refTransId': transaction_id
+             }
+-        }
++        })
++        return self._format_response(response, 'void')
+ 
+-        response = self._authorize_request(values)
++    def refund(self, transaction_id, amount):
++        """Refund a previously authorized payment. If the transaction is not settled
++            yet, it will be voided.
+ 
+-        if response and response.get('err_code'):
++        :param str transaction_id: the id of the authorized transaction in the
++                                   Authorize.net backend
++        :param float amount: transaction amount to refund
++        :return: a dict containing the response code, transaction id and transaction type
++        :rtype: dict
++        """
++        tx_details = self._get_transaction_details(transaction_id)
++
++        if tx_details and tx_details.get('err_code'):
+             return {
+                 'x_response_code': self.AUTH_ERROR_STATUS,
+-                'x_response_reason_text': response.get('err_msg')
++                'x_response_reason_text': tx_details.get('err_msg')
+             }
+ 
+-        return {
+-            'x_response_code': response.get('transactionResponse', {}).get('responseCode'),
+-            'x_trans_id': response.get('transactionResponse', {}).get('transId'),
+-            'x_type': 'void'
+-        }
++        # Void transaction not yet settled instead of issuing a refund
++        # (spoiler alert: a refund on a non settled transaction will throw an error)
++        if tx_details.get('transaction', {}).get('transactionStatus') in ['authorizedPendingCapture', 'capturedPendingSettlement']:
++            return self.void(transaction_id)
++
++        card = tx_details.get('transaction', {}).get('payment', {}).get('creditCard', {}).get('cardNumber')
++        response = self._make_request('createTransactionRequest', {
++            'transactionRequest': {
++                'transactionType': 'refundTransaction',
++                'amount': str(amount),
++                'payment': {
++                    'creditCard': {
++                        'cardNumber': card,
++                        'expirationDate': 'XXXX',
++                    }
++                },
++                'refTransId': transaction_id,
++            }
++        })
++        return self._format_response(response, 'refund')
++
++    # Acquirer configuration: fetch authorize_client_key & currencies
++    def merchant_details(self):
++        """ Retrieves the merchant details and generate a new public client key if none exists.
++
++        :return: Dictionary containing the merchant details
++        :rtype: dict"""
++        return self._make_request('getMerchantDetailsRequest')
+ 
+     # Test
+     def test_authenticate(self):
+-        """Test Authorize.net communication with a simple credentials check.
++        """ Test Authorize.net communication with a simple credentials check.
+ 
+-        :return: True if authentication was successful, else False (or throws an error)
+-        :rtype: bool
++        :return: The authentication results
++        :rtype: dict
+         """
+-        values = {
+-            'authenticateTestRequest': {
+-                "merchantAuthentication": {
+-                    "name": self.name,
+-                    "transactionKey": self.transaction_key
+-                },
+-            }
+-        }
+-
+-        response = self._authorize_request(values)
+-        if response and response.get('err_code'):
+-            return False
+-        return True
+-
+-    # Client Key
+-    def get_client_secret(self):
+-        """ Create a client secret that will be needed for the AcceptJS integration. """
+-        values = {
+-            "getMerchantDetailsRequest": {
+-                "merchantAuthentication": {
+-                    "name": self.name,
+-                    "transactionKey": self.transaction_key,
+-                }
+-            }
+-        }
+-        response = self._authorize_request(values)
+-        client_secret = response.get('publicClientKey')
+-        return client_secret
++        return self._make_request('authenticateTestRequest')
+
+--- a/addons/payment_authorize/models/payment.py
++++ b/None
+@@ -1,335 +0,0 @@
+-# coding: utf-8
+-from werkzeug import urls
+-
+-from .authorize_request import AuthorizeAPI
+-import hashlib
+-import hmac
+-import logging
+-import time
+-
+-from odoo import _, api, fields, models
+-from odoo.addons.payment.models.payment_acquirer import ValidationError
+-from odoo.addons.payment_authorize.controllers.main import AuthorizeController
+-from odoo.tools.float_utils import float_compare, float_repr
+-from odoo.exceptions import UserError
+-
+-_logger = logging.getLogger(__name__)
+-
+-
+-class PaymentAcquirerAuthorize(models.Model):
+-    _inherit = 'payment.acquirer'
+-
+-    provider = fields.Selection(selection_add=[
+-        ('authorize', 'Authorize.Net')
+-    ], ondelete={'authorize': 'set default'})
+-    authorize_login = fields.Char(string='API Login Id', required_if_provider='authorize', groups='base.group_user')
+-    authorize_transaction_key = fields.Char(string='API Transaction Key', required_if_provider='authorize', groups='base.group_user')
+-    authorize_signature_key = fields.Char(string='API Signature Key', required_if_provider='authorize', groups='base.group_user')
+-    authorize_client_key = fields.Char(string='API Client Key', groups='base.group_user')
+-
+-    @api.onchange('provider', 'check_validity')
+-    def onchange_check_validity(self):
+-        if self.provider == 'authorize' and self.check_validity:
+-            self.check_validity = False
+-            return {'warning': {
+-                'title': _("Warning"),
+-                'message': ('This option is not supported for Authorize.net')}}
+-
+-    def action_client_secret(self):
+-        api = AuthorizeAPI(self)
+-        if not api.test_authenticate():
+-            raise UserError(_('Unable to fetch Client Key, make sure the API Login and Transaction Key are correct.'))
+-        self.authorize_client_key = api.get_client_secret()
+-        return True
+-
+-    def _get_feature_support(self):
+-        """Get advanced feature support by provider.
+-
+-        Each provider should add its technical in the corresponding
+-        key for the following features:
+-            * fees: support payment fees computations
+-            * authorize: support authorizing payment (separates
+-                         authorization and capture)
+-            * tokenize: support saving payment data in a payment.tokenize
+-                        object
+-        """
+-        res = super(PaymentAcquirerAuthorize, self)._get_feature_support()
+-        res['authorize'].append('authorize')
+-        res['tokenize'].append('authorize')
+-        return res
+-
+-    def _get_authorize_urls(self, environment):
+-        """ Authorize URLs """
+-        if environment == 'prod':
+-            return {'authorize_form_url': 'https://secure2.authorize.net/gateway/transact.dll'}
+-        else:
+-            return {'authorize_form_url': 'https://test.authorize.net/gateway/transact.dll'}
+-
+-    def _authorize_generate_hashing(self, values):
+-        data = '^'.join([
+-            values['x_login'],
+-            values['x_fp_sequence'],
+-            values['x_fp_timestamp'],
+-            values['x_amount'],
+-            values['x_currency_code']]).encode('utf-8')
+-
+-        return hmac.new(bytes.fromhex(self.authorize_signature_key), data, hashlib.sha512).hexdigest().upper()
+-
+-    def authorize_form_generate_values(self, values):
+-        self.ensure_one()
+-        # State code is only supported in US, use state name by default
+-        # See https://developer.authorize.net/api/reference/
+-        state = values['partner_state'].name if values.get('partner_state') else ''
+-        if values.get('partner_country') and values.get('partner_country') == self.env.ref('base.us', False):
+-            state = values['partner_state'].code if values.get('partner_state') else ''
+-        billing_state = values['billing_partner_state'].name if values.get('billing_partner_state') else ''
+-        if values.get('billing_partner_country') and values.get('billing_partner_country') == self.env.ref('base.us', False):
+-            billing_state = values['billing_partner_state'].code if values.get('billing_partner_state') else ''
+-
+-        base_url = self.get_base_url()
+-        authorize_tx_values = dict(values)
+-        temp_authorize_tx_values = {
+-            'x_login': self.authorize_login,
+-            'x_amount': float_repr(values['amount'], values['currency'].decimal_places if values['currency'] else 2),
+-            'x_show_form': 'PAYMENT_FORM',
+-            'x_type': 'AUTH_CAPTURE' if not self.capture_manually else 'AUTH_ONLY',
+-            'x_method': 'CC',
+-            'x_fp_sequence': '%s%s' % (self.id, int(time.time())),
+-            'x_version': '3.1',
+-            'x_relay_response': 'TRUE',
+-            'x_fp_timestamp': str(int(time.time())),
+-            'x_relay_url': urls.url_join(base_url, AuthorizeController._return_url),
+-            'x_cancel_url': urls.url_join(base_url, AuthorizeController._cancel_url),
+-            'x_currency_code': values['currency'] and values['currency'].name or '',
+-            'address': values.get('partner_address'),
+-            'city': values.get('partner_city'),
+-            'country': values.get('partner_country') and values.get('partner_country').name or '',
+-            'email': values.get('partner_email'),
+-            'zip_code': values.get('partner_zip'),
+-            'first_name': values.get('partner_first_name'),
+-            'last_name': values.get('partner_last_name'),
+-            'phone': values.get('partner_phone'),
+-            'state': state,
+-            'billing_address': values.get('billing_partner_address'),
+-            'billing_city': values.get('billing_partner_city'),
+-            'billing_country': values.get('billing_partner_country') and values.get('billing_partner_country').name or '',
+-            'billing_email': values.get('billing_partner_email'),
+-            'billing_zip_code': values.get('billing_partner_zip'),
+-            'billing_first_name': values.get('billing_partner_first_name'),
+-            'billing_last_name': values.get('billing_partner_last_name'),
+-            'billing_phone': values.get('billing_partner_phone'),
+-            'billing_state': billing_state,
+-        }
+-        temp_authorize_tx_values['returndata'] = authorize_tx_values.pop('return_url', '')
+-        temp_authorize_tx_values['x_fp_hash'] = self._authorize_generate_hashing(temp_authorize_tx_values)
+-        authorize_tx_values.update(temp_authorize_tx_values)
+-        return authorize_tx_values
+-
+-    def authorize_get_form_action_url(self):
+-        self.ensure_one()
+-        environment = 'prod' if self.state == 'enabled' else 'test'
+-        return self._get_authorize_urls(environment)['authorize_form_url']
+-
+-    @api.model
+-    def authorize_s2s_form_process(self, data):
+-        values = {
+-            'opaqueData': data.get('opaqueData'),
+-            'encryptedCardData': data.get('encryptedCardData'),
+-            'acquirer_id': int(data.get('acquirer_id')),
+-            'partner_id': int(data.get('partner_id'))
+-        }
+-        PaymentMethod = self.env['payment.token'].sudo().create(values)
+-        return PaymentMethod
+-
+-    def authorize_s2s_form_validate(self, data):
+-        error = dict()
+-        mandatory_fields = ["opaqueData", "encryptedCardData"]
+-        # Validation
+-        for field_name in mandatory_fields:
+-            if not data.get(field_name):
+-                error[field_name] = 'missing'
+-        return False if error else True
+-
+-    def authorize_test_credentials(self):
+-        self.ensure_one()
+-        transaction = AuthorizeAPI(self.acquirer_id)
+-        return transaction.test_authenticate()
+-
+-class TxAuthorize(models.Model):
+-    _inherit = 'payment.transaction'
+-
+-    _authorize_valid_tx_status = 1
+-    _authorize_pending_tx_status = 4
+-    _authorize_cancel_tx_status = 2
+-    _authorize_error_tx_status = 3
+-
+-    # --------------------------------------------------
+-    # FORM RELATED METHODS
+-    # --------------------------------------------------
+-
+-    @api.model
+-    def _authorize_form_get_tx_from_data(self, data):
+-        """ Given a data dict coming from authorize, verify it and find the related
+-        transaction record. """
+-        reference, description, trans_id, fingerprint = data.get('x_invoice_num'), data.get('x_description'), data.get('x_trans_id'), data.get('x_SHA2_Hash') or data.get('x_MD5_Hash')
+-        if not reference or not trans_id or not fingerprint:
+-            error_msg = _('Authorize: received data with missing reference (%s) or trans_id (%s) or fingerprint (%s)') % (reference, trans_id, fingerprint)
+-            _logger.info(error_msg)
+-            raise ValidationError(error_msg)
+-        tx = self.search(['|', ('reference', '=', reference), ('reference', '=', description)])
+-        if not tx or len(tx) > 1:
+-            error_msg = 'Authorize: received data for x_invoice_num %s and x_description %s' % (reference, description)
+-            if not tx:
+-                error_msg += '; no order found'
+-            else:
+-                error_msg += '; multiple order found'
+-            _logger.info(error_msg)
+-            raise ValidationError(error_msg)
+-        return tx[0]
+-
+-    def _authorize_form_get_invalid_parameters(self, data):
+-        invalid_parameters = []
+-
+-        if self.acquirer_reference and data.get('x_trans_id') != self.acquirer_reference:
+-            invalid_parameters.append(('Transaction Id', data.get('x_trans_id'), self.acquirer_reference))
+-        # check what is buyed
+-        if float_compare(float(data.get('x_amount', '0.0')), self.amount, 2) != 0:
+-            invalid_parameters.append(('Amount', data.get('x_amount'), '%.2f' % self.amount))
+-        return invalid_parameters
+-
+-    def _authorize_form_validate(self, data):
+-        if self.state == 'done':
+-            _logger.warning('Authorize: trying to validate an already validated tx (ref %s)' % self.reference)
+-            return True
+-        status_code = int(data.get('x_response_code', '0'))
+-        if status_code == self._authorize_valid_tx_status:
+-            if data.get('x_type').lower() in ['auth_capture', 'prior_auth_capture']:
+-                self.write({
+-                    'acquirer_reference': data.get('x_trans_id'),
+-                    'date': fields.Datetime.now(),
+-                })
+-                self._set_transaction_done()
+-            elif data.get('x_type').lower() in ['auth_only']:
+-                self.write({'acquirer_reference': data.get('x_trans_id')})
+-                self._set_transaction_authorized()
+-            if self.partner_id and not self.payment_token_id and \
+-               (self.type == 'form_save' or self.acquirer_id.save_token == 'always'):
+-                transaction = AuthorizeAPI(self.acquirer_id)
+-                res = transaction.create_customer_profile_from_tx(self.partner_id, self.acquirer_reference)
+-                if res:
+-                    token_id = self.env['payment.token'].create({
+-                        'authorize_profile': res.get('profile_id'),
+-                        'name': res.get('name'),
+-                        'acquirer_ref': res.get('payment_profile_id'),
+-                        'acquirer_id': self.acquirer_id.id,
+-                        'partner_id': self.partner_id.id,
+-                    })
+-                    self.payment_token_id = token_id
+-            return True
+-        elif status_code == self._authorize_pending_tx_status:
+-            self.write({'acquirer_reference': data.get('x_trans_id')})
+-            self._set_transaction_pending()
+-            return True
+-        else:
+-            error = data.get('x_response_reason_text')
+-            _logger.info(error)
+-            self.write({
+-                'state_message': error,
+-                'acquirer_reference': data.get('x_trans_id'),
+-            })
+-            self._set_transaction_cancel()
+-            return False
+-
+-    def authorize_s2s_do_transaction(self, **data):
+-        self.ensure_one()
+-        transaction = AuthorizeAPI(self.acquirer_id)
+-
+-        if not self.payment_token_id.authorize_profile:
+-            raise UserError(_('Invalid token found: the Authorize profile is missing.'
+-                              'Please make sure the token has a valid acquirer reference.'))
+-
+-        if not self.acquirer_id.capture_manually:
+-            res = transaction.auth_and_capture(self.payment_token_id, round(self.amount, self.currency_id.decimal_places), self.reference)
+-        else:
+-            res = transaction.authorize(self.payment_token_id, round(self.amount, self.currency_id.decimal_places), self.reference)
+-        return self._authorize_s2s_validate_tree(res)
+-
+-    def authorize_s2s_capture_transaction(self):
+-        self.ensure_one()
+-        transaction = AuthorizeAPI(self.acquirer_id)
+-        tree = transaction.capture(self.acquirer_reference or '', round(self.amount, self.currency_id.decimal_places))
+-        return self._authorize_s2s_validate_tree(tree)
+-
+-    def authorize_s2s_void_transaction(self):
+-        self.ensure_one()
+-        transaction = AuthorizeAPI(self.acquirer_id)
+-        tree = transaction.void(self.acquirer_reference or '')
+-        return self._authorize_s2s_validate_tree(tree)
+-
+-    def _authorize_s2s_validate_tree(self, tree):
+-        return self._authorize_s2s_validate(tree)
+-
+-    def _authorize_s2s_validate(self, tree):
+-        if self.state == 'done':
+-            _logger.warning('Authorize: trying to validate an already validated tx (ref %s)' % self.reference)
+-            return True
+-        status_code = int(tree.get('x_response_code', '0'))
+-        if status_code == self._authorize_valid_tx_status:
+-            if tree.get('x_type').lower() in ['auth_capture', 'prior_auth_capture']:
+-                init_state = self.state
+-                self.write({
+-                    'acquirer_reference': tree.get('x_trans_id'),
+-                    'date': fields.Datetime.now(),
+-                })
+-
+-                self._set_transaction_done()
+-
+-                if init_state != 'authorized':
+-                    self.execute_callback()
+-            if tree.get('x_type').lower() == 'auth_only':
+-                self.write({'acquirer_reference': tree.get('x_trans_id')})
+-                self._set_transaction_authorized()
+-                self.execute_callback()
+-            if tree.get('x_type').lower() == 'void':
+-                self._set_transaction_cancel()
+-            return True
+-        elif status_code == self._authorize_pending_tx_status:
+-            self.write({'acquirer_reference': tree.get('x_trans_id')})
+-            self._set_transaction_pending()
+-            return True
+-        else:
+-            error = tree.get('x_response_reason_text')
+-            _logger.info(error)
+-            self.write({
+-                'acquirer_reference': tree.get('x_trans_id'),
+-            })
+-            self._set_transaction_error(msg=error)
+-            return False
+-
+-
+-class PaymentToken(models.Model):
+-    _inherit = 'payment.token'
+-
+-    authorize_profile = fields.Char(string='Authorize.net Profile ID', help='This contains the unique reference '
+-                                    'for this partner/payment token combination in the Authorize.net backend')
+-    provider = fields.Selection(string='Provider', related='acquirer_id.provider', readonly=False)
+-    save_token = fields.Selection(string='Save Cards', related='acquirer_id.save_token', readonly=False)
+-
+-    @api.model
+-    def authorize_create(self, values):
+-        if values.get('opaqueData') and values.get('encryptedCardData'):
+-            acquirer = self.env['payment.acquirer'].browse(values['acquirer_id'])
+-            partner = self.env['res.partner'].browse(values['partner_id'])
+-            transaction = AuthorizeAPI(acquirer)
+-            res = transaction.create_customer_profile(partner, values['opaqueData'])
+-            if res.get('profile_id') and res.get('payment_profile_id'):
+-                return {
+-                    'authorize_profile': res.get('profile_id'),
+-                    'name': values['encryptedCardData'].get('cardNumber'),
+-                    'acquirer_ref': res.get('payment_profile_id'),
+-                    'verified': True
+-                }
+-            else:
+-                raise ValidationError(_('The Customer Profile creation in Authorize.NET failed.'))
+-        else:
+-            return values
+
+--- a/None
++++ b/addons/payment_authorize/models/payment_acquirer.py
+@@ -0,0 +1,94 @@
++# Part of Odoo. See LICENSE file for full copyright and licensing details.
++
++import logging
++import pprint
++
++from odoo import _, api, fields, models
++from odoo.exceptions import UserError
++
++from .authorize_request import AuthorizeAPI
++
++_logger = logging.getLogger(__name__)
++
++
++class PaymentAcquirer(models.Model):
++    _inherit = 'payment.acquirer'
++
++    provider = fields.Selection(
++        selection_add=[('authorize', 'Authorize.Net')], ondelete={'authorize': 'set default'})
++    authorize_login = fields.Char(
++        string="API Login ID", help="The ID solely used to identify the account with Authorize.Net",
++        required_if_provider='authorize')
++    authorize_transaction_key = fields.Char(
++        string="API Transaction Key", required_if_provider='authorize', groups='base.group_system')
++    authorize_signature_key = fields.Char(
++        string="API Signature Key", required_if_provider='authorize', groups='base.group_system')
++    authorize_client_key = fields.Char(
++        string="API Client Key",
++        help="The public client key. To generate directly from Odoo or from Authorize.Net backend.")
++    # Authorize.Net supports only one currency: "One gateway account is required for each currency"
++    # See https://community.developer.authorize.net/t5/The-Authorize-Net-Developer-Blog/Authorize-Net-UK-Europe-Update/ba-p/35957
++    authorize_currency_id = fields.Many2one(
++        string="Authorize Currency", comodel_name='res.currency', groups='base.group_system')
++
++    def action_update_merchant_details(self):
++        """ Fetch the merchant details to update the client key and the account currency. """
++        self.ensure_one()
++
++        if self.state == 'disabled':
++            raise UserError(_("This action cannot be performed while the acquirer is disabled."))
++
++        authorize_API = AuthorizeAPI(self)
++
++        # Validate the API Login ID and Transaction Key
++        res_content = authorize_API.test_authenticate()
++        _logger.info("test_authenticate request response:\n%s", pprint.pformat(res_content))
++        if res_content.get('err_msg'):
++            raise UserError(_("Failed to authenticate.\n%s", res_content['err_msg']))
++
++        # Update the merchant details
++        res_content = authorize_API.merchant_details()
++        _logger.info("merchant_details request response:\n%s", pprint.pformat(res_content))
++        if res_content.get('err_msg'):
++            raise UserError(_("Could not fetch merchant details:\n%s", res_content['err_msg']))
++
++        currency = self.env['res.currency'].search([('name', 'in', res_content.get('currencies'))])
++        self.authorize_currency_id = currency
++        self.authorize_client_key = res_content.get('publicClientKey')
++
++    @api.model
++    def _get_compatible_acquirers(self, *args, currency_id=None, **kwargs):
++        """ Override of payment to unlist Authorize acquirers for unsupported currencies. """
++        acquirers = super()._get_compatible_acquirers(*args, currency_id=currency_id, **kwargs)
++
++        currency = self.env['res.currency'].browse(currency_id).exists()
++        if currency:
++            acquirers = acquirers.filtered(
++                lambda a: a.provider != 'authorize' or currency == a.authorize_currency_id
++            )
++
++        return acquirers
++
++    def _get_validation_amount(self):
++        """ Override of payment to return the amount for Authorize.Net validation operations.
++
++        :return: The validation amount
++        :rtype: float
++        """
++        res = super()._get_validation_amount()
++        if self.provider != 'authorize':
++            return res
++
++        return 0.01
++
++    def _get_validation_currency(self):
++        """ Override of payment to return the currency for Authorize.Net validation operations.
++
++        :return: The validation currency
++        :rtype: recordset of `res.currency`
++        """
++        res = super()._get_validation_currency()
++        if self.provider != 'authorize':
++            return res
++
++        return self.authorize_currency_id
+
+--- a/None
++++ b/addons/payment_authorize/models/payment_token.py
+@@ -0,0 +1,47 @@
++# Part of Odoo. See LICENSE file for full copyright and licensing details.
++
++import logging
++import pprint
++
++from odoo import _, fields, models
++from odoo.exceptions import UserError
++
++from .authorize_request import AuthorizeAPI
++
++_logger = logging.getLogger(__name__)
++
++
++class PaymentToken(models.Model):
++    _inherit = 'payment.token'
++
++    authorize_profile = fields.Char(
++        string="Authorize.Net Profile ID",
++        help="The unique reference for the partner/token combination in the Authorize.net backend.")
++
++    def _handle_deactivation_request(self):
++        """ Override of payment to request Authorize.Net to delete the token.
++
++        Note: self.ensure_one()
++
++        :return: None
++        """
++        super()._handle_deactivation_request()
++        if self.provider != 'authorize':
++            return
++
++        authorize_API = AuthorizeAPI(self.acquirer_id)
++        res_content = authorize_API.delete_customer_profile(self.authorize_profile)
++        _logger.info("delete_customer_profile request response:\n%s", pprint.pformat(res_content))
++
++    def _handle_reactivation_request(self):
++        """ Override of payment to raise an error informing that Auth.net tokens cannot be restored.
++
++        Note: self.ensure_one()
++
++        :return: None
++        """
++        super()._handle_reactivation_request()
++        if self.provider != 'authorize':
++            return
++
++        raise UserError(_("Saved payment methods cannot be restored once they have been deleted."))
+
+--- a/None
++++ b/addons/payment_authorize/models/payment_transaction.py
+@@ -0,0 +1,243 @@
++# Part of Odoo. See LICENSE file for full copyright and licensing details.
++
++import logging
++import pprint
++
++from odoo import _, api, models
++
++from odoo.addons.payment import utils as payment_utils
++from odoo.exceptions import UserError, ValidationError
++
++from .authorize_request import AuthorizeAPI
++
++_logger = logging.getLogger(__name__)
++
++
++class PaymentTransaction(models.Model):
++    _inherit = 'payment.transaction'
++
++    def _get_specific_processing_values(self, processing_values):
++        """ Override of payment to return an access token as acquirer-specific processing values.
++
++        Note: self.ensure_one() from `_get_processing_values`
++
++        :param dict processing_values: The generic processing values of the transaction
++        :return: The dict of acquirer-specific processing values
++        :rtype: dict
++        """
++        res = super()._get_specific_processing_values(processing_values)
++        if self.provider != 'authorize':
++            return res
++
++        return {
++            'access_token': payment_utils.generate_access_token(
++                processing_values['reference'], processing_values['partner_id']
++            )
++        }
++
++    def _authorize_create_transaction_request(self, opaque_data):
++        """ Create an Authorize.Net payment transaction request.
++
++        Note: self.ensure_one()
++
++        :param dict opaque_data: The payment details obfuscated by Authorize.Net
++        :return:
++        """
++        self.ensure_one()
++
++        authorize_API = AuthorizeAPI(self.acquirer_id)
++        if self.acquirer_id.capture_manually or self.operation == 'validation':
++            return authorize_API.authorize(self.amount, self.reference, opaque_data=opaque_data)
++        else:
++            return authorize_API.auth_and_capture(
++                self.amount, self.reference, opaque_data=opaque_data
++            )
++
++    def _send_payment_request(self):
++        """ Override of payment to send a payment request to Authorize.
++
++        Note: self.ensure_one()
++
++        :return: None
++        :raise: UserError if the transaction is not linked to a token
++        """
++        super()._send_payment_request()
++        if self.provider != 'authorize':
++            return
++
++        if not self.token_id.authorize_profile:
++            raise UserError("Authorize.Net: " + _("The transaction is not linked to a token."))
++
++        authorize_API = AuthorizeAPI(self.acquirer_id)
++        if self.acquirer_id.capture_manually:
++            res_content = authorize_API.authorize(self.amount, self.reference, token=self.token_id)
++            _logger.info("authorize request response:\n%s", pprint.pformat(res_content))
++        else:
++            res_content = authorize_API.auth_and_capture(
++                self.amount, self.reference, token=self.token_id
++            )
++            _logger.info("auth_and_capture request response:\n%s", pprint.pformat(res_content))
++
++        # As the API has no redirection flow, we always know the reference of the transaction.
++        # Still, we prefer to simulate the matching of the transaction by crafting dummy feedback
++        # data in order to go through the centralized `_handle_feedback_data` method.
++        feedback_data = {'reference': self.reference, 'response': res_content}
++        self._handle_feedback_data('authorize', feedback_data)
++
++    @api.model
++    def _get_tx_from_feedback_data(self, provider, data):
++        """ Find the transaction based on the feedback data.
++
++        :param str provider: The provider of the acquirer that handled the transaction
++        :param dict data: The feedback data sent by the acquirer
++        :return: The transaction if found
++        :rtype: recordset of `payment.transaction`
++        """
++        tx = super()._get_tx_from_feedback_data(provider, data)
++        if provider != 'authorize':
++            return tx
++
++        reference = data.get('reference')
++        tx = self.search([('reference', '=', reference), ('provider', '=', 'authorize')])
++        if not tx:
++            raise ValidationError(
++                "Authorize.Net: " + _("No transaction found matching reference %s.", reference)
++            )
++        return tx
++
++    def _process_feedback_data(self, data):
++        """ Override of payment to process the transaction based on Authorize data.
++
++        Note: self.ensure_one()
++
++        :param dict data: The feedback data sent by the provider
++        :return: None
++        """
++        super()._process_feedback_data(data)
++        if self.provider != 'authorize':
++            return
++
++        response_content = data.get('response')
++
++        self.acquirer_reference = response_content.get('x_trans_id')
++        status_code = response_content.get('x_response_code', '3')
++        if status_code == '1':  # Approved
++            status_type = response_content.get('x_type').lower()
++            if status_type in ('auth_capture', 'prior_auth_capture'):
++                self._set_done()
++                if self.tokenize and not self.token_id:
++                    self._authorize_tokenize()
++            elif status_type == 'auth_only':
++                self._set_authorized()
++                if self.tokenize and not self.token_id:
++                    self._authorize_tokenize()
++            elif status_type == 'void':
++                self._set_canceled()
++        elif status_code == '2':  # Declined
++            self._set_canceled()
++        elif status_code == '4':  # Held for Review
++            self._set_pending()
++        else:  # Error / Unknown code
++            error_code = response_content.get('x_response_reason_text')
++            _logger.info(
++                "received data with invalid status code %s and error code %s",
++                status_code, error_code
++            )
++            self._set_error(
++                "Authorize.Net: " + _(
++                    "Received data with status code \"%(status)s\" and error code \"%(error)s\"",
++                    status=status_code, error=error_code
++                )
++            )
++
++    def _authorize_tokenize(self):
++        """ Create a token for the current transaction.
++
++        Note: self.ensure_one()
++
++        :return: None
++        """
++        self.ensure_one()
++
++        authorize_API = AuthorizeAPI(self.acquirer_id)
++        cust_profile = authorize_API.create_customer_profile(
++            self.partner_id, self.acquirer_reference
++        )
++        _logger.info("create_customer_profile request response:\n%s", pprint.pformat(cust_profile))
++        if cust_profile:
++            token = self.env['payment.token'].create({
++                'acquirer_id': self.acquirer_id.id,
++                'name': cust_profile.get('name'),
++                'partner_id': self.partner_id.id,
++                'acquirer_ref': cust_profile.get('payment_profile_id'),
++                'authorize_profile': cust_profile.get('profile_id'),
++            })
++            self.write({
++                'token_id': token.id,
++                'tokenize': False,
++            })
++            _logger.info(
++                "created token with id %s for partner with id %s", token.id, self.partner_id.id
++            )
++
++    def _send_refund_request(self):
++        """ Override of payment to send a refund request to Authorize.
++
++        Note: self.ensure_one()
++
++        :return: None
++        """
++        super()._send_refund_request()
++        if self.provider != 'authorize':
++            return
++
++        authorize_API = AuthorizeAPI(self.acquirer_id)
++        rounded_amount = round(self.amount, self.currency_id.decimal_places)
++        res_content = authorize_API.refund(self.acquirer_reference, rounded_amount)
++        _logger.info("refund request response:\n%s", pprint.pformat(res_content))
++        # As the API has no redirection flow, we always know the reference of the transaction.
++        # Still, we prefer to simulate the matching of the transaction by crafting dummy feedback
++        # data in order to go through the centralized `_handle_feedback_data` method.
++        feedback_data = {'reference': self.reference, 'response': res_content}
++        self._handle_feedback_data('authorize', feedback_data)
++
++    def _send_capture_request(self):
++        """ Override of payment to send a capture request to Authorize.
++
++        Note: self.ensure_one()
++
++        :return: None
++        """
++        super()._send_capture_request()
++        if self.provider != 'authorize':
++            return
++
++        authorize_API = AuthorizeAPI(self.acquirer_id)
++        rounded_amount = round(self.amount, self.currency_id.decimal_places)
++        res_content = authorize_API.capture(self.acquirer_reference, rounded_amount)
++        _logger.info("capture request response:\n%s", pprint.pformat(res_content))
++        # As the API has no redirection flow, we always know the reference of the transaction.
++        # Still, we prefer to simulate the matching of the transaction by crafting dummy feedback
++        # data in order to go through the centralized `_handle_feedback_data` method.
++        feedback_data = {'reference': self.reference, 'response': res_content}
++        self._handle_feedback_data('authorize', feedback_data)
++
++    def _send_void_request(self):
++        """ Override of payment to send a void request to Authorize.
++
++        Note: self.ensure_one()
++
++        :return: None
++        """
++        super()._send_void_request()
++        if self.provider != 'authorize':
++            return
++
++        authorize_API = AuthorizeAPI(self.acquirer_id)
++        res_content = authorize_API.void(self.acquirer_reference)
++        _logger.info("void request response:\n%s", pprint.pformat(res_content))
++        # As the API has no redirection flow, we always know the reference of the transaction.
++        # Still, we prefer to simulate the matching of the transaction by crafting dummy feedback
++        # data in order to go through the centralized `_handle_feedback_data` method.
++        feedback_data = {'reference': self.reference, 'response': res_content}
++        self._handle_feedback_data('authorize', feedback_data)

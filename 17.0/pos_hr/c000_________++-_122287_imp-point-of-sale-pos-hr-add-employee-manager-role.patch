@@ -1,0 +1,147 @@
+PR: https://github.com/odoo/odoo/pull/122287
+
+From: a3d530c846ffd0692ffe386ed9c2fc2991cdbb14
+From: David Monnom (moda)
+Date: 2023-06-15 15:36:08
+
+Breaking data model changes score: 8, change matches:
+-    employee_ids = fields.Many2many(
++    basic_employee_ids = fields.Many2many(
++    advanced_employee_ids = fields.Many2many(
+-    pos_employee_ids = fields.Many2many(related='pos_config_id.employee_ids', readonly=False)
++    pos_basic_employee_ids = fields.Many2many(related='pos_config_id.basic_employee_ids', readonly=False,
++    pos_advanced_employee_ids = fields.Many2many(related='pos_config_id.advanced_employee_ids', readonly=False,
+
+Total Changes: 61
+
+[IMP] point_of_sale,pos_hr: add employee manager role
+
+Currently, POS-allowed employees can manage cash:
+* at the opening (cash control)
+* on cash payment
+
+Now, after adding the mananger role, it is possible for an employee to
+open the cash register. In the settings of a `pos_config`, you can add
+employees with a "basic" role and with a "manager" role, the latter
+grants the same rights as a classic odoo manager user.
+
+closes odoo/odoo#122287
+
+Related: odoo/upgrade#4700
+Signed-off-by: Guilliams Adrien (adgu) <adgu@odoo.com>
+
+================================= pseudo patch: =================================
+
+--- a/addons/pos_hr/models/hr_employee.py
++++ b/addons/pos_hr/models/hr_employee.py
+@@ -25,12 +25,12 @@ class HrEmployee(models.Model):
+     @api.ondelete(at_uninstall=False)
+     def _unlink_except_active_pos_session(self):
+         configs_with_employees = self.env['pos.config'].sudo().search([('module_pos_hr', '=', 'True')]).filtered(lambda c: c.current_session_id)
+-        configs_with_all_employees = configs_with_employees.filtered(lambda c: not c.employee_ids)
+-        configs_with_specific_employees = configs_with_employees.filtered(lambda c: c.employee_ids & self)
++        configs_with_all_employees = configs_with_employees.filtered(lambda c: not c.basic_employee_ids and not c.advanced_employee_ids)
++        configs_with_specific_employees = configs_with_employees.filtered(lambda c: (c.basic_employee_ids or c.advanced_employee_ids) & self)
+         if configs_with_all_employees or configs_with_specific_employees:
+             error_msg = _("You cannot delete an employee that may be used in an active PoS session, close the session(s) first: \n")
+             for employee in self:
+-                config_ids = configs_with_all_employees | configs_with_specific_employees.filtered(lambda c: employee in c.employee_ids)
++                config_ids = configs_with_all_employees | configs_with_specific_employees.filtered(lambda c: employee in c.basic_employee_ids)
+                 if config_ids:
+                     error_msg += _("Employee: %s - PoS Config(s): %s \n") % (employee.name, ', '.join(config.name for config in config_ids))
+ 
+
+--- a/addons/pos_hr/models/pos_config.py
++++ b/addons/pos_hr/models/pos_config.py
+@@ -1,13 +1,26 @@
+ # -*- coding: utf-8 -*-
+ 
+-from functools import partial
+-
+-from odoo import models, fields
++from odoo import models, fields, api
+ 
+ 
+ class PosConfig(models.Model):
+     _inherit = 'pos.config'
+ 
+-    employee_ids = fields.Many2many(
+-        'hr.employee', string="Employees with access",
+-        help='If left empty, all employees can log in to the PoS session')
++    basic_employee_ids = fields.Many2many(
++        'hr.employee', 'pos_hr_basic_employee_hr_employee', string="Employees with basic access",
++        help='If left empty, all employees can log in to PoS')
++    advanced_employee_ids = fields.Many2many(
++        'hr.employee', 'pos_hr_advanced_employee_hr_employee', string="Employees with manager access",
++        help='If left empty, only Odoo users have extended rights in PoS')
++
++    @api.onchange('basic_employee_ids')
++    def _onchange_basic_employee_ids(self):
++        for employee in self.basic_employee_ids:
++            if employee in self.advanced_employee_ids:
++                self.advanced_employee_ids -= employee
++
++    @api.onchange('advanced_employee_ids')
++    def _onchange_advanced_employee_ids(self):
++        for employee in self.advanced_employee_ids:
++            if employee in self.basic_employee_ids:
++                self.basic_employee_ids -= employee
+
+--- a/addons/pos_hr/models/pos_session.py
++++ b/addons/pos_hr/models/pos_session.py
+@@ -21,8 +21,10 @@ class PosSession(models.Model):
+         return result
+ 
+     def _loader_params_hr_employee(self):
+-        if len(self.config_id.employee_ids) > 0:
+-            domain = ['&', ('company_id', '=', self.config_id.company_id.id), '|', ('user_id', '=', self.user_id.id), ('id', 'in', self.config_id.employee_ids.ids)]
++        if len(self.config_id.basic_employee_ids) > 0:
++            domain = [
++                '&', ('company_id', '=', self.config_id.company_id.id),
++                '|', ('user_id', '=', self.user_id.id), ('id', 'in', self.config_id.basic_employee_ids.ids + self.config_id.advanced_employee_ids.ids)]
+         else:
+             domain = [('company_id', '=', self.config_id.company_id.id)]
+         return {'search_params': {'domain': domain, 'fields': ['name', 'id', 'user_id', 'work_contact_id'], 'load': False}}
+@@ -36,7 +38,10 @@ class PosSession(models.Model):
+         employees_barcode_pin = self.env['hr.employee'].browse(employee_ids).get_barcodes_and_pin_hashed()
+         bp_per_employee_id = {bp_e['id']: bp_e for bp_e in employees_barcode_pin}
+         for employee in employees:
+-            employee['role'] = 'manager' if employee['user_id'] and employee['user_id'] in manager_ids else 'cashier'
++            if employee['user_id'] and employee['user_id'] in manager_ids or employee['id'] in self.config_id.advanced_employee_ids.ids:
++                employee['role'] = 'manager'
++            else:
++                employee['role'] = 'cashier'
+             employee['barcode'] = bp_per_employee_id[employee['id']]['barcode']
+             employee['pin'] = bp_per_employee_id[employee['id']]['pin']
+ 
+
+--- a/addons/pos_hr/models/res_config_settings.py
++++ b/addons/pos_hr/models/res_config_settings.py
+@@ -1,10 +1,25 @@
+ # -*- coding: utf-8 -*-
+ 
+-from odoo import fields, models
++from odoo import fields, models, api
+ 
+ 
+ class ResConfigSettings(models.TransientModel):
+     _inherit = 'res.config.settings'
+ 
+     # pos.config fields
+-    pos_employee_ids = fields.Many2many(related='pos_config_id.employee_ids', readonly=False)
++    pos_basic_employee_ids = fields.Many2many(related='pos_config_id.basic_employee_ids', readonly=False,
++        help='If left empty, all employees can log in to PoS')
++    pos_advanced_employee_ids = fields.Many2many(related='pos_config_id.advanced_employee_ids', readonly=False,
++        help='If left empty, only Odoo users have extended rights in PoS')
++
++    @api.onchange('pos_basic_employee_ids')
++    def _onchange_basic_employee_ids(self):
++        for employee in self.pos_basic_employee_ids:
++            if employee in self.pos_advanced_employee_ids:
++                self.pos_advanced_employee_ids -= employee
++
++    @api.onchange('pos_advanced_employee_ids')
++    def _onchange_advanced_employee_ids(self):
++        for employee in self.pos_advanced_employee_ids:
++            if employee in self.pos_basic_employee_ids:
++                self.pos_basic_employee_ids -= employee

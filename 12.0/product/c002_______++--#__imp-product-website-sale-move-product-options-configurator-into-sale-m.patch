@@ -1,0 +1,396 @@
+PR: https://github.com/odoo/odoo/pull/
+
+From: 856c2e9008f1af7bc1327d9c2900db1e109ab0fa
+From: Aurélien Warnon
+Date: 2018-09-25 16:39:32
+
+Breaking data model changes score: 10, change matches:
++    product_attribute_value_ids = fields.Many2many(
+-    product_ids = fields.Many2many('product.product', string='Variants', readonly=True)
+-    price_ids = fields.One2many('product.attribute.price', 'value_id', 'Attribute Prices', readonly=True)
++    exclude_for = fields.Many2many(
+-    value_id = fields.Many2one('product.attribute.value', 'Product Attribute Value', ondelete='cascade', required=True)
+-    price_extra = fields.Float('Price Extra', digits=dp.get_precision('Product Price'))
++    value_ids = fields.Many2many(
++    product_value_ids = fields.Many2many('product.product.attribute.value', string='Product Attribute Values', compute="_set_product_value_ids")
+
+Total Changes: 221
+
+[IMP] product,(website_)sale: Move product options configurator into sale module
+
+Task #1871557
+
+Purpose
+=======
+
+* Configure a product from a sales order as easily as in the ecommerce
+  The backend uses the same template as the frontend to configure a products and its options
+
+* Display optionnal products of optionnal products in the "sale options" section
+
+* Allow adding exlusions to some combinations of the product and/or
+  to some combinations of the optionnal and accessory products
+
+Specification
+=============
+
+PHASE I
+
+1. Improve the "Add to cart" with optional products
+
+* When you add an option to cart, move the product to the cart & show the options of this option
+* Don't open the option wizard if no option available (in case this module becomes generic,
+  it's better to skip this step when it's not needed)
+* Display the options right under their related product in the cart
+
+2. Do not allow to add the product as an optional product for itself
+Why ?
+* No functional sense
+* Creates issues in the add to cart wizard
+
+3. Exclude some attribute combinations within the product or with related options and accessory products
+
+* Rename VARIANT PRICES button -> CONFIGURE VARIANTS
+* When you click this button and select a value, open form view rather than inline edition
+* Form view of variant values:
+	- Attribute
+	- Value
+	- HTML Color Index
+	- Attribute Price Extra
+	- Not Compatible with: o2m tab with 2 fields: Product AND Attribute Value (of this product)
+	  [m2m tag selection]
+	- in any new line, autocomplete the current product by default
+	- Tooltip: A list of product and attribute values that you want to exclude for
+          this product's attribue value. Also applies on optionnal and accessory products.
+
+4. New option to configure a product in a sales order line
+
+* This option is only visible if the corresponding option is activated in the sales settings
+* It opens a wizard to select a product template, configure related attribute values
+  and select optional products (based on frontend view)
+* Attributes not compatible with other selected attributes should not be selectable
+* Must work like in the frontend
+
+================================= pseudo patch: =================================
+
+--- a/addons/product/models/product.py
++++ b/addons/product/models/product.py
+@@ -93,7 +93,7 @@ class ProductProduct(models.Model):
+     lst_price = fields.Float(
+         'Sale Price', compute='_compute_product_lst_price',
+         digits=dp.get_precision('Product Price'), inverse='_set_product_lst_price',
+-        help="The sale price is managed from the product template. Click on the 'Variant Prices' button to set the extra attribute prices.")
++        help="The sale price is managed from the product template. Click on the 'Configure Variants' button to set the extra attribute prices.")
+ 
+     default_code = fields.Char('Internal Reference', index=True)
+     code = fields.Char('Reference', compute='_compute_product_code')
+@@ -110,6 +110,8 @@ class ProductProduct(models.Model):
+         help="International Article Number used for product identification.")
+     attribute_value_ids = fields.Many2many(
+         'product.attribute.value', string='Attributes', ondelete='restrict')
++    product_attribute_value_ids = fields.Many2many(
++        'product.product.attribute.value', string='Attribute Values', compute="_compute_product_attribute_value_ids")
+     # image: all image fields are base64 encoded and PIL-supported
+     image_variant = fields.Binary(
+         "Variant Image", attachment=True,
+@@ -193,15 +195,10 @@ class ProductProduct(models.Model):
+             value -= product.price_extra
+             product.write({'list_price': value})
+ 
+-    @api.depends('attribute_value_ids.price_ids.price_extra', 'attribute_value_ids.price_ids.product_tmpl_id')
++    @api.depends('product_attribute_value_ids.price_extra')
+     def _compute_product_price_extra(self):
+-        # TDE FIXME: do a real multi and optimize a bit ?
+         for product in self:
+-            price_extra = 0.0
+-            for attribute_price in product.mapped('attribute_value_ids.price_ids'):
+-                if attribute_price.product_tmpl_id == product.product_tmpl_id:
+-                    price_extra += attribute_price.price_extra
+-            product.price_extra = price_extra
++            product.price_extra = sum(product.mapped('product_attribute_value_ids.price_extra'))
+ 
+     @api.depends('list_price', 'price_extra')
+     def _compute_product_lst_price(self):
+@@ -276,6 +273,12 @@ class ProductProduct(models.Model):
+         else:
+             self.product_tmpl_id.image = image
+ 
++    def _compute_product_attribute_value_ids(self):
++        for product in self:
++            product.product_attribute_value_ids = self.env['product.product.attribute.value']._search([
++                ('product_tmpl_id', '=', product.product_tmpl_id.id),
++                ('product_attribute_value_id', 'in', product.attribute_value_ids.ids)])
++
+     @api.one
+     def _get_pricelist_items(self):
+         self.pricelist_item_ids = self.env['product.pricelist.item'].search([
+
+--- a/addons/product/models/product_attribute.py
++++ b/addons/product/models/product_attribute.py
+@@ -19,75 +19,67 @@ class ProductAttribute(models.Model):
+     create_variant = fields.Boolean(default=True, help="Check this if you want to create multiple variants for this attribute.")
+ 
+ 
+-class ProductAttributevalue(models.Model):
++class ProductAttributeValue(models.Model):
+     _name = "product.attribute.value"
+     _order = 'attribute_id, sequence, id'
+     _description = 'Product Attribute Value'
+ 
+-    name = fields.Char('Attribute Value', required=True, translate=True)
+-    sequence = fields.Integer('Sequence', help="Determine the display order")
+-    attribute_id = fields.Many2one('product.attribute', 'Attribute', ondelete='cascade', required=True)
+-    product_ids = fields.Many2many('product.product', string='Variants', readonly=True)
+-    price_extra = fields.Float(
+-        'Attribute Price Extra', compute='_compute_price_extra', inverse='_set_price_extra',
+-        default=0.0, digits=dp.get_precision('Product Price'),
+-        help="Price Extra: Extra price for the variant with this attribute value on sale price. eg. 200 price extra, 1000 + 200 = 1200.")
+-    price_ids = fields.One2many('product.attribute.price', 'value_id', 'Attribute Prices', readonly=True)
++    name = fields.Char(string='Value', required=True, translate=True)
++    sequence = fields.Integer(string='Sequence', help="Determine the display order")
++    attribute_id = fields.Many2one('product.attribute', string='Attribute', ondelete='cascade', required=True)
+ 
+     _sql_constraints = [
+-        ('value_company_uniq', 'unique (name,attribute_id)', 'This attribute value already exists !')
++        ('value_company_uniq', 'unique (name, attribute_id)', 'This attribute value already exists !')
+     ]
+ 
+-    @api.one
+-    def _compute_price_extra(self):
+-        if self._context.get('active_id'):
+-            price = self.price_ids.filtered(lambda price: price.product_tmpl_id.id == self._context['active_id'])
+-            self.price_extra = price.price_extra
+-        else:
+-            self.price_extra = 0.0
+-
+-    def _set_price_extra(self):
+-        if not self._context.get('active_id'):
+-            return
+-
+-        AttributePrice = self.env['product.attribute.price']
+-        prices = AttributePrice.search([('value_id', 'in', self.ids), ('product_tmpl_id', '=', self._context['active_id'])])
+-        updated = prices.mapped('value_id')
+-        if prices:
+-            prices.write({'price_extra': self.price_extra})
+-        else:
+-            for value in self - updated:
+-                AttributePrice.create({
+-                    'product_tmpl_id': self._context['active_id'],
+-                    'value_id': value.id,
+-                    'price_extra': self.price_extra,
+-                })
+-
+     @api.multi
+     def name_get(self):
+         if not self._context.get('show_attribute', True):  # TDE FIXME: not used
+-            return super(ProductAttributevalue, self).name_get()
++            return super(ProductAttributeValue, self).name_get()
+         return [(value.id, "%s: %s" % (value.attribute_id.name, value.name)) for value in self]
+ 
++    @api.multi
++    def _variant_name(self, variable_attributes):
++        return ", ".join([v.name for v in self if v.attribute_id in variable_attributes])
++
+     @api.multi
+     def unlink(self):
+         linked_products = self.env['product.product'].with_context(active_test=False).search([('attribute_value_ids', 'in', self.ids)])
+         if linked_products:
+             raise UserError(_('The operation cannot be completed:\nYou are trying to delete an attribute value with a reference on a product variant.'))
+-        return super(ProductAttributevalue, self).unlink()
++        return super(ProductAttributeValue, self).unlink()
++
++
++class ProductProductAttributeValue(models.Model):
++    _name = "product.product.attribute.value"
++
++    name = fields.Char('Value', related="product_attribute_value_id.name")
++    product_attribute_value_id = fields.Many2one('product.attribute.value', string='Attribute Value', required=True, ondelete='cascade', index=True)
++    product_tmpl_id = fields.Many2one('product.template', string='Product Template', required=True, ondelete='cascade', index=True)
++    attribute_id = fields.Many2one('product.attribute', string='Attribute', related="product_attribute_value_id.attribute_id")
++    sequence = fields.Integer('product.sequence', related="product_attribute_value_id.sequence")
++    price_extra = fields.Float(
++        string='Attribute Price Extra', default=0.0, digits=dp.get_precision('Product Price'),
++        help="Price Extra: Extra price for the variant with this attribute value on sale price. eg. 200 price extra, 1000 + 200 = 1200.")
++    exclude_for = fields.Many2many(
++        'product.attribute.filter.line', string="Exclude for", relation="product_attribute_value_exclusion",
++        help="""A list of product and attribute values that you want to exclude for this product's attribue value.
++        Also applies on optionnal and accessory products.""")
+ 
+     @api.multi
+-    def _variant_name(self, variable_attributes):
+-        return ", ".join([v.name for v in self if v.attribute_id in variable_attributes])
++    def name_get(self):
++        if not self._context.get('show_attribute', True):  # TDE FIXME: not used
++            return super(ProductAttributeValue, self).name_get()
++        return [(value.id, "%s: %s" % (value.attribute_id.name, value.name)) for value in self]
+ 
+ 
+-class ProductAttributePrice(models.Model):
+-    _name = "product.attribute.price"
+-    _description = 'Product Attribute Price'
++class ProductAttributeFilterLine(models.Model):
++    _name = "product.attribute.filter.line"
+ 
+-    product_tmpl_id = fields.Many2one('product.template', 'Product Template', ondelete='cascade', required=True)
+-    value_id = fields.Many2one('product.attribute.value', 'Product Attribute Value', ondelete='cascade', required=True)
+-    price_extra = fields.Float('Price Extra', digits=dp.get_precision('Product Price'))
++    product_tmpl_id = fields.Many2one('product.template', string='Product Template', ondelete='cascade', required=True)
++    value_ids = fields.Many2many(
++        'product.product.attribute.value', relation="product_attr_filter_line_value_ids_rel",
++        string='Attribute Values', domain="[('product_tmpl_id', '=', product_tmpl_id), ('attribute_id.create_variant', '=', True)]")
+ 
+ 
+ class ProductAttributeLine(models.Model):
+@@ -95,9 +87,10 @@ class ProductAttributeLine(models.Model):
+     _rec_name = 'attribute_id'
+     _description = 'Product Attribute Line'
+ 
+-    product_tmpl_id = fields.Many2one('product.template', 'Product Template', ondelete='cascade', required=True)
+-    attribute_id = fields.Many2one('product.attribute', 'Attribute', ondelete='restrict', required=True)
++    product_tmpl_id = fields.Many2one('product.template', string='Product Template', ondelete='cascade', required=True)
++    attribute_id = fields.Many2one('product.attribute', string='Attribute', ondelete='restrict', required=True)
+     value_ids = fields.Many2many('product.attribute.value', string='Attribute Values')
++    product_value_ids = fields.Many2many('product.product.attribute.value', string='Product Attribute Values', compute="_set_product_value_ids")
+ 
+     @api.constrains('value_ids', 'attribute_id')
+     def _check_valid_attribute(self):
+@@ -105,6 +98,64 @@ class ProductAttributeLine(models.Model):
+             raise ValidationError(_('You cannot use this attribute with the following value.'))
+         return True
+ 
++    @api.model
++    def create(self, values):
++        res = super(ProductAttributeLine, self).create(values)
++        res._update_product_product_attribute_values()
++        return res
++
++    def write(self, values):
++        res = super(ProductAttributeLine, self).write(values)
++        self._update_product_product_attribute_values()
++        return res
++
++    @api.depends('value_ids')
++    def _set_product_value_ids(self):
++        for product_attribute_line in self:
++            product_attribute_line.product_value_ids = self.env['product.product.attribute.value'].search([
++                ('product_tmpl_id', 'in', product_attribute_line.product_tmpl_id.ids),
++                ('product_attribute_value_id.attribute_id', 'in', product_attribute_line.value_ids.mapped('attribute_id').ids)])
++
++    @api.multi
++    def unlink(self):
++        for product_attribute_line in self:
++            self.env['product.product.attribute.value'].search([
++                ('product_tmpl_id', 'in', product_attribute_line.product_tmpl_id.ids), 
++                ('product_attribute_value_id.attribute_id', 'in', product_attribute_line.value_ids.mapped('attribute_id').ids)]).unlink()
++
++        return super(ProductAttributeLine, self).unlink()
++
++    def _update_product_product_attribute_values(self):
++        """
++        Create or unlink product.product.attribute.value based on the attribute lines.
++        If the product.attribute.value is removed, remove the corresponding product.product.attribute.value
++        If no product.product.attribute.value exists for the newly added product.attribute.value, create it.
++        """
++        for attribute_line in self:
++            # All existing product.product.attribute.value for this template
++            product_product_attribute_values_to_remove = self.env['product.product.attribute.value'].search([
++                ('product_tmpl_id', '=', attribute_line.product_tmpl_id.id),
++                ('product_attribute_value_id.attribute_id', 'in', attribute_line.value_ids.mapped('attribute_id').ids)])
++            # All existing product.attribute.value shared by all products
++            # eg (Yellow, Red, Blue, Small, Large)
++            existing_product_attribute_values = product_product_attribute_values_to_remove.mapped('product_attribute_value_id')
++
++            # Loop on product.attribute.values for the line (eg: Yellow, Red, Blue)
++            for product_attribute_value in attribute_line.value_ids:
++                if product_attribute_value in existing_product_attribute_values:
++                    # property is already existing: don't touch, remove it from list to avoid unlinking it
++                    product_product_attribute_values_to_remove = product_product_attribute_values_to_remove.filtered(
++                        lambda value: product_attribute_value not in value.mapped('product_attribute_value_id')
++                    )
++                else:
++                    # property does not exist: create it
++                    self.env['product.product.attribute.value'].create({
++                        'product_attribute_value_id': product_attribute_value.id,
++                        'product_tmpl_id': attribute_line.product_tmpl_id.id})
++            # at this point, existing properties can be removed to reflect the modifications on value_ids
++            if product_product_attribute_values_to_remove:
++                product_product_attribute_values_to_remove.unlink()
++
+     @api.model
+     def _name_search(self, name, args=None, operator='ilike', limit=100, name_get_uid=None):
+         # TDE FIXME: currently overriding the domain; however as it includes a
+
+--- a/addons/product/models/product_template.py
++++ b/addons/product/models/product_template.py
+@@ -479,6 +479,59 @@ class ProductTemplate(models.Model):
+ 
+         return True
+ 
++    @api.multi
++    def get_filtered_variants(self, reference_product=None):
++        """
++        Will filter availability (excluded) for the product
++        combinations (ex: color: white excludes size: large).
++
++        Will also filter availability (excluded) for the parent
++        product if specified (meaning that this product is a an optionnal or
++        accessory product of the reference_product).
++        Args:
++            reference_product (product.product): The reference product that has
++            the current product as an option or accessory product.
++        Returns:
++            The filtered list of product variants
++        """
++        self.ensure_one()
++        product_product_attribute_values = self.env['product.product.attribute.value'].search([('product_tmpl_id', '=', self.id)])
++        if reference_product:
++            # append the reference_product if provided
++            product_product_attribute_values |= reference_product.product_attribute_value_ids
++        product_variants = self.product_variant_ids
++
++        for product_product_attribute_value in product_product_attribute_values:
++            # CASE 1: The whole product is excluded when no attribute values are selected in the parent product
++            # returns empty recordset of product.product if so. What is checked is:
++            # If the product_attribute value doesn't belong to self (i.e. belongs to the reference product)
++            # and self is the excluded product template on the exclusion lines 
++            # and the exclusions is on the product without specified product attribute values (i.e. the whole product is excluded)
++            if product_product_attribute_value.product_tmpl_id != self \
++                    and self in product_product_attribute_value.exclude_for.mapped('product_tmpl_id') \
++                    and not product_product_attribute_value.exclude_for.filtered(
++                        lambda excluded_product_attribute_value: excluded_product_attribute_value.product_tmpl_id == self).value_ids:
++                return self.env['product.product']
++
++            # CASE 2: Check if some of the product.product.attribute.value of the product are excluded
++            # for this prodcut. A variant could be excluded:
++            # - Either by itself (eg: The office chair with iron legs excludes the color white)
++            # - Or by the reference product (eg: The customizable desk with iron legs excludes the office chair with aluminium legs)
++            for excluded in product_product_attribute_value.exclude_for.filtered(
++                    lambda excluded_product_attribute_value: excluded_product_attribute_value.product_tmpl_id == self):
++                product_variants -= product_variants.filtered(
++                    lambda variant:
++                    # 1/ Check the applicability of the exlusion
++                    # i.e: the restiction comes from the parent
++                    # OR the restriction is on a product_attribute_value that this variant has, eg:
++                    # if the office chair with iron legs excludes the color white, we must check 
++                    # that this variant has iron legs to check the exclusion
++                    (product_product_attribute_value.product_tmpl_id != self or product_product_attribute_value in variant.product_attribute_value_ids) and
++                    # 2/ Check the variant has one of the exluded attribute values
++                    any(attribute_value in excluded.value_ids for attribute_value in variant.product_attribute_value_ids))
++
++        return product_variants
++
+     @api.model
+     def get_empty_list_help(self, help):
+         self = self.with_context(
+
+--- a/addons/product/models/res_config_settings.py
++++ b/addons/product/models/res_config_settings.py
+@@ -13,7 +13,7 @@ class ResConfigSettings(models.TransientModel):
+              " * Checked : Product are visible for every company, even if a company is defined on the partner.\n"
+              " * Unchecked : Each company can see only its product (product where company is defined). Product not related to a company are visible for all companies.")
+     group_uom = fields.Boolean("Units of Measure", implied_group='uom.group_uom')
+-    group_product_variant = fields.Boolean("Attributes and Variants", implied_group='product.group_product_variant')
++    group_product_variant = fields.Boolean("Variants and Options", implied_group='product.group_product_variant')
+     group_stock_packaging = fields.Boolean('Product Packagings',
+         implied_group='product.group_stock_packaging')
+     group_sale_pricelist = fields.Boolean("Use pricelists to adapt your price per customers",

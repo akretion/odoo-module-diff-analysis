@@ -1,0 +1,178 @@
+PR: https://github.com/odoo/odoo/pull/110016
+
+From: 512574861691f425ec6a17f20fe4b586bb88a299
+From: wan
+Date: 2023-02-17 18:30:40
+
+Breaking data model changes score: 4, change matches:
+-    _inherit = 'account.tax.template'
+-    amount_type = fields.Selection(selection_add=[
+-    python_compute = fields.Text(string='Python Code', default="result = price_unit * 0.10",
+-    python_applicable = fields.Text(string='Applicable Code', default="result = True",
+
+Total Changes: 31
+
+[REF] account: remove chart template
+
+Rewrite the whole chart template mechanism, removing the templates
+stored in the database. The new format will mainly use CSV.
+
+Speed up install time
+*--------------------
+
+* About half of the time of installing a localization for the first time is
+  taken by creating the template records. This new in code format gets
+  completely rid of this.
+* Creating the template records could often not be done in batch because
+  of parent/children relations.
+* The instanciation of the accounts on the company has been entirely
+  reworked too, by
+  - optimizing the order of creation of records to avoid UPDATE queries
+  - using precomputed fields to avoid UPDATE queries
+  - updating the translation in batch
+  - deactivating logging in the chatter
+  - avoiding access rights checks by checking the rights at the start
+
+Overall, when installing a chart template for the first time, it is 4
+times faster because half of the time spent on saving the template in
+the database is not done at all anymore, and the instanciation on the
+company is more than twice as fast.
+
+Reduce technical debt
+*--------------------
+
+There is no need to synchronize the templates with the real records
+anymore. No need to use hooks to copy the data from one to the other.
+
+It is easier to change a template in a stable version, which can often
+be necessary due to legal reasons (i.e. a change of tax rates, reporting
+tags,...)
+
+Two modules have been removed:
+* `l10n_generic_coa`: since there is nothing left datawise in this
+  module, it can be integrated in `account` for free. It is just code
+  and CSV.
+* `l10n_multilang`: the fields that this module modified to be
+  translatable are now always translatable:
+  - there was an issue when updating modules that deleted all the
+    translations because the fields were not translatable at some point
+    during the loading of the registry, then they because translatable
+    again but lost all translations because of the column type change.
+  - most devs are not able to understand all the languages needed for
+    all the localization available. Therefore, english has been added in
+    the sources in most localization to understand better issues while
+    debugging.
+  - no need to call post init hooks anymore, doing the sync with the
+    templates.
+  - more: see "Translations" section
+
+Because most of the data is now in CSV, it is also easier for product
+owners to edit, audit, modify files themselves, removing one layer
+during trivial development processes when only data should be changed.
+
+More flexibility for declaration
+*-------------------------------
+
+The data declaration can now be done easily in python or CSV.
+A nice feature is that you can declare everything at once, even for some
+more complex chart of accounts:
+* if you have to set default taxes on accounts, would need to
+  - declare the accounts because accounts are required on the taxes
+  - declare the taxes
+  - declare the taxes to put on the accounts
+  This would lead to scatter information in multiple files. Now,
+  everything can be declared in the same place and the loading of the
+  chart of accounts will do the 3 steps automatically.
+* if you have a relation of child/parent, you would first need to
+  declare the parents then the children, and the loading would not be
+  efficient because done one by one. Now, everything is done in batch
+  automatically without having to think about it.
+
+It is also easier to update fields on records where there was no field
+for that on the templates, like
+* setting a restriction for journals on accounts
+* setting specific values on the company
+* modifying journals and linking them easily by using the xml_id instead
+  of having to compute it manually
+
+Translations
+*-----------
+
+Some countries have multiple languages (i.e. Belgium uses officially
+French, Dutch and German, and the CoA also has an official English
+version) and we must support the languages in all these countries.
+All these translations are known, and hard coded without using out
+translation platform (Transifex). We also like to have the English
+version (even if an official one doesn't exist) so that support can be
+done more easily in databases using chart templates in other languages
+(especially using a non roman alphabet).
+
+Because the translations were not on Transifex for these records, it was
+really hard to maintain: the translation templates (`.pot` files) were
+not easy to extract as the automatic export would give values mixing
+both the CoA and the menuitmes, the fields' strings,... But we don't
+want to translate the CoA as we already know the value.
+Managing the translations in the `.po` files was also annoying:
+* it is easy to forget that the translations need an update too
+* it requires a special editor, special terminal commands that everyone
+  is not familiar with
+* it is easy to make mistakes in the source string
+
+The new format is the following: `field@en_US` where `field` is the
+translatable field (usually `name`) and `en_US` is the locale code.
+This allows to have the whole declaration on one line, everything in one
+file. It also makes the process easier when debugging: instead of
+searching for the translation in the `.po` files, it directly appears
+next to the configuration of the account/tax/... .
+
+Update of the code
+*-----------------
+
+The code can be updated using this script
+https://github.com/william-andre/transform_coa
+Forward ports can be managed too by stashing/resetting/checkout the new
+modules or the changes in the modules updated in the same PR.
+
+task-2687567
+
+Part-of: odoo/odoo#110016
+
+================================= pseudo patch: =================================
+
+--- a/addons/account_tax_python/models/account_tax.py
++++ b/addons/account_tax_python/models/account_tax.py
+@@ -51,34 +51,3 @@ class AccountTaxPython(models.Model):
+             if localdict.get('result', False):
+                 taxes += tax
+         return super(AccountTaxPython, taxes).compute_all(price_unit, currency, quantity, product, partner, is_refund=is_refund, handle_price_include=handle_price_include, include_caba_tags=include_caba_tags, fixed_multiplicator=fixed_multiplicator)
+-
+-
+-class AccountTaxTemplatePython(models.Model):
+-    _inherit = 'account.tax.template'
+-
+-    amount_type = fields.Selection(selection_add=[
+-        ('code', 'Python Code')
+-    ], ondelete={'code': 'cascade'})
+-
+-    python_compute = fields.Text(string='Python Code', default="result = price_unit * 0.10",
+-        help="Compute the amount of the tax by setting the variable 'result'.\n\n"
+-            ":param base_amount: float, actual amount on which the tax is applied\n"
+-            ":param price_unit: float\n"
+-            ":param quantity: float\n"
+-            ":param product: product.product recordset singleton or None\n"
+-            ":param partner: res.partner recordset singleton or None")
+-    python_applicable = fields.Text(string='Applicable Code', default="result = True",
+-        help="Determine if the tax will be applied by setting the variable 'result' to True or False.\n\n"
+-            ":param price_unit: float\n"
+-            ":param quantity: float\n"
+-            ":param product: product.product recordset singleton or None\n"
+-            ":param partner: res.partner recordset singleton or None")
+-
+-    def _get_tax_vals(self, company, tax_template_to_tax):
+-        """ This method generates a dictionnary of all the values for the tax that will be created.
+-        """
+-        self.ensure_one()
+-        res = super(AccountTaxTemplatePython, self)._get_tax_vals(company, tax_template_to_tax)
+-        res['python_compute'] = self.python_compute
+-        res['python_applicable'] = self.python_applicable
+-        return res

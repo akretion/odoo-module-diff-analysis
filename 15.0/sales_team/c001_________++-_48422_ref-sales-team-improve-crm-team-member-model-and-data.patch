@@ -1,0 +1,271 @@
+PR: https://github.com/odoo/odoo/pull/48422
+
+From: e1355dae7a775237a735847b5f5f426e08642c0b
+From: Thibault Delavallée
+Date: 2021-01-21 10:56:37
+
+Breaking data model changes score: 5, change matches:
++    crm_team_member_ids = fields.One2many(
++    crm_team_member_all_ids = fields.One2many(
++    user_in_teams_ids = fields.Many2many(
+-    crm_team_member_ids = fields.One2many('crm.team.member', 'user_id', string='Sales Team Memberships')
+
+Total Changes: 118
+
+[REF] sales_team: improve crm.team.member model and data
+
+GLOBAL PURPOSE
+
+Ability to have salesmen belonging to several sales team is a core requirement
+of CRM. It is therefore moved from website_crm_score to crm along with cleaning
+and behavior improvement. Automatic lead assignment is also moved and cleaned.
+
+SPECIFICATIONS: MODEL CLEANING
+
+In this commit we improve team member model to make it more usable and
+aligned with current Odoo views and usability.
+
+This commit contains notably
+  * add some related fields on the user: phone, mobile, company, email;
+  * rename "team_user_domain" to "assignment_domain";
+  * rename "maximum_user_leads" to "assignment_max";
+  * improve member views globally;
+
+We also introduce dynamic domain computation for users and teams when seeing
+team members. This allows to limit selection of users or teams depending
+on already existing configuration. Purpose is to avoid having people trying
+to create wrong configuration (duplicates, ...) and receiving error messages.
+
+Also
+  * clean some data and demo about teams and members;
+  * fix some views glitches;
+  * improve views: add some fields in search views, improve wording of
+    fields or actions, ... globally improve usability and US as well as
+    feedback given to users;
+  * group sales team members by team by default as it help getting an
+    overview of team members distribution;
+  * update tests to create team members instead of writing directly on m2m
+    towards users;
+
+SPECIFICATIONS: SALE_TEAM_ID FIELD ON RES.USERS
+
+In this commit we also rewrite sale_team_id field of res.users. Previously in
+crm it was simply a many2one field linking to a crm.team. It was used to compute
+team membership as a standard many2one / one2many relationship. In enterprise
+module ``website_crm_score`` this field was set as a related on first user
+teams. Indeed scoring changed relationship between users and teams to a
+many2many.
+
+This field is now directly a computed many2one field that links to the
+"main" team of the user even in multi memberships mode. As memberships can
+now be de-activated we changed this field to a computed stored field. It is
+based on oldest active membership of user. That way default team of documents
+will be the user's oldest team considered as its "main team".
+
+SPECIFICATIONS: LEAD_ALL_ASSIGNED_MONTH_COUNT
+
+Improve crm_team ``lead_all_assigned_month_count`` field computation. It is
+now simply the sum of assigned leads of team members. Differences may
+happen if a lead in teamA is assigned to an user working in teamB. This should
+not happen if team / user is correctly set at lead level which is generally
+the case. However if that happens, old field counted it. New field will not
+count it as it is not directly linked to a team's member.
+
+SPECIFICATIONS: DEMO DATA
+
+Make crm.lead demo data coherent with user_id / team_id . As demo data should
+be using a mono-membership behavior for users and teams, we have to ensure
+user_id and team_id effectively matches. It allows to have coherent reporting
+and assignment demo flows.
+
+Also avoid having Odoobot responsible of leads. Instead of undefined user_id
+and team_id leading to Odoobot being responsible of some leads, force it
+to be False. Those demo data allow to test automatic assignment of lead
+
+LINKS
+
+Task ID-2086889 (main task)
+Task ID-2357969 (scoring migration task)
+Community PR odoo/odoo#48422
+Enterprise PR odoo/enterprise#499
+Upgrade PR odoo/upgrade#996
+
+================================= pseudo patch: =================================
+
+--- a/addons/sales_team/models/crm_team.py
++++ b/addons/sales_team/models/crm_team.py
+@@ -25,7 +25,7 @@ class CrmTeam(models.Model):
+ 
+         team = self.env['crm.team'].search([
+             ('company_id', 'in', [False, self.env.company.id]),
+-            '|', ('user_id', '=', user_id), ('member_ids', 'in', user_id),
++            '|', ('user_id', '=', user_id), ('member_ids', 'in', [user_id]),
+         ], limit=1)
+         if not team and 'default_team_id' in self.env.context:
+             team = self.env['crm.team'].browse(self.env.context.get('default_team_id'))
+@@ -36,6 +36,7 @@ class CrmTeam(models.Model):
+     def _get_default_favorite_user_ids(self):
+         return [(6, 0, [self.env.uid])]
+ 
++    # description
+     name = fields.Char('Sales Team', required=True, translate=True)
+     sequence = fields.Integer('Sequence', default=10)
+     active = fields.Boolean(default=True, help="If the active field is set to false, it will allow you to hide the Sales Team without removing it.")
+@@ -48,10 +49,15 @@ class CrmTeam(models.Model):
+     user_id = fields.Many2one('res.users', string='Team Leader', check_company=True)
+     # memberships
+     member_ids = fields.Many2many(
+-        'res.users', 'crm_team_member', 'crm_team_id', 'user_id', string='Channel Members',
+-        check_company=True, domain=[('share', '=', False)],
++        'res.users', string='Salespersons', check_company=True, domain=[('share', '=', False)],
++        compute='_compute_member_ids', inverse='_inverse_member_ids', search='_search_member_ids',
++        help="Users assigned to this team.")
++    crm_team_member_ids = fields.One2many(
++        'crm.team.member', 'crm_team_id', string='Sales Team Members',
+         help="Add members to automatically assign their documents to this sales team.")
+-    crm_team_member_ids = fields.One2many('crm.team.member', 'crm_team_id', string='Sales Team Memberships')
++    crm_team_member_all_ids = fields.One2many(
++        'crm.team.member', 'crm_team_id', string='Sales Team Members (incl. inactive)',
++        context={'active_test': False})
+     # UX options
+     color = fields.Integer(string='Color Index', help="The color of the channel")
+     favorite_user_ids = fields.Many2many(
+@@ -63,6 +69,29 @@ class CrmTeam(models.Model):
+     dashboard_button_name = fields.Char(string="Dashboard Button", compute='_compute_dashboard_button_name')
+     dashboard_graph_data = fields.Text(compute='_compute_dashboard_graph')
+ 
++    @api.depends('crm_team_member_ids.active')
++    def _compute_member_ids(self):
++        for team in self:
++            team.member_ids = team.crm_team_member_ids.user_id
++
++    def _inverse_member_ids(self):
++        for team in self:
++            # pre-save value to avoid having _compute_member_ids interfering
++            # while building membership status
++            memberships = team.crm_team_member_ids
++            users_current = team.member_ids
++            users_new = users_current - memberships.user_id
++
++            # add missing memberships
++            self.env['crm.team.member'].create([{'crm_team_id': team.id, 'user_id': user.id} for user in users_new])
++
++            # activate or deactivate other memberships depending on members
++            for membership in memberships:
++                membership.active = membership.user_id in users_current
++
++    def _search_member_ids(self, operator, value):
++        return [('crm_team_member_ids.user_id', operator, value)]
++
+     def _compute_is_favorite(self):
+         for team in self:
+             team.is_favorite = self.env.user in team.favorite_user_ids
+
+--- a/addons/sales_team/models/crm_team_member.py
++++ b/addons/sales_team/models/crm_team_member.py
+@@ -1,7 +1,7 @@
+ # -*- coding: utf-8 -*-
+ # Part of Odoo. See LICENSE file for full copyright and licensing details.
+ 
+-from odoo import fields, models
++from odoo import api, fields, models
+ 
+ 
+ class CrmTeamMember(models.Model):
+@@ -9,8 +9,42 @@ class CrmTeamMember(models.Model):
+     _inherit = ['mail.thread']
+     _description = 'Sales Team Member'
+     _rec_name = 'user_id'
++    _order = 'create_date ASC'
+ 
+-    crm_team_id = fields.Many2one('crm.team', string='Sales Team', required=True)
+-    user_id = fields.Many2one('res.users', string='Saleman', required=True)  # check responsible field
+-    name = fields.Char(string="Name", related='user_id.partner_id.display_name', readonly=False)
+-    active = fields.Boolean(string='Running', default=True)
++    crm_team_id = fields.Many2one(
++        'crm.team', string='Sales Team',
++        default=False,  # TDE: temporary fix to activate depending computed fields
++        index=True, required=True)
++    user_id = fields.Many2one(
++        'res.users', string='Salesman',   # check responsible field
++        index=True, ondelete='cascade', required=True,
++        domain="['&', ('share', '=', False), ('id', 'not in', user_in_teams_ids)]")
++    user_in_teams_ids = fields.Many2many(
++        'res.users', compute='_compute_user_in_teams_ids',
++        help='UX: Give users not to add in the currently chosen team to avoid duplicates')
++    active = fields.Boolean(string='Active', default=True)
++    # salesman information
++    image_1920 = fields.Image("Image", related="user_id.image_1920", max_width=1920, max_height=1920)
++    image_128 = fields.Image("Image (128)", related="user_id.image_128", max_width=128, max_height=128)
++    name = fields.Char(string='Name', related='user_id.display_name', readonly=False)
++    email = fields.Char(string='Email', related='user_id.email')
++    phone = fields.Char(string='Phone', related='user_id.phone')
++    mobile = fields.Char(string='Mobile', related='user_id.mobile')
++    company_id = fields.Many2one('res.company', string='Company', related='user_id.company_id')
++
++    _sql_constraints = [
++        ('crm_team_member_unique',
++         'UNIQUE(crm_team_id,user_id)',
++         'Error, team / user memberships should not be duplicated.'),
++    ]
++
++    @api.depends('crm_team_id')
++    @api.depends_context('default_crm_team_id')
++    def _compute_user_in_teams_ids(self):
++        for member in self:
++            if member.crm_team_id:
++                member.user_in_teams_ids = member.crm_team_id.member_ids
++            elif self.env.context.get('default_crm_team_id'):
++                member.user_in_teams_ids = self.env['crm.team'].browse(self.env.context['default_crm_team_id']).member_ids
++            else:
++                member.user_in_teams_ids = self.env['res.users']
+
+--- a/addons/sales_team/models/res_users.py
++++ b/addons/sales_team/models/res_users.py
+@@ -1,20 +1,35 @@
+ # -*- coding: utf-8 -*-
+ # Part of Odoo. See LICENSE file for full copyright and licensing details.
+ 
+-from odoo import fields, models
++from odoo import api, fields, models
+ 
+ 
+ class ResUsers(models.Model):
+     _inherit = 'res.users'
+ 
+-    crm_team_ids = fields.Many2many('crm.team', 'crm_team_member', 'user_id', 'crm_team_id', string='Sales Teams')
+-    crm_team_member_ids = fields.One2many('crm.team.member', 'user_id', string='Sales Team Memberships')
+-    # mov of the field defined in website_crm_score. The field is now computed
+-    # based on the new modeling introduced in this module. It is stored to avoid
+-    # breaking the member_ids inverse field. As the relationship between users
+-    # and sales team is a one2many / many2one relationship we take the first of
+-    # the crm.team.member record to find the user's sales team.
++    crm_team_ids = fields.Many2many(
++        'crm.team', 'crm_team_member', 'user_id', 'crm_team_id', string='Sales Teams',
++        check_company=True, copy=False, readonly=True,
++        compute='_compute_crm_team_ids', search='_search_crm_team_ids')
++    crm_team_member_ids = fields.One2many('crm.team.member', 'user_id', string='Sales Team Members')
+     sale_team_id = fields.Many2one(
+-        'crm.team', string='User Sales Team',
+-        related='crm_team_member_ids.crm_team_id',
+-        readonly=False, store=True)
++        'crm.team', string='User Sales Team', compute='_compute_sale_team_id',
++        readonly=True, store=True,
++        help="Main user sales team. Used notably for pipeline, or to set sales team in invoicing or subscription.")
++
++    @api.depends('crm_team_member_ids.active')
++    def _compute_crm_team_ids(self):
++        for user in self:
++            user.crm_team_ids = user.crm_team_member_ids.crm_team_id
++
++    def _search_crm_team_ids(self, operator, value):
++        return [('crm_team_member_ids.crm_team_id', operator, value)]
++
++    @api.depends('crm_team_member_ids.crm_team_id', 'crm_team_member_ids.create_date', 'crm_team_member_ids.active')
++    def _compute_sale_team_id(self):
++        for user in self:
++            if not user.crm_team_member_ids.ids:
++                user.sale_team_id = False
++            else:
++                sorted_memberships = user.crm_team_member_ids  # sorted by create date
++                user.sale_team_id = sorted_memberships[0].crm_team_id if sorted_memberships else False

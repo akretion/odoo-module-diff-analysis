@@ -1,0 +1,643 @@
+PR: https://github.com/odoo/odoo/pull/111748
+
+From: f7c033eff7b7bc83d6d18fc5e4df320f43ae5021
+From: Valentin Vallaeys (vava)
+Date: 2023-02-03 10:45:42
+
+Breaking data model changes score: 8.4, change matches:
++    price_rule_ids = fields.One2many(
+-    _inherit = 'delivery.carrier'
+-    delivery_type = fields.Selection(selection_add=[
+-    price_rule_ids = fields.One2many('delivery.price.rule', 'carrier_id', 'Pricing Rules', copy=True)
+-    _inherit = 'sale.order.line'
+-    product_qty = fields.Float(compute='_compute_product_qty', string='Product Qty', digits='Product Unit of Measure')
++    product_qty = fields.Float(
+-    _inherit = "stock.quant.package"
+-    _inherit = 'stock.return.picking'
+
+Total Changes: 553
+
+[MOV] delivery: rename and split files by model names
+
+Part-of: odoo/odoo#111748
+
+================================= pseudo patch: =================================
+
+--- a/addons/delivery/models/__init__.py
++++ b/addons/delivery/models/__init__.py
+@@ -1,11 +1,13 @@
+ # Part of Odoo. See LICENSE file for full copyright and licensing details.
+ 
+ from . import delivery_carrier
+-from . import delivery_grid
++from . import delivery_price_rule
+ from . import delivery_zip_prefix
+-from . import partner
+ from . import product_template
++from . import res_partner
+ from . import sale_order
++from . import sale_order_line
+ from . import stock_move
+ from . import stock_package_type
+ from . import stock_picking
++from . import stock_quant_package
+
+--- a/addons/delivery/models/delivery_carrier.py
++++ b/addons/delivery/models/delivery_carrier.py
+@@ -4,7 +4,7 @@ import psycopg2
+ import re
+ 
+ from odoo import _, api, fields, models, registry, SUPERUSER_ID
+-from odoo.exceptions import UserError
++from odoo.exceptions import UserError, ValidationError
+ from odoo.tools import float_round
+ from odoo.tools.safe_eval import safe_eval
+ 
+@@ -40,7 +40,12 @@ class DeliveryCarrier(models.Model):
+     active = fields.Boolean(default=True)
+     sequence = fields.Integer(help="Determine the display order", default=10)
+     # This field will be overwritten by internal shipping providers by adding their own type (ex: 'fedex')
+-    delivery_type = fields.Selection([('fixed', 'Fixed Price')], string='Provider', default='fixed', required=True)
++    delivery_type = fields.Selection(
++        [('base_on_rule', 'Based on Rules'), ('fixed', 'Fixed Price')],
++        string='Provider',
++        default='fixed',
++        required=True,
++    )
+     integration_level = fields.Selection([('rate', 'Get Rate'), ('rate_and_ship', 'Get Rate and Create Shipment')], string="Integration Level", default='rate_and_ship', help="Action while validating Delivery Orders")
+     prod_environment = fields.Boolean("Environment", help="Set to True if your credentials are certified for production.")
+     debug_logging = fields.Boolean('Debug logging', help="Log requests in order to ease debugging")
+@@ -78,6 +83,10 @@ class DeliveryCarrier(models.Model):
+         default=0
+     )
+ 
++    price_rule_ids = fields.One2many(
++        'delivery.price.rule', 'carrier_id', 'Pricing Rules', copy=True
++    )
++
+     _sql_constraints = [
+         ('margin_not_under_100_percent', 'CHECK (margin >= -100)', 'Margin cannot be lower than -100%'),
+         ('shipping_insurance_is_percentage', 'CHECK(shipping_insurance >= 0 AND shipping_insurance <= 100)', "The shipping insurance must be a percentage between 0 and 100."),
+@@ -316,6 +325,120 @@ class DeliveryCarrier(models.Model):
+     def fixed_cancel_shipment(self, pickings):
+         raise NotImplementedError()
+ 
++    # ----------------------------------- #
++    # Based on rule delivery type methods #
++    # ----------------------------------- #
++
++    def base_on_rule_rate_shipment(self, order):
++        carrier = self._match_address(order.partner_shipping_id)
++        if not carrier:
++            return {'success': False,
++                    'price': 0.0,
++                    'error_message': _('Error: this delivery method is not available for this address.'),
++                    'warning_message': False}
++
++        try:
++            price_unit = self._get_price_available(order)
++        except UserError as e:
++            return {'success': False,
++                    'price': 0.0,
++                    'error_message': e.args[0],
++                    'warning_message': False}
++
++        price_unit = self._compute_currency(order, price_unit, 'company_to_pricelist')
++
++        return {'success': True,
++                'price': price_unit,
++                'error_message': False,
++                'warning_message': False}
++
++    def _get_conversion_currencies(self, order, conversion):
++        if conversion == 'company_to_pricelist':
++            from_currency, to_currency = order.company_id.currency_id, order.pricelist_id.currency_id
++        elif conversion == 'pricelist_to_company':
++            from_currency, to_currency = order.currency_id, order.company_id.currency_id
++
++        return from_currency, to_currency
++
++    def _compute_currency(self, order, price, conversion):
++        from_currency, to_currency = self._get_conversion_currencies(order, conversion)
++        if from_currency.id == to_currency.id:
++            return price
++        return from_currency._convert(price, to_currency, order.company_id, order.date_order or fields.Date.today())
++
++    def _get_price_available(self, order):
++        self.ensure_one()
++        self = self.sudo()
++        order = order.sudo()
++        total = weight = volume = quantity = 0
++        total_delivery = 0.0
++        for line in order.order_line:
++            if line.state == 'cancel':
++                continue
++            if line.is_delivery:
++                total_delivery += line.price_total
++            if not line.product_id or line.is_delivery:
++                continue
++            if line.product_id.type == "service":
++                continue
++            qty = line.product_uom._compute_quantity(line.product_uom_qty, line.product_id.uom_id)
++            weight += (line.product_id.weight or 0.0) * qty
++            volume += (line.product_id.volume or 0.0) * qty
++            quantity += qty
++        total = (order.amount_total or 0.0) - total_delivery
++
++        total = self._compute_currency(order, total, 'pricelist_to_company')
++        # weight is either,
++        # 1- weight chosen by user in choose.delivery.carrier wizard passed by context
++        # 2- saved weight to use on sale order
++        # 3- total order line weight as fallback
++        weight = self.env.context.get('order_weight') or order.shipping_weight or weight
++        return self._get_price_from_picking(total, weight, volume, quantity)
++
++    def _get_price_dict(self, total, weight, volume, quantity):
++        '''Hook allowing to retrieve dict to be used in _get_price_from_picking() function.
++        Hook to be overridden when we need to add some field to product and use it in variable factor from price rules. '''
++        return {
++            'price': total,
++            'volume': volume,
++            'weight': weight,
++            'wv': volume * weight,
++            'quantity': quantity
++        }
++
++    def _get_price_from_picking(self, total, weight, volume, quantity):
++        price = 0.0
++        criteria_found = False
++        price_dict = self._get_price_dict(total, weight, volume, quantity)
++        if self.free_over and total >= self.amount:
++            return 0
++        for line in self.price_rule_ids:
++            test = safe_eval(line.variable + line.operator + str(line.max_value), price_dict)
++            if test:
++                price = line.list_base_price + line.list_price * price_dict[line.variable_factor]
++                criteria_found = True
++                break
++        if not criteria_found:
++            raise UserError(_("No price rule matching this order; delivery cost cannot be computed."))
++
++        return price
++
++    def base_on_rule_send_shipping(self, pickings):
++        res = []
++        for p in pickings:
++            carrier = self._match_address(p.partner_id)
++            if not carrier:
++                raise ValidationError(_('There is no matching delivery rule.'))
++            res = res + [{'exact_price': p.carrier_id._get_price_available(p.sale_id) if p.sale_id else 0.0,  # TODO cleanme
++                          'tracking_number': False}]
++        return res
++
++    def base_on_rule_get_tracking_link(self, picking):
++        return False
++
++    def base_on_rule_cancel_shipment(self, pickings):
++        raise NotImplementedError()
++
+     # -------------------------------- #
+     # get default packages/commodities #
+     # -------------------------------- #
+
+--- a/addons/delivery/models/delivery_grid.py
++++ b/None
+@@ -1,155 +0,0 @@
+-# Part of Odoo. See LICENSE file for full copyright and licensing details.
+-
+-from odoo import api, fields, models, _
+-from odoo.exceptions import UserError, ValidationError
+-from odoo.tools.safe_eval import safe_eval
+-
+-
+-class PriceRule(models.Model):
+-    _name = "delivery.price.rule"
+-    _description = "Delivery Price Rules"
+-    _order = 'sequence, list_price, id'
+-
+-    @api.depends('variable', 'operator', 'max_value', 'list_base_price', 'list_price', 'variable_factor')
+-    def _compute_name(self):
+-        for rule in self:
+-            name = 'if %s %s %.02f then' % (rule.variable, rule.operator, rule.max_value)
+-            if rule.list_base_price and not rule.list_price:
+-                name = '%s fixed price %.02f' % (name, rule.list_base_price)
+-            elif rule.list_price and not rule.list_base_price:
+-                name = '%s %.02f times %s' % (name, rule.list_price, rule.variable_factor)
+-            else:
+-                name = '%s fixed price %.02f plus %.02f times %s' % (name, rule.list_base_price, rule.list_price, rule.variable_factor)
+-            rule.name = name
+-
+-    name = fields.Char(compute='_compute_name')
+-    sequence = fields.Integer(required=True, default=10)
+-    carrier_id = fields.Many2one('delivery.carrier', 'Carrier', required=True, ondelete='cascade')
+-
+-    variable = fields.Selection([('weight', 'Weight'), ('volume', 'Volume'), ('wv', 'Weight * Volume'), ('price', 'Price'), ('quantity', 'Quantity')], required=True, default='weight')
+-    operator = fields.Selection([('==', '='), ('<=', '<='), ('<', '<'), ('>=', '>='), ('>', '>')], required=True, default='<=')
+-    max_value = fields.Float('Maximum Value', required=True)
+-    list_base_price = fields.Float(string='Sale Base Price', digits='Product Price', required=True, default=0.0)
+-    list_price = fields.Float('Sale Price', digits='Product Price', required=True, default=0.0)
+-    variable_factor = fields.Selection([('weight', 'Weight'), ('volume', 'Volume'), ('wv', 'Weight * Volume'), ('price', 'Price'), ('quantity', 'Quantity')], 'Variable Factor', required=True, default='weight')
+-
+-
+-class ProviderGrid(models.Model):
+-    _inherit = 'delivery.carrier'
+-
+-    delivery_type = fields.Selection(selection_add=[
+-        ('base_on_rule', 'Based on Rules'),
+-        ], ondelete={'base_on_rule': lambda recs: recs.write({
+-            'delivery_type': 'fixed', 'fixed_price': 0,
+-        })})
+-    price_rule_ids = fields.One2many('delivery.price.rule', 'carrier_id', 'Pricing Rules', copy=True)
+-
+-    def base_on_rule_rate_shipment(self, order):
+-        carrier = self._match_address(order.partner_shipping_id)
+-        if not carrier:
+-            return {'success': False,
+-                    'price': 0.0,
+-                    'error_message': _('Error: this delivery method is not available for this address.'),
+-                    'warning_message': False}
+-
+-        try:
+-            price_unit = self._get_price_available(order)
+-        except UserError as e:
+-            return {'success': False,
+-                    'price': 0.0,
+-                    'error_message': e.args[0],
+-                    'warning_message': False}
+-
+-        price_unit = self._compute_currency(order, price_unit, 'company_to_pricelist')
+-
+-        return {'success': True,
+-                'price': price_unit,
+-                'error_message': False,
+-                'warning_message': False}
+-
+-    def _get_conversion_currencies(self, order, conversion):
+-        if conversion == 'company_to_pricelist':
+-            from_currency, to_currency = order.company_id.currency_id, order.pricelist_id.currency_id
+-        elif conversion == 'pricelist_to_company':
+-            from_currency, to_currency = order.currency_id, order.company_id.currency_id
+-
+-        return from_currency, to_currency
+-
+-    def _compute_currency(self, order, price, conversion):
+-        from_currency, to_currency = self._get_conversion_currencies(order, conversion)
+-        if from_currency.id == to_currency.id:
+-            return price
+-        return from_currency._convert(price, to_currency, order.company_id, order.date_order or fields.Date.today())
+-
+-    def _get_price_available(self, order):
+-        self.ensure_one()
+-        self = self.sudo()
+-        order = order.sudo()
+-        total = weight = volume = quantity = 0
+-        total_delivery = 0.0
+-        for line in order.order_line:
+-            if line.state == 'cancel':
+-                continue
+-            if line.is_delivery:
+-                total_delivery += line.price_total
+-            if not line.product_id or line.is_delivery:
+-                continue
+-            if line.product_id.type == "service":
+-                continue
+-            qty = line.product_uom._compute_quantity(line.product_uom_qty, line.product_id.uom_id)
+-            weight += (line.product_id.weight or 0.0) * qty
+-            volume += (line.product_id.volume or 0.0) * qty
+-            quantity += qty
+-        total = (order.amount_total or 0.0) - total_delivery
+-
+-        total = self._compute_currency(order, total, 'pricelist_to_company')
+-        # weight is either,
+-        # 1- weight chosen by user in choose.delivery.carrier wizard passed by context
+-        # 2- saved weight to use on sale order
+-        # 3- total order line weight as fallback
+-        weight = self.env.context.get('order_weight') or order.shipping_weight or weight
+-        return self._get_price_from_picking(total, weight, volume, quantity)
+-
+-    def _get_price_dict(self, total, weight, volume, quantity):
+-        '''Hook allowing to retrieve dict to be used in _get_price_from_picking() function.
+-        Hook to be overridden when we need to add some field to product and use it in variable factor from price rules. '''
+-        return {
+-            'price': total,
+-            'volume': volume,
+-            'weight': weight,
+-            'wv': volume * weight,
+-            'quantity': quantity
+-        }
+-
+-    def _get_price_from_picking(self, total, weight, volume, quantity):
+-        price = 0.0
+-        criteria_found = False
+-        price_dict = self._get_price_dict(total, weight, volume, quantity)
+-        if self.free_over and total >= self.amount:
+-            return 0
+-        for line in self.price_rule_ids:
+-            test = safe_eval(line.variable + line.operator + str(line.max_value), price_dict)
+-            if test:
+-                price = line.list_base_price + line.list_price * price_dict[line.variable_factor]
+-                criteria_found = True
+-                break
+-        if not criteria_found:
+-            raise UserError(_("No price rule matching this order; delivery cost cannot be computed."))
+-
+-        return price
+-
+-    def base_on_rule_send_shipping(self, pickings):
+-        res = []
+-        for p in pickings:
+-            carrier = self._match_address(p.partner_id)
+-            if not carrier:
+-                raise ValidationError(_('There is no matching delivery rule.'))
+-            res = res + [{'exact_price': p.carrier_id._get_price_available(p.sale_id) if p.sale_id else 0.0,  # TODO cleanme
+-                          'tracking_number': False}]
+-        return res
+-
+-    def base_on_rule_get_tracking_link(self, picking):
+-        return False
+-
+-    def base_on_rule_cancel_shipment(self, pickings):
+-        raise NotImplementedError()
+
+--- a/None
++++ b/addons/delivery/models/delivery_price_rule.py
+@@ -0,0 +1,32 @@
++# Part of Odoo. See LICENSE file for full copyright and licensing details.
++
++from odoo import api, fields, models
++
++
++class PriceRule(models.Model):
++    _name = "delivery.price.rule"
++    _description = "Delivery Price Rules"
++    _order = 'sequence, list_price, id'
++
++    @api.depends('variable', 'operator', 'max_value', 'list_base_price', 'list_price', 'variable_factor')
++    def _compute_name(self):
++        for rule in self:
++            name = 'if %s %s %.02f then' % (rule.variable, rule.operator, rule.max_value)
++            if rule.list_base_price and not rule.list_price:
++                name = '%s fixed price %.02f' % (name, rule.list_base_price)
++            elif rule.list_price and not rule.list_base_price:
++                name = '%s %.02f times %s' % (name, rule.list_price, rule.variable_factor)
++            else:
++                name = '%s fixed price %.02f plus %.02f times %s' % (name, rule.list_base_price, rule.list_price, rule.variable_factor)
++            rule.name = name
++
++    name = fields.Char(compute='_compute_name')
++    sequence = fields.Integer(required=True, default=10)
++    carrier_id = fields.Many2one('delivery.carrier', 'Carrier', required=True, ondelete='cascade')
++
++    variable = fields.Selection([('weight', 'Weight'), ('volume', 'Volume'), ('wv', 'Weight * Volume'), ('price', 'Price'), ('quantity', 'Quantity')], required=True, default='weight')
++    operator = fields.Selection([('==', '='), ('<=', '<='), ('<', '<'), ('>=', '>='), ('>', '>')], required=True, default='<=')
++    max_value = fields.Float('Maximum Value', required=True)
++    list_base_price = fields.Float(string='Sale Base Price', digits='Product Price', required=True, default=0.0)
++    list_price = fields.Float('Sale Price', digits='Product Price', required=True, default=0.0)
++    variable_factor = fields.Selection([('weight', 'Weight'), ('volume', 'Volume'), ('wv', 'Weight * Volume'), ('price', 'Price'), ('quantity', 'Quantity')], 'Variable Factor', required=True, default='weight')
+
+--- a/addons/delivery/models/partner.py
++++ b/addons/delivery/models/res_partner.py
+
+--- a/addons/delivery/models/sale_order.py
++++ b/addons/delivery/models/sale_order.py
+@@ -162,46 +162,3 @@ class SaleOrder(models.Model):
+         for order_line in self.order_line.filtered(lambda l: l.product_id.type in ['product', 'consu'] and not l.is_delivery and not l.display_type):
+             weight += order_line.product_qty * order_line.product_id.weight
+         return weight
+-
+-
+-class SaleOrderLine(models.Model):
+-    _inherit = 'sale.order.line'
+-
+-    is_delivery = fields.Boolean(string="Is a Delivery", default=False)
+-    product_qty = fields.Float(compute='_compute_product_qty', string='Product Qty', digits='Product Unit of Measure')
+-    recompute_delivery_price = fields.Boolean(related='order_id.recompute_delivery_price')
+-
+-    def _is_not_sellable_line(self):
+-        return self.is_delivery or super()._is_not_sellable_line()
+-
+-    @api.depends('product_id', 'product_uom', 'product_uom_qty')
+-    def _compute_product_qty(self):
+-        for line in self:
+-            if not line.product_id or not line.product_uom or not line.product_uom_qty:
+-                line.product_qty = 0.0
+-                continue
+-            line.product_qty = line.product_uom._compute_quantity(line.product_uom_qty, line.product_id.uom_id)
+-
+-    def unlink(self):
+-        for line in self:
+-            if line.is_delivery:
+-                line.order_id.carrier_id = False
+-        return super().unlink()
+-
+-    def _is_delivery(self):
+-        self.ensure_one()
+-        return self.is_delivery
+-
+-    # override to allow deletion of delivery line in a confirmed order
+-    def _check_line_unlink(self):
+-        """
+-        Extend the allowed deletion policy of SO lines.
+-
+-        Lines that are delivery lines can be deleted from a confirmed order.
+-
+-        :rtype: recordset sale.order.line
+-        :returns: set of lines that cannot be deleted
+-        """
+-
+-        undeletable_lines = super()._check_line_unlink()
+-        return undeletable_lines.filtered(lambda line: not line.is_delivery)
+
+--- a/None
++++ b/addons/delivery/models/sale_order_line.py
+@@ -0,0 +1,50 @@
++# Part of Odoo. See LICENSE file for full copyright and licensing details.
++
++from odoo import api, fields, models
++
++
++class SaleOrderLine(models.Model):
++    _inherit = 'sale.order.line'
++
++    is_delivery = fields.Boolean(string="Is a Delivery", default=False)
++    product_qty = fields.Float(
++        string='Product Qty', compute='_compute_product_qty', digits='Product Unit of Measure'
++    )
++    recompute_delivery_price = fields.Boolean(related='order_id.recompute_delivery_price')
++
++    def _is_not_sellable_line(self):
++        return self.is_delivery or super()._is_not_sellable_line()
++
++    @api.depends('product_id', 'product_uom', 'product_uom_qty')
++    def _compute_product_qty(self):
++        for line in self:
++            if not line.product_id or not line.product_uom or not line.product_uom_qty:
++                line.product_qty = 0.0
++                continue
++            line.product_qty = line.product_uom._compute_quantity(
++                line.product_uom_qty, line.product_id.uom_id
++            )
++
++    def unlink(self):
++        for line in self:
++            if line.is_delivery:
++                line.order_id.carrier_id = False
++        return super().unlink()
++
++    def _is_delivery(self):
++        self.ensure_one()
++        return self.is_delivery
++
++    # override to allow deletion of delivery line in a confirmed order
++    def _check_line_unlink(self):
++        """
++        Extend the allowed deletion policy of SO lines.
++
++        Lines that are delivery lines can be deleted from a confirmed order.
++
++        :rtype: recordset sale.order.line
++        :returns: set of lines that cannot be deleted
++        """
++
++        undeletable_lines = super()._check_line_unlink()
++        return undeletable_lines.filtered(lambda line: not line.is_delivery)
+
+--- a/addons/delivery/models/stock_picking.py
++++ b/addons/delivery/models/stock_picking.py
+@@ -8,58 +8,6 @@ from odoo.exceptions import UserError
+ from odoo.tools.sql import column_exists, create_column
+ 
+ 
+-class StockQuantPackage(models.Model):
+-    _inherit = "stock.quant.package"
+-
+-    @api.depends('quant_ids', 'package_type_id')
+-    def _compute_weight(self):
+-        if self.env.context.get('picking_id'):
+-            package_weights = defaultdict(float)
+-            # Ordering by qty_done prevents the default ordering by groupby fields that can inject multiple Left Joins in the resulting query.
+-            res_groups = self.env['stock.move.line'].read_group(
+-                [('result_package_id', 'in', self.ids), ('product_id', '!=', False), ('picking_id', '=', self.env.context['picking_id'])],
+-                ['id:count'],
+-                ['result_package_id', 'product_id', 'product_uom_id', 'qty_done'],
+-                lazy=False, orderby='qty_done asc'
+-            )
+-            for res_group in res_groups:
+-                product_id = self.env['product.product'].browse(res_group['product_id'][0])
+-                product_uom_id = self.env['uom.uom'].browse(res_group['product_uom_id'][0])
+-                package_weights[res_group['result_package_id'][0]] += (
+-                    res_group['__count']
+-                    * product_uom_id._compute_quantity(res_group['qty_done'], product_id.uom_id)
+-                    * product_id.weight
+-                )
+-        for package in self:
+-            weight = package.package_type_id.base_weight or 0.0
+-            if self.env.context.get('picking_id'):
+-                package.weight = weight + package_weights[package.id]
+-            else:
+-                for quant in package.quant_ids:
+-                    weight += quant.quantity * quant.product_id.weight
+-                package.weight = weight
+-
+-    def _get_default_weight_uom(self):
+-        return self.env['product.template']._get_weight_uom_name_from_ir_config_parameter()
+-
+-    def _compute_weight_uom_name(self):
+-        for package in self:
+-            package.weight_uom_name = self.env['product.template']._get_weight_uom_name_from_ir_config_parameter()
+-
+-    def _compute_weight_is_kg(self):
+-        self.weight_is_kg = False
+-        uom_id = self.env['product.template']._get_weight_uom_id_from_ir_config_parameter()
+-        if uom_id == self.env.ref('uom.product_uom_kgm'):
+-            self.weight_is_kg = True
+-        self.weight_uom_rounding = uom_id.rounding
+-
+-    weight = fields.Float(compute='_compute_weight', digits='Stock Weight', help="Total weight of all the products contained in the package.")
+-    weight_uom_name = fields.Char(string='Weight unit of measure label', compute='_compute_weight_uom_name', readonly=True, default=_get_default_weight_uom)
+-    weight_is_kg = fields.Boolean("Technical field indicating whether weight uom is kg or not (i.e. lb)", compute="_compute_weight_is_kg")
+-    weight_uom_rounding = fields.Float("Technical field indicating weight's number of decimal places", compute="_compute_weight_is_kg")
+-    shipping_weight = fields.Float(string='Shipping Weight', help="Total weight of the package.")
+-
+-
+ class StockPicking(models.Model):
+     _inherit = 'stock.picking'
+ 
+@@ -318,16 +266,3 @@ class StockPicking(models.Model):
+     def _should_generate_commercial_invoice(self):
+         self.ensure_one()
+         return self.picking_type_id.warehouse_id.partner_id.country_id != self.partner_id.country_id
+-
+-
+-class StockReturnPicking(models.TransientModel):
+-    _inherit = 'stock.return.picking'
+-
+-    def _create_returns(self):
+-        # Prevent copy of the carrier and carrier price when generating return picking
+-        # (we have no integration of returns for now)
+-        new_picking, pick_type_id = super()._create_returns()
+-        picking = self.env['stock.picking'].browse(new_picking)
+-        picking.write({'carrier_id': False,
+-                       'carrier_price': 0.0})
+-        return new_picking, pick_type_id
+
+--- a/None
++++ b/addons/delivery/models/stock_quant_package.py
+@@ -0,0 +1,57 @@
++# Part of Odoo. See LICENSE file for full copyright and licensing details.
++
++from collections import defaultdict
++
++from odoo import api, fields, models
++
++
++class StockQuantPackage(models.Model):
++    _inherit = "stock.quant.package"
++
++    @api.depends('quant_ids', 'package_type_id')
++    def _compute_weight(self):
++        if self.env.context.get('picking_id'):
++            package_weights = defaultdict(float)
++            # Ordering by qty_done prevents the default ordering by groupby fields that can inject multiple Left Joins in the resulting query.
++            res_groups = self.env['stock.move.line'].read_group(
++                [('result_package_id', 'in', self.ids), ('product_id', '!=', False), ('picking_id', '=', self.env.context['picking_id'])],
++                ['id:count'],
++                ['result_package_id', 'product_id', 'product_uom_id', 'qty_done'],
++                lazy=False, orderby='qty_done asc'
++            )
++            for res_group in res_groups:
++                product_id = self.env['product.product'].browse(res_group['product_id'][0])
++                product_uom_id = self.env['uom.uom'].browse(res_group['product_uom_id'][0])
++                package_weights[res_group['result_package_id'][0]] += (
++                    res_group['__count']
++                    * product_uom_id._compute_quantity(res_group['qty_done'], product_id.uom_id)
++                    * product_id.weight
++                )
++        for package in self:
++            weight = package.package_type_id.base_weight or 0.0
++            if self.env.context.get('picking_id'):
++                package.weight = weight + package_weights[package.id]
++            else:
++                for quant in package.quant_ids:
++                    weight += quant.quantity * quant.product_id.weight
++                package.weight = weight
++
++    def _get_default_weight_uom(self):
++        return self.env['product.template']._get_weight_uom_name_from_ir_config_parameter()
++
++    def _compute_weight_uom_name(self):
++        for package in self:
++            package.weight_uom_name = self.env['product.template']._get_weight_uom_name_from_ir_config_parameter()
++
++    def _compute_weight_is_kg(self):
++        self.weight_is_kg = False
++        uom_id = self.env['product.template']._get_weight_uom_id_from_ir_config_parameter()
++        if uom_id == self.env.ref('uom.product_uom_kgm'):
++            self.weight_is_kg = True
++        self.weight_uom_rounding = uom_id.rounding
++
++    weight = fields.Float(compute='_compute_weight', digits='Stock Weight', help="Total weight of all the products contained in the package.")
++    weight_uom_name = fields.Char(string='Weight unit of measure label', compute='_compute_weight_uom_name', readonly=True, default=_get_default_weight_uom)
++    weight_is_kg = fields.Boolean("Technical field indicating whether weight uom is kg or not (i.e. lb)", compute="_compute_weight_is_kg")
++    weight_uom_rounding = fields.Float("Technical field indicating weight's number of decimal places", compute="_compute_weight_is_kg")
++    shipping_weight = fields.Float(string='Shipping Weight', help="Total weight of the package.")

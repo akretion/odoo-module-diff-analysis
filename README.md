@@ -34,21 +34,19 @@ these 10 breaking changes and 2 important features:
 
 ```text
 ls -1 17.0/account
- c000___________+-_103682_fix-account-reconcile-model-display-improvement.patch
- c001________++---_110016_ref-account-merge-repartition-lines-m2o-field.patch
- c002___-------###_110016_ref-account-remove-chart-template.patch
- c003________---##_110274_imp-account-simplify-payment-term-usability.patch
- c004____________-_99209_imp-account-sale-repair-website-purchase-remove-setting-and-display-co.patch
- c007_________---#_104223_ref-use-onboarding-module.patch
- c008_______+---##_125642_imp-account-manage-subsidiary-companies.patch
- c009___________--_130632_ref-account-make-alias-usage-standard.patch
- feat005___________111857_imp-account-send-print-with-documents.patch
- feat006___________117964_imp-account-dashboard-performances.patch
+ c000_________+--_110016_ref-account-merge-repartition-lines-m2o-field.patch
+ c001__-------###_110016_ref-account-remove-chart-template.patch
+ c002_______---##_110274_imp-account-simplify-payment-term-usability.patch
+ c003___________-_99209_imp-account-sale-repair-website-purchase-remove-setting-and-display-co.patch
+ c006________---#_104223_ref-use-onboarding-module.patch
+ c007__________--_130632_ref-account-make-alias-usage-standard.patch
+ feat004__________111857_imp-account-send-print-with-documents.patch
+ feat005__________117964_imp-account-dashboard-performances.patch
 ```
 
 Explanations:
 
--  The 10 first files are CHANGE pseudo patches with the commit diff and commit explanations.
+-  The 8 first files are CHANGE pseudo patches with the commit diff and commit explanations.
 -  The 2 last files are FEATURE pseudo patches
 -  The 1st number is just a sequence to reflect the order the commits were made
 -  The 2nd number is the Github PR number (you'll also find it in the 1st line of the pseudo patch alongh with the commut sha code)
