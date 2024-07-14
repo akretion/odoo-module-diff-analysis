@@ -1,0 +1,291 @@
+PR: https://github.com/odoo/odoo/pull/76734
+
+From: 1b16757d285577b22a2c6968eceefc5b5a5052e7
+From: Thibault Delavallée
+Date: 2023-10-24 19:24:50
++    company_ids = fields.One2many(
+
+Total Changes: 193
+
+[IMP] mail: add 'mail.alias.domain' model to store alias domains
+
+PURPOSE
+
+Allow alias domains to be multiple, notably to be used in a multi company
+environment where each company has its own alias domain.
+
+SPECIFICATIONS
+
+Add a new 'mail.alias.domain' model storing information previously stored
+as a unique value in 'mail.catchall.domain' configuration parameter. Domains
+are not completely linked to companies, allowing to have a mono-domain MC
+setup, or mono-company multi-domain setup.
+
+A main email domain is present on companies for all default domain computation
+when being in that company while keeping flexibility of having other domains
+defined.
+
+Now that a new 'mail.alias.domain' model exists we move bounce and catchall
+aliases definition directly on this model. Update related computation on
+company model. Default_from is also moved on this model, allowing an higher
+level default from computation for mail servers when having knowledge of
+alias domain environment. Filtering configuration based on default_from_filter
+is kept as an ICP as it is mainly used for odoo-bin with smtp-host.
+
+Usage of 'mail.catchall.domain' will soon be completely removed to be replaced
+by proposed company-based email alias domain usage.
+
+Constraints are added so that each bounce and catchall defined on domains
+do not clash with existing aliases. Sanitize of bounce and catchall is also
+performed to ensure they make valid emails. This matches previous behavior
+of ICP parameters. Domain name is also sanitized like alias names.
+
+Currently only base modeling and computation is done. Their usage is about to
+be gradually added in mail stack.
+
+LINKS
+
+Task-36879 (Mail: Support Multi Domains Aliases)
+
+Part-of: odoo/odoo#76734
+
+================================= pseudo patch: =================================
+
+--- a/addons/mail/models/__init__.py
++++ b/addons/mail/models/__init__.py
+@@ -3,6 +3,7 @@
+ 
+ # core models (required for mixins)
+ from . import mail_alias
++from . import mail_alias_domain
+ from . import models
+ 
+ # mixin
+
+--- a/addons/mail/models/ir_config_parameter.py
++++ b/addons/mail/models/ir_config_parameter.py
+@@ -20,12 +20,9 @@ class IrConfigParameter(models.Model):
+                 # remove existing users, including inactive template user
+                 # admin will regain the right via implied_ids on group_system
+                 group_user._remove_group(group_mail_template_editor)
+-        # sanitize, normalize and check uniqueness of catchall / bounce aliases
+-        # note that False = unlink ICP
++        # sanitize, normalize; note that False = unlink ICP
+         elif key in {'mail.bounce.alias', 'mail.catchall.alias'} and value:
+             value = self.env['mail.alias']._sanitize_alias_name(value)
+-            if value:
+-                self.env['mail.alias']._check_unique([value], skip_icp_keys={key})
+         # sanitize and normalize allowed catchall domains
+         elif key == 'mail.catchall.domain.allowed' and value:
+             value = self.env['mail.alias']._clean_and_check_mail_catchall_allowed_domains(value)
+
+--- a/None
++++ b/addons/mail/models/mail_alias_domain.py
+@@ -0,0 +1,145 @@
++# -*- coding: utf-8 -*-
++# Part of Odoo. See LICENSE file for full copyright and licensing details.
++
++from odoo import api, exceptions, fields, models, _
++from odoo.addons.mail.models.mail_alias import dot_atom_text
++
++class AliasDomain(models.Model):
++    """ Model alias domains, now company-specific. Alias domains are email
++    domains used to receive emails through catchall and bounce aliases, as
++    well as using mail.alias records to redirect email replies.
++
++    This replaces ``mail.alias.domain`` configuration parameter use until v16.
++    """
++    _name = 'mail.alias.domain'
++    _description = "Email Domain"
++    _order = 'sequence ASC, id ASC'
++
++    name = fields.Char('Name', required=True)
++    company_ids = fields.One2many(
++        'res.company', 'alias_domain_id', string='Companies')
++    sequence = fields.Integer(default=10)
++    bounce_alias = fields.Char('Bounce Alias', default='bounce', required=True)
++    bounce_email = fields.Char('Bounce Email', compute='_compute_bounce_email')
++    catchall_alias = fields.Char('Catchall Alias', default='catchall', required=True)
++    catchall_email = fields.Char('Catchall Email', compute='_compute_catchall_email')
++    default_from = fields.Char('Default From Alias', default='notifications')
++    default_from_email = fields.Char('Default From', compute='_compute_default_from_email')
++
++    _sql_constraints = [
++        (
++            'bounce_email_uniques',
++            'UNIQUE(bounce_alias, name)',
++            'Bounce emails should be unique'
++        ),
++        (
++            'catchall_email_uniques',
++            'UNIQUE(catchall_alias, name)',
++            'Catchall emails should be unique'
++        ),
++    ]
++
++    @api.depends('bounce_alias', 'name')
++    def _compute_bounce_email(self):
++        self.bounce_email = ''
++        for domain in self.filtered('bounce_alias'):
++            domain.bounce_email = f'{domain.bounce_alias}@{domain.name}'
++
++    @api.depends('catchall_alias', 'name')
++    def _compute_catchall_email(self):
++        self.catchall_email = ''
++        for domain in self.filtered('catchall_alias'):
++            domain.catchall_email = f'{domain.catchall_alias}@{domain.name}'
++
++    @api.depends('default_from', 'name')
++    def _compute_default_from_email(self):
++        self.default_from_email = ''
++        for domain in self.filtered('default_from'):
++            domain.default_from_email = f'{domain.default_from}@{domain.name}'
++
++    @api.constrains('bounce_alias', 'catchall_alias')
++    def _check_bounce_catchall_uniqueness(self):
++        names = self.filtered('bounce_alias').mapped('bounce_alias') + self.filtered('catchall_alias').mapped('catchall_alias')
++        if not names:
++            return
++
++        similar_domains = self.env['mail.alias.domain'].search([('name', 'in', self.mapped('name'))])
++        for tocheck in self:
++            if any(similar.bounce_alias == tocheck.bounce_alias
++                   for similar in similar_domains if similar != tocheck and similar.name == tocheck.name):
++                raise exceptions.ValidationError(
++                    _('Bounce alias %(bounce)s is already used for another domain with same name. '
++                      'Use another bounce or simply use the other alias domain.',
++                      bounce=tocheck.bounce_email)
++                )
++            if any(similar.catchall_alias == tocheck.catchall_alias
++                   for similar in similar_domains if similar != tocheck and similar.name == tocheck.name):
++                raise exceptions.ValidationError(
++                    _('Catchall alias %(catchall)s is already used for another domain with same name. '
++                      'Use another catchall or simply use the other alias domain.',
++                      catchall=tocheck.catchall_email)
++                )
++
++        existing = self.env['mail.alias'].search(
++            [('alias_name', 'in', list(set(names)))],
++            limit=1,
++        )
++        if existing:
++            document_name = False
++            # If owner or target: display document name also in the warning
++            if existing.alias_parent_model_id and existing.alias_parent_thread_id:
++                document_name = self.env[existing.alias_parent_model_id.model].sudo().browse(existing.alias_parent_thread_id).display_name
++            elif existing.alias_model_id and existing.alias_force_thread_id:
++                document_name = self.env[existing.alias_model_id.model].sudo().browse(existing.alias_force_thread_id).display_name
++            if document_name:
++                raise exceptions.ValidationError(
++                    _("Bounce/Catchall '%(matching_alias_name)s' is already used by %(document_name)s. Choose another alias or change it on the other document.",
++                      matching_alias_name=existing.display_name,
++                      document_name=document_name)
++                        )
++            raise exceptions.ValidationError(
++                _("Bounce/Catchall '%(matching_alias_name)s' is already used. Choose another alias or change it on the linked model.",
++                  matching_alias_name=existing.display_name)
++            )
++
++    @api.constrains('name')
++    def _check_name(self):
++        """ Should match a sanitized version of itself, otherwise raise to warn
++        user (do not dynamically change it, would be confusing). """
++        for domain in self:
++            if not dot_atom_text.match(domain.name):
++                raise exceptions.ValidationError(
++                    _("You cannot use anything else than unaccented latin characters in the domain name %(domain_name)s.",
++                      domain_name=domain.name)
++                )
++
++    @api.model_create_multi
++    def create(self, vals_list):
++        """ Sanitize bounce_alias / catchall_alias """
++        for vals in vals_list:
++            if vals.get('bounce_alias'):
++                vals['bounce_alias'] = self.env['mail.alias']._sanitize_alias_name(vals['bounce_alias'])
++            if vals.get('catchall_alias'):
++                vals['catchall_alias'] = self.env['mail.alias']._sanitize_alias_name(vals['catchall_alias'])
++            if vals.get('default_from'):
++                vals['default_from'] = self.env['mail.alias']._sanitize_alias_name(vals['default_from'])
++
++        alias_domains = super().create(vals_list)
++
++        # alias domain init: populate companies at first creation
++        if alias_domains and self.search_count([]) == len(alias_domains):
++            self.env['res.company'].search(
++                [('alias_domain_id', '=', False)]
++            ).alias_domain_id = alias_domains[0].id
++
++        return alias_domains
++
++    def write(self, vals):
++        """ Sanitize bounce_alias / catchall_alias """
++        if vals.get('bounce_alias'):
++            vals['bounce_alias'] = self.env['mail.alias']._sanitize_alias_name(vals['bounce_alias'])
++        if vals.get('catchall_alias'):
++            vals['catchall_alias'] = self.env['mail.alias']._sanitize_alias_name(vals['catchall_alias'])
++        if vals.get('default_from'):
++            vals['default_from'] = self.env['mail.alias']._sanitize_alias_name(vals['default_from'])
++        return super().write(vals)
+
+--- a/addons/mail/models/res_company.py
++++ b/addons/mail/models/res_company.py
+@@ -8,8 +8,20 @@ class Company(models.Model):
+     _name = 'res.company'
+     _inherit = 'res.company'
+ 
++    def _default_alias_domain_id(self):
++        return self.env['mail.alias.domain'].search([], limit=1)
++
++    alias_domain_id = fields.Many2one(
++        'mail.alias.domain', string='Email Domain',
++        default=lambda self: self._default_alias_domain_id())
++    alias_domain_name = fields.Char('Alias Domain Name', related='alias_domain_id.name', readonly=True, store=True)
++    bounce_email = fields.Char(string="Bounce Email", compute="_compute_bounce")
++    bounce_formatted = fields.Char(string="Bounce", compute="_compute_bounce")
+     catchall_email = fields.Char(string="Catchall Email", compute="_compute_catchall")
+     catchall_formatted = fields.Char(string="Catchall", compute="_compute_catchall")
++    default_from_email = fields.Char(
++        string="Default From", related="alias_domain_id.default_from_email",
++        readonly=True)
+     # the compute method is sudo'ed because it needs to access res.partner records
+     # portal users cannot access those (but they should be able to read the company email address)
+     email_formatted = fields.Char(
+@@ -22,19 +34,25 @@ class Company(models.Model):
+         "Email Button Color", compute="_compute_email_secondary_color",
+         readonly=False, store=True)
+ 
+-    @api.depends('name')
++    @api.depends('alias_domain_id', 'name')
++    def _compute_bounce(self):
++        self.bounce_email = ''
++        self.bounce_formatted = ''
++
++        for company in self.filtered('alias_domain_id'):
++            bounce_email = company.alias_domain_id.bounce_email
++            company.bounce_email = bounce_email
++            company.bounce_formatted = tools.formataddr((company.name, bounce_email))
++
++    @api.depends('alias_domain_id', 'name')
+     def _compute_catchall(self):
+-        ConfigParameter = self.env['ir.config_parameter'].sudo()
+-        alias = ConfigParameter.get_param('mail.catchall.alias')
+-        domain = ConfigParameter.get_param('mail.catchall.domain')
+-        if alias and domain:
+-            for company in self:
+-                company.catchall_email = '%s@%s' % (alias, domain)
+-                company.catchall_formatted = tools.formataddr((company.name, company.catchall_email))
+-        else:
+-            for company in self:
+-                company.catchall_email = ''
+-                company.catchall_formatted = ''
++        self.catchall_email = ''
++        self.catchall_formatted = ''
++
++        for company in self.filtered('alias_domain_id'):
++            catchall_email = company.alias_domain_id.catchall_email
++            company.catchall_email = catchall_email
++            company.catchall_formatted = tools.formataddr((company.name, catchall_email))
+ 
+     @api.depends('partner_id', 'catchall_formatted')
+     def _compute_email_formatted(self):

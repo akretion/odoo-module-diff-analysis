@@ -1,0 +1,248 @@
+PR: https://github.com/odoo/odoo/pull/157249
+
+From: f2cf8167d7a36c91d7058785d9c532cec7d61f0e
+From: Chong Wang (cwg)
+Date: 2024-06-21 14:10:47
+
+Total Changes: 178
+
+[IMP] cloud_storage: support google/azure cloud storage
+
+A cloud storage integration to allow attachments for mail can be stored in the
+cloud storage.
+1. file can be directly uploaded to cloud
+2. file can be directly downloaded from cloud
+
+Here is the work flow (make sure your window is wide enough)
+Create a cloud storage attachment
+
++--------+                        1. upload file info    +---------+   2. create ir.attachment
+|        | --------------------------------------------> |         | --------------------------+
+|        |                                               |  Odoo   |                           |
+|        |  3. cloud storage upload url with token       |         |                           |
+|  Web   | <-------------------------------------------- |         | <-------------------------+
+| Client |                                               +---------+
+|        |                                               +---------+
+|        |                             4. upload file    |  Cloud  |
+|        | --------------------------------------------> | Storage |
++--------+                                               +---------+
+
+Download a cloud storage attachment
+
++--------+                     1. odoo attachment url    +---------+
+|        | --------------------------------------------> |         |
+|        |                                               |  Odoo   |
+|        |  2. cloud storage download url with token     |         |
+|  Web   | <-------------------------------------------- |         |
+| Client |                                               +---------+
+|        |                                               +---------+
+|        |                                3. redirect    |  Cloud  |
+|        | --------------------------------------------> | Storage |
++--------+                                               +---------+
+
+Unlink a cloud storage attachment
+the cloud blobs won't be deleted automatically by Odoo after their ir.attachment
+records are unlinked. The administrator can manually delete them using
+cloud_storage_xxx/utils/cleanup_cloud_storage_xxx.py
+
+closes odoo/odoo#157249
+
+Task: 3692084
+Related: odoo/enterprise#64572
+Signed-off-by: Raphael Collet <rco@odoo.com>
+
+================================= pseudo patch: =================================
+
+--- a/None
++++ b/addons/cloud_storage/models/__init__.py
+@@ -0,0 +1,5 @@
++# Part of Odoo. See LICENSE file for full copyright and licensing details.
++
++from . import ir_attachment
++from . import ir_http
++from . import res_config_settings
+
+--- a/None
++++ b/addons/cloud_storage/models/ir_attachment.py
+@@ -0,0 +1,86 @@
++# Part of Odoo. See LICENSE file for full copyright and licensing details.
++
++import uuid
++
++from odoo import models, fields, _
++from odoo.exceptions import UserError
++from odoo.http import Stream
++
++
++class CloudStorageAttachment(models.Model):
++    _inherit = 'ir.attachment'
++    _cloud_storage_upload_url_time_to_expiry = 300  # 300 seconds
++    _cloud_storage_download_url_time_to_expiry = 300  # 300 seconds
++
++    type = fields.Selection(
++        selection_add=[('cloud_storage', 'Cloud Storage')],
++        ondelete={'cloud_storage': 'set url'}
++    )
++
++    def _to_http_stream(self):
++        if (self.type == 'cloud_storage' and
++              self.env['res.config.settings']._get_cloud_storage_configuration()):
++            self.ensure_one()
++            info = self._generate_cloud_storage_download_info()
++            stream = Stream(type='url', url=info['url'])
++            if 'time_to_expiry' in info:
++                # cache the redirection until 10 seconds before the expiry
++                stream.max_age = max(info['time_to_expiry'] - 10, 0)
++            return stream
++        return super()._to_http_stream()
++
++    def _post_add_create(self, **kwargs):
++        super()._post_add_create(**kwargs)
++        if kwargs.get('cloud_storage'):
++            if not self.env['ir.config_parameter'].sudo().get_param('cloud_storage_provider'):
++                raise UserError(_('Cloud Storage is not enabled'))
++            for record in self:
++                record.write({
++                    'raw': False,
++                    'type': 'cloud_storage',
++                    'url': record._generate_cloud_storage_url(),
++                })
++
++    def _generate_cloud_storage_blob_name(self):
++        """
++        Generate a unique blob name for the attachment
++        :param attachment: an ir.attachment record
++        :return: A unique blob name str
++        """
++        return f'{self.id}/{uuid.uuid4()}/{self.name}'
++
++    # Implement the following methods for each cloud storage provider.
++    def _generate_cloud_storage_url(self):
++        """
++        Generate a cloud blob url without signature or token for the attachment.
++        This url is only used to identify the cloud blob.
++        :param attachment: an ir.attachment record
++        :return: A cloud blob url str
++        """
++        raise NotImplementedError()
++
++    def _generate_cloud_storage_download_info(self):
++        """
++        Generate the download info for the public client to directly download
++        the attachment's blob from the cloud storage.
++        :param attachment: an ir.attachment record
++        :return: An download_info dictionary containing:
++            * download_url: cloud storage url with permission to download the file
++            * time_to_expiry: the time in seconds before the download url expires
++        """
++        raise NotImplementedError()
++
++    def _generate_cloud_storage_upload_info(self):
++        """
++        Generate the upload info for the public client to directly upload a
++        file to the cloud storage.
++        :param attachment: an ir.attachment record
++        :return: An upload_info dictionary containing:
++            * upload_url: cloud storage url with permission to upload the file
++            * method: the request method used to upload the file
++            * response_status: the status of the response for a successful
++                upload request
++            * [Optionally] headers: a dictionary of headers to be added to the
++                upload request
++        """
++        raise NotImplementedError()
+
+--- a/None
++++ b/addons/cloud_storage/models/ir_http.py
+@@ -0,0 +1,15 @@
++# Part of Odoo. See LICENSE file for full copyright and licensing details.
++
++from odoo import models
++from .res_config_settings import DEFAULT_CLOUD_STORAGE_MIN_FILE_SIZE
++
++
++class IrHttp(models.AbstractModel):
++    _inherit = 'ir.http'
++
++    def session_info(self):
++        res = super().session_info()
++        ICP = self.env['ir.config_parameter'].sudo()
++        if ICP.get_param('cloud_storage_provider'):
++            res['cloud_storage_min_file_size'] = ICP.get_param('cloud_storage_min_file_size', DEFAULT_CLOUD_STORAGE_MIN_FILE_SIZE)
++        return res
+
+--- a/None
++++ b/addons/cloud_storage/models/res_config_settings.py
+@@ -0,0 +1,72 @@
++# Part of Odoo. See LICENSE file for full copyright and licensing details.
++
++from odoo import models, fields, _
++from odoo.exceptions import UserError
++
++
++DEFAULT_CLOUD_STORAGE_MIN_FILE_SIZE = 20_000_000
++
++
++class CloudStorageSettings(models.TransientModel):
++    """
++    Instructions:
++    cloud_storage_provider: Once set, new attachments from the web client can
++        be created as cloud storage attachments. Once changed, all attachments
++        stored in the old cloud storage provider cannot be fetched. Please
++        migrate those cloud storage blobs and the url field of their
++        ir.attachment records before change.
++    cloud_storage_mim_file_size: a soft limit for the file size that can be
++        uploaded as the cloud storage attachments for web client.
++    """
++    _inherit = 'res.config.settings'
++
++    cloud_storage_provider = fields.Selection(
++        selection=[],
++        string='Cloud Storage Provider for new attachments',
++        config_parameter='cloud_storage_provider',
++    )
++
++    cloud_storage_min_file_size = fields.Integer(
++        string='Minimum File Size (bytes)',
++        help='''webclient can upload files larger than the minimum file size
++        (in bytes) as url attachments to the server and then upload the file to
++        the cloud storage.''',
++        config_parameter='cloud_storage_min_file_size',
++        default=DEFAULT_CLOUD_STORAGE_MIN_FILE_SIZE,
++    )
++
++    def _setup_cloud_storage_provider(self):
++        """
++        Setup the cloud storage provider and check the validity of the account
++        info after saving the config in settings.
++        return: None
++        """
++        pass
++
++    def _get_cloud_storage_configuration(self):
++        """
++        Return the configuration for the cloud storage provider. If the cloud
++        storage provider is not fully configured, return an empty dict.
++        :return: A configuration dict
++        """
++        return {}
++
++    def _check_cloud_storage_uninstallable(self, provider_name):
++        """
++        Check if the cloud storages provider is used by any attachments
++        :raise UserError: when the cloud storage provider cannot be uninstalled
++        """
++        pass
++
++    def set_values(self):
++        ICP = self.env['ir.config_parameter']
++        cloud_storage_configuration_before = self._get_cloud_storage_configuration()
++        cloud_storage_provider_before = ICP.get_param('cloud_storage_provider')
++        super().set_values()
++        if cloud_storage_provider_before and ICP.get_param('cloud_storage_provider') != cloud_storage_provider_before:
++            self._check_cloud_storage_uninstallable(cloud_storage_provider_before)
++        cloud_storage_configuration = self._get_cloud_storage_configuration()
++        if not cloud_storage_configuration and self.cloud_storage_provider:
++            raise UserError(_('Please configure the Cloud Storage before enabling it'))
++        if cloud_storage_configuration and cloud_storage_configuration != cloud_storage_configuration_before:
++            self._setup_cloud_storage_provider()

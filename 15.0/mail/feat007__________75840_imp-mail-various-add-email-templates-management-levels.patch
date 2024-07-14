@@ -1,0 +1,310 @@
+PR: https://github.com/odoo/odoo/pull/75840
+
+From: cc012a086464e88f7ede1e5fa9218fe45ac0ea09
+From: std-odoo
+Date: 2021-09-02 03:42:54
+
+Total Changes: 143
+
+[IMP] mail, various: add email templates management levels
+
+Purpose
+=======
+
+Purpose of this commit is to add a new group for the mail template designer.
+Goal is to make roles clearer: managers edit templates, users use them. This
+commit allow some designers / managers to make email template and to let
+others users use those email templates.
+
+Specifications
+==============
+
+When this feature is enabled in the Settings page, a new group is required to
+modify email templates in a composer like wizard or to make dynamic content.
+This allows to separate managers editing / composing templates from standard
+users that use them.
+
+If the current does not have this group, the email body will be in readonly
+mode if he selected an email template. That way we force him to use the email
+template that the manager made.
+
+Technical
+=========
+
+New Group
+*--------
+
+Only users in this group will be able to create / write email template or
+to write Jinja code in the mail composer (including other fields like subject
+in mailing).
+
+By default, all internal users have this group. Mass mailing users also have
+this group as writing mailings is about the same management level as writing
+templates.
+
+Mail Composer Mixin
+*------------------
+
+In comment mode, the template is rendered and then saved on the body field
+so non-"Mail Template Editor" users can load email templates.
+
+But in mass mode, the body of the template is saved and then rendered and
+many things change the body (HTML sanitizer, web editor move inline CSS
+properties, add / remove spaces...). So in this case, we can not know if
+the user changed the body or not. That is why we put the body field in
+readonly mode so, it is not modified by the web editor.
+
+Jinja code detection
+*-------------------
+
+To detect dynamic Jinja content, we compile the template, and we browse the
+AST. If we do not have a single "Template Data" node, we assume that the
+template is dynamic.
+
+When we detect the template as static, we do not render it. That way we
+avoid unnecessary rendering.
+
+Code cleaning
+*------------
+
+Move Jinja import into tools so that it is outside of mail framework code.
+
+Task-2187263
+
+closes odoo/odoo#75840
+
+Related: odoo/enterprise#20547
+Signed-off-by: Thibault Delavallee (tde) <tde@openerp.com>
+
+================================= pseudo patch: =================================
+
+--- a/addons/mail/models/ir_config_parameter.py
++++ b/addons/mail/models/ir_config_parameter.py
+@@ -19,3 +19,17 @@ class IrConfigParameter(models.Model):
+             if 'value' in vals and parameter.key in ['mail.bounce.alias', 'mail.catchall.alias'] and vals['value'] != parameter.value:
+                 vals['value'] = self.env['mail.alias']._clean_and_check_unique([vals.get('value')])[0]
+         return super().write(vals)
++
++    @api.model
++    def set_param(self, key, value):
++        if key == 'mail.restrict.template.rendering':
++            group_user = self.env.ref('base.group_user')
++            group_mail_template_editor = self.env.ref('mail.group_mail_template_editor')
++
++            if not value and group_mail_template_editor not in group_user.implied_ids:
++                group_user.implied_ids |= group_mail_template_editor
++
++            elif value and group_mail_template_editor in group_user.implied_ids:
++                group_user.implied_ids -= group_mail_template_editor
++
++        return super(IrConfigParameter, self).set_param(key, value)
+
+--- a/addons/mail/models/mail_composer_mixin.py
++++ b/addons/mail/models/mail_composer_mixin.py
+@@ -1,7 +1,7 @@
+ # -*- coding: utf-8 -*-
+ # Part of Odoo. See LICENSE file for full copyright and licensing details.
+ 
+-from odoo import api, fields, models
++from odoo import api, fields, models, tools, _
+ 
+ 
+ class MailComposerMixin(models.AbstractModel):
+@@ -25,6 +25,7 @@ class MailComposerMixin(models.AbstractModel):
+     body = fields.Html('Contents', sanitize_style=True, compute='_compute_body', store=True, readonly=False)
+     template_id = fields.Many2one('mail.template', 'Mail Template', domain="[('model', '=', render_model)]")
+     # Access
++    is_mail_template_editor = fields.Boolean('Is Editor', compute='_compute_is_mail_template_editor')
+     can_edit_body = fields.Boolean('Can Edit Body', compute='_compute_can_edit_body')
+ 
+     @api.depends('template_id')
+@@ -43,7 +44,50 @@ class MailComposerMixin(models.AbstractModel):
+             elif not composer_mixin.body:
+                 composer_mixin.body = False
+ 
+-    @api.depends('template_id')
+     @api.depends_context('uid')
++    def _compute_is_mail_template_editor(self):
++        is_mail_template_editor = self.env.is_admin() or self.env.user.has_group('mail.group_mail_template_editor')
++        for record in self:
++            record.is_mail_template_editor = is_mail_template_editor
++
++    @api.depends('template_id', 'is_mail_template_editor')
+     def _compute_can_edit_body(self):
+-        self.can_edit_body = True
++        for record in self:
++            record.can_edit_body = (
++                record.is_mail_template_editor
++                or not record.template_id
++            )
++
++    def _render_field(self, field, *args, **kwargs):
++        """Render the given field on the given records.
++        This method bypass the rights when needed to
++        be able to render the template values in mass mode.
++        """
++        if field not in self._fields:
++            raise ValueError(_("The field %s does not exist on the model %s", field, self._name))
++
++        composer_value = self[field]
++
++        if (
++            not self.template_id
++            or self.is_mail_template_editor
++        ):
++            # Do not need to bypass the verification
++            return super(MailComposerMixin, self)._render_field(field, *args, **kwargs)
++
++        template_field = 'body_html' if field == 'body' else field
++        assert template_field in self.template_id._fields
++        template_value = self.template_id[template_field]
++
++        if field == 'body':
++            sanitized_template_value = tools.html_sanitize(template_value)
++            if not self.can_edit_body or composer_value in (sanitized_template_value, template_value):
++                # Take the previous body which we can trust without HTML editor reformatting
++                self.body = self.template_id.body_html
++                return super(MailComposerMixin, self.sudo())._render_field(field, *args, **kwargs)
++
++        elif composer_value == template_value:
++            # The value is the same as the mail template so we trust it
++            return super(MailComposerMixin, self.sudo())._render_field(field, *args, **kwargs)
++
++        return super(MailComposerMixin, self)._render_field(field, *args, **kwargs)
+
+--- a/addons/mail/models/mail_render_mixin.py
++++ b/addons/mail/models/mail_render_mixin.py
+@@ -3,18 +3,17 @@
+ 
+ import babel
+ import copy
+-import functools
+ import logging
+ import re
+ 
+-import dateutil.relativedelta as relativedelta
+ from lxml import html
+ from markupsafe import Markup
+ from werkzeug import urls
+ 
+ from odoo import _, api, fields, models, tools
+-from odoo.exceptions import UserError
++from odoo.exceptions import UserError, AccessError
+ from odoo.tools import is_html_empty, safe_eval
++from odoo.tools.jinja import jinja_safe_template_env, jinja_template_env, template_env_globals
+ 
+ _logger = logging.getLogger(__name__)
+ 
+@@ -38,61 +37,15 @@ def format_time(env, time, tz=False, time_format='medium', lang_code=False):
+     except babel.core.UnknownLocaleError:
+         return time
+ 
+-def relativedelta_proxy(*args, **kwargs):
+-    # dateutil.relativedelta is an old-style class and cannot be directly
+-    # instanciated wihtin a jinja2 expression, so a lambda "proxy" is
+-    # is needed, apparently
+-    return relativedelta.relativedelta(*args, **kwargs)
+-
+-template_env_globals = {
+-    'str': str,
+-    'quote': urls.url_quote,
+-    'urlencode': urls.url_encode,
+-    'datetime': safe_eval.datetime,
+-    'len': len,
+-    'abs': abs,
+-    'min': min,
+-    'max': max,
+-    'sum': sum,
+-    'filter': filter,
+-    'reduce': functools.reduce,
+-    'map': map,
+-    'relativedelta': relativedelta_proxy,
+-    'round': round,
+-}
+-
+-try:
+-    # We use a jinja2 sandboxed environment to render mako templates.
+-    # Note that the rendering does not cover all the mako syntax, in particular
+-    # arbitrary Python statements are not accepted, and not all expressions are
+-    # allowed: only "public" attributes (not starting with '_') of objects may
+-    # be accessed.
+-    # This is done on purpose: it prevents incidental or malicious execution of
+-    # Python code that may break the security of the server.
+-    from jinja2.sandbox import SandboxedEnvironment
+-    jinja_template_env = SandboxedEnvironment(
+-        block_start_string="<%",
+-        block_end_string="%>",
+-        variable_start_string="${",
+-        variable_end_string="}",
+-        comment_start_string="<%doc>",
+-        comment_end_string="</%doc>",
+-        line_statement_prefix="%",
+-        line_comment_prefix="##",
+-        trim_blocks=True,               # do not output newline after blocks
+-        autoescape=True,                # XML/HTML automatic escaping
+-    )
+-    jinja_template_env.globals.update(template_env_globals)
+-    jinja_safe_template_env = copy.copy(jinja_template_env)
+-    jinja_safe_template_env.autoescape = False
+-except ImportError:
+-    _logger.warning("jinja2 not available, templating features will not work!")
+-
+ 
+ class MailRenderMixin(models.AbstractModel):
+     _name = 'mail.render.mixin'
+     _description = 'Mail Render Mixin'
+ 
++    # If True, we trust the value on the model for rendering
++    # If False, we need the group "Template Editor" to render the model fields
++    _unrestricted_rendering = False
++
+     # language for rendering
+     lang = fields.Char(
+         'Language',
+@@ -421,6 +374,19 @@ class MailRenderMixin(models.AbstractModel):
+             _logger.info("Failed to load template %r", template_txt, exc_info=True)
+             return results
+ 
++        if (not self._unrestricted_rendering and template.is_dynamic and not self.env.is_admin() and
++           not self.env.user.has_group('mail.group_mail_template_editor')):
++            group = self.env.ref('mail.group_mail_template_editor')
++            raise AccessError(_('Only users belonging to the "%s" group can modify dynamic templates.', group.name))
++
++        if not template.is_dynamic:
++            # Either the content is a raw text without placeholders, either we fail to
++            # detect placeholders code. In both case we skip the rendering and return
++            # the raw content, so even if we failed to detect dynamic code,
++            # non "mail_template_editor" users will not gain rendering tools available
++            # only for template specific group users
++            return {record_id: template_txt for record_id in res_ids}
++
+         # prepare template variables
+         variables = self._render_jinja_eval_context()
+         if add_context:
+
+--- a/addons/mail/models/mail_template.py
++++ b/addons/mail/models/mail_template.py
+@@ -18,6 +18,8 @@ class MailTemplate(models.Model):
+     _description = 'Email Templates'
+     _order = 'name'
+ 
++    _unrestricted_rendering = True
++
+     @api.model
+     def default_get(self, fields):
+         res = super(MailTemplate, self).default_get(fields)
+
+--- a/addons/mail/models/res_config_settings.py
++++ b/addons/mail/models/res_config_settings.py
+@@ -14,6 +14,11 @@ class ResConfigSettings(models.TransientModel):
+     fail_counter = fields.Integer('Fail Mail', readonly=True)
+     alias_domain = fields.Char('Alias Domain', help="If you have setup a catch-all email domain redirected to "
+                                "the Odoo server, enter the domain name here.", config_parameter='mail.catchall.domain')
++    restrict_template_rendering = fields.Boolean(
++        'Restrict Template Rendering',
++        config_parameter='mail.restrict.template.rendering',
++        help='Users will still be able to render templates.\n'
++        'However only Mail Template Editors will be able to create new dynamic templates or modify existing ones.')
+ 
+     @api.model
+     def get_values(self):
