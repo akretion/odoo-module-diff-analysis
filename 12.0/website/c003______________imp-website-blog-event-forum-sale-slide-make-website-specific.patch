@@ -1,0 +1,198 @@
+PR: https://github.com/odoo/odoo/pull/
+
+From: 066cfc9598a307a48b86104f4bf861a58de09b41
+From: Jeremy Kersten
+Date: 2018-08-13 18:16:34
+
+Breaking data model changes scores: del:2 + add:0, change matches:
+-    website_id = fields.Many2one('website', string='Website', help='Restrict publishing to this website.')
+-    _inherit = 'website.published.mixin'
+
+Total Changes: 91
+
+[IMP] website_[blog|event|forum|sale|slide]: make website specific
+
+Set up env & tools for module website multiwebsite (blog, event, sale..)
+website_id in modelConverter and ir_rule
+
+add _compute_domain_keys to have a different cache per website
+  or rules would not be correctly website_dependant
+  eg: blog 1 on website 1, blog 2 on website 2
+      access blog 1 from website 1 => can access -> normal
+      access blog 1 from website 2 => can access -> should crash because (ir rule)
+
+split mixing website.published.mixin and website.published.multi.mixin to have
+website_id only on last one.
+ multi mixing will:
+     - override website_published compute to take current_website into account (not in backend)
+     - force website when clicking on published in backend
+
+* website blog, website_sale, website_event, website_forum, website_slides are now multi website
+
+Co-authored-by: Derie Romain <rde@odoo.com>
+Co-authored-by: Kersten Jérémy <jke@odoo.com>
+
+================================= pseudo patch: =================================
+
+--- a/addons/website/models/__init__.py
++++ b/addons/website/models/__init__.py
+@@ -7,6 +7,7 @@ from . import ir_http
+ from . import ir_qweb
+ from . import ir_qweb_fields
+ from . import website
++from . import ir_rule
+ from . import ir_ui_view
+ from . import res_company
+ from . import res_partner
+
+--- a/addons/website/models/ir_http.py
++++ b/addons/website/models/ir_http.py
+@@ -267,6 +267,8 @@ class ModelConverter(ModelConverter):
+ 
+     def generate(self, uid, dom=None, args=None):
+         Model = request.env[self.model].sudo(uid)
++        # Allow to current_website_id directly in route domain
++        args.update(current_website_id=request.env['website'].get_current_website().id)
+         domain = safe_eval(self.domain, (args or {}).copy())
+         if dom:
+             domain += dom
+
+--- a/addons/website/models/ir_rule.py
++++ b/addons/website/models/ir_rule.py
+@@ -8,5 +8,9 @@ class IrRule(models.Model):
+     @api.model
+     def _eval_context(self):
+         res = super(IrRule, self)._eval_context()
+-        res['website_id'] = self._context.get('website_id')
++        res['website_id'] = self.env['website'].get_current_website().id
+         return res
++
++    def _compute_domain_keys(self):
++        """ Return the list of context keys to use for caching ``_compute_domain``. """
++        return super(IrRule, self)._compute_domain_keys() + ['website_id']
+
+--- a/addons/website/models/ir_ui_view.py
++++ b/addons/website/models/ir_ui_view.py
+@@ -297,3 +297,6 @@ class View(models.Model):
+             'url': '/website/pages',
+             'target': 'self',
+         }
++
++    def _read_template_keys(self):
++        return super(View, self)._read_template_keys() + ['website_id']
+
+--- a/addons/website/models/website.py
++++ b/addons/website/models/website.py
+@@ -694,18 +694,63 @@ class SeoMetadata(models.AbstractModel):
+     website_meta_keywords = fields.Char("Website meta keywords", translate=True)
+ 
+ 
++class WebsiteMultiMixin(models.AbstractModel):
++
++    _name = 'website.multi.mixin'
++
++    website_id = fields.Many2one('website', string='Website', help='Restrict publishing to this website.')
++
++    @api.multi
++    def can_access_from_current_website(self, website_id=False):
++        can_access = True
++        for record in self:
++            if (website_id or record.website_id.id) not in (False, request.website.id):
++                can_access = False
++                continue
++        return can_access
++
++
+ class WebsitePublishedMixin(models.AbstractModel):
+ 
+     _name = "website.published.mixin"
+ 
+-    website_published = fields.Boolean('Visible on current website',
+-                                       compute='_compute_website_published',
+-                                       inverse='_inverse_website_published',
+-                                       search='_search_website_published')  # todo jov evaluate places where this is used, we can probably replace some with is_published
++    website_published = fields.Boolean('Visible on current website', related='is_published')
+     is_published = fields.Boolean('Is published')
+-    website_id = fields.Many2one('website', string='Website', help='Restrict publishing to this website.')
+     website_url = fields.Char('Website URL', compute='_compute_website_url', help='The full URL to access the document through the website.')
+ 
++    @api.multi
++    def _compute_website_url(self):
++        for record in self:
++            record.website_url = '#'
++
++    @api.multi
++    def website_publish_button(self):
++        self.ensure_one()
++        if self.env.user.has_group('website.group_website_publisher') and self.website_url != '#':
++            # Force website to land on record's website to publish/unpublish it
++            if 'website_id' in self and self.env.user.has_group('website.group_multi_website'):
++                self.website_id._force()
++            return self.open_website_url()
++        return self.write({'website_published': not self.website_published})
++
++    def open_website_url(self):
++        return {
++            'type': 'ir.actions.act_url',
++            'url': self.website_url,
++            'target': 'self',
++        }
++
++
++class WebsitePublishedMultiMixin(WebsitePublishedMixin):
++
++    _name = 'website.published.multi.mixin'
++    _inherit = ['website.published.mixin', 'website.multi.mixin']
++
++    website_published = fields.Boolean(compute='_compute_website_published',
++                                       inverse='_inverse_website_published',
++                                       search='_search_website_published',
++                                       related=False)
++
+     @api.multi
+     @api.depends('is_published', 'website_id')
+     def _compute_website_published(self):
+@@ -718,11 +763,8 @@ class WebsitePublishedMixin(models.AbstractModel):
+ 
+     @api.multi
+     def _inverse_website_published(self):
+-        current_website_id = self._context.get('website_id')
+         for record in self:
+             record.is_published = record.website_published
+-            if record.website_published and current_website_id:
+-                record.write({'website_id': current_website_id})
+ 
+     def _search_website_published(self, operator, value):
+         if not isinstance(value, bool) or operator not in ('=', '!='):
+@@ -740,30 +782,11 @@ class WebsitePublishedMixin(models.AbstractModel):
+         else:  # should be in the backend, return things that are published anywhere
+             return is_published
+ 
+-    @api.multi
+-    def _compute_website_url(self):
+-        for record in self:
+-            record.website_url = '#'
+-
+-    @api.multi
+-    def website_publish_button(self):
+-        self.ensure_one()
+-        if self.env.user.has_group('website.group_website_publisher') and self.website_url != '#':
+-            return self.open_website_url()
+-        return self.write({'website_published': not self.website_published})
+-
+-    def open_website_url(self):
+-        return {
+-            'type': 'ir.actions.act_url',
+-            'url': self.website_url,
+-            'target': 'self',
+-        }
+-
+ 
+ class Page(models.Model):
+     _name = 'website.page'
+     _inherits = {'ir.ui.view': 'view_id'}
+-    _inherit = 'website.published.mixin'
++    _inherit = 'website.published.multi.mixin'
+     _description = 'Page'
+     _order = 'website_id'
+ 

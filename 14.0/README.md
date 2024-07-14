@@ -5,15 +5,15 @@ You can see below the Odoo addons that got the largest data model changes betwee
 You can browse each directory to dig into the detail of these changes.
 
 1. account - 840K
-2. calendar - 212K
-3. survey - 168K
-4. mrp - 164K
+2. mrp - 212K
+3. calendar - 212K
+4. survey - 168K
 5. crm - 100K
 6. event - 96K
 7. google_calendar - 88K
-8. base - 84K
-9. sale_timesheet - 80K
-10. hr_holidays - 76K
+8. hr_holidays - 84K
+9. base - 84K
+10. sale_timesheet - 80K
 11. event_sale - 68K
 12. stock - 60K
 13. mail - 48K
@@ -34,11 +34,12 @@ You can browse each directory to dig into the detail of these changes.
 28. sales_team - 16K
 29. sale_management - 16K
 30. project - 16K
-31. base_address_extended - 16K
-32. stock_dropshipping - 12K
-33. sale - 12K
-34. purchase_mrp - 12K
-35. mass_mailing_crm - 12K
-36. hr_recruitment - 12K
-37. uom - 7.5K
-38. hr_presence - 7.5K
+31. hr - 16K
+32. base_address_extended - 16K
+33. stock_dropshipping - 12K
+34. sale - 12K
+35. purchase_mrp - 12K
+36. mass_mailing_crm - 12K
+37. hr_recruitment - 12K
+38. uom - 7.5K
+39. hr_presence - 7.5K

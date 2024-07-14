@@ -5,7 +5,7 @@ You can see below the Odoo addons that got the largest data model changes betwee
 You can browse each directory to dig into the detail of these changes.
 
 1. project - 628K
-2. account - 400K
+2. account - 404K
 3. hr_expense - 260K
 4. mail - 236K
 5. stock - 220K

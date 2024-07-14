@@ -8,14 +8,14 @@ You can browse each directory to dig into the detail of these changes.
 2. account - 152K
 3. sale - 132K
 4. purchase - 116K
-5. stock - 108K
-6. website - 100K
+5. website - 108K
+6. stock - 108K
 7. product - 92K
 8. project - 60K
 9. payment - 48K
 10. point_of_sale - 32K
 11. mass_mailing - 32K
-12. base - 28K
+12. base - 32K
 13. mrp - 24K
 14. mail_bot - 24K
 15. account_payment - 20K
