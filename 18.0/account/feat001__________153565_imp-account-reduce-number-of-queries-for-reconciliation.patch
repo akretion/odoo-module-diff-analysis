@@ -1,0 +1,417 @@
+PR: https://github.com/odoo/odoo/pull/153565
+
+From: 34421b1222228408433f26a3fcd2d6b40d81b832
+From: william-andre
+Date: 2024-02-10 14:51:56
+
+Total Changes: 150
+
+[IMP] account: reduce number of queries for reconciliation
+
+Summary:
+========
+
+1. Handle the inverse fields of `account.full.reconcile` manually
+2. Batch the update of matching numbers
+3. Batch the balance consistency test
+4. Batch the construction of reconciliation batches
+5. Precompute fields on partials
+6. Avoid recomputation of same default analytic distributions
+7. Cache the accounting date wrt lock date
+
+1: Handle the inverse fields of `account.full.reconcile` manually
+*----------------------------------------------------------------
+
+In order to update the inverse fields of `reconciled_line_ids` and
+`partial_reconcile_ids`, the ORM is triggering one query per full
+reconcile record. In the case of a big batch payment, that is a lot of
+round trips.
+This also bypasses the computation for possible tracking, which is
+expensive to do for 2 records at a time. That field is not tracked
+anyway.
+
+2: Batch the update of matching numbers
+*--------------------------------------
+
+Basically the same as 1. without the tracking.
+
+3: Batch the balance consistency test
+*------------------------------------
+
+Use the various context managers around `__reconcile_plan` to check for
+the balance consistency only at the end in one single query. This avoids
+checking it at every single intermediate write done on the lines.
+Also doing it for the sync of dynamic lines. It should be useless but it
+doesn't cost anything, and allows to remove the context keys in
+enterprise without a cost. (they shouldn't be used explicitly, the
+context managers should always be used instead)
+Using these context managers also allows to remove all the `skip_`
+context keys, which should not be used: using them will mean that as
+soon as the journal entry is modified for any reason, some business
+fields will change because of the synchronisation since the context
+won't be the same anymore.
+This commit therefore also makes `_sync_dynamic_line` more resilient and
+avoids even more useless syncs.
+
+4: Batch the construction of reconciliation batches
+*--------------------------------------------------
+
+Introduce `_reconciled_by_number`, which is basically a `_read_group`.
+In conjuction with `_filter_reconciled_by_number`, we can find all the
+reconciled lines in one single query, for as many batches as needed; as
+opposed to one query per batch before.
+
+5: Precompute fields on partials
+*-------------------------------
+
+Simply avoid doing one batched `INSERT INTO` followed by one `UPDATE` for
+each record.
+
+6: Avoid recomputation of same default analytic distributions
+*------------------------------------------------------------
+
+Not really linked to the reconciliation, but when a lot of lines are
+using the same parameters for the default analytic distribution, it is
+useless to re-compute it multiple times.
+Can speed up the population of test data for instance.
+
+7: Cache the accounting date wrt lock date
+*-----------------------------------------
+
+When preparing the create values for the exchange moves, computing the
+date with regards to the lock date once per move is very expensive.
+By creating a context dependent field, we can cache the value and avoid
+doing the same operation multiple times.
+
+Benchmark:
+==========
+
+We are testing 2 use cases:
+* a lot of small matchings that are producing a full 2 by 2
+* one big matching (also producing a full)
+
+To reconcile a batch payment of 500 (identical) lines in the bank reco:
+
+|        | Queries |  SQL  |  Other |
+|--------|---------|-------|--------|
+| Before |    4191 | 4.649 | 16.253 |
+|  After |     226 | 0.989 |  3.581 |
+
+To reconcile one big batch of 1000 lines with the generic reco widget
+(spaghetti):
+
+|        | Queries |  SQL  | Other |
+|--------|---------|-------|-------|
+| Before |      82 | 0.478 | 1.131 |
+|  After |      66 | 0.634 | 0.974 |
+
+To reconcile a batch of 1000 lines *in foreign currency*
+
+|        | Queries |  SQL  | Other |
+|--------|---------|-------|-------|
+| Before |         |       |       |
+|  After |   45995 | 125.0 | 146.3 |
+
+All the times are in seconds.
+We can see the the use case of the batch payment is improved a lot (the
+time is expected to be linear with regards to the number of payments),
+while the time for big batches is not impacted.
+
+closes odoo/odoo#153565
+
+X-original-commit: 313d7071a9580ac401f58369b4c834eb2018f0ed
+Related: odoo/enterprise#56348
+Signed-off-by: Brice Bartoletti (bib) <bib@odoo.com>
+
+================================= pseudo patch: =================================
+
+--- a/addons/account/models/account_full_reconcile.py
++++ b/addons/account/models/account_full_reconcile.py
+@@ -1,5 +1,5 @@
+ # -*- coding: utf-8 -*-
+-from odoo import api, fields, models, _
++from odoo import api, fields, models, _, Command
+ 
+ 
+ class AccountFullReconcile(models.Model):
+@@ -37,7 +37,35 @@ class AccountFullReconcile(models.Model):
+ 
+     @api.model_create_multi
+     def create(self, vals_list):
+-        fulls = super().create(vals_list)
+-        for full in fulls.with_context(skip_matching_number_check=True):
+-            full.reconciled_line_ids.matching_number = str(full.id)
++        def get_ids(commands):
++            for command in commands:
++                if command[0] == Command.LINK:
++                    yield command[1]
++                elif command[0] == Command.SET:
++                    yield from command[2]
++                else:
++                    raise ValueError("Unexpected command: %s" % command)
++        move_line_ids = [list(get_ids(vals.pop('reconciled_line_ids'))) for vals in vals_list]
++        partial_ids = [list(get_ids(vals.pop('partial_reconcile_ids'))) for vals in vals_list]
++        fulls = super(AccountFullReconcile, self.with_context(tracking_disable=True)).create(vals_list)
++
++        self.env.cr.execute_values("""
++            UPDATE account_move_line line
++               SET full_reconcile_id = source.full_id
++              FROM (VALUES %s) AS source(full_id, line_ids)
++             WHERE line.id = ANY(source.line_ids)
++        """, [(full.id, line_ids) for full, line_ids in zip(fulls, move_line_ids)], page_size=1000)
++        fulls.reconciled_line_ids.invalidate_recordset(['full_reconcile_id'], flush=False)
++        fulls.invalidate_recordset(['reconciled_line_ids'], flush=False)
++
++        self.env.cr.execute_values("""
++            UPDATE account_partial_reconcile partial
++               SET full_reconcile_id = source.full_id
++              FROM (VALUES %s) AS source(full_id, partial_ids)
++             WHERE partial.id = ANY(source.partial_ids)
++        """, [(full.id, line_ids) for full, line_ids in zip(fulls, partial_ids)], page_size=1000)
++        fulls.partial_reconcile_ids.invalidate_recordset(['full_reconcile_id'], flush=False)
++        fulls.invalidate_recordset(['partial_reconcile_ids'], flush=False)
++
++        self.env['account.partial.reconcile']._update_matching_number(fulls.reconciled_line_ids)
+         return fulls
+
+--- a/addons/account/models/account_journal.py
++++ b/addons/account/models/account_journal.py
+@@ -202,6 +202,7 @@ class AccountJournal(models.Model):
+     selected_payment_method_codes = fields.Char(
+         compute='_compute_selected_payment_method_codes',
+     )
++    accounting_date = fields.Date(compute='_compute_accounting_date')
+ 
+     _sql_constraints = [
+         ('code_company_uniq', 'unique (company_id, code)', 'Journal codes must be unique per company.'),
+@@ -350,6 +351,16 @@ class AccountJournal(models.Model):
+             else:
+                 journal.suspense_account_id = False
+ 
++    @api.depends('company_id')
++    @api.depends_context('move_date', 'has_tax')
++    def _compute_accounting_date(self):
++        move_date = self.env.context.get('move_date') or fields.Date.context_today(self)
++        has_tax = self.env.context.get('has_tax') or False
++        for journal in self:
++            temp_move = self.env['account.move'].new({'journal_id': journal.id})
++            journal.accounting_date = temp_move._get_accounting_date(move_date, has_tax)
++
++
+     @api.onchange('type')
+     def _onchange_type_for_alias(self):
+         self.filtered(lambda journal: journal.type not in {'sale', 'purchase'}).alias_name = False
+
+--- a/addons/account/models/account_move.py
++++ b/addons/account/models/account_move.py
+@@ -2450,6 +2450,9 @@ class AccountMove(models.Model):
+             dirty_recs = eligible_recs.filtered(dirty_fname)
+             return dirty_recs, dirty_fname
+ 
++        def filter_trivial(mapping):
++            return {k: v for k, v in mapping.items() if 'id' not in k}
++
+         existing_before = existing()
+         needed_before = needed()
+         dirty_recs_before, dirty_fname = dirty()
+@@ -2475,7 +2478,9 @@ class AccountMove(models.Model):
+         }
+ 
+         if needed_after == needed_before:
+-            return
++            return  # do not modify user input if nothing changed in the needs
++        if not needed_before and (filter_trivial(existing_after) != filter_trivial(existing_before)):
++            return  # do not modify user input if already created manually
+ 
+         to_delete = [
+             line.id
+
+--- a/addons/account/models/account_move_line.py
++++ b/addons/account/models/account_move_line.py
+@@ -1124,9 +1124,10 @@ class AccountMoveLine(models.Model):
+ 
+     @api.depends('account_id', 'partner_id', 'product_id')
+     def _compute_analytic_distribution(self):
++        cache = {}
+         for line in self:
+             if line.display_type == 'product' or not line.move_id.is_invoice(include_receipts=True):
+-                distribution = self.env['account.analytic.distribution.model']._get_distribution({
++                arguments = frozendict({
+                     "product_id": line.product_id.id,
+                     "product_categ_id": line.product_id.categ_id.id,
+                     "partner_id": line.partner_id.id,
+@@ -1134,7 +1135,9 @@ class AccountMoveLine(models.Model):
+                     "account_prefix": line.account_id.code,
+                     "company_id": line.company_id.id,
+                 })
+-                line.analytic_distribution = distribution or line.analytic_distribution
++                if arguments not in cache:
++                    cache[arguments] = self.env['account.analytic.distribution.model']._get_distribution(arguments)
++                line.analytic_distribution = cache[arguments] or line.analytic_distribution
+ 
+     @api.depends('discount_date', 'date_maturity')
+     def _compute_payment_date(self):
+@@ -2335,12 +2338,17 @@ class AccountMoveLine(models.Model):
+ 
+         :param reconciliation_plan: A list of reconciliation to perform.
+         """
+-        # Parameter allowing to disable the exchange journal entries on partials.
+-        disable_partial_exchange_diff = bool(self.env['ir.config_parameter'].sudo().get_param('account.disable_partial_exchange_diff'))
+-
+         # ==== Prepare the reconciliation ====
+         # Batch the amls all together to know what should be reconciled and when.
+         plan_list, all_amls = self._optimize_reconciliation_plan(reconciliation_plan)
++        move_container = {'records': all_amls.move_id}
++        with all_amls.move_id._check_balanced(move_container),\
++             all_amls.move_id._sync_dynamic_lines(move_container):
++            self._reconcile_plan_with_sync(plan_list, all_amls)
++
++    def _reconcile_plan_with_sync(self, plan_list, all_amls):
++        # Parameter allowing to disable the exchange journal entries on partials.
++        disable_partial_exchange_diff = bool(self.env['ir.config_parameter'].sudo().get_param('account.disable_partial_exchange_diff'))
+ 
+         # ==== Prefetch the fields all at once to speedup the reconciliation ====
+         # All of those fields will be cached by the orm. Since the amls are split into multiple batches, the orm is not
+@@ -2425,12 +2433,13 @@ class AccountMoveLine(models.Model):
+ 
+         full_batches = []
+         all_aml_ids = set()
++        number2lines = all_amls._reconciled_by_number()
+         for plan in plan_list:
+             for aml in plan['amls']:
+                 if 'full_batch_index' in aml_values_map[aml]:
+                     continue
+ 
+-                involved_amls = plan['amls']._all_reconciled_lines()
++                involved_amls = plan['amls']._filter_reconciled_by_number(number2lines)
+                 all_aml_ids.update(involved_amls.ids)
+                 full_batch_index = len(full_batches)
+                 has_multiple_currencies = len(involved_amls.currency_id) > 1
+@@ -2526,13 +2535,7 @@ class AccountMoveLine(models.Model):
+                 })
+                 full_reconcile_full_batch_index.append(full_batch_index)
+ 
+-        self.env['account.full.reconcile']\
+-            .with_context(
+-                skip_invoice_sync=True,
+-                skip_invoice_line_sync=True,
+-                skip_account_move_synchronization=True,
+-            )\
+-            .create(full_reconcile_values_list)
++        self.env['account.full.reconcile'].create(full_reconcile_values_list)
+ 
+         # === Cash basis rounding autoreconciliation ===
+         # In case a cash basis rounding difference line got created for the transition account, we reconcile it with the corresponding lines
+@@ -2599,15 +2602,11 @@ class AccountMoveLine(models.Model):
+         journal = company.currency_exchange_journal_id
+         expense_exchange_account = company.expense_currency_exchange_account_id
+         income_exchange_account = company.income_currency_exchange_account_id
+-
+-        temp_exchange_move = self.env['account.move'].new({'journal_id': journal.id})
+-        accounting_exchange_date = temp_exchange_move._get_accounting_date(
+-            exchange_date or fields.Date.context_today(self),
+-            False,
+-        )
++        accounting_exchange_date = journal.with_context(move_date=exchange_date).accounting_date
+ 
+         move_vals = {
+             'move_type': 'entry',
++            'name': '/', # do not trigger the compute name before posting as it will most likely be posted immediately after
+             'date': accounting_exchange_date,
+             'journal_id': journal.id,
+             'line_ids': [],
+@@ -2713,13 +2712,7 @@ class AccountMoveLine(models.Model):
+                 ))
+ 
+         # ==== Create the move ====
+-        exchange_moves = self.env['account.move']\
+-            .with_context(
+-                skip_invoice_sync=True,
+-                skip_invoice_line_sync=True,
+-                skip_account_move_synchronization=True,
+-            )\
+-            .create(exchange_move_values_list)
++        exchange_moves = self.env['account.move'].create(exchange_move_values_list)
+         exchange_moves._post(soft=False)
+ 
+         # ==== Reconcile ====
+@@ -3062,12 +3055,28 @@ class AccountMoveLine(models.Model):
+             ids.append(aml.id)
+         return ids
+ 
+-    def _all_reconciled_lines(self):
+-        reconciled = self
++    def _reconciled_by_number(self) -> dict:
++        """Get the mapping of all the lines matched with the lines in self grouped by matching number."""
+         matching_numbers = [n for n in set(self.mapped('matching_number')) if n]
+         if matching_numbers:
+-            reconciled |= self.search([('matching_number', 'in', matching_numbers)])
+-        return reconciled
++            return dict(self._read_group(
++                domain=[('matching_number', 'in', matching_numbers)],
++                groupby=['matching_number'],
++                aggregates=['id:recordset'],
++            ))
++        return {}
++
++    def _filter_reconciled_by_number(self, mapping: dict):
++        """Get all the the lines matched with the lines in self.
++
++        Uses a mapping built with `_reconciled_by_number` to avoid multiple calls to the database.
++        """
++        matching_numbers = [n for n in set(self.mapped('matching_number')) if n]
++        return self | self.browse([_id for number in matching_numbers for _id in mapping[number].ids])
++
++    def _all_reconciled_lines(self):
++        """Get all the the lines matched with the lines in self."""
++        return self._filter_reconciled_by_number(self._reconciled_by_number())
+ 
+     def _get_attachment_domains(self):
+         self.ensure_one()
+
+--- a/addons/account/models/account_partial_reconcile.py
++++ b/addons/account/models/account_partial_reconcile.py
+@@ -53,9 +53,11 @@ class AccountPartialReconcile(models.Model):
+     company_id = fields.Many2one(
+         comodel_name='res.company',
+         string="Company", store=True, readonly=False,
++        precompute=True,
+         compute='_compute_company_id')
+     max_date = fields.Date(
+         string="Max Date of Matched Lines", store=True,
++        precompute=True,
+         compute='_compute_max_date')
+         # used to determine at which date this reconciliation needs to be shown on the aged receivable/payable reports
+ 
+@@ -168,18 +170,19 @@ class AccountPartialReconcile(models.Model):
+                 line2number[partial.debit_move_id.id] = partial.id
+                 line2number[partial.credit_move_id.id] = partial.id
+ 
+-        processed_aml_ids = []
+-        with amls.move_id._check_balanced({'records': amls.move_id}):  # avoid checking the consistency for each individual write
+-            for min_partial_id, line_ids in number2lines.items():
+-                min_partial = self.browse(min_partial_id)
+-                lines = self.env['account.move.line'].browse(line_ids).with_context(skip_matching_number_check=True)
+-                lines.matching_number = (
+-                    str(min_partial.full_reconcile_id.id)
+-                    if min_partial.full_reconcile_id else
+-                    f"P{min_partial.id}"
+-                )
+-                processed_aml_ids.extend(line_ids)
+-            self.env['account.move.line'].browse(set(amls.ids) - set(processed_aml_ids)).matching_number = False
++        amls.flush_recordset(['full_reconcile_id'])
++        self.env.cr.execute_values("""
++            UPDATE account_move_line l
++               SET matching_number = CASE
++                       WHEN l.full_reconcile_id IS NOT NULL THEN l.full_reconcile_id::text
++                       ELSE 'P' || source.number
++                   END
++              FROM (VALUES %s) AS source(number, ids)
++             WHERE l.id = ANY(source.ids)
++        """, list(number2lines.items()), page_size=1000)
++        processed_amls = self.env['account.move.line'].browse([_id for ids in number2lines.values() for _id in ids])
++        processed_amls.invalidate_recordset(['matching_number'])
++        (amls - processed_amls).matching_number = False
+ 
+     # -------------------------------------------------------------------------
+     # RECONCILIATION METHODS

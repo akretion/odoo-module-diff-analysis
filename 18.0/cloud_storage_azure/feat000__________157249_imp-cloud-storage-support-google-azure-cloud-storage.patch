@@ -1,0 +1,288 @@
+PR: https://github.com/odoo/odoo/pull/157249
+
+From: f2cf8167d7a36c91d7058785d9c532cec7d61f0e
+From: Chong Wang (cwg)
+Date: 2024-06-21 14:10:47
+
+Total Changes: 222
+
+[IMP] cloud_storage: support google/azure cloud storage
+
+A cloud storage integration to allow attachments for mail can be stored in the
+cloud storage.
+1. file can be directly uploaded to cloud
+2. file can be directly downloaded from cloud
+
+Here is the work flow (make sure your window is wide enough)
+Create a cloud storage attachment
+
++--------+                        1. upload file info    +---------+   2. create ir.attachment
+|        | --------------------------------------------> |         | --------------------------+
+|        |                                               |  Odoo   |                           |
+|        |  3. cloud storage upload url with token       |         |                           |
+|  Web   | <-------------------------------------------- |         | <-------------------------+
+| Client |                                               +---------+
+|        |                                               +---------+
+|        |                             4. upload file    |  Cloud  |
+|        | --------------------------------------------> | Storage |
++--------+                                               +---------+
+
+Download a cloud storage attachment
+
++--------+                     1. odoo attachment url    +---------+
+|        | --------------------------------------------> |         |
+|        |                                               |  Odoo   |
+|        |  2. cloud storage download url with token     |         |
+|  Web   | <-------------------------------------------- |         |
+| Client |                                               +---------+
+|        |                                               +---------+
+|        |                                3. redirect    |  Cloud  |
+|        | --------------------------------------------> | Storage |
++--------+                                               +---------+
+
+Unlink a cloud storage attachment
+the cloud blobs won't be deleted automatically by Odoo after their ir.attachment
+records are unlinked. The administrator can manually delete them using
+cloud_storage_xxx/utils/cleanup_cloud_storage_xxx.py
+
+closes odoo/odoo#157249
+
+Task: 3692084
+Related: odoo/enterprise#64572
+Signed-off-by: Raphael Collet <rco@odoo.com>
+
+================================= pseudo patch: =================================
+
+--- a/None
++++ b/addons/cloud_storage_azure/models/__init__.py
+@@ -0,0 +1,4 @@
++# Part of Odoo. See LICENSE file for full copyright and licensing details.
++
++from . import ir_attachment
++from . import res_config_settings
+
+--- a/None
++++ b/addons/cloud_storage_azure/models/ir_attachment.py
+@@ -0,0 +1,113 @@
++# Part of Odoo. See LICENSE file for full copyright and licensing details.
++
++import re
++from datetime import datetime, timedelta, timezone
++from urllib.parse import unquote, quote
++
++from odoo import models
++from odoo.exceptions import ValidationError
++
++from ..utils.cloud_storage_azure_utils import generate_blob_sas, get_user_delegation_key, ClientAuthenticationError
++
++
++class IrAttachment(models.Model):
++    _inherit = 'ir.attachment'
++    _cloud_storage_azure_url_pattern = re.compile(r'https://(?P<account_name>[\w]+).blob.core.windows.net/(?P<container_name>[\w]+)/(?P<blob_name>[^?]+)')
++    __cloud_storage_azure_user_delegation_keys = {}  # {db_name: (config, user_delegation_key or exception)}
++
++    def _get_cloud_storage_azure_info(self):
++        match = self._cloud_storage_azure_url_pattern.match(self.url)
++        if not match:
++            raise ValidationError('%s is not a valid Azure Blob Storage URL.', self.url)
++        return {
++            'account_name': match['account_name'],
++            'container_name': match['container_name'],
++            'blob_name': unquote(match['blob_name']),
++        }
++
++    def _get_cloud_storage_azure_user_delegation_key(self):
++        """
++        Generate a UserDelegationKey used for generating SAS tokens.
++
++        The cached UserDelegationKey is refreshed every 6 days. If the account
++        information expires, a ClientAuthenticationError will also be cached to
++        prevent the server from repeatedly sending requests to the cloud
++        storage provider to get the user delegation key. Note that the cached
++        values are not invalidated when the ORM cache is invalidated. To
++        invalidate these cached values, you must update the cloud storage
++        configuration or the cloud_storage_azure_user_delegation_key_sequence.
++
++        :return: A valid and unexpired UserDelegationKey which is compatible
++                with azure.storage.blob.UserDelegationKey
++        """
++        cached_config, cached_user_delegation_key = self.__cloud_storage_azure_user_delegation_keys.get(self.env.registry.db_name, (None, None))
++        db_config = self.env['res.config.settings']._get_cloud_storage_configuration()
++        db_config.pop('container_name')
++        ICP = self.env['ir.config_parameter'].sudo()
++        db_config['sequence'] = int(ICP.get_param('cloud_storage_azure_user_delegation_key_sequence', 0))
++        if db_config == cached_config:
++            if isinstance(cached_user_delegation_key, Exception):
++                raise cached_user_delegation_key
++            if cached_user_delegation_key:
++                expiry = datetime.strptime(cached_user_delegation_key.signed_expiry, '%Y-%m-%dT%H:%M:%SZ').replace(tzinfo=timezone.utc)
++                if expiry > datetime.now(timezone.utc) + timedelta(days=1):
++                    return cached_user_delegation_key
++        key_start_time = datetime.now(timezone.utc)
++        key_expiry_time = key_start_time + timedelta(days=7)
++        try:
++            user_delegation_key = get_user_delegation_key(
++                tenant_id=db_config['tenant_id'],
++                client_id=db_config['client_id'],
++                client_secret=db_config['client_secret'],
++                account_name=db_config['account_name'],
++                key_start_time=key_start_time,
++                key_expiry_time=key_expiry_time,
++            )
++            self.__cloud_storage_azure_user_delegation_keys[self.env.registry.db_name] = (db_config, user_delegation_key)
++        except ClientAuthenticationError as e:
++            ve = ValidationError(e)
++            self.__cloud_storage_azure_user_delegation_keys[self.env.registry.db_name] = (db_config, ve)
++            raise ve
++        return user_delegation_key
++
++    def _generate_cloud_storage_azure_url(self, blob_name):
++        ICP = self.env['ir.config_parameter'].sudo()
++        account_name = ICP.get_param('cloud_storage_azure_account_name')
++        container_name = ICP.get_param('cloud_storage_azure_container_name')
++        return f"https://{account_name}.blob.core.windows.net/{container_name}/{quote(blob_name)}"
++
++    def _generate_cloud_storage_azure_sas_url(self, **kwargs):
++        token = generate_blob_sas(user_delegation_key=self._get_cloud_storage_azure_user_delegation_key(), **kwargs)
++        return f"{self._generate_cloud_storage_azure_url(kwargs['blob_name'])}?{token}"
++
++    # OVERRIDES
++    def _generate_cloud_storage_url(self):
++        if self.env['ir.config_parameter'].sudo().get_param('cloud_storage_provider') != 'azure':
++            return super()._generate_cloud_storage_url()
++        blob_name = self._generate_cloud_storage_blob_name()
++        return self._generate_cloud_storage_azure_url(blob_name)
++
++    def _generate_cloud_storage_download_info(self):
++        if self.env['ir.config_parameter'].sudo().get_param('cloud_storage_provider') != 'azure':
++            return super()._generate_cloud_storage_download_info()
++        info = self._get_cloud_storage_azure_info()
++        expiry = datetime.now(timezone.utc) + timedelta(seconds=self._cloud_storage_download_url_time_to_expiry)
++        return {
++            'url': self._generate_cloud_storage_azure_sas_url(**info, permission='r', expiry=expiry, cache_control=f'private, max-age={self._cloud_storage_download_url_time_to_expiry}'),
++            'time_to_expiry': self._cloud_storage_download_url_time_to_expiry,
++        }
++
++    def _generate_cloud_storage_upload_info(self):
++        if self.env['ir.config_parameter'].sudo().get_param('cloud_storage_provider') != 'azure':
++            return super()._generate_cloud_storage_upload_info()
++        info = self._get_cloud_storage_azure_info()
++        expiry = datetime.now(timezone.utc) + timedelta(seconds=self._cloud_storage_upload_url_time_to_expiry)
++        url = self._generate_cloud_storage_azure_sas_url(**info, permission='c', expiry=expiry)
++        return {
++            'url': url,
++            'method': 'PUT',
++            'headers': {
++                'x-ms-blob-type': 'BlockBlob',
++            },
++            'response_status': 201,
++        }
+
+--- a/None
++++ b/addons/cloud_storage_azure/models/res_config_settings.py
+@@ -0,0 +1,105 @@
++# Part of Odoo. See LICENSE file for full copyright and licensing details.
++
++import requests
++from datetime import datetime, timedelta, timezone
++
++from odoo import models, fields, _
++from odoo.exceptions import ValidationError, UserError
++
++
++class CloudStorageSettings(models.TransientModel):
++    """
++    Instructions:
++    cloud_storage_azure_account_name, cloud_storage_azure_container_name:
++        if changed and old container names are still in use, you should
++        promise the current application registration has the permission
++        to access all old containers.
++    cloud_storage_azure_invalidate_user_delegation_key:
++        invalidate the cached value for
++        self.env['ir.attachment']._get_cloud_storage_azure_user_delegation_key
++    """
++    _inherit = 'res.config.settings'
++
++    cloud_storage_provider = fields.Selection(selection_add=[('azure', 'Azure Cloud Storage')])
++
++    cloud_storage_azure_account_name = fields.Char(
++        string='Azure Account Name',
++        config_parameter='cloud_storage_azure_account_name')
++    cloud_storage_azure_container_name = fields.Char(
++        string='Azure Container Name',
++        config_parameter='cloud_storage_azure_container_name')
++    # Application Registry Info
++    cloud_storage_azure_tenant_id = fields.Char(
++        string='Azure Tenant ID',
++        config_parameter='cloud_storage_azure_tenant_id')
++    cloud_storage_azure_client_id = fields.Char(
++        string='Azure Client ID',
++        config_parameter='cloud_storage_azure_client_id')
++    cloud_storage_azure_client_secret = fields.Char(
++        string='Azure Client Secret',
++        config_parameter='cloud_storage_azure_client_secret')
++    cloud_storage_azure_invalidate_user_delegation_key = fields.Boolean(
++        string='Invalidate Cached Azure User Delegation Key',
++    )
++
++    def _get_cloud_storage_configuration(self):
++        ICP = self.env['ir.config_parameter'].sudo()
++        if ICP.get_param('cloud_storage_provider') != 'azure':
++            return super()._get_cloud_storage_configuration
++        configuration = {
++            'container_name': ICP.get_param('cloud_storage_azure_container_name'),
++            'account_name': ICP.get_param('cloud_storage_azure_account_name'),
++            'tenant_id': ICP.get_param('cloud_storage_azure_tenant_id'),
++            'client_id': ICP.get_param('cloud_storage_azure_client_id'),
++            'client_secret': ICP.get_param('cloud_storage_azure_client_secret'),
++        }
++        return configuration if all(configuration.values()) else {}
++
++    def _setup_cloud_storage_provider(self):
++        ICP = self.env['ir.config_parameter'].sudo()
++        if ICP.get_param('cloud_storage_provider') != 'azure':
++            return super()._setup_cloud_storage_provider()
++        blob_info = {
++            'account_name': ICP.get_param('cloud_storage_azure_account_name'),
++            'container_name': ICP.get_param('cloud_storage_azure_container_name'),
++            # use different blob names in case the credentials are allowed to
++            # overwrite an existing blob created by previous tests
++            'blob_name': f'0/{datetime.now(timezone.utc)}.txt',
++        }
++
++        # check blob create permission
++        upload_expiry = datetime.now(timezone.utc) + timedelta(seconds=self.env['ir.attachment']._cloud_storage_upload_url_time_to_expiry)
++        upload_url = self.env['ir.attachment']._generate_cloud_storage_azure_sas_url(**blob_info, permission='c', expiry=upload_expiry)
++        upload_response = requests.put(upload_url, data=b'', headers={'x-ms-blob-type': 'BlockBlob'}, timeout=5)
++        if upload_response.status_code != 201:
++            raise ValidationError(_('The connection string is not allowed to upload blobs to the container.\n%s', str(upload_response.text)))
++
++        # check blob read permission
++        download_expiry = datetime.now(timezone.utc) + timedelta(seconds=self.env['ir.attachment']._cloud_storage_download_url_time_to_expiry)
++        download_url = self.env['ir.attachment']._generate_cloud_storage_azure_sas_url(**blob_info, permission='r', expiry=download_expiry)
++        download_response = requests.get(download_url, timeout=5)
++        if download_response.status_code != 200:
++            raise ValidationError(_('The connection string is not allowed to download blobs from the container.\n%s', str(download_response.text)))
++
++    def _check_cloud_storage_uninstallable(self, provider_name):
++        if provider_name != 'azure':
++            return super()._check_cloud_storage_uninstallable(provider_name)
++        cr = self.env.cr
++        cr.execute(
++            """
++                SELECT 1
++                FROM ir_attachment
++                WHERE type = 'cloud_storage'
++                AND url LIKE 'https://%.blob.core.windows.net/%'
++                LIMIT 1
++            """,
++        )
++        if cr.fetchone():
++            raise UserError(_('Some Azure attachments are in use, please migrate their cloud storages before disable this module'))
++
++    def set_values(self):
++        super().set_values()
++        if self.cloud_storage_azure_invalidate_user_delegation_key:
++            ICP = self.env['ir.config_parameter']
++            old_seq = int(ICP.get_param('cloud_storage_azure_user_delegation_key_sequence', 0))
++            ICP.set_param('cloud_storage_azure_user_delegation_key_sequence', old_seq + 1)
