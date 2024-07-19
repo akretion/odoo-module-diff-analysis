@@ -16,7 +16,7 @@ that will require migrations scripts (see [OpenUpgrade](https://github.com/OCA/O
 are certainly the place to start from.
 
 So while scanning all commits between two Odoo series, `odoo-module-diff` will retain the very ones
-removing database tables and columns.
+removing or altering database tables and columns.
 
 Eventually the biggest documented features where new tables or columns are added are also kept with the
 `feat` prefix. But you usually hear about the new features from the Odoo marketing so the focus here
@@ -30,7 +30,7 @@ even just the standard Odoo ORM will indeed likely deal well with such trivial c
 
 Example: what are the main breaking changes for the account module in version 17? Out of the 978 commits 
 in the account module between the release 16.0 and 17.0, `odoo-module-diff` will highlight only
-these 10 breaking changes and 2 important features:
+these 8 breaking changes and 2 important features:
 
 ```text
 ls -1 17.0/account
