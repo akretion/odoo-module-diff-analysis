@@ -30,7 +30,7 @@ even just the standard Odoo ORM will indeed likely deal well with such trivial c
 
 Example: what are the main breaking changes for the account module in version 17? Out of the 978 commits 
 in the account module between the release 16.0 and 17.0, `odoo-module-diff` will highlight only
-these 8 breaking changes and 2 important features:
+these 6 breaking changes and 2 important features:
 
 ```text
 ls -1 17.0/account
@@ -46,7 +46,7 @@ ls -1 17.0/account
 
 Explanations:
 
--  The 8 first files are CHANGE pseudo patches with the commit diff and commit explanations.
+-  The 6 first files are CHANGE pseudo patches with the commit diff and commit explanations.
 -  The 2 last files are FEATURE pseudo patches
 -  The 1st number is just a sequence to reflect the order the commits were made
 -  The 2nd number is the Github PR number (you'll also find it in the 1st line of the pseudo patch alongh with the commut sha code)
