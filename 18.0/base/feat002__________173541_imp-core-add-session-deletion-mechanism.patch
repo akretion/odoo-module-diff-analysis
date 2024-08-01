@@ -1,0 +1,292 @@
+PR: https://github.com/odoo/odoo/pull/173541
+
+From: 6fb676a4e3566c781ddd57480a200cddc88d99ae
+From: Thomas Lefebvre (thle)
+Date: 2024-07-18 15:42:41
++    device_ids = fields.One2many('res.device', 'user_id', string='User devices')
+
+Total Changes: 181
+
+[IMP] core: add session deletion mechanism
+
+Objective:
+*---------
+A user must be able to see which of his sessions/devices are active.
+Make it easy to block devices and analyse current sessions.
+If a user notices unusual operations concerning him on another device,
+he must be able to stop these operations by blocking the session used by this device.
+
+General:
+*-------
+A device is uniquely identified by its name, IP address and the session to which it is linked.
+Consequently, a device is always linked to a session, and a session is always linked to at least one device.
+
+A device is tracked with its last activity.
+The same device is updated every X seconds in order to track its use in terms of duration of activity.
+
+Tracking data is collected within the session itself.
+This data is updated in the database when necessary (according to elapsed time).
+
+Within the database, data are inserted as logs (model `res.device.log`).
+The `res.device` model is responsible for filtering the logs so that the user can obtain usable data.
+Logs are cleaned during garbage collection.
+
+Each user sees data from their own devices.
+Administrators can view all devices.
+
+Blocking sessions:
+*-----------------
+Blocking a session by selecting a device must block the session directly.
+From an administrator's point of view, if we want to block a session,
+we expect the session file to be deleted directly on the filesystem.
+
+If the session file is no longer present on the filesystem, we can be sure
+that there is no longer any risk of session usurpation.
+
+Note:
+There are several ways of blocking the session, but this is the safest.
+Blocking a session based on DB values does not cover scenarios in which we perform a backup, for example.
+
+Find the session file:
+*---------------------
+To find a session file on the filesystem, we need to know the sid of the session (as this is its filename).
+We don't want to store the sid in the database.
+However, we can store a part of it with:
+* a large enough part to be certain of the uniqueness of the session;
+* a small enough part that we cannot brute force the end of the sid.
+
+Browsing the filesystem has a certain performance cost (and can therefore have defects if abused).
+
+The proposed solution is to change the granularity of the way we store the session on the filesystem.
+This means finding a compromise between sub-folders and files per sub-folder to browse for a session file.
+
+The sid will be Base64 encoded in order to increase the number of sub-folders (64^2 instead of 16^2).
+
+Task:3627898
+
+closes odoo/odoo#173541
+
+Signed-off-by: Toufik Benjaa (tbe) <tbe@odoo.com>
+
+================================= pseudo patch: =================================
+
+--- a/odoo/addons/base/models/__init__.py
++++ b/odoo/addons/base/models/__init__.py
+@@ -46,5 +46,6 @@ from . import res_company
+ from . import res_users
+ from . import res_users_settings
+ from . import res_users_deletion
++from . import res_device
+ 
+ from . import decimal_precision
+
+--- a/odoo/addons/base/models/ir_http.py
++++ b/odoo/addons/base/models/ir_http.py
+@@ -159,7 +159,7 @@ class IrHttp(models.AbstractModel):
+     def _authenticate_explicit(cls, auth):
+         try:
+             if request.session.uid is not None:
+-                if not security.check_session(request.session, request.env):
++                if not security.check_session(request.session, request.env, request):
+                     request.session.logout(keep_db=True)
+                     request.env = api.Environment(request.env.cr, None, request.session.context)
+             getattr(cls, f'_auth_method_{auth}')()
+
+--- a/None
++++ b/odoo/addons/base/models/res_device.py
+@@ -0,0 +1,175 @@
++# Part of Odoo. See LICENSE file for full copyright and licensing details.
++
++from contextlib import nullcontext
++from datetime import datetime
++import logging
++
++from odoo import api, fields, models, tools
++from odoo.http import GeoIP, request, root
++from odoo.tools import SQL, OrderedSet, unique
++from odoo.tools.translate import _
++from .res_users import check_identity
++
++_logger = logging.getLogger(__name__)
++
++
++class ResDeviceLog(models.Model):
++    _name = 'res.device.log'
++    _description = 'Device Log'
++    _rec_names_search = ['platform', 'browser']
++
++    session_identifier = fields.Char("Session Identifier", required=True, index='btree')
++    platform = fields.Char("Platform")
++    browser = fields.Char("Browser")
++    ip_address = fields.Char("IP Address")
++    country = fields.Char("Country")
++    city = fields.Char("City")
++    device_type = fields.Selection([('computer', 'Computer'), ('mobile', 'Mobile')], "Device Type")
++    user_id = fields.Many2one("res.users", index='btree')
++    first_activity = fields.Datetime("First Activity")
++    last_activity = fields.Datetime("Last Activity", index='btree')
++    revoked = fields.Boolean("Revoked",
++                            help="""If True, the session file corresponding to this device
++                                    no longer exists on the filesystem.""")
++    is_current = fields.Boolean("Current Device", compute="_compute_is_current")
++    linked_ip_addresses = fields.Text("Linked IP address", compute="_compute_linked_ip_addresses")
++
++    def _compute_display_name(self):
++        for device in self:
++            platform = device.platform or _("Unknown")
++            browser = device.browser or _("Unknown")
++            device.display_name = f"{platform.capitalize()} {browser.capitalize()}"
++
++    def _compute_is_current(self):
++        for device in self:
++            device.is_current = request and request.session.sid.startswith(device.session_identifier)
++
++    def _compute_linked_ip_addresses(self):
++        device_group_map = dict(self._read_group(
++            domain=[('session_identifier', 'in', self.mapped('session_identifier'))],
++            groupby=['session_identifier'],
++            aggregates=['ip_address:array_agg']
++        ))
++        for device in self:
++            device.linked_ip_addresses = '\n'.join(OrderedSet(device_group_map.get(device.session_identifier, [])))
++
++    def _order_field_to_sql(self, alias, field_name, direction, nulls, query):
++        if field_name == 'is_current' and request:
++            return SQL("session_identifier = %s DESC", request.session.sid[:42])
++        return super()._order_field_to_sql(alias, field_name, direction, nulls, query)
++
++    def _is_mobile(self, platform):
++        if not platform:
++            return False
++        mobile_platform = ['android', 'iphone', 'ipad', 'ipod', 'blackberry', 'windows phone', 'webos']
++        return platform.lower() in mobile_platform
++
++    @api.model
++    def _update_device(self, request):
++        """
++            Must be called when we want to update the device for the current request.
++            Passage through this method must leave a "trace" in the session.
++
++            :param request: Request or WebsocketRequest object
++        """
++        trace = request.session.update_trace(request)
++        if not trace:
++            return
++
++        geoip = GeoIP(trace['ip_address'])
++        user_id = request.session.uid
++        session_identifier = request.session.sid[:42]
++
++        if self.env.cr.readonly:
++            self.env.cr.rollback()
++            cursor = self.env.registry.cursor(readonly=False)
++        else:
++            cursor = nullcontext(self.env.cr)
++        with cursor as cr:
++            cr.execute(SQL("""
++                INSERT INTO res_device_log (session_identifier, platform, browser, ip_address, country, city, device_type, user_id, first_activity, last_activity, revoked)
++                VALUES (%(session_identifier)s, %(platform)s, %(browser)s, %(ip_address)s, %(country)s, %(city)s, %(device_type)s, %(user_id)s, %(first_activity)s, %(last_activity)s, %(revoked)s)
++            """,
++                session_identifier=session_identifier,
++                platform=trace['platform'],
++                browser=trace['browser'],
++                ip_address=trace['ip_address'],
++                country=geoip.get('country_name'),
++                city=geoip.get('city'),
++                device_type='mobile' if self._is_mobile(trace['platform']) else 'computer',
++                user_id=user_id,
++                first_activity=datetime.fromtimestamp(trace['first_activity']),
++                last_activity=datetime.fromtimestamp(trace['last_activity']),
++                revoked=False,
++            ))
++        _logger.info("User %d inserts device log (%s)", user_id, session_identifier)
++
++    @api.autovacuum
++    def _gc_device_log(self):
++        # Keep the last device log
++        # (even if the session file no longer exists on the filesystem)
++        self.env.cr.execute("""
++            DELETE FROM res_device_log log1
++            WHERE EXISTS (
++                SELECT 1 FROM res_device_log log2
++                WHERE
++                    log1.session_identifier = log2.session_identifier
++                    AND log1.platform = log2.platform
++                    AND log1.browser = log2.browser
++                    AND log1.ip_address = log2.ip_address
++                    AND log1.last_activity < log2.last_activity
++            )
++        """)
++        _logger.info("GC device logs delete %d entries", self.env.cr.rowcount)
++
++
++class ResDevice(models.Model):
++    _name = "res.device"
++    _inherit = ["res.device.log"]
++    _description = "Devices"
++    _auto = False
++
++    @check_identity
++    def revoke(self):
++        return self._revoke()
++
++    def _revoke(self):
++        ResDeviceLog = self.env['res.device.log']
++        session_identifiers = list(unique(device.session_identifier for device in self))
++        root.session_store.delete_from_identifiers(session_identifiers)
++        revoked_devices = ResDeviceLog.sudo().search([('session_identifier', 'in', session_identifiers)])
++        revoked_devices.write({'revoked': True})
++        _logger.info("User %d revokes devices (%s)", self.env.uid, ', '.join(session_identifiers))
++
++        must_logout = bool(self.filtered('is_current'))
++        if must_logout:
++            request.session.logout()
++
++    @api.model
++    def _select(self):
++        return "SELECT DISTINCT ON (D.session_identifier, D.platform, D.browser) D.*"
++
++    @api.model
++    def _from(self):
++        return "FROM res_device_log D"
++
++    @api.model
++    def _where(self):
++        return "WHERE D.revoked = False"
++
++    @api.model
++    def _order_by(self):
++        return "ORDER BY D.session_identifier, D.platform, D.browser, D.last_activity DESC"
++
++    @property
++    def _query(self):
++        return "%s %s %s %s" % (self._select(), self._from(), self._where(), self._order_by())
++
++    def init(self):
++        tools.drop_view_if_exists(self.env.cr, self._table)
++        self.env.cr.execute(SQL("""
++            CREATE or REPLACE VIEW %s as (%s)
++        """,
++            SQL.identifier(self._table),
++            SQL(self._query)
++        ))
+
+--- a/odoo/addons/base/models/res_users.py
++++ b/odoo/addons/base/models/res_users.py
+@@ -335,7 +335,7 @@ class Users(models.Model):
+             'image_1024', 'image_512', 'image_256', 'image_128', 'lang', 'tz',
+             'tz_offset', 'groups_id', 'partner_id', 'write_date', 'action_id',
+             'avatar_1920', 'avatar_1024', 'avatar_512', 'avatar_256', 'avatar_128',
+-            'share',
++            'share', 'device_ids',
+         ]
+ 
+     @property
+@@ -371,6 +371,7 @@ class Users(models.Model):
+         help="If specified, this action will be opened at log on for this user, in addition to the standard menu.")
+     groups_id = fields.Many2many('res.groups', 'res_groups_users_rel', 'uid', 'gid', string='Groups', default=lambda s: s._default_groups())
+     log_ids = fields.One2many('res.users.log', 'create_uid', string='User log entries')
++    device_ids = fields.One2many('res.device', 'user_id', string='User devices')
+     login_date = fields.Datetime(related='log_ids.create_date', string='Latest authentication', readonly=False)
+     share = fields.Boolean(compute='_compute_share', compute_sudo=True, string='Share User', store=True,
+          help="External user with limited access, created only for the purpose of sharing data.")
