@@ -1,0 +1,1541 @@
+PR: https://github.com/odoo/odoo/pull/175205
+
+From: 432e375246f0b5ab440d33bb7cfabdb363ef6828
+From: william-andre
+Date: 2024-08-02 13:17:50
+
+Breaking data model changes scores: del:2 + add:0, change matches:
+-    _inherit = ['mail.thread']
+-    _inherit = ['avatar.mixin']
+
+Total Changes: 815
+
+[REF] bus, *: shortcut to send message to user via bus
+
+* = account, auth_signup, base_geolocalize, bus, calendar, crm_livechat,
+    iap_mail, im_livechat, mail, point_of_sale,
+    website_crm_partner_assign, website_livechat
+
+Make a safe and simpler helper for usages of `<bus.bus>._sendone`.
+If the code is using this helper, it doesn't require any particular
+attention regarding security as the channel crafted is safe by design.
+It also reduces the possibility to have a channel that doesn't exist.
+
+However supported channels still have to be added manually in
+`_build_bus_channel_list` depending on each user/guest needs and access
+rights.
+
+Implementation:
+
+A new mixin (`bus.listener.mixin`) implementing `_bus_send` can be added
+on models, which, when called, will send a message to listeners of these
+records.
+
+In order to do that, models inheriting that mixin will need to also
+implement `_bus_channel`, returning the channel to use for the current
+record (by default it is the record itself).
+
+The opportunity is taken to add various sending helpers that are used
+often, in particular `_bus_send_store`.
+
+Transient message helper is also cleaned to use a similar pattern, to
+enforce markup usage, and to follow proper translation guidelines.
+
+closes odoo/odoo#175205
+
+Related: odoo/enterprise#67733
+Signed-off-by: Sébastien Theys (seb) <seb@odoo.com>
+Co-authored-by: Sébastien Theys <seb@odoo.com>
+Co-authored-by: william-andre <wan@odoo.com>
+
+================================= pseudo patch: =================================
+
+--- a/addons/mail/models/__init__.py
++++ b/addons/mail/models/__init__.py
+@@ -1,4 +1,3 @@
+-# -*- coding: utf-8 -*-
+ # Part of Odoo. See LICENSE file for full copyright and licensing details.
+ 
+ # core models (required for mixins)
+@@ -7,6 +6,7 @@ from . import mail_alias_domain
+ from . import models
+ 
+ # mixin
++from . import bus_listener_mixin
+ from . import mail_activity_mixin
+ from . import mail_alias_mixin_optional
+ from . import mail_alias_mixin
+
+--- a/None
++++ b/addons/mail/models/bus_listener_mixin.py
+@@ -0,0 +1,21 @@
++# Part of Odoo. See LICENSE file for full copyright and licensing details.
++
++from odoo import models
++from odoo.addons.mail.tools.discuss import Store
++
++
++class BusListenerMixin(models.AbstractModel):
++    _inherit = "bus.listener.mixin"
++
++    def _bus_send_store(
++        self, /, *args, notification_type="mail.record/insert", subchannel=None, **kwargs
++    ):
++        """Use the given Store or create a Store from the given params and send this
++        Store to ``self`` bus listener."""
++        if len(args) == 1 and isinstance(args[0], Store):
++            assert not kwargs, f"should not have kwargs with Store: {kwargs}"
++            store = args[0]
++        else:
++            store = Store(*args, **kwargs)
++        if res := store.get_result():
++            self._bus_send(notification_type, res, subchannel=subchannel)
+
+--- a/addons/mail/models/discuss/__init__.py
++++ b/addons/mail/models/discuss/__init__.py
+@@ -12,6 +12,7 @@ from . import discuss_voice_metadata
+ from . import mail_guest
+ 
+ # odoo models
++from . import bus_listener_mixin
+ from . import ir_attachment
+ from . import ir_binary
+ from . import ir_websocket
+
+--- a/None
++++ b/addons/mail/models/discuss/bus_listener_mixin.py
+@@ -0,0 +1,20 @@
++# Part of Odoo. See LICENSE file for full copyright and licensing details.
++
++from markupsafe import Markup
++
++from odoo import models
++from odoo.addons.mail.tools.discuss import Store
++
++
++class BusListenerMixin(models.AbstractModel):
++    _inherit = "bus.listener.mixin"
++
++    def _bus_send_transient_message(self, channel, content):
++        """Posts a fake message in the given ``channel``, only visible for ``self`` listeners."""
++        self._bus_send(
++            "discuss.channel/transient_message",
++            {
++                "body": Markup("<span class='o_mail_notification'>%s</span>") % content,
++                "thread": Store.one_id(channel, as_thread=True),
++            },
++        )
+
+--- a/addons/mail/models/discuss/discuss_channel.py
++++ b/addons/mail/models/discuss/discuss_channel.py
+@@ -29,7 +29,7 @@ class Channel(models.Model):
+     _name = 'discuss.channel'
+     _mail_flat_thread = False
+     _mail_post_access = 'read'
+-    _inherit = ['mail.thread']
++    _inherit = ["mail.thread", "bus.listener.mixin"]
+ 
+     MAX_BOUNCE_LIMIT = 10
+ 
+@@ -264,7 +264,8 @@ class Channel(models.Model):
+             all_emp_group = None
+         if all_emp_group and all_emp_group in self:
+             raise UserError(_('You cannot delete those groups, as the Whole Company group is required by other modules.'))
+-        self.env['bus.bus']._sendmany([(channel, 'discuss.channel/delete', {'id': channel.id}) for channel in self])
++        for channel in self:
++            channel._bus_send("discuss.channel/delete", {"id": channel.id})
+ 
+     def write(self, vals):
+         if 'channel_type' in vals:
+@@ -273,7 +274,6 @@ class Channel(models.Model):
+                 raise UserError(_('Cannot change the channel type of: %(channel_names)s', channel_names=', '.join(failing_channels.mapped('name'))))
+         old_vals = {channel: channel._channel_basic_info() for channel in self}
+         result = super().write(vals)
+-        notifications = []
+         for channel in self:
+             info = channel._channel_basic_info()
+             diff = {}
+@@ -281,12 +281,9 @@ class Channel(models.Model):
+                 if value != old_vals[channel][key]:
+                     diff[key] = value
+             if diff:
+-                notifications.append(
+-                    (channel, "mail.record/insert", Store(channel, diff).get_result())
+-                )
++                channel._bus_send_store(channel, diff)
+         if vals.get('group_ids'):
+             self._subscribe_users_automatically()
+-        self.env['bus.bus']._sendmany(notifications)
+         return result
+ 
+     def init(self):
+@@ -308,19 +305,10 @@ class Channel(models.Model):
+             ]
+             # sudo: discuss.channel.member - adding member of other users based on channel auto-subscribe
+             self.env['discuss.channel.member'].sudo().create(to_create)
+-        notifications = []
+         for channel in self:
+-            for group in channel.group_ids:
+-                notifications.append(
+-                    (
+-                        group,
+-                        "mail.record/insert",
+-                        Store(
+-                            channel, {**channel._channel_basic_info(), "is_pinned": True}
+-                        ).get_result(),
+-                    )
+-                )
+-        self.env["bus.bus"]._sendmany(notifications)
++            channel.group_ids._bus_send_store(
++                channel, {**channel._channel_basic_info(), "is_pinned": True}
++            )
+ 
+     def _subscribe_users_automatically_get_members(self):
+         """ Return new members per channel ID """
+@@ -339,7 +327,7 @@ class Channel(models.Model):
+             [("channel_id", "=", self.id), ("partner_id", "=", partner.id)]
+         )
+         if not member:
+-            self.env["bus.bus"]._sendone(partner, "discuss.channel/leave", custom_store.get_result())
++            partner._bus_send_store(custom_store, notification_type="discuss.channel/leave")
+             return
+         member.unlink()
+         notification = Markup('<div class="o_mail_notification">%s</div>') % _("left the channel")
+@@ -348,17 +336,13 @@ class Channel(models.Model):
+             body=notification, subtype_xmlid="mail.mt_comment", author_id=partner.id
+         )
+         # send custom store after message_post to avoid is_pinned reset to True
+-        self.env["bus.bus"]._sendone(partner, "discuss.channel/leave", custom_store.get_result())
+-        self.env["bus.bus"]._sendone(
++        partner._bus_send_store(custom_store, notification_type="discuss.channel/leave")
++        self._bus_send_store(
+             self,
+-            "mail.record/insert",
+-            Store(
+-                self,
+-                {
+-                    "channelMembers": Store.many(member, "DELETE", only_id=True),
+-                    "memberCount": self.member_count,
+-                },
+-            ).get_result(),
++            {
++                "channelMembers": Store.many(member, "DELETE", only_id=True),
++                "memberCount": self.member_count,
++            },
+         )
+ 
+     def add_members(self, partner_ids=None, guest_ids=None, invite_to_rtc_call=False, open_chat_window=False, post_joined_message=True):
+@@ -366,7 +350,6 @@ class Channel(models.Model):
+         current_partner, current_guest = self.env["res.partner"]._get_current_persona()
+         partners = self.env['res.partner'].browse(partner_ids or []).exists()
+         guests = self.env['mail.guest'].browse(guest_ids or []).exists()
+-        notifications = []
+         all_new_members = self.env["discuss.channel.member"]
+         for channel in self:
+             members_to_create = []
+@@ -387,73 +370,39 @@ class Channel(models.Model):
+             } for guest in guests - existing_members.guest_id]
+             new_members = self.env['discuss.channel.member'].create(members_to_create)
+             all_new_members += new_members
+-            for member in new_members.filtered(lambda member: member.partner_id):
+-                # notify invited members through the bus
+-                user = member.partner_id.user_ids[0] if member.partner_id.user_ids else self.env['res.users']
+-                if user:
+-                    notifications.append(
+-                        (
+-                            member.partner_id,
+-                            "discuss.channel/joined",
+-                            {
+-                                "channel": {
+-                                    **member.channel_id._channel_basic_info(),
+-                                    "model": "discuss.channel",
+-                                    "is_pinned": True,
+-                                },
+-                                "invited_by_user_id": self.env.user.id,
+-                                "open_chat_window": open_chat_window,
+-                            },
+-                        )
+-                    )
+-                if post_joined_message:
+-                    # notify existing members with a new message in the channel
+-                    if member.partner_id == self.env.user.partner_id:
+-                        notification = Markup('<div class="o_mail_notification">%s</div>') % _('joined the channel')
+-                    else:
+-                        notification = (Markup('<div class="o_mail_notification">%s</div>') % _("invited %s to the channel")) % member.partner_id._get_html_link()
+-                    member.channel_id.message_post(body=notification, message_type="notification", subtype_xmlid="mail.mt_comment")
+-            for member in new_members.filtered(lambda member: member.guest_id):
++            for member in new_members:
++                payload = {
++                    "channel": {
++                        **member.channel_id._channel_basic_info(),
++                        "model": "discuss.channel",
++                        "is_pinned": True,
++                    },
++                    "open_chat_window": open_chat_window,
++                }
++                if not member.is_self and not self.env.user._is_public():
++                    payload["invited_by_user_id"] = self.env.user.id
++                member._bus_send("discuss.channel/joined", payload)
+                 if post_joined_message:
+-                    member.channel_id.message_post(body=Markup('<div class="o_mail_notification">%s</div>') % _('joined the channel'),
+-                        message_type="notification", subtype_xmlid="mail.mt_comment")
+-                guest = member.guest_id
+-                if guest:
+-                    notifications.append(
+-                        (
+-                            guest,
+-                            "discuss.channel/joined",
+-                            {
+-                                "channel": {
+-                                    **member.channel_id._channel_basic_info(),
+-                                    "model": "discuss.channel",
+-                                },
+-                            },
+-                        )
++                    notification = (
++                        _("joined the channel")
++                        if member.is_self
++                        else _("invited %s to the channel", member._get_html_link(for_persona=True))
+                     )
+-            if new_members:
+-                notifications.append(
+-                    (
+-                        channel,
+-                        "mail.record/insert",
+-                        Store(channel, {"memberCount": channel.member_count})
+-                        .add(new_members)
+-                        .get_result(),
++                    member.channel_id.message_post(
++                        body=Markup('<div class="o_mail_notification">%s</div>') % notification,
++                        message_type="notification",
++                        subtype_xmlid="mail.mt_comment",
+                     )
++            if new_members:
++                channel._bus_send_store(
++                    Store(channel, {"memberCount": channel.member_count}).add(new_members)
+                 )
+             if existing_members and (current_partner or current_guest):
+                 # If the current user invited these members but they are already present, notify the current user about their existence as well.
+                 # In particular this fixes issues where the current user is not aware of its own member in the following case:
+                 # create channel from form view, and then join from discuss without refreshing the page.
+-                target = current_partner or current_guest
+-                notifications.append(
+-                    (
+-                        target,
+-                        "mail.record/insert",
+-                        Store(channel, {"memberCount": channel.member_count})
+-                        .add(existing_members)
+-                        .get_result(),
+-                    )
++                (current_partner or current_guest)._bus_send_store(
++                    Store(channel, {"memberCount": channel.member_count}).add(existing_members)
+                 )
+         if invite_to_rtc_call:
+             for channel in self:
+@@ -462,7 +411,6 @@ class Channel(models.Model):
+                 if current_channel_member and current_channel_member.sudo().rtc_session_ids:
+                     # sudo: discuss.channel.rtc.session - current user can invite new members in call
+                     current_channel_member.sudo()._rtc_invite_members(member_ids=new_members.ids)
+-        self.env['bus.bus']._sendmany(notifications)
+         return all_new_members
+ 
+     # ------------------------------------------------------------
+@@ -482,36 +430,20 @@ class Channel(models.Model):
+         ]
+         if member_ids:
+             channel_member_domain = expression.AND([channel_member_domain, [('id', 'in', member_ids)]])
+-        notifications = []
+         members = self.env['discuss.channel.member'].search(channel_member_domain)
+-        for member in members:
+-            member.rtc_inviting_session_id = False
+-            target = member.partner_id or member.guest_id
+-            notifications.append(
+-                (
+-                    target,
+-                    "mail.record/insert",
+-                    Store(self, {"rtcInvitingSession": False}).get_result(),
+-                )
+-            )
++        members.rtc_inviting_session_id = False
++        members._bus_send_store(self, {"rtcInvitingSession": False})
+         if members:
+-            notifications.append(
+-                (
+-                    self,
+-                    "mail.record/insert",
+-                    Store(
+-                        self,
+-                        {
+-                            "invitedMembers": Store.many(
+-                                members,
+-                                "DELETE",
+-                                fields={"channel": [], "persona": ["name", "im_status"]},
+-                            ),
+-                        },
+-                    ).get_result(),
+-                )
++            self._bus_send_store(
++                self,
++                {
++                    "invitedMembers": Store.many(
++                        members,
++                        "DELETE",
++                        fields={"channel": [], "persona": ["name", "im_status"]},
++                    ),
++                },
+             )
+-        self.env["bus.bus"]._sendmany(notifications)
+ 
+     # ------------------------------------------------------------
+     # MAILING
+@@ -639,16 +571,8 @@ class Channel(models.Model):
+         payload = {"data": Store(message).get_result(), "id": self.id}
+         if temporary_id := self.env.context.get("temporary_id"):
+             payload["temporary_id"] = temporary_id
+-        bus_notifications = [
+-            (
+-                (self, "members"),
+-                "mail.record/insert",
+-                Store(self, {"is_pinned": True}).get_result(),
+-            ),
+-            (self, "discuss.channel/new_message", payload),
+-        ]
+-        # sudo: bus.bus - sending on safe channel (discuss.channel)
+-        self.env["bus.bus"].sudo()._sendmany(bus_notifications)
++        self._bus_send_store(self, {"is_pinned": True}, subchannel="members")
++        self._bus_send("discuss.channel/new_message", payload)
+         return rdata
+ 
+     def _notify_by_web_push_prepare_payload(self, message, msg_vals=False):
+@@ -747,15 +671,6 @@ class Channel(models.Model):
+         """ Broadcast the current channel header to the given partner ids
+             :param partner_ids : the partner to notify
+         """
+-        notifications = self._channel_channel_notifications(partner_ids)
+-        self.env['bus.bus']._sendmany(notifications)
+-
+-    def _channel_channel_notifications(self, partner_ids):
+-        """ Generate the bus notifications of current channel for the given partner ids
+-            :param partner_ids : the partner to send the current channel header
+-            :returns list of bus notifications (tuple (bus_channe, message_content))
+-        """
+-        notifications = []
+         for partner in self.env['res.partner'].browse(partner_ids):
+             user_id = partner.user_ids and partner.user_ids[0] or False
+             if user_id:
+@@ -763,9 +678,7 @@ class Channel(models.Model):
+                     # sudo: res.company - context is required by ir.rules
+                     allowed_company_ids=user_id.sudo().company_ids.ids
+                 )
+-                store = Store(user_channels)
+-                notifications.append((partner, 'mail.record/insert', store.get_result()))
+-        return notifications
++                partner._bus_send_store(user_channels)
+ 
+     # ------------------------------------------------------------
+     # INSTANT MESSAGING API
+@@ -799,11 +712,7 @@ class Channel(models.Model):
+                             (fields.Datetime.now() if pinned else None, message_to_update.id))
+         message_to_update.invalidate_recordset(['pinned_at'])
+ 
+-        self.env["bus.bus"]._sendone(
+-            self,
+-            "mail.record/insert",
+-            Store(message_to_update, {"pinned_at": message_to_update.pinned_at}).get_result(),
+-        )
++        self._bus_send_store(message_to_update, {"pinned_at": message_to_update.pinned_at})
+         if pinned:
+             notification_text = '''
+                 <div data-oe-type="pin" class="o_mail_notification">
+@@ -1052,10 +961,9 @@ class Channel(models.Model):
+         if member:
+             member.write({'unpin_dt': False if pinned else fields.Datetime.now()})
+         if not pinned:
+-            self.env['bus.bus']._sendone(self.env.user.partner_id, 'discuss.channel/unpin', {'id': self.id})
++            self.env.user._bus_send("discuss.channel/unpin", {"id": self.id})
+         else:
+-            store = Store(self)
+-            self.env['bus.bus']._sendone(self.env.user.partner_id, 'mail.record/insert', store.get_result())
++            self.env.user._bus_send_store(self)
+ 
+     def _types_allowing_seen_infos(self):
+         """ Return the channel types which allow sending seen infos notification
+@@ -1086,22 +994,21 @@ class Channel(models.Model):
+                 )
+             """
+             self.env.cr.execute(query, (last_message_id, member.id))
+-            self.env['bus.bus']._sendone(channel, 'discuss.channel.member/fetched', {
+-                'channel_id': channel.id,
+-                'id': member.id,
+-                'last_message_id': last_message_id,
+-                'partner_id': self.env.user.partner_id.id,
+-            })
++            channel._bus_send(
++                "discuss.channel.member/fetched",
++                {
++                    "channel_id": channel.id,
++                    "id": member.id,
++                    "last_message_id": last_message_id,
++                    "partner_id": self.env.user.partner_id.id,
++                },
++            )
+ 
+     def channel_set_custom_name(self, name):
+         self.ensure_one()
+         member = self.env['discuss.channel.member'].search([('partner_id', '=', self.env.user.partner_id.id), ('channel_id', '=', self.id)])
+         member.write({'custom_channel_name': name})
+-        self.env["bus.bus"]._sendone(
+-            member.partner_id,
+-            "mail.record/insert",
+-            Store(self, {"custom_channel_name": name}).get_result(),
+-        )
++        member._bus_send_store(self, {"custom_channel_name": name})
+ 
+     def channel_rename(self, name):
+         self.ensure_one()
+@@ -1136,8 +1043,7 @@ class Channel(models.Model):
+         new_channel.group_public_id = group.id if group else None
+         notification = Markup('<div class="o_mail_notification">%s</div>') % _("created this channel.")
+         new_channel.message_post(body=notification, message_type="notification", subtype_xmlid="mail.mt_comment")
+-        store = Store(new_channel)
+-        self.env['bus.bus']._sendone(self.env.user.partner_id, 'mail.record/insert', store.get_result())
++        self.env.user._bus_send_store(new_channel)
+         return new_channel
+ 
+     @api.model
+@@ -1220,52 +1126,42 @@ class Channel(models.Model):
+     # COMMANDS
+     # ------------------------------------------------------------
+ 
+-    def _send_transient_message(self, partner_to, content):
+-        """ Notifies partner_to that a message (not stored in DB) has been
+-            written in this channel.
+-            `content` is HTML, dynamic parts should be escaped by the caller.
+-        """
+-        self.env['bus.bus']._sendone(partner_to, 'discuss.channel/transient_message', {
+-            'body': f"<span class='o_mail_notification'>{content}</span>",
+-            'thread': {'model': self._name, 'id': self.id},
+-        })
+-
+     def execute_command_help(self, **kwargs):
++        self.ensure_one()
+         if self.channel_type == 'channel':
+-            msg = html_escape(_("You are in channel %(bold_start)s#%(channel_name)s%(bold_end)s.")) % {
+-                "bold_start": Markup("<b>"),
+-                "bold_end": Markup("</b>"),
+-                "channel_name": self.name,
+-            }
++            msg = _(
++                "You are in channel %(bold_start)s#%(channel_name)s%(bold_end)s.",
++                bold_start=Markup("<b>"),
++                bold_end=Markup("</b>"),
++                channel_name=self.name,
++            )
+         else:
+-            all_channel_members = self.env['discuss.channel.member'].with_context(active_test=False)
+-            channel_members = all_channel_members.search([("is_self", "=", False), ("channel_id", "=", self.id)], order='id asc')
+-            if channel_members:
+-                member_names = Markup(
+-                    format_list(
+-                        self.env,
+-                        [f"<b>@%(member_{member.id})s</b>" for member in channel_members],
++            if members := self.channel_member_ids.filtered(lambda m: not m.is_self):
++                msg = _(
++                    "You are in a private conversation with %(member_names)s.",
++                    member_names=html_escape(
++                        format_list(self.env, [f"%(member_{member.id})s" for member in members])
+                     )
+-                ) % {
+-                    f"member_{member.id}": member.partner_id.name or member.guest_id.name for member in channel_members
+-                }
+-                msg = html_escape(_("You are in a private conversation with %(member_names)s.")) % {
+-                    "member_names": member_names,
+-                }
++                    % {
++                        f"member_{member.id}": member._get_html_link(for_persona=True)
++                        for member in members
++                    },
++                )
+             else:
+                 msg = _("You are alone in a private conversation.")
+         msg += self._execute_command_help_message_extra()
+-        self._send_transient_message(self.env.user.partner_id, msg)
++        self.env.user._bus_send_transient_message(self, msg)
+ 
+     def _execute_command_help_message_extra(self):
+-        msg = html_escape(
+-            _(
+-                "%(new_line)s"
+-                "%(new_line)sType %(bold_start)s@username%(bold_end)s to mention someone, and grab their attention."
+-                "%(new_line)sType %(bold_start)s#channel%(bold_end)s to mention a channel."
+-                "%(new_line)sType %(bold_start)s/command%(bold_end)s to execute a command."
+-            )
+-        ) % {"bold_start": Markup("<b>"), "bold_end": Markup("</b>"), "new_line": Markup("<br>")}
++        msg = _(
++            "%(new_line)s"
++            "%(new_line)sType %(bold_start)s@username%(bold_end)s to mention someone, and grab their attention."
++            "%(new_line)sType %(bold_start)s#channel%(bold_end)s to mention a channel."
++            "%(new_line)sType %(bold_start)s/command%(bold_end)s to execute a command.",
++            bold_start=Markup("<b>"),
++            bold_end=Markup("</b>"),
++            new_line=Markup("<br>"),
++        )
+         return msg
+ 
+     def execute_command_leave(self, **kwargs):
+@@ -1275,15 +1171,21 @@ class Channel(models.Model):
+             self.channel_pin(False)
+ 
+     def execute_command_who(self, **kwargs):
+-        channel_members = self.env['discuss.channel.member'].with_context(active_test=False).search([('partner_id', '!=', self.env.user.partner_id.id), ('channel_id', '=', self.id)])
+-        members = [
+-            m.partner_id._get_html_link(title=f"@{m.partner_id.name}") if m.partner_id else f'<strong>@{html_escape(m.guest_id.name)}</strong>'
+-            for m in channel_members[:30]
+-        ]
+-        if len(members) == 0:
+-            msg = _("You are alone in this channel.")
++        if all_other_members := self.channel_member_ids.filtered(lambda m: not m.is_self):
++            members = all_other_members[:30]
++            list_params = [f"%(member_{member.id})s" for member in members]
++            if len(all_other_members) != len(members):
++                list_params.append(_("more"))
++            else:
++                list_params.append(_("you"))
++            msg = _(
++                "Users in this channel: %(members)s.",
++                members=html_escape(format_list(self.env, list_params))
++                % {
++                    f"member_{member.id}": member._get_html_link(for_persona=True)
++                    for member in members
++                },
++            )
+         else:
+-            dots = "..." if len(members) != len(channel_members) else ""
+-            msg = _("Users in this channel: %(members)s %(dots)s and you.", members=", ".join(members), dots=dots)
+-
+-        self._send_transient_message(self.env.user.partner_id, msg)
++            msg = _("You are alone in this channel.")
++        self.env.user._bus_send_transient_message(self, msg)
+
+--- a/addons/mail/models/discuss/discuss_channel_member.py
++++ b/addons/mail/models/discuss/discuss_channel_member.py
+@@ -3,8 +3,8 @@
+ import logging
+ import requests
+ import uuid
++from markupsafe import Markup
+ 
+-import odoo
+ from odoo import api, fields, models, _
+ from odoo.addons.mail.tools.discuss import Store
+ from odoo.exceptions import AccessError, UserError, ValidationError
+@@ -17,6 +17,7 @@ SFU_MODE_THRESHOLD = 3
+ 
+ class ChannelMember(models.Model):
+     _name = "discuss.channel.member"
++    _inherit = ["bus.listener.mixin"]
+     _description = "Channel Member"
+     _rec_names_search = ["channel_id", "partner_id", "guest_id"]
+     _bypass_create_check = {}
+@@ -185,45 +186,26 @@ class ChannelMember(models.Model):
+         self.sudo().rtc_session_ids.unlink()  # ensure unlink overrides are applied
+         return super().unlink()
+ 
++    def _bus_channel(self):
++        return (self.partner_id or self.guest_id)._bus_channel()
++
+     def _notify_typing(self, is_typing):
+         """ Broadcast the typing notification to channel members
+             :param is_typing: (boolean) tells whether the members are typing or not
+         """
+-        notifications = []
+         for member in self:
+-            notifications.append(
+-                [
+-                    member.channel_id,
+-                    "mail.record/insert",
+-                    Store(member).add(member, {"isTyping": is_typing}).get_result(),
+-                ]
+-            )
+-        self.env['bus.bus']._sendmany(notifications)
++            member.channel_id._bus_send_store(Store(member).add(member, {"isTyping": is_typing}))
+ 
+     def _notify_mute(self):
+-        notifications = []
+         for member in self:
+-            notifications.append(
+-                (
+-                    member.partner_id,
+-                    "mail.record/insert",
+-                    Store(member.channel_id, {"mute_until_dt": member.mute_until_dt}).get_result(),
+-                )
+-            )
++            member._bus_send_store(member.channel_id, {"mute_until_dt": member.mute_until_dt})
+             if member.mute_until_dt and member.mute_until_dt != -1:
+                 self.env.ref("mail.ir_cron_discuss_channel_member_unmute")._trigger(member.mute_until_dt)
+-        self.env["bus.bus"]._sendmany(notifications)
+ 
+     def set_custom_notifications(self, custom_notifications):
+         self.ensure_one()
+         self.custom_notifications = custom_notifications
+-        self.env["bus.bus"]._sendone(
+-            self.partner_id,
+-            "mail.record/insert",
+-            Store(
+-                self.channel_id, {"custom_notifications": self.custom_notifications}
+-            ).get_result(),
+-        )
++        self._bus_send_store(self.channel_id, {"custom_notifications": self.custom_notifications})
+ 
+     @api.model
+     def _cleanup_expired_mutes(self):
+@@ -293,12 +275,15 @@ class ChannelMember(models.Model):
+         if self.fold_state == state:
+             return
+         self.fold_state = state
+-        self.env['bus.bus']._sendone(self.partner_id or self.guest_id, 'discuss.Thread/fold_state', {
+-            'foldStateCount': state_count,
+-            'id': self.channel_id.id,
+-            'model': 'discuss.channel',
+-            'fold_state': self.fold_state,
+-        })
++        self._bus_send(
++            "discuss.Thread/fold_state",
++            {
++                "fold_state": self.fold_state,
++                "foldStateCount": state_count,
++                "id": self.channel_id.id,
++                "model": "discuss.channel",
++            },
++        )
+     # --------------------------------------------------------------------------
+     # RTC (voice/video)
+     # --------------------------------------------------------------------------
+@@ -364,15 +349,11 @@ class ChannelMember(models.Model):
+         response_dict = response.json()
+         self.channel_id.sfu_channel_uuid = response_dict["uuid"]
+         self.channel_id.sfu_server_url = response_dict["url"]
+-        notifications = [
+-            [
+-                session.guest_id or session.partner_id,
++        for session in self.channel_id.rtc_session_ids:
++            session._bus_send(
+                 "discuss.channel.rtc.session/sfu_hot_swap",
+                 {"serverInfo": self._get_rtc_server_info(session, ice_servers, key=sfu_local_key)},
+-            ]
+-            for session in self.channel_id.rtc_session_ids
+-        ]
+-        self.env["bus.bus"]._sendmany(notifications)
++            )
+ 
+     def _get_rtc_server_info(self, rtc_session, ice_servers=None, key=None):
+         sfu_channel_uuid = self.channel_id.sfu_channel_uuid
+@@ -423,37 +404,20 @@ class ChannelMember(models.Model):
+         ]
+         if member_ids:
+             channel_member_domain = expression.AND([channel_member_domain, [('id', 'in', member_ids)]])
+-        invitation_notifications = []
+         members = self.env['discuss.channel.member'].search(channel_member_domain)
+         for member in members:
+             member.rtc_inviting_session_id = self.rtc_session_ids.id
+-            if member.partner_id:
+-                target = member.partner_id
+-            else:
+-                target = member.guest_id
+-            invitation_notifications.append(
+-                (
+-                    target,
+-                    "mail.record/insert",
+-                    Store(
+-                        self.channel_id,
+-                        {"rtcInvitingSession": Store.one(member.rtc_inviting_session_id)},
+-                    ).get_result(),
+-                )
++            member._bus_send_store(
++                self.channel_id, {"rtcInvitingSession": Store.one(member.rtc_inviting_session_id)}
+             )
+-        self.env['bus.bus']._sendmany(invitation_notifications)
+         if members:
+-            self.env["bus.bus"]._sendone(
++            self.channel_id._bus_send_store(
+                 self.channel_id,
+-                "mail.record/insert",
+-                Store(
+-                    self.channel_id,
+-                    {
+-                        "invitedMembers": Store.many(
+-                            members, "ADD", fields={"channel": [], "persona": ["name", "im_status"]}
+-                        ),
+-                    },
+-                ).get_result(),
++                {
++                    "invitedMembers": Store.many(
++                        members, "ADD", fields={"channel": [], "persona": ["name", "im_status"]}
++                    ),
++                },
+             )
+         return members
+ 
+@@ -494,15 +458,11 @@ class ChannelMember(models.Model):
+         self.last_seen_dt = fields.Datetime.now()
+         if not notify:
+             return
+-        target = self.partner_id or self.guest_id
++        target = self
+         if self.channel_id.channel_type in self.channel_id._types_allowing_seen_infos():
+             target = self.channel_id
+-        self.env["bus.bus"]._sendone(
+-            target,
+-            "mail.record/insert",
+-            Store(
+-                self, fields={"channel": [], "persona": ["name"], "seen_message_id": True}
+-            ).get_result(),
++        target._bus_send_store(
++            self, fields={"channel": [], "persona": ["name"], "seen_message_id": True}
+         )
+ 
+     def _set_new_message_separator(self, message_id, sync=False):
+@@ -517,10 +477,7 @@ class ChannelMember(models.Model):
+         if message_id == self.new_message_separator:
+             return
+         self.new_message_separator = message_id
+-        target = self.partner_id or self.guest_id
+-        self.env["bus.bus"]._sendone(
+-            target,
+-            "mail.record/insert",
++        self._bus_send_store(
+             Store(
+                 self,
+                 fields={
+@@ -529,7 +486,12 @@ class ChannelMember(models.Model):
+                     "new_message_separator": True,
+                     "persona": ["name"],
+                 },
+-            )
+-            .add(self, {"syncUnread": sync})
+-            .get_result(),
++            ).add(self, {"syncUnread": sync})
+         )
++
++    def _get_html_link(self, *args, for_persona=False, **kwargs):
++        if not for_persona:
++            return self._get_html_link(*args, **kwargs)
++        if self.partner_id:
++            return self.partner_id._get_html_link(title=f"@{self.partner_id.name}")
++        return Markup("<strong>%s</strong>") % self.guest_id.name
+
+--- a/addons/mail/models/discuss/discuss_channel_rtc_session.py
++++ b/addons/mail/models/discuss/discuss_channel_rtc_session.py
+@@ -15,6 +15,7 @@ _logger = logging.getLogger(__name__)
+ 
+ class MailRtcSession(models.Model):
+     _name = 'discuss.channel.rtc.session'
++    _inherit = ["bus.listener.mixin"]
+     _description = 'Mail RTC session'
+     _rec_name = 'channel_member_id'
+ 
+@@ -38,19 +39,11 @@ class MailRtcSession(models.Model):
+     @api.model_create_multi
+     def create(self, vals_list):
+         rtc_sessions = super().create(vals_list)
+-        notifications = []
+         rtc_sessions_by_channel = defaultdict(lambda: self.env["discuss.channel.rtc.session"])
+         for rtc_session in rtc_sessions:
+             rtc_sessions_by_channel[rtc_session.channel_id] += rtc_session
+         for channel, rtc_sessions in rtc_sessions_by_channel.items():
+-            notifications.append(
+-                (
+-                    channel,
+-                    "mail.record/insert",
+-                    Store(channel, {"rtcSessions": Store.many(rtc_sessions, "ADD")}).get_result(),
+-                )
+-            )
+-        self.env["bus.bus"]._sendmany(notifications)
++            channel._bus_send_store(channel, {"rtcSessions": Store.many(rtc_sessions, "ADD")})
+         return rtc_sessions
+ 
+     def unlink(self):
+@@ -66,26 +59,22 @@ class MailRtcSession(models.Model):
+                 # than to attempt recycling a possibly stale channel uuid.
+                 channel.sfu_channel_uuid = False
+                 channel.sfu_server_url = False
+-        notifications = []
+         rtc_sessions_by_channel = defaultdict(lambda: self.env["discuss.channel.rtc.session"])
+         for rtc_session in self:
+             rtc_sessions_by_channel[rtc_session.channel_id] += rtc_session
+         for channel, rtc_sessions in rtc_sessions_by_channel.items():
+-            notifications.append(
+-                (
+-                    channel,
+-                    "mail.record/insert",
+-                    Store(
+-                        channel, {"rtcSessions": Store.many(rtc_sessions, "DELETE", only_id=True)}
+-                    ).get_result(),
+-                )
++            channel._bus_send_store(
++                channel, {"rtcSessions": Store.many(rtc_sessions, "DELETE", only_id=True)}
+             )
+         for rtc_session in self:
+-            target = rtc_session.guest_id or rtc_session.partner_id
+-            notifications.append((target, 'discuss.channel.rtc.session/ended', {'sessionId': rtc_session.id}))
+-        self.env['bus.bus']._sendmany(notifications)
++            rtc_session._bus_send(
++                "discuss.channel.rtc.session/ended", {"sessionId": rtc_session.id}
++            )
+         return super().unlink()
+ 
++    def _bus_channel(self):
++        return self.channel_member_id._bus_channel()
++
+     def _update_and_broadcast(self, values):
+         """ Updates the session and notifies all members of the channel
+             of the change.
+@@ -93,8 +82,7 @@ class MailRtcSession(models.Model):
+         valid_values = {'is_screen_sharing_on', 'is_camera_on', 'is_muted', 'is_deaf'}
+         self.write({key: values[key] for key in valid_values if key in values})
+         store = Store(self, extra=True)
+-        self.env["bus.bus"]._sendone(
+-            self.channel_id,
++        self.channel_id._bus_send(
+             "discuss.channel.rtc.session/update_and_broadcast",
+             {"data": store.get_result(), "channelId": self.channel_id.id},
+         )
+@@ -144,9 +132,9 @@ class MailRtcSession(models.Model):
+         payload_by_target = defaultdict(lambda: {'sender': self.id, 'notifications': []})
+         for target_session_ids, content in notifications:
+             for target_session in self.env['discuss.channel.rtc.session'].browse(target_session_ids).exists():
+-                target = target_session.guest_id or target_session.partner_id
+-                payload_by_target[target]['notifications'].append(content)
+-        return self.env['bus.bus']._sendmany([(target, 'discuss.channel.rtc.session/peer_notification', payload) for target, payload in payload_by_target.items()])
++                payload_by_target[target_session]['notifications'].append(content)
++        for target, payload in payload_by_target.items():
++            target._bus_send("discuss.channel.rtc.session/peer_notification", payload)
+ 
+     def _to_store(self, store: Store, extra=False):
+         for rtc_session in self:
+
+--- a/addons/mail/models/discuss/ir_attachment.py
++++ b/addons/mail/models/discuss/ir_attachment.py
+@@ -9,14 +9,14 @@ class IrAttachment(models.Model):
+ 
+     voice_ids = fields.One2many("discuss.voice.metadata", "attachment_id")
+ 
+-    def _bus_notification_target(self):
++    def _bus_channel(self):
+         self.ensure_one()
+         if self.res_model == "discuss.channel" and self.res_id:
+-            return self.env["discuss.channel"].browse(self.res_id)
++            return self.env["discuss.channel"].browse(self.res_id)._bus_channel()
+         guest = self.env["mail.guest"]._get_guest_from_context()
+         if self.env.user._is_public() and guest:
+-            return guest
+-        return super()._bus_notification_target()
++            return guest._bus_channel()
++        return super()._bus_channel()
+ 
+     def _to_store(self, store: Store, **kwargs):
+         super()._to_store(store, **kwargs)
+
+--- a/addons/mail/models/discuss/mail_guest.py
++++ b/addons/mail/models/discuss/mail_guest.py
+@@ -5,7 +5,6 @@ import uuid
+ from datetime import datetime, timedelta
+ from functools import wraps
+ 
+-import odoo
+ from odoo.tools import consteq
+ from odoo import _, api, fields, models
+ from odoo.http import request
+@@ -44,7 +43,7 @@ def add_guest_to_context(func):
+ class MailGuest(models.Model):
+     _name = 'mail.guest'
+     _description = "Guest"
+-    _inherit = ['avatar.mixin']
++    _inherit = ["avatar.mixin", "bus.listener.mixin"]
+     _avatar_name_field = "name"
+     _cookie_name = 'dgid'
+     _cookie_separator = '|'
+@@ -108,11 +107,8 @@ class MailGuest(models.Model):
+             raise UserError(_("Guest's name is too long."))
+         self.name = name
+         store = Store(self, fields=["name", "write_date"])
+-        bus_notifs = []
+-        for channel in self.channel_ids:
+-            bus_notifs.append((channel, "mail.record/insert", store.get_result()))
+-        bus_notifs.append((self, "mail.record/insert", store.get_result()))
+-        self.env["bus.bus"]._sendmany(bus_notifs)
++        self.channel_ids._bus_send_store(store)
++        self._bus_send_store(store)
+ 
+     def _update_timezone(self, timezone):
+         query = """
+
+--- a/addons/mail/models/discuss/mail_message.py
++++ b/addons/mail/models/discuss/mail_message.py
+@@ -26,11 +26,11 @@ class MailMessage(models.Model):
+                     message, {"parentMessage": Store.one(message.parent_id, format_reply=False)}
+                 )
+ 
+-    def _bus_notification_target(self):
++    def _bus_channel(self):
+         self.ensure_one()
+         if self.model == "discuss.channel" and self.res_id:
+-            return self.env["discuss.channel"].browse(self.res_id)
++            return self.env["discuss.channel"].browse(self.res_id)._bus_channel()
+         guest = self.env["mail.guest"]._get_guest_from_context()
+         if self.env.user._is_public() and guest:
+-            return guest
+-        return super()._bus_notification_target()
++            return guest._bus_channel()
++        return super()._bus_channel()
+
+--- a/addons/mail/models/ir_attachment.py
++++ b/addons/mail/models/ir_attachment.py
+@@ -1,9 +1,8 @@
+-# -*- coding: utf-8 -*-
+ # Part of Odoo. See LICENSE file for full copyright and licensing details.
+ 
+ import contextlib
+ 
+-from odoo import _, api, models, SUPERUSER_ID
++from odoo import _, models, SUPERUSER_ID
+ from odoo.exceptions import AccessError, MissingError, UserError
+ from odoo.http import request
+ from odoo.tools import consteq
+@@ -66,15 +65,18 @@ class IrAttachment(models.Model):
+         if message:
+             # sudo: mail.message - safe write just updating the date, because guests don't have the rights
+             message.sudo().write({})  # to make sure write_date on the message is updated
+-        self.env['bus.bus']._sendmany((attachment._bus_notification_target(), 'ir.attachment/delete', {
+-            'id': attachment.id, 'message': {'id': message.id, 'write_date': message.write_date} if message else None
+-        }) for attachment in self)
++        for attachment in self:
++            attachment._bus_send(
++                "ir.attachment/delete",
++                {
++                    "id": attachment.id,
++                    "message": (
++                        {"id": message.id, "write_date": message.write_date} if message else None
++                    ),
++                },
++            )
+         self.unlink()
+ 
+-    def _bus_notification_target(self):
+-        self.ensure_one()
+-        return self.env.user.partner_id
+-
+     def _to_store(self, store: Store, /, *, fields=None, access_token=False):
+         if fields is None:
+             fields = [
+
+--- a/addons/mail/models/ir_websocket.py
++++ b/addons/mail/models/ir_websocket.py
+@@ -21,5 +21,4 @@ class IrWebsocket(models.AbstractModel):
+         if self.env.user and not self.env.user._is_public():
+             store = Store()
+             self._im_status_to_store(store, im_status_ids_by_model=im_status_ids_by_model)
+-            if res := store.get_result():
+-                self.env["bus.bus"]._sendone(self.env.user.partner_id, "mail.record/insert", res)
++            self.env.user._bus_send_store(store)
+
+--- a/addons/mail/models/mail_activity.py
++++ b/addons/mail/models/mail_activity.py
+@@ -1,4 +1,3 @@
+-# -*- coding: utf-8 -*-
+ # Part of Odoo. See LICENSE file for full copyright and licensing details.
+ 
+ from ast import literal_eval
+@@ -9,8 +8,7 @@ from collections import defaultdict, Counter
+ from datetime import date, datetime, timedelta
+ from dateutil.relativedelta import relativedelta
+ 
+-from odoo import api, exceptions, fields, models, _, Command
+-from odoo.osv import expression
++from odoo import api, fields, models, _
+ from odoo.tools import is_html_empty
+ from odoo.tools.misc import clean_context, get_lang, groupby
+ from odoo.addons.mail.tools.discuss import Store
+@@ -298,16 +296,13 @@ class MailActivity(models.Model):
+         # send notifications about activity creation
+         todo_activities = activities.filtered(lambda act: act.date_deadline <= fields.Date.today())
+         if todo_activities:
+-            self.env['bus.bus']._sendmany([
+-                (activity.user_id.partner_id, 'mail.activity/updated', {'activity_created': True})
+-                for activity in todo_activities
+-            ])
++            activity.user_id._bus_send("mail.activity/updated", {"activity_created": True})
+         return activities
+ 
+     def write(self, values):
+         if values.get('user_id'):
+             user_changes = self.filtered(lambda activity: activity.user_id.id != values.get('user_id'))
+-            pre_responsibles = user_changes.mapped('user_id.partner_id')
++            pre_responsibles = user_changes.user_id
+         res = super(MailActivity, self).write(values)
+ 
+         if values.get('user_id'):
+@@ -320,23 +315,16 @@ class MailActivity(models.Model):
+             # send bus notifications
+             todo_activities = user_changes.filtered(lambda act: act.date_deadline <= fields.Date.today())
+             if todo_activities:
+-                self.env['bus.bus']._sendmany([
+-                    [partner, 'mail.activity/updated', {'activity_created': True}]
+-                    for partner in todo_activities.user_id.partner_id
+-                ])
+-                self.env['bus.bus']._sendmany([
+-                    [partner, 'mail.activity/updated', {'activity_deleted': True}]
+-                    for partner in pre_responsibles
+-                ])
++                todo_activities.user_id._bus_send(
++                    "mail.activity/updated", {"activity_created": True}
++                )
++                pre_responsibles._bus_send("mail.activity/updated", {"activity_deleted": True})
+         return res
+ 
+     def unlink(self):
+         todo_activities = self.filtered(lambda act: act.date_deadline <= fields.Date.today())
+         if todo_activities:
+-            self.env['bus.bus']._sendmany([
+-                [partner, 'mail.activity/updated', {'activity_deleted': True}]
+-                for partner in todo_activities.user_id.partner_id
+-            ])
++            todo_activities.user_id._bus_send("mail.activity/updated", {"activity_deleted": True})
+         return super(MailActivity, self).unlink()
+ 
+     @api.model
+
+--- a/addons/mail/models/mail_canned_response.py
++++ b/addons/mail/models/mail_canned_response.py
+@@ -72,12 +72,7 @@ class MailCannedResponse(models.Model):
+     def _broadcast(self, method="insert"):
+         notif_type = "mail.record/insert" if method == "insert" else "mail.record/delete"
+         field_names = ["id", "source", "substitution"] if method == "insert" else ["id"]
+-        notifications = []
+         for canned_response in self:
+-            targets = [self.env.user.partner_id]
+-            if self.env.user != canned_response.create_uid:
+-                targets.append(canned_response.create_uid.partner_id)
+-            targets.extend(canned_response.group_ids)
+             payload = {"CannedResponse": canned_response._read_format(field_names)}
+-            notifications.extend((target, notif_type, payload) for target in targets)
+-        self.env["bus.bus"]._sendmany(notifications)
++            (self.env.user | canned_response.create_uid)._bus_send(notif_type, payload)
++            canned_response.group_ids._bus_send(notif_type, payload)
+
+--- a/addons/mail/models/mail_link_preview.py
++++ b/addons/mail/models/mail_link_preview.py
+@@ -7,12 +7,13 @@ from lxml import html
+ 
+ from odoo import api, models, fields, tools
+ from odoo.tools.misc import OrderedSet
+-from odoo.addons.mail.tools import link_preview
+ from odoo.addons.mail.tools.discuss import Store
++from odoo.addons.mail.tools.link_preview import get_link_preview_from_url
+ 
+ 
+ class LinkPreview(models.Model):
+     _name = 'mail.link.preview'
++    _inherit = "bus.listener.mixin"
+     _description = "Store link preview data"
+ 
+     message_id = fields.Many2one('mail.message', string='Message', index=True, ondelete='cascade')
+@@ -27,6 +28,9 @@ class LinkPreview(models.Model):
+     image_mimetype = fields.Char('Image MIME type')
+     create_date = fields.Datetime(index=True)
+ 
++    def _bus_channel(self):
++        return self.message_id._bus_channel()
++
+     @api.model
+     def _create_from_message_and_notify(self, message):
+         if tools.is_html_empty(message.body):
+@@ -44,7 +48,7 @@ class LinkPreview(models.Model):
+                 if not preview.is_hidden:
+                     link_previews += preview
+                 continue
+-            if preview := link_preview.get_link_preview_from_url(url, requests_session):
++            if preview := get_link_preview_from_url(url, requests_session):
+                 preview['message_id'] = message.id
+                 link_preview_values.append(preview)
+             if len(link_preview_values) + len(link_previews) > 5:
+@@ -54,44 +58,26 @@ class LinkPreview(models.Model):
+         if link_preview_values:
+             link_previews += link_previews.create(link_preview_values)
+         if link_previews := link_previews.sorted(key=lambda p: list(urls).index(p.source_url)):
+-            self.env["bus.bus"]._sendone(
+-                message._bus_notification_target(),
+-                "mail.record/insert",
+-                Store(message, {"linkPreviews": Store.many(link_previews)}).get_result(),
+-            )
++            message._bus_send_store(message, {"linkPreviews": Store.many(link_previews)})
+ 
+     def _hide_and_notify(self):
+         if not self:
+             return True
+-        notifications = [
+-            (
+-                link_preview.message_id._bus_notification_target(),
+-                "mail.record/insert",
+-                Store(
+-                    link_preview.message_id,
+-                    {"linkPreviews": Store.many(link_preview, "DELETE", only_id=True)},
+-                ).get_result(),
++        for link_preview in self:
++            link_preview._bus_send_store(
++                link_preview.message_id,
++                {"linkPreviews": Store.many(link_preview, "DELETE", only_id=True)},
+             )
+-            for link_preview in self
+-        ]
+         self.is_hidden = True
+-        self.env['bus.bus']._sendmany(notifications)
+ 
+     def _unlink_and_notify(self):
+         if not self:
+             return True
+-        notifications = [
+-            (
+-                link_preview.message_id._bus_notification_target(),
+-                "mail.record/insert",
+-                Store(
+-                    link_preview.message_id,
+-                    {"linkPreviews": Store.many(link_preview, "DELETE", only_id=True)},
+-                ).get_result(),
++        for link_preview in self:
++            link_preview._bus_send_store(
++                link_preview.message_id,
++                {"linkPreviews": Store.many(link_preview, "DELETE", only_id=True)},
+             )
+-            for link_preview in self
+-        ]
+-        self.env['bus.bus']._sendmany(notifications)
+         self.unlink()
+ 
+     @api.model
+@@ -108,7 +94,7 @@ class LinkPreview(models.Model):
+             ('create_date', '>=', fields.Datetime.now() - timedelta(days=lifetime)),
+         ], order='create_date DESC', limit=1)
+         if not preview:
+-            preview_values = link_preview.get_link_preview_from_url(url)
++            preview_values = get_link_preview_from_url(url)
+             if not preview_values:
+                 return self.env["mail.link.preview"]
+             preview = self.env['mail.link.preview'].create(preview_values)
+
+--- a/addons/mail/models/mail_message.py
++++ b/addons/mail/models/mail_message.py
+@@ -1,4 +1,3 @@
+-# -*- coding: utf-8 -*-
+ # Part of Odoo. See LICENSE file for full copyright and licensing details.
+ 
+ import logging
+@@ -7,7 +6,7 @@ import textwrap
+ from binascii import Error as binascii_error
+ from collections import defaultdict
+ 
+-from odoo import _, api, Command, fields, models, modules, tools
++from odoo import _, api, fields, models, modules, tools
+ from odoo.exceptions import AccessError
+ from odoo.osv import expression
+ from odoo.tools import clean_context, groupby, SQL
+@@ -65,6 +64,7 @@ class Message(models.Model):
+     information.
+     """
+     _name = 'mail.message'
++    _inherit = ["bus.listener.mixin"]
+     _description = 'Message'
+     _order = 'id desc'
+     _rec_name = 'record_name'
+@@ -733,14 +733,9 @@ class Message(models.Model):
+         for elem in self:
+             for partner in elem.partner_ids & partners_with_user:
+                 messages_by_partner[partner] |= elem
+-
+         # Notify front-end of messages deletion for partners having a user
+-        if messages_by_partner:
+-            self.env['bus.bus']._sendmany([
+-                (partner, 'mail.message/delete', {'message_ids': messages.ids})
+-                for partner, messages in messages_by_partner.items()
+-            ])
+-
++        for partner, messages in messages_by_partner.items():
++            partner._bus_send("mail.message/delete", {"message_ids": messages.ids})
+         return super(Message, self).unlink()
+ 
+     def export_data(self, fields_to_export):
+@@ -784,43 +779,43 @@ class Message(models.Model):
+         notifications = self.env['mail.notification'].sudo().search_fetch(notif_domain, ['mail_message_id'])
+         notifications.write({'is_read': True})
+ 
+-        self.env['bus.bus']._sendone(self.env.user.partner_id, 'mail.message/mark_as_read', {
+-            'message_ids': notifications.mail_message_id.ids,
+-            'needaction_inbox_counter': self.env.user.partner_id._get_needaction_count(),
+-        })
++        self.env.user._bus_send(
++            "mail.message/mark_as_read",
++            {
++                "message_ids": notifications.mail_message_id.ids,
++                "needaction_inbox_counter": self.env.user.partner_id._get_needaction_count(),
++            },
++        )
+ 
+     def set_message_done(self):
+         """ Remove the needaction from messages for the current partner. """
+         partner_id = self.env.user.partner_id
+-
+         notifications = self.env['mail.notification'].sudo().search_fetch([
+             ('mail_message_id', 'in', self.ids),
+             ('res_partner_id', '=', partner_id.id),
+             ('is_read', '=', False),
+         ], ['mail_message_id'])
+-
+         if not notifications:
+             return
+-
+         notifications.write({'is_read': True})
+-
+         # notifies changes in messages through the bus.
+-        self.env['bus.bus']._sendone(partner_id, 'mail.message/mark_as_read', {
+-            'message_ids': notifications.mail_message_id.ids,
+-            'needaction_inbox_counter': self.env.user.partner_id._get_needaction_count(),
+-        })
++        self.env.user._bus_send(
++            "mail.message/mark_as_read",
++            {
++                "message_ids": notifications.mail_message_id.ids,
++                "needaction_inbox_counter": self.env.user.partner_id._get_needaction_count(),
++            },
++        )
+ 
+     @api.model
+     def unstar_all(self):
+         """ Unstar messages for the current partner. """
+         partner = self.env.user.partner_id
+-
+         starred_messages = self.search([('starred_partner_ids', 'in', partner.id)])
+         partner.starred_message_ids -= starred_messages
+-        self.env['bus.bus']._sendone(partner, 'mail.message/toggle_star', {
+-            'message_ids': starred_messages.ids,
+-            'starred': False,
+-        })
++        self.env.user._bus_send(
++            "mail.message/toggle_star", {"message_ids": starred_messages.ids, "starred": False}
++        )
+ 
+     def toggle_message_starred(self):
+         """ Toggle messages as (un)starred. Technically, the notifications related
+@@ -834,11 +829,9 @@ class Message(models.Model):
+             partner.starred_message_ids |= self
+         else:
+             partner.starred_message_ids -= self
+-
+-        self.env['bus.bus']._sendone(partner, 'mail.message/toggle_star', {
+-            'message_ids': [self.id],
+-            'starred': starred,
+-        })
++        self.env.user._bus_send(
++            "mail.message/toggle_star", {"message_ids": [self.id], "starred": starred}
++        )
+ 
+     def _message_reaction(self, content, action):
+         self.ensure_one()
+@@ -872,13 +865,11 @@ class Message(models.Model):
+             "personas": Store.many_ids(guest or partner, "ADD" if action == "add" else "DELETE"),
+             "message": Store.one_id(self),
+         }
+-        self.env["bus.bus"]._sendone(
+-            self._bus_notification_target(),
+-            "mail.record/insert",
+-            Store(self, {"reactions": [(group_command, group_values)]})
+-            # sudo: mail.guest - guest can send their own name when reacting
+-            .add(guest.sudo() or partner, fields=["name", "write_date"])
+-            .get_result(),
++        # sudo: mail.guest - guest can send their own name when reacting
++        self._bus_send_store(
++            Store(self, {"reactions": [(group_command, group_values)]}).add(
++                guest.sudo() or partner, fields=["name", "write_date"]
++            )
+         )
+ 
+     # ------------------------------------------------------
+@@ -1163,16 +1154,13 @@ class Message(models.Model):
+                 messages_per_partner[self.env.user.partner_id] |= message
+             if message.author_id and not any(user._is_public() for user in message.author_id.with_context(active_test=False).user_ids):
+                 messages_per_partner[message.author_id] |= message
+-        updates = []
+         for partner, messages in messages_per_partner.items():
+             store = Store()
+             messages._message_notifications_to_store(store)
+-            updates.append((partner, "mail.record/insert", store.get_result()))
+-        self.env['bus.bus']._sendmany(updates)
++            partner._bus_send_store(store)
+ 
+-    def _bus_notification_target(self):
+-        self.ensure_one()
+-        return self.env.user.partner_id
++    def _bus_channel(self):
++        return self.env.user._bus_channel()
+ 
+     # ------------------------------------------------------
+     # TOOLS
+@@ -1197,25 +1185,17 @@ class Message(models.Model):
+               ORDER BY res_partner_id
+             """, [tuple(outdated_starred_partners.ids)])
+             star_count_by_partner_id = dict(self.env.cr.fetchall())
+-            notifications = []
+             for partner in outdated_starred_partners:
+-                notifications.append(
+-                    (
+-                        partner,
+-                        "mail.record/insert",
+-                        Store(
+-                            "mail.thread",
+-                            {
+-                                "counter": star_count_by_partner_id.get(partner.id, 0),
+-                                "counter_bus_id": bus_last_id,
+-                                "id": "starred",
+-                                "messages": Store.many(self, "DELETE", only_id=True),
+-                                "model": "mail.box",
+-                            },
+-                        ).get_result(),
+-                    )
++                partner._bus_send_store(
++                    "mail.thread",
++                    {
++                        "counter": star_count_by_partner_id.get(partner.id, 0),
++                        "counter_bus_id": bus_last_id,
++                        "id": "starred",
++                        "messages": Store.many(self, "DELETE", only_id=True),
++                        "model": "mail.box",
++                    },
+                 )
+-            self.env["bus.bus"]._sendmany(notifications)
+ 
+     def _filter_empty(self):
+         """ Return subset of "void" messages """
+
+--- a/addons/mail/models/mail_thread.py
++++ b/addons/mail/models/mail_thread.py
+@@ -1,4 +1,3 @@
+-# -*- coding: utf-8 -*-
+ # Part of Odoo. See LICENSE file for full copyright and licensing details.
+ 
+ import ast
+@@ -3160,7 +3159,6 @@ class MailThread(models.AbstractModel):
+         :param dict msg_vals: values dict used to create the message, allows to
+           skip message usage and spare some queries;
+         """
+-        bus_notifications = []
+         inbox_pids_uids = [(r["id"], r["uid"]) for r in recipients_data if r["notif"] == "inbox"]
+         if inbox_pids_uids:
+             notif_create_values = [
+@@ -3185,20 +3183,14 @@ class MailThread(models.AbstractModel):
+                 ]
+             )
+             for user in users:
+-                bus_notifications.append(
+-                    (
+-                        user.partner_id,
+-                        "mail.message/inbox",
+-                        Store(
+-                            message.with_user(user),
+-                            msg_vals=msg_vals,
+-                            for_current_user=True,
+-                            add_followers=True,
+-                            followers=followers,
+-                        ).get_result(),
+-                    )
++                user._bus_send_store(
++                    message.with_user(user),
++                    msg_vals=msg_vals,
++                    for_current_user=True,
++                    add_followers=True,
++                    followers=followers,
++                    notification_type="mail.message/inbox",
+                 )
+-        self.env["bus.bus"].sudo()._sendmany(bus_notifications)
+ 
+     def _notify_thread_by_email(self, message, recipients_data, msg_vals=False,
+                                 mail_auto_delete=True,  # mail.mail
+@@ -4533,11 +4525,7 @@ class MailThread(models.AbstractModel):
+             # sudo: mail.message.translation - discarding translations of message after editing it
+             self.env["mail.message.translation"].sudo().search([("message_id", "=", message.id)]).unlink()
+             res["translationValue"] = False
+-        self.env["bus.bus"]._sendone(
+-            message._bus_notification_target(),
+-            "mail.record/insert",
+-            Store(message, res).get_result(),
+-        )
++        message._bus_send_store(message, res)
+ 
+     # ------------------------------------------------------
+     # CONTROLLERS
+
+--- a/addons/mail/models/res_users.py
++++ b/addons/mail/models/res_users.py
+@@ -145,14 +145,10 @@ class Users(models.Model):
+                 )
+         if 'notification_type' in vals:
+             for user in user_notification_type_modified:
+-                self.env["bus.bus"]._sendone(
++                user._bus_send_store(
+                     user.partner_id,
+-                    "mail.record/insert",
+-                    Store(
+-                        user.partner_id,
+-                        fields=["notification_type"],
+-                        main_user_by_partner={user.partner_id: user},
+-                    ).get_result(),
++                    fields=["notification_type"],
++                    main_user_by_partner={user.partner_id: user},
+                 )
+ 
+         return write_res
+
+--- a/addons/mail/models/res_users_settings.py
++++ b/addons/mail/models/res_users_settings.py
+@@ -1,4 +1,3 @@
+-# -*- coding: utf-8 -*-
+ # Part of Odoo. See LICENSE file for full copyright and licensing details.
+ 
+ from odoo import api, fields, models
+@@ -45,26 +44,18 @@ class ResUsersSettings(models.Model):
+         return res
+ 
+     def _notify_mute(self):
+-        notifications = []
+         for setting in self:
+-            notifications.append(
+-                (
+-                    setting.user_id.partner_id,
+-                    "res.users.settings",
+-                    {"mute_until_dt": setting.mute_until_dt},
+-                )
+-            )
++            setting._bus_send("res.users.settings", {"mute_until_dt": setting.mute_until_dt})
+             if setting.mute_until_dt and setting.mute_until_dt != -1:
+                 self.env.ref("mail.ir_cron_discuss_users_settings_unmute")._trigger(setting.mute_until_dt)
+-        self.env["bus.bus"]._sendmany(notifications)
+ 
+     def set_custom_notifications(self, custom_notifications):
+         self.set_res_users_settings({"channel_notifications": custom_notifications})
+ 
+     def set_res_users_settings(self, new_settings):
+-        formated = super().set_res_users_settings(new_settings)
+-        self.env['bus.bus']._sendone(self.user_id.partner_id, 'res.users.settings', formated)
+-        return formated
++        formatted = super().set_res_users_settings(new_settings)
++        self._bus_send("res.users.settings", formatted)
++        return formatted
+ 
+     def set_volume_setting(self, partner_id, volume, guest_id=None):
+         """
+@@ -87,4 +78,6 @@ class ResUsersSettings(models.Model):
+                 'partner_id': partner_id,
+                 'guest_id': guest_id,
+             })
+-        self.env['bus.bus']._sendone(self.user_id.partner_id, 'res.users.settings.volumes', volume_setting._discuss_users_settings_volume_format())
++        self._bus_send(
++            "res.users.settings.volumes", volume_setting._discuss_users_settings_volume_format()
++        )

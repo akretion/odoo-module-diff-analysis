@@ -1,0 +1,671 @@
+PR: https://github.com/odoo/odoo/pull/175486
+
+From: 51ce16950f9f374662f8d2d0dd108b341912cbd9
+From: Renaud Thiry
+Date: 2024-08-02 11:51:59
++    card_element_ids = fields.One2many('card.campaign.element', inverse_name='campaign_id', copy=True)
++    tag_ids = fields.Many2many('card.campaign.tag', string='Tags')
+
+Total Changes: 546
+
+[ADD] marketing_cards: create dynamic shareable card urls
+
+Word-of-mouth is a great way to get high-quality leads for cheap.
+This addon allows users to create templates for partners to share a link
+with their a cover image tailored to them on social media.
+
+A good use case is to allow presenters to advertize their track
+during an event, each of them can advertize their own track and the
+event in a way that's consistent accross all presenters of the event.
+
+This also allows for rewarding partners who do share the event by
+giving them any link once they share the event, to a coupon for example.
+
+*---------------------------------
+
+To get social networks to render the image, we use opengraph with a redirect url.
+When a social network bot is detected on the redirection endpoint, the endpoint
+serves a minimal html page containing only open graph data. When a regular user
+then clicks the link they'll be redirected normally to a url of our choosing.
+
+The list of network bot user agents needs to be kept up to date for this feature
+to work properly, and the feature will only work for listed social networks.
+
+The rendering is in two steps:
+* ir.qweb to get an html web page
+* wkhtmltoimage to actually render the image to a jpeg
+
+wkhtmltoimage works very similarly to wkhtmltopdf, instanciating a headless
+webkit engine to render the page. For our purposes the html body should be
+self-sufficient, meaning wkhtmltopdf may not execute scripts or fetch data.
+
+A card campaign comprises:
+
+* A template, defining the general design/layout of the card in html
+* Elements, modifiable by the user to either set static or dynamic values
+* A target model, defining what model the dynamic values are picked from
+* A preview record, allowing users to preview the card with specific values
+* A send button, allowing users to send the card by mail using a domain
+
+Each campaign tracks cards sent, cards opened, cards shared and how many clicks
+these cards from social media globally.
+
+The campaign elements simply hold values to be passed to ir.qweb at the time
+of rendering. Either a static value (text/uploaded image), or a field path.
+The field path is validated based on hard-coded values on each model.
+Other field paths may only be set by system administrators, as they may
+pose security concerns. **All paths are fetched as sudo**.
+
+Sharing the card by other means than the built-in composer can be done
+by just calling `_get_preview_url_from_res_id` on a specific card campaign
+for any automated action and/or mail template. The card will be auto-generated
+no matter what. Although it is recommended to create it uppon sending
+for tracking purposes.
+
+Templates define the layout of the card in html as well as some
+default color and background settings. For the base data the bodies
+simply call views which makes it easier to reuse CSS classes and
+qweb variables.
+
+Cards cache the resulting card image for any recipient so as to prevent compute
+spamming, as rendering is relatively expensive. For the same reason card URLs
+are hmac-signed so users cannot generate cards for all recipients at once
+by just guessing url parameters.
+
+One a user has shared the card, they'll get a message on the preview page
+which can be used for them to get small rewards. The message is the same
+for every participant, and the "share" detection mechanism is not totally
+reliable in that it will lead to false positives. Therefore the rewards
+should not be too consequential.
+
+To avoid massive unused data, the cards are cleared of their images every day.
+And (re-)computed on demand.
+
+*---------------------------------
+
+task-3495279
+
+Part-of: odoo/odoo#175486
+Related: odoo/enterprise#67854
+Signed-off-by: Thibault Delavallee (tde) <tde@openerp.com>
+Signed-off-by: Renaud Thiry (reth) <reth@odoo.com>
+
+================================= pseudo patch: =================================
+
+--- a/None
++++ b/addons/marketing_card/models/__init__.py
+@@ -0,0 +1,7 @@
++from . import card_campaign
++from . import card_campaign_element
++from . import card_campaign_tag
++from . import card_template
++from . import card_card
++from . import models
++from . import utm_source
+
+--- a/None
++++ b/addons/marketing_card/models/card_campaign.py
+@@ -0,0 +1,284 @@
++import base64
++from lxml import html
++from itertools import count
++
++from odoo import _, api, Command, fields, models
++from odoo.tools.misc import hmac
++
++from .card_template import TEMPLATE_DIMENSIONS
++
++
++class CardCampaign(models.Model):
++    _name = 'card.campaign'
++    _description = 'Marketing Card Campaign'
++    _inherit = ['mail.activity.mixin', 'mail.render.mixin', 'mail.thread']
++    _order = 'id DESC'
++
++    def _default_card_template_id(self):
++        return self.env['card.template'].search([], limit=1)
++
++    def default_get(self, fields_list):
++        default_vals = super().default_get(fields_list)
++        if 'card_element_ids' in fields_list and 'card_element_ids' not in default_vals:
++            default_vals.setdefault('card_element_ids', [
++                Command.create({'card_element_role': 'background', 'render_type': 'image'}),
++                Command.create({'card_element_role': 'header', 'render_type': 'text'}),
++                Command.create({'card_element_role': 'subheader', 'render_type': 'text'}),
++                Command.create({'card_element_role': 'section_1', 'render_type': 'text'}),
++                Command.create({'card_element_role': 'subsection_1', 'render_type': 'text'}),
++                Command.create({'card_element_role': 'subsection_2', 'render_type': 'text'}),
++                Command.create({'card_element_role': 'button', 'render_type': 'text'}),
++                Command.create({'card_element_role': 'image_1', 'render_type': 'image'}),
++                Command.create({'card_element_role': 'image_2', 'render_type': 'image'}),
++            ])
++        return default_vals
++
++    def _get_model_selection(self):
++        """Hardcoded list of models, checked against actually-present models."""
++        allowed_models = ['res.partner', 'event.track', 'event.booth', 'event.registration']
++        models = self.env['ir.model'].sudo().search_fetch([('model', 'in', allowed_models)], ['model', 'name'])
++        return [(model.model, model.name) for model in models]
++
++    name = fields.Char(required=True)
++    active = fields.Boolean(default=True)
++    body_html = fields.Html(related='card_template_id.body', render_engine="qweb")
++
++    card_count = fields.Integer(compute='_compute_card_stats')
++    card_click_count = fields.Integer(compute='_compute_card_stats')
++    card_share_count = fields.Integer(compute='_compute_card_stats')
++
++    card_template_id = fields.Many2one('card.template', string="Design", default=_default_card_template_id, required=True)
++    card_element_ids = fields.One2many('card.campaign.element', inverse_name='campaign_id', copy=True)
++    image_preview = fields.Image(compute='_compute_image_preview', readonly=True, store=True, compute_sudo=False, attachment=False)
++    link_tracker_id = fields.Many2one('link.tracker', ondelete="restrict")
++    res_model = fields.Selection(string="Model Name", selection=_get_model_selection,
++                                 compute="_compute_res_model", copy=True, precompute=True,
++                                 readonly=False, required=True, store=True)
++
++    post_suggestion = fields.Text(help="Description below the card and default text when sharing on X")
++    preview_record_ref = fields.Reference(string="Preview Record", selection="_selection_preview_record_ref")
++    preview_record_url = fields.Char('Preview Record Link', compute="_compute_preview_record_url")
++    reward_message = fields.Html(string='Thanks to You Message')
++    reward_target_url = fields.Char(string='Reward Link')
++    tag_ids = fields.Many2many('card.campaign.tag', string='Tags')
++    target_url = fields.Char(string='Shared Link')
++    target_url_click_count = fields.Integer(related="link_tracker_id.count")
++
++    user_id = fields.Many2one('res.users', string='Responsible', default=lambda self: self.env.user, domain="[('share', '=', False)]")
++
++    def _compute_card_stats(self):
++        cards_by_status_count = self.env['card.card']._read_group(
++            domain=[('campaign_id', 'in', self.ids)],
++            groupby=['campaign_id', 'share_status'],
++            aggregates=['__count'],
++            order='campaign_id ASC',
++        )
++        self.update({
++            'card_count': 0,
++            'card_click_count': 0,
++            'card_share_count': 0,
++        })
++        for campaign, status, card_count in cards_by_status_count:
++            # shared cards are implicitly visited
++            if status == 'shared':
++                campaign.card_share_count += card_count
++            if status:
++                campaign.card_click_count += card_count
++            campaign.card_count += card_count
++
++    @api.depends('body_html', 'card_element_ids', 'preview_record_ref', 'res_model', 'card_element_ids.card_element_role',
++                 'card_element_ids.card_element_image', 'card_element_ids.card_element_text', 'card_element_ids.field_path',
++                 'card_element_ids.text_color', 'card_element_ids.render_type', 'card_element_ids.value_type')
++    def _compute_image_preview(self):
++        rendered_campaigns = self.filtered('card_template_id.body').filtered('card_element_ids')
++        (self - rendered_campaigns).image_preview = False
++
++        for campaign in rendered_campaigns:
++            if campaign.preview_record_ref and campaign.preview_record_ref.exists():
++                image = campaign._get_image_b64(campaign.preview_record_ref)
++            else:
++                image = campaign._get_generic_image_b64()
++            if image is not None:
++                campaign.image_preview = image
++
++    @api.depends('preview_record_ref')
++    def _compute_preview_record_url(self):
++        self.preview_record_url = False
++        for campaign in self.filtered('preview_record_ref'):
++            if campaign._origin.id:
++                campaign.preview_record_url = campaign._get_preview_url_from_res_id(campaign.preview_record_ref.id)
++
++    @api.depends('preview_record_ref')
++    def _compute_res_model(self):
++        for campaign in self:
++            if campaign.preview_record_ref:
++                campaign.res_model = campaign.preview_record_ref._name
++            elif not campaign.res_model:
++                campaign.res_model = 'res.partner'
++
++    @api.onchange('res_model', 'preview_record_ref')
++    def _onchange_res_model(self):
++        for campaign in self:
++            if not campaign._origin.res_model:
++                continue
++            if campaign._origin.res_model != campaign.res_model:
++                campaign.card_element_ids.value_type = 'static'
++
++    @api.model_create_multi
++    def create(self, create_vals):
++        utm_source = self.env.ref('marketing_card.utm_source_marketing_card', raise_if_not_found=False)
++        link_trackers = self.env['link.tracker'].sudo().create([
++            {
++                'url': vals.get('target_url') or self.env['card.campaign'].get_base_url(),
++                'title': vals['name'],  # not having this will trigger a request in the create
++                'source_id': utm_source.id if utm_source else None,
++                'label': f"marketing_card_campaign_{vals.get('name', '')}_{fields.Datetime.now()}",
++            }
++            for vals in create_vals
++        ])
++        return super().create([{
++            **vals,
++            'link_tracker_id': link_tracker_id,
++        } for vals, link_tracker_id in zip(create_vals, link_trackers.ids)])
++
++    def write(self, vals):
++        link_tracker_vals = {}
++
++        if 'target_url' in vals:
++            link_tracker_vals['url'] = vals['target_url'] or self.env['card.campaign'].get_base_url()
++        if link_tracker_vals:
++            self.link_tracker_id.sudo().write(link_tracker_vals)
++
++        return super().write(vals)
++
++    @api.model
++    def _selection_preview_record_ref(self):
++        return self._fields['res_model']._description_selection(self.env)
++
++    def action_view_cards(self):
++        self.ensure_one()
++        return self.env["ir.actions.actions"]._for_xml_id("marketing_card.cards_card_action") | {
++            'context': {},
++            'domain': [('campaign_id', '=', self.id)],
++        }
++
++    def action_view_cards_clicked(self):
++        self.ensure_one()
++        return self.env["ir.actions.actions"]._for_xml_id("marketing_card.cards_card_action") | {
++            'context': {'search_default_filter_visited': True},
++            'domain': [('campaign_id', '=', self.id)],
++        }
++
++    def action_view_cards_shared(self):
++        self.ensure_one()
++        return self.env["ir.actions.actions"]._for_xml_id("marketing_card.cards_card_action") | {
++            'context': {'search_default_filter_shared': True},
++            'domain': [('campaign_id', '=', self.id)],
++        }
++
++    def action_share(self):
++        self.ensure_one()
++        return {
++            'type': 'ir.actions.act_window',
++            'name': _('Send Cards'),
++            'res_model': 'card.card.share',
++            'context': {'default_card_campaign_id': self.id, 'default_subject': self.name},
++            'views': [[False, 'form']],
++            'target': 'new',
++        }
++
++    # ==========================================================================
++    # Image generation
++    # ==========================================================================
++
++    def _get_image_b64(self, record):
++        if not self.card_template_id.body:
++            return ''
++
++        # check this early to get a better error message
++        for element in self.card_element_ids:
++            if element._origin.field_path != element.field_path:
++                element._check_fields()
++
++        image_bytes = self.env['ir.actions.report']._run_wkhtmltoimage(
++            [self._render_field('body_html', record.ids, add_context={'card_campaign': self})[record.id]],
++            *TEMPLATE_DIMENSIONS
++        )[0]
++        return image_bytes and base64.b64encode(image_bytes)
++
++    def _get_generic_image_b64(self):
++        """Render a single preview image with no record."""
++        rendered_body = self.env['ir.qweb']._render(
++            html.fromstring(self.body_html),
++            self._render_eval_context() | {
++                'card_campaign': self,
++                'preview_values': {
++                    'header': _('Title'),
++                    'subheader': _('Subtitle'),
++                }
++            },
++            raise_on_code=False,
++        )
++        image_bytes = self.env['ir.actions.report']._run_wkhtmltoimage(
++            [rendered_body],
++            *TEMPLATE_DIMENSIONS
++        )[0]
++        return image_bytes and base64.b64encode(image_bytes)
++
++    # ==========================================================================
++    # Card creation
++    # ==========================================================================
++
++    def _generate_card_hash_token(self, record_id):
++        """Generate a token for a specific recipient of this campaign."""
++        self.ensure_one()
++        return hmac(self.env(su=True), ('marketing_card', self._name, self._origin.id, self.name), record_id)
++
++    def _get_or_create_cards_from_res_ids(self, res_ids):
++        """Create missing cards for the given ids."""
++        self.ensure_one()
++        cards = self.env['card.card'].search_fetch([('campaign_id', '=', self.id), ('res_id', 'in', res_ids)], ['res_id'])
++        missing_ids = set(res_ids) - set(cards.mapped('res_id'))
++        cards += self.env['card.card'].create([{'campaign_id': self.id, 'res_id': missing_id} for missing_id in missing_ids])
++
++        # order based on input
++        res_order = dict(zip(res_ids, count()))
++        return cards.sorted(key=lambda card: res_order[card.res_id])
++
++    def _get_preview_url_from_res_id(self, res_id):
++        return self._get_card_path(res_id, 'preview')
++
++    def _get_card_path(self, res_id, suffix):
++        self.ensure_one()
++        return f'{self.get_base_url()}/cards/{self._origin.id}/{res_id}/{self._generate_card_hash_token(res_id)}/{suffix}'
++
++    # ==========================================================================
++    # Mail render mixin / Render utils
++    # ==========================================================================
++
++    @api.depends('res_model')
++    def _compute_render_model(self):
++        """ override for mail.render.mixin """
++        for campaign in self:
++            campaign.render_model = campaign.res_model
++
++    def _get_card_element_values(self, record, preview_values):
++        """Helper to get the right value for each element when rendering."""
++        self.ensure_one()
++        value_from_role = {}
++        default_values = {
++            'background': self.card_template_id.default_background
++        }
++        for element in self.card_element_ids:
++            value = element._get_render_value(record)
++            if not value and element.card_element_role in default_values:
++                value = default_values[element.card_element_role]
++            if not value and preview_values and element.card_element_role in preview_values and element.value_type == 'static':
++                value = preview_values[element.card_element_role]
++            if not value and not record:
++                value = element._get_placeholder_value()
++            value_from_role[element.card_element_role] = value
++
++        # in qweb t-out of "False" effectively removed the element while '' does not
++        # we force everything to '' to be consistent
++        return {element: val or '' for element, val in value_from_role.items()}
+
+--- a/None
++++ b/addons/marketing_card/models/card_campaign_element.py
+@@ -0,0 +1,116 @@
++import base64
++
++from odoo import _, api, exceptions, fields, models
++
++
++class CardCampaignElement(models.Model):
++    _name = 'card.campaign.element'
++    _description = 'Marketing Card Campaign Element'
++
++    res_model = fields.Selection(related="campaign_id.res_model", precompute=True, readonly=True, store=True)
++    campaign_id = fields.Many2one('card.campaign', required=True, ondelete='cascade')
++
++    card_element_role = fields.Selection([
++        ('background', 'Background'),
++        ('header', 'Header'),
++        ('subheader', 'Sub-Header'),
++        ('section_1', 'Section 1'),
++        ('subsection_1', 'Sub-Section 1'),
++        ('subsection_2', 'Sub-Section 2'),
++        ('button', 'Button'),
++        ('image_1', 'Image 1'),
++        ('image_2', 'Image 2')
++    ], required=True)
++
++    card_element_image = fields.Image(attachment=False, compute="_compute_value_fields", readonly=False, store=True)
++    card_element_text = fields.Text(compute="_compute_value_fields", readonly=False, store=True)
++    # text displayed in list view
++    card_element_text_value = fields.Char(string="Text", compute="_compute_card_element_text_value")
++    field_path = fields.Char(compute="_compute_value_fields", readonly=False, store=True)
++    text_color = fields.Char(compute="_compute_value_fields", readonly=False, store=True)
++
++    render_type = fields.Selection([('image', 'Image'), ('text', 'User Text')], default='text', required=True)
++    value_type = fields.Selection([('static', 'Manual'), ('field', 'Dynamic')], default='static', required=True)
++
++    _sql_constraints = [('role_uniq', "unique(campaign_id, card_element_role)", "Each campaign should only have one element for each role.")]
++
++    @api.constrains('field_path', 'res_model')
++    def _check_fields(self):
++        skip_security = self.env.su or self.env.user._is_admin()
++        for element in self.filtered(lambda e: e.value_type == 'field'):
++            RenderModel = self.env[element.res_model]
++            field_path = element.field_path
++            if not field_path:
++                raise exceptions.ValidationError(_("field path must be set on %(element_role)s", element_role=element.card_element_role))
++            try:
++                RenderModel.sudo()._find_value_from_field_path(field_path)
++            except (exceptions.UserError, KeyError) as err:
++                raise exceptions.ValidationError(
++                    _('%(model_name)s.%(field_name)s does not seem reachable.',
++                      model_name=RenderModel._name, field_name=field_path)
++                ) from err
++
++            if not skip_security and field_path not in RenderModel._marketing_card_allowed_field_paths():
++                raise exceptions.ValidationError(
++                    _('%(model_name)s.%(field_name)s cannot be used for card campaigns.',
++                      model_name=RenderModel._name, field_name=field_path)
++                )
++
++            path_start, _dummy, last_field = field_path.rpartition('.')
++            # check the last field has a sensible type
++            if element.render_type == 'image' and RenderModel.sudo().mapped(path_start)._fields[last_field].type != 'binary':
++                raise exceptions.ValidationError(
++                    _('%(field_path)s cannot be used as an image value for %(element_role)s',
++                      field_path=field_path, element_role=element.card_element_role)
++                )
++
++    @api.depends('card_element_text', 'field_path')
++    def _compute_card_element_text_value(self):
++        for element in self:
++            field_val = f'[{element.field_path}]' if element.field_path else ''
++            element.card_element_text_value = field_val or element.card_element_text
++
++    @api.depends('render_type', 'value_type')
++    def _compute_value_fields(self):
++        """Reset values irrelevant to the new type of render or value."""
++        for element in self:
++            if element.render_type == 'image':
++                element.text_color = False
++
++            if element.value_type == 'static':
++                element.field_path = False
++
++            if element.value_type == 'field' or element.render_type == 'image':
++                element.card_element_text = False
++
++            if element.value_type == 'field' or element.render_type == 'text':
++                element.card_element_image = False
++
++    def _get_render_value(self, record):
++        """Get the value of the element for a specific record."""
++        self.ensure_one()
++        if record:
++            record.ensure_one()
++        if self.value_type == 'field' and record:
++            # if the value has changed since this was called, we don't know if sudo is allowed
++            if self._origin.field_path != self.field_path:
++                self._check_fields()
++            # this will be called with sudo from the controller, sudo here too for consistency
++            if self.render_type == 'text':
++                return record.sudo()._find_value_from_field_path(self.field_path) or ''
++            return record.sudo().mapped(self.field_path)[0] or ''
++        if self.render_type == 'image':
++            return self.card_element_image or ''
++        if self.render_type == 'text':
++            return self.card_element_text or ''
++        return None
++
++    def _get_placeholder_value(self):
++        """Placeholder to display in preview mode."""
++        self.ensure_one()
++        if self.value_type == 'field':
++            if self.render_type == 'image':
++                return base64.b64encode(self.env['ir.binary']._placeholder())
++            if self.render_type == 'text':
++                return f'[{self.field_path}]'
++        return ''
+
+--- a/None
++++ b/addons/marketing_card/models/card_campaign_tag.py
+@@ -0,0 +1,16 @@
++import random
++
++from odoo import fields, models
++
++
++class CardCampaignTag(models.Model):
++    _name = 'card.campaign.tag'
++    _description = 'Marketing Card Campaign Tag'
++
++    def _get_default_color(self):
++        return random.randint(1, 11)
++
++    name = fields.Char(required=True)
++    color = fields.Integer(default=_get_default_color)
++
++    _sql_constraints = [('name_uniq', "unique(name)", "Tags may not reuse existing names.")]
+
+--- a/None
++++ b/addons/marketing_card/models/card_card.py
+@@ -0,0 +1,53 @@
++from datetime import datetime, timedelta
++
++from odoo import api, fields, models
++
++
++class MarketingCard(models.Model):
++    """Mapping from a unique ID to a 'sharer' of a campaign. Storing state of sharing and their specific card."""
++    _name = 'card.card'
++    _description = 'Marketing Card'
++
++    campaign_id = fields.Many2one('card.campaign', required=True, ondelete="cascade")
++    res_model = fields.Selection(related='campaign_id.res_model')
++    record_ref = fields.Reference(string='Record', selection='_selection_record_ref', compute='_compute_record_ref')
++    res_id = fields.Many2oneReference('Record ID', model_field='res_model', required=True)
++    image = fields.Image()
++    share_status = fields.Selection([
++        ('shared', 'Shared on Social Networks'),
++        ('visited', 'Share URL Visited'),
++    ])
++
++    _sql_constraints = [
++        ('campaign_record_unique', 'unique(campaign_id, res_id)',
++         'Each record should be unique for a campaign'),
++    ]
++
++    @api.depends('res_model', 'res_id')
++    def _compute_record_ref(self):
++        for card in self:
++            card.record_ref = f'{card.res_model},{card.res_id}'
++
++    @api.autovacuum
++    def _gc_card_url_images(self):
++        """Remove images after a day. Social networks are expected to cache the images on their side."""
++        timedelta_days = self.env['ir.config_parameter'].get_param('marketing_card.card_image_cleanup_interval_days', 1)
++        if not timedelta_days:
++            return
++        self.search([('write_date', '<=', datetime.now() - timedelta(days=timedelta_days))]).image = False
++
++    def _get_card_url(self):
++        return self.campaign_id._get_card_path(self.res_id, 'card.jpg')
++
++    def _get_redirect_url(self):
++        return self.campaign_id._get_card_path(self.res_id, 'redirect')
++
++    def _get_or_generate_image(self):
++        # generate if not already stored
++        if not self.image:
++            self.image = self.campaign_id._get_image_b64(self.env[self.res_model].browse(self.res_id))
++        return self.image
++
++    @api.model
++    def _selection_record_ref(self):
++        return self.env['card.campaign']._fields['res_model']._description_selection(self.env)
+
+--- a/None
++++ b/addons/marketing_card/models/card_template.py
+@@ -0,0 +1,22 @@
++from odoo import fields, models
++
++# Good ratio to have a large image still small enough to stay under 5MB (common limit)
++# Close to the 2:1 ratio recommended by twitter and these dimensions are recommended by meta
++# https://developers.facebook.com/docs/sharing/webmasters/images/
++# https://developer.twitter.com/en/docs/twitter-for-websites/cards/overview/summary-card-with-large-image
++TEMPLATE_DIMENSIONS = (600, 315)
++TEMPLATE_RATIO = 40 / 21
++
++
++class CardCampaignTemplate(models.Model):
++    _name = 'card.template'
++    _description = 'Marketing Card Template'
++
++    name = fields.Char(required=True)
++    default_background = fields.Image()
++    body = fields.Html(sanitize_tags=False, sanitize_attributes=False)
++
++    primary_color = fields.Char(default='#f9f9f9', required=True)
++    secondary_color = fields.Char(default='#000000', required=True)
++    primary_text_color = fields.Char(default='#000000', required=True)
++    secondary_text_color = fields.Char(default='#ffffff', required=True)
+
+--- a/None
++++ b/addons/marketing_card/models/models.py
+@@ -0,0 +1,34 @@
++from odoo import api, models
++
++
++class BaseModel(models.AbstractModel):
++    _inherit = 'base'
++
++    @api.model
++    def _marketing_card_allowed_field_paths(self) -> list[str]:
++        """List of fields allowed to be accessed in template rendering."""
++        allowed_fields_dict = {
++            'res.partner': [
++                'display_name', 'name',
++                'email', 'mobile', 'phone',
++                'country_id', 'country_id.display_name', 'country_id.name',
++                'image_128', 'image_256', 'image_512', 'image_1024',
++            ],
++
++        }
++        allowed_fields_dict['event.track'] = [
++            'display_name', 'name',
++            'event_id', 'event_id.name', 'event_id.display_name',
++            'image', 'partner_id',
++            'location_id', 'location_id.name', 'location_id.display_name',
++            'date', 'date_end',
++            'event_id', 'event_id.name', 'event_id.display_name'
++        ] + [f'partner_id.{partner_path}' for partner_path in allowed_fields_dict['res.partner']]
++        allowed_fields_dict['event.booth'] = [
++            'display_name', 'name',
++            'event_id', 'event_id.name', 'event_id.display_name', 'event_id.address_inline',
++            'event_id.date_begin', 'event_id.date_end', 'event_id.date_tz',
++            'contact_name', 'contact_email', 'contact_phone',
++            'sponsor_name', 'sponsor_email', 'sponsor_mobile', 'sponsor_phone', 'sponsor_subtitle', 'sponsor_image_512',
++        ]
++        return allowed_fields_dict.get(self._name, [])
+
+--- a/None
++++ b/addons/marketing_card/models/utm_source.py
+@@ -0,0 +1,14 @@
++from odoo import _, api, models, exceptions
++
++
++class UtmSource(models.Model):
++    _inherit = 'utm.source'
++
++    @api.ondelete(at_uninstall=False)
++    def _unlink_except_utm_source_marketing_card(self):
++        utm_source_marketing_card = self.env.ref('marketing_card.utm_source_marketing_card', raise_if_not_found=False)
++        if utm_source_marketing_card and utm_source_marketing_card in self:
++            raise exceptions.UserError(_(
++                "The UTM source '%s' cannot be deleted as it is used to promote marketing cards campaigns.",
++                utm_source_marketing_card.name
++            ))
