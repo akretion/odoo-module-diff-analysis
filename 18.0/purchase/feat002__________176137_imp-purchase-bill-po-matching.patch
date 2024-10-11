@@ -1,0 +1,418 @@
+PR: https://github.com/odoo/odoo/pull/176137
+
+From: 7ba5cbb00cb651d384ead556f8550d8314b4ab7b
+From: Habib (ayh)
+Date: 2024-08-15 04:21:44
+
+Total Changes: 257
+
+[IMP] purchase: Bill & PO matching
+
+Purpose
+*------
+
+With EDI's becoming more common, bills are typically imported automatically, thereby losing the link with the original PO.
+In order to provide options to better link PO lines with Bill lines, a new view is add that allows linking these lines.
+
+The View
+*-------
+
+A new model with a non-stored table (`_auto = False`) is used to read Account Move lines and Purchase Order lines.
+It displays all lines which could still be matched.
+The matching view is accessible from a smart button on both Vendor Bill (when all lines haven't been matched yet), and a Purchase Order (when there are vendor bills for the partner and the PO hasn't been fully invoiced yet)
+Even though it is accessed from a Bill/PO, all unmatched lines for the Vendor are displayed.
+
+Features:
+*--------
+1. Match existing lines: Manual linking of a Bill line, to the corresponding Purchase Order line. When multiple lines are selected, the **Match** button becomes visible. Many bill lines can be matched to the same po line, provided they share the same product. Note: Matching will fail when 2+ PO lines have the same product (more intelligent matching might be done in the future)
+
+But sometimes the PO/ purchase order line doesn't exist yet
+
+2. Add lines to PO and match: products invoiced on the vendor bill can be added to an existing purchase order, or a new purchase order could be created containing those lines. This is especially useful when the stock module is installed, and a PO is the quickest way to generate an inventory receipt. To use, select bill lines with a product, and click the **Add to PO** button.
+
+3. Down Payments: deposit payments are often required to confirm an order. These vendor bill lines rarely contain a product. It works similar to feature 2's **Add to PO**, but instead choosing the **Add Down Payments** button in the wizard.
+Note: The final bill should contain the lines for the products/services purchased and a negative down payment line to reimburse the deposit already paid. These lines should also be matched using the features in 1 & 2 above, marking the Purchase Order as fully invoiced.
+
+Typical Down Payment Flow Example
+*--------------------------------
+
+* Company creates,confirms & sends a purchase order to a Vendor for 10 x Product/Service @ €100.00
+* Vendor requires a 10% deposit/ down payment to confirm the order
+* We receive a bill for 1 x down payment (no product) @ €100.00
+* On the bill, the Purchase Matching smart button is visible, and it display both the down payment and the order lines.
+* Select both and click "Add to PO" > "Add Down Payment"
+* A new downpayment line with a billed qty is added to the PO. (this line shouldn't be editable)
+* When we receive the inventory, we also receive the final invoice for a total of €900.00:
+    - 10 x Product/Service @ €100.00
+    - downpayment reduction -1 x €100.00 (no product, label only)
+* Purchase Matching now displays 4 matchable lines: the PO line for products/service, the bill line with the same product, The downpayment line from the PO, the downpayment paid line from the bill
+* Selecting all lines and clicking "Match" will link the down payment lines (reducing the billed qty to Zero), and the product lines and purchase order will be marked as fully invoiced.
+
+Task-4050320
+
+closes odoo/odoo#176137
+
+Signed-off-by: Habib Ayob (ayh) <ayh@odoo.com>
+
+================================= pseudo patch: =================================
+
+--- a/addons/purchase/models/__init__.py
++++ b/addons/purchase/models/__init__.py
+@@ -6,6 +6,7 @@ from . import account_tax
+ from . import analytic_account
+ from . import analytic_applicability
+ from . import ir_actions_report
++from . import purchase_bill_line_match
+ from . import purchase_order
+ from . import purchase_order_line
+ from . import product
+
+--- a/addons/purchase/models/account_invoice.py
++++ b/addons/purchase/models/account_invoice.py
+@@ -22,6 +22,8 @@ class AccountMove(models.Model):
+         string='Purchase Order',
+         help="Auto-complete from a past purchase order.")
+     purchase_order_count = fields.Integer(compute="_compute_origin_po_count", string='Purchase Order Count')
++    purchase_order_name = fields.Char(compute='_compute_purchase_order_name')
++    is_purchase_matched = fields.Boolean(compute='_compute_is_purchase_matched')  # 0: PO not required or partially linked. 1: All lines linked
+ 
+     def _get_invoice_reference(self):
+         self.ensure_one()
+@@ -114,11 +116,30 @@ class AccountMove(models.Model):
+ 
+         return res
+ 
++    @api.depends('line_ids.purchase_line_id')
++    def _compute_is_purchase_matched(self):
++        for move in self:
++            if any(il.display_type == 'product' and not bool(il.purchase_line_id) for il in move.invoice_line_ids):
++                move.is_purchase_matched = False
++                continue
++            move.is_purchase_matched = True
++
+     @api.depends('line_ids.purchase_line_id')
+     def _compute_origin_po_count(self):
+         for move in self:
+             move.purchase_order_count = len(move.line_ids.purchase_line_id.order_id)
+ 
++    @api.depends('purchase_order_count')
++    def _compute_purchase_order_name(self):
++        for move in self:
++            if move.purchase_order_count == 1:
++                move.purchase_order_name = move.invoice_line_ids.purchase_order_id.display_name
++            else:
++                move.purchase_order_name = False
++
++    def action_purchase_matching(self):
++        return self.partner_id.action_open_purchase_matching()
++
+     def action_view_source_purchase_orders(self):
+         self.ensure_one()
+         source_orders = self.line_ids.purchase_line_id.order_id
+@@ -473,10 +494,23 @@ class AccountMoveLine(models.Model):
+     """ Override AccountInvoice_line to add the link to the purchase order line it is related to"""
+     _inherit = 'account.move.line'
+ 
+-    purchase_line_id = fields.Many2one('purchase.order.line', 'Purchase Order Line', ondelete='set null', index='btree_not_null')
++    is_downpayment = fields.Boolean()
++    purchase_line_id = fields.Many2one('purchase.order.line', 'Purchase Order Line', ondelete='set null', index='btree_not_null', copy=False)
+     purchase_order_id = fields.Many2one('purchase.order', 'Purchase Order', related='purchase_line_id.order_id', readonly=True)
+ 
+     def _copy_data_extend_business_fields(self, values):
+         # OVERRIDE to copy the 'purchase_line_id' field as well.
+         super(AccountMoveLine, self)._copy_data_extend_business_fields(values)
+         values['purchase_line_id'] = self.purchase_line_id.id
++
++    def _prepare_line_values_for_purchase(self):
++        return [
++            {
++                'product_id': line.product_id.id,
++                'product_qty': line.quantity,
++                'product_uom': line.product_uom_id.id,
++                'price_unit': line.price_unit,
++                'discount': line.discount,
++            }
++            for line in self
++        ]
+
+--- a/None
++++ b/addons/purchase/models/purchase_bill_line_match.py
+@@ -0,0 +1,166 @@
++# Part of Odoo. See LICENSE file for full copyright and licensing details.
++
++from odoo import fields, models, _
++
++from odoo.tools import format_list, SQL
++from odoo.exceptions import UserError
++
++
++class PurchaseBillMatch(models.Model):
++    _name = "purchase.bill.line.match"
++    _description = "Purchase Line and Vendor Bill line matching view"
++    _auto = False
++    _order = 'product_id, aml_id, pol_id'
++
++    pol_id = fields.Many2one(comodel_name='purchase.order.line')
++    aml_id = fields.Many2one(comodel_name='account.move.line')
++    company_id = fields.Many2one(comodel_name='res.company')
++    partner_id = fields.Many2one(comodel_name='res.partner')
++    product_id = fields.Many2one(comodel_name='product.product')
++    line_qty = fields.Float()
++    line_uom_id = fields.Many2one(comodel_name='uom.uom')
++    qty_invoiced = fields.Float()
++    purchase_order_id = fields.Many2one(comodel_name='purchase.order')
++    account_move_id = fields.Many2one(comodel_name='account.move')
++    line_amount_untaxed = fields.Monetary()
++    currency_id = fields.Many2one(comodel_name='res.currency')
++    state = fields.Char()
++
++    product_uom_id = fields.Many2one(comodel_name='uom.uom', related='product_id.uom_id')
++    product_uom_qty = fields.Float(compute='_compute_product_uom_qty')
++    billed_amount_untaxed = fields.Monetary(compute='_compute_amount_untaxed_fields', currency_field='currency_id')
++    purchase_amount_untaxed = fields.Monetary(compute='_compute_amount_untaxed_fields', currency_field='currency_id')
++    reference = fields.Char(compute='_compute_reference')
++
++    def _compute_amount_untaxed_fields(self):
++        for line in self:
++            line.billed_amount_untaxed = line.line_amount_untaxed if line.account_move_id else False
++            line.purchase_amount_untaxed = line.line_amount_untaxed if line.purchase_order_id else False
++
++    def _compute_reference(self):
++        for line in self:
++            line.reference = line.purchase_order_id.display_name or line.account_move_id.display_name
++
++    def _compute_display_name(self):
++        for line in self:
++            line.display_name = line.product_id.display_name or line.aml_id.name or line.pol_id.name
++
++    def _compute_product_uom_qty(self):
++        for line in self:
++            line.product_uom_qty = line.line_uom_id._compute_quantity(line.line_qty, line.product_uom_id)
++
++    def _select_po_line(self):
++        return SQL("""
++            SELECT pol.id,
++                   pol.id as pol_id,
++                   NULL as aml_id,
++                   pol.company_id as company_id,
++                   pol.partner_id as partner_id,
++                   pol.product_id as product_id,
++                   pol.product_qty as line_qty,
++                   pol.product_uom as line_uom_id,
++                   pol.qty_invoiced as qty_invoiced,
++                   po.id as purchase_order_id,
++                   NULL as account_move_id,
++                   pol.price_subtotal as line_amount_untaxed,
++                   pol.currency_id as currency_id,
++                   po.state as state
++              FROM purchase_order_line pol
++         LEFT JOIN purchase_order po ON pol.order_id = po.id
++             WHERE pol.state in ('purchase', 'done')
++               AND pol.product_qty > pol.qty_invoiced
++                OR ((pol.display_type = '' OR pol.display_type IS NULL) AND pol.is_downpayment AND pol.qty_invoiced > 0)
++        """)
++
++    def _select_am_line(self):
++        return SQL("""
++            SELECT -aml.id,
++                   NULL as pol_id,
++                   aml.id as aml_id,
++                   aml.company_id as company_id,
++                   aml.partner_id as partner_id,
++                   aml.product_id as product_id,
++                   aml.quantity as line_qty,
++                   aml.product_uom_id as line_uom_id,
++                   NULL as qty_invoiced,
++                   NULL as purchase_order_id,
++                   am.id as account_move_id,
++                   aml.amount_currency as line_amount_untaxed,
++                   aml.currency_id as currency_id,
++                   aml.parent_state as state
++              FROM account_move_line aml
++         LEFT JOIN account_move am on aml.move_id = am.id
++             WHERE aml.display_type = 'product'
++               AND am.move_type in ('in_invoice', 'in_refund')
++               AND aml.parent_state in ('draft', 'posted')
++               AND aml.purchase_line_id IS NULL
++        """)
++
++    @property
++    def _table_query(self):
++        return SQL("%s UNION ALL %s", self._select_po_line(), self._select_am_line())
++
++    def action_open_line(self):
++        self.ensure_one()
++        return {
++            'type': 'ir.actions.act_window',
++            'res_model': 'account.move' if self.account_move_id else 'purchase.order',
++            'view_mode': 'form',
++            'res_id': self.account_move_id.id if self.account_move_id else self.purchase_order_id.id,
++        }
++
++    def action_match_lines(self):
++        if not self.pol_id or not self.aml_id:
++            raise UserError(_("You must select at least one Purchase Order line and one Vendor Bill line to match them."))
++
++        matches_found = 0
++        problem_products = self.env['product.product']
++        pol_by_product = self.pol_id.grouped('product_id')
++        aml_by_product = self.aml_id.grouped('product_id')
++
++        for product, po_lines in pol_by_product.items():
++            if len(po_lines) > 1:
++                problem_products += product
++                continue
++            matching_bill_lines = aml_by_product.get(product)
++            if matching_bill_lines:
++                matching_bill_lines.purchase_line_id = po_lines.id
++                matches_found += 1
++        if problem_products:
++            message = _("More than 1 Purchase Order line has the same product: %(products)s",
++                        products=format_list(self.env, problem_products.mapped('display_name')))
++            return {
++                'type': 'ir.actions.client',
++                'tag': 'display_notification',
++                'params': {
++                    'title': _("Unable to match"),
++                    'type': "warning",
++                    'message': message,
++                    'next': {
++                        'type': 'ir.actions.act_window_close',
++                    },
++                }
++            }
++        if not matches_found:
++            raise UserError(_("No matching products found."))
++
++    def action_add_to_po(self):
++        if not self or not self.aml_id:
++            raise UserError(_("Select Vendor Bill lines to add to a Purchase Order"))
++        context = {
++            'default_partner_id': self.partner_id.id,
++            'dialog_size': 'medium',
++            'has_products': bool(self.aml_id.product_id),
++        }
++        if len(self.purchase_order_id) > 1:
++            raise UserError(_("Vendor Bill lines can only be added to one Purchase Order."))
++        elif self.purchase_order_id:
++            context['default_purchase_order_id'] = self.purchase_order_id.id
++        return {
++            'type': 'ir.actions.act_window',
++            'name': _("Add to Purchase Order"),
++            'res_model': 'bill.to.po.wizard',
++            'target': 'new',
++            'views': [(self.env.ref('purchase.bill_to_po_wizard_form').id, 'form')],
++            'context': context,
++        }
+
+--- a/addons/purchase/models/purchase_order.py
++++ b/addons/purchase/models/purchase_order.py
+@@ -108,6 +108,7 @@ class PurchaseOrder(models.Model):
+     order_line = fields.One2many('purchase.order.line', 'order_id', string='Order Lines', copy=True)
+     notes = fields.Html('Terms and Conditions')
+ 
++    partner_bill_count = fields.Integer(related='partner_id.supplier_invoice_count')
+     invoice_count = fields.Integer(compute="_compute_invoice", string='Bill Count', copy=False, default=0, store=True)
+     invoice_ids = fields.Many2many('account.move', compute="_compute_invoice", string='Bills', copy=False, store=True)
+     invoice_status = fields.Selection([
+@@ -580,6 +581,42 @@ class PurchaseOrder(models.Model):
+                 # supplier info should be added regardless of the user access rights
+                 line.product_id.product_tmpl_id.sudo().write(vals)
+ 
++    def action_bill_matching(self):
++        return self.partner_id.action_open_purchase_matching()
++
++    def _prepare_down_payment_section_values(self):
++        self.ensure_one()
++        context = {'lang': self.partner_id.lang}
++        res = {
++            'product_qty': 0.0,
++            'order_id': self.id,
++            'display_type': 'line_section',
++            'is_downpayment': True,
++            'sequence': (self.order_line[-1:].sequence or 9) + 1,
++            'name': _("Down Payments"),
++        }
++        del context
++        return res
++
++    def _create_downpayments(self, line_vals):
++        self.ensure_one()
++
++        # create section
++        if not any(line.display_type and line.is_downpayment for line in self.order_line):
++            section_line = self.order_line.create(self._prepare_down_payment_section_values())
++        else:
++            section_line = self.order_line.filtered(lambda line: line.display_type and line.is_downpayment)
++        vals = [
++            {
++                **line_val,
++                'sequence': section_line.sequence + i,
++            }
++            for i, line_val in enumerate(line_vals, start=1)
++        ]
++        downpayment_lines = self.env['purchase.order.line'].create(vals)
++        self.order_line += downpayment_lines
++        return downpayment_lines
++
+     def action_create_invoice(self):
+         """Create the invoice associated to the PO.
+         """
+
+--- a/addons/purchase/models/purchase_order_line.py
++++ b/addons/purchase/models/purchase_order_line.py
+@@ -77,10 +77,11 @@ class PurchaseOrderLine(models.Model):
+     display_type = fields.Selection([
+         ('line_section', "Section"),
+         ('line_note', "Note")], default=False, help="Technical field for UX purpose.")
++    is_downpayment = fields.Boolean()
+ 
+     _sql_constraints = [
+         ('accountable_required_fields',
+-            "CHECK(display_type IS NOT NULL OR (product_id IS NOT NULL AND product_uom IS NOT NULL AND date_planned IS NOT NULL))",
++            "CHECK(display_type IS NOT NULL OR is_downpayment OR (product_id IS NOT NULL AND product_uom IS NOT NULL AND date_planned IS NOT NULL))",
+             "Missing required fields on accountable purchase order line."),
+         ('non_accountable_null_fields',
+             "CHECK(display_type IS NULL OR (product_id IS NULL AND price_unit = 0 AND product_uom_qty = 0 AND product_uom IS NULL AND date_planned is NULL))",
+@@ -581,6 +582,7 @@ class PurchaseOrderLine(models.Model):
+             'price_unit': self.currency_id._convert(self.price_unit, aml_currency, self.company_id, date, round=False),
+             'tax_ids': [(6, 0, self.taxes_id.ids)],
+             'purchase_line_id': self.id,
++            'is_downpayment': self.is_downpayment,
+         }
+         if self.analytic_distribution and not self.display_type:
+             res['analytic_distribution'] = self.analytic_distribution
+
+--- a/addons/purchase/models/res_partner.py
++++ b/addons/purchase/models/res_partner.py
+@@ -1,7 +1,7 @@
+ # -*- coding: utf-8 -*-
+ # Part of Odoo. See LICENSE file for full copyright and licensing details.
+ 
+-from odoo import api, fields, models
++from odoo import api, fields, models, _
+ from odoo.addons.base.models.res_partner import WARNING_MESSAGE, WARNING_HELP
+ 
+ 
+@@ -36,6 +36,7 @@ class res_partner(models.Model):
+         )
+         supplier_invoice_groups = self.env['account.move']._read_group(
+             domain=[('partner_id', 'in', all_partners.ids),
++                    *self.env['account.move']._check_company_domain(self.env.company),
+                     ('move_type', 'in', ('in_invoice', 'in_refund'))],
+             groupby=['partner_id'], aggregates=['__count']
+         )
+@@ -65,3 +66,13 @@ class res_partner(models.Model):
+     reminder_date_before_receipt = fields.Integer('Days Before Receipt', default=1, company_dependent=True,
+         help="Number of days to send reminder email before the promised receipt date")
+     buyer_id = fields.Many2one('res.users', string='Buyer')
++
++    def action_open_purchase_matching(self):
++        self.ensure_one()
++        return {
++            'type': 'ir.actions.act_window',
++            'name': _("Purchase Matching"),
++            'res_model': 'purchase.bill.line.match',
++            'domain': [('partner_id', '=', self.id), ('company_id', 'in', [self.env.company.id])],
++            'views': [(self.env.ref('purchase.purchase_bill_line_match_tree').id, 'tree')],
++        }

@@ -1,0 +1,213 @@
+PR: https://github.com/odoo/odoo/pull/175205
+
+From: 432e375246f0b5ab440d33bb7cfabdb363ef6828
+From: william-andre
+Date: 2024-08-02 13:17:50
+
+Breaking data model changes scores: del:2 + add:0, change matches:
+-    _inherit = 'res.partner'
+-    _inherit = "res.users"
+
+Total Changes: 94
+
+[REF] bus, *: shortcut to send message to user via bus
+
+* = account, auth_signup, base_geolocalize, bus, calendar, crm_livechat,
+    iap_mail, im_livechat, mail, point_of_sale,
+    website_crm_partner_assign, website_livechat
+
+Make a safe and simpler helper for usages of `<bus.bus>._sendone`.
+If the code is using this helper, it doesn't require any particular
+attention regarding security as the channel crafted is safe by design.
+It also reduces the possibility to have a channel that doesn't exist.
+
+However supported channels still have to be added manually in
+`_build_bus_channel_list` depending on each user/guest needs and access
+rights.
+
+Implementation:
+
+A new mixin (`bus.listener.mixin`) implementing `_bus_send` can be added
+on models, which, when called, will send a message to listeners of these
+records.
+
+In order to do that, models inheriting that mixin will need to also
+implement `_bus_channel`, returning the channel to use for the current
+record (by default it is the record itself).
+
+The opportunity is taken to add various sending helpers that are used
+often, in particular `_bus_send_store`.
+
+Transient message helper is also cleaned to use a similar pattern, to
+enforce markup usage, and to follow proper translation guidelines.
+
+closes odoo/odoo#175205
+
+Related: odoo/enterprise#67733
+Signed-off-by: Sébastien Theys (seb) <seb@odoo.com>
+Co-authored-by: Sébastien Theys <seb@odoo.com>
+Co-authored-by: william-andre <wan@odoo.com>
+
+================================= pseudo patch: =================================
+
+--- a/addons/bus/models/__init__.py
++++ b/addons/bus/models/__init__.py
+@@ -1,7 +1,12 @@
+-# -*- coding: utf-8 -*-
++# Part of Odoo. See LICENSE file for full copyright and licensing details.
++
+ from . import bus
++from . import bus_listener_mixin
+ from . import bus_presence
++from . import ir_attachment
+ from . import ir_model
+ from . import ir_websocket
++from . import res_groups
+ from . import res_users
++from . import res_users_settings
+ from . import res_partner
+
+--- a/addons/bus/models/bus.py
++++ b/addons/bus/models/bus.py
+@@ -95,13 +95,16 @@ class ImBus(models.Model):
+         domain = [('create_date', '<', timeout_ago)]
+         return self.sudo().search(domain).unlink()
+ 
+-    @api.model
+-    def _sendmany(self, notifications):
+-        for notification in notifications:
+-            self._sendone(*notification)
+-
+     @api.model
+     def _sendone(self, target, notification_type, message):
++        """Low-level method to send ``notification_type`` and ``message`` to ``target``.
++
++        Using ``_bus_send()`` from ``bus.listener.mixin`` is recommended for simplicity and
++        security.
++
++        When using ``_sendone`` directly, ``target`` (if str) should not be guessable by an
++        attacker.
++        """
+         self._ensure_hooks()
+         channel = channel_with_db(self.env.cr.dbname, target)
+         self.env.cr.precommit.data["bus.bus.values"].append(
+
+--- a/None
++++ b/addons/bus/models/bus_listener_mixin.py
+@@ -0,0 +1,26 @@
++# Part of Odoo. See LICENSE file for full copyright and licensing details.
++
++from odoo import models
++
++
++class BusListenerMixin(models.AbstractModel):
++    """Allow sending messages related to the current model via as a bus.bus channel.
++
++    The model needs to be allowed as a valid channel for the bus in `_build_bus_channel_list`.
++    """
++
++    _name = "bus.listener.mixin"
++    _description = "Can send messages via bus.bus"
++
++    def _bus_send(self, notification_type, message, /, *, subchannel=None):
++        """Send a notification to the webclient."""
++        for record in self:
++            main_channel = record._bus_channel()
++            assert isinstance(main_channel, models.Model)
++            main_channel.ensure_one()
++            channel = main_channel if subchannel is None else (main_channel, subchannel)
++            self.env["bus.bus"]._sendone(channel, notification_type, message)
++
++    def _bus_channel(self):
++        self.ensure_one()
++        return self
+
+--- a/None
++++ b/addons/bus/models/ir_attachment.py
+@@ -0,0 +1,11 @@
++# Part of Odoo. See LICENSE file for full copyright and licensing details.
++
++from odoo import models
++
++
++class IrAttachment(models.Model):
++    _name = "ir.attachment"
++    _inherit = ["ir.attachment", "bus.listener.mixin"]
++
++    def _bus_channel(self):
++        return self.env.user._bus_channel()
+
+--- a/None
++++ b/addons/bus/models/res_groups.py
+@@ -0,0 +1,8 @@
++# Part of Odoo. See LICENSE file for full copyright and licensing details.
++
++from odoo import models
++
++
++class ResGroups(models.Model):
++    _name = "res.groups"
++    _inherit = ["res.groups", "bus.listener.mixin"]
+
+--- a/addons/bus/models/res_partner.py
++++ b/addons/bus/models/res_partner.py
+@@ -1,12 +1,13 @@
+-# -*- coding: utf-8 -*-
++# Part of Odoo. See LICENSE file for full copyright and licensing details.
+ 
+-from odoo import api, fields, models
++from odoo import fields, models
+ from odoo.addons.bus.models.bus_presence import AWAY_TIMER
+ from odoo.addons.bus.models.bus_presence import DISCONNECTION_TIMER
+ 
+ 
+ class ResPartner(models.Model):
+-    _inherit = 'res.partner'
++    _name = "res.partner"
++    _inherit = ["res.partner", "bus.listener.mixin"]
+ 
+     im_status = fields.Char('IM Status', compute='_compute_im_status')
+ 
+
+--- a/addons/bus/models/res_users.py
++++ b/addons/bus/models/res_users.py
+@@ -1,13 +1,13 @@
+-# -*- coding: utf-8 -*-
++# Part of Odoo. See LICENSE file for full copyright and licensing details.
+ 
+-from odoo import api, fields, models
++from odoo import fields, models
+ from odoo.addons.bus.models.bus_presence import AWAY_TIMER
+ from odoo.addons.bus.models.bus_presence import DISCONNECTION_TIMER
+ 
+ 
+ class ResUsers(models.Model):
+-
+-    _inherit = "res.users"
++    _name = "res.users"
++    _inherit = ["res.users", "bus.listener.mixin"]
+ 
+     im_status = fields.Char('IM Status', compute='_compute_im_status')
+ 
+@@ -26,3 +26,6 @@ class ResUsers(models.Model):
+         res = dict(((status['id'], status['status']) for status in self.env.cr.dictfetchall()))
+         for user in self:
+             user.im_status = res.get(user.id, 'offline')
++
++    def _bus_channel(self):
++        return self.partner_id._bus_channel()
+
+--- a/None
++++ b/addons/bus/models/res_users_settings.py
+@@ -0,0 +1,11 @@
++# Part of Odoo. See LICENSE file for full copyright and licensing details.
++
++from odoo import models
++
++
++class ResUsersSettings(models.Model):
++    _name = "res.users.settings"
++    _inherit = ["res.users.settings", "bus.listener.mixin"]
++
++    def _bus_channel(self):
++        return self.user_id._bus_channel()

@@ -1,0 +1,1164 @@
+PR: https://github.com/odoo/odoo/pull/169741
+
+From: 91ddd31afef68dfec72630d0419e96f6e580299b
+From: Demesmaeker
+Date: 2024-08-12 10:42:06
+
+Breaking data model changes scores: del:9 + add:11, change matches:
++    form_field_ids = fields.Many2many(
++    quotation_template_ids = fields.Many2many(
++    form_field_ids = fields.Many2many(
+-    _inherit = 'res.company'
+-    sale_header = fields.Binary(string="Header pages")
+-    sale_header_name = fields.Char()
+-    sale_footer = fields.Binary(string="Footer pages")
+-    sale_footer_name = fields.Char()
++    quotation_document_ids = fields.Many2many(
++    available_product_document_ids = fields.Many2many(
++    product_document_ids = fields.Many2many(
+-    sale_header = fields.Binary(
+-    sale_header_name = fields.Char(default=lambda self: self.env.company.sale_header_name)
+-    sale_footer = fields.Binary(
+-    sale_footer_name = fields.Char(default=lambda self: self.env.company.sale_footer_name)
++    quotation_document_ids = fields.Many2many(
++    sale_header_ids = fields.Many2many(
++    sale_footer_ids = fields.Many2many(
++    product_document_ids = fields.Many2many(
++    quotation_document_ids = fields.Many2many(
+
+Total Changes: 989
+
+[IMP] sale_pdf_quote_builder: use custom zones
+
+Add even more flexibility to the quote builder by:
+* allowing salesmen to customize each quote with specific textual
+information.
+* choose for each quote if the quote builder is needed
+* choose between headers, footers, product documents...
+
+task-3950502
+
+closes odoo/odoo#169741
+
+Related: odoo/enterprise#66373
+Related: odoo/upgrade#6230
+Signed-off-by: Victor Feyens (vfe) <vfe@odoo.com>
+
+================================= pseudo patch: =================================
+
+--- a/addons/sale_pdf_quote_builder/models/__init__.py
++++ b/addons/sale_pdf_quote_builder/models/__init__.py
+@@ -2,5 +2,8 @@
+ 
+ from . import ir_actions_report
+ from . import product_document
+-from . import res_company
++from . import quotation_document
++from . import sale_order
++from . import sale_order_line
+ from . import sale_order_template
++from . import sale_pdf_form_field
+
+--- a/addons/sale_pdf_quote_builder/models/ir_actions_report.py
++++ b/addons/sale_pdf_quote_builder/models/ir_actions_report.py
+@@ -10,72 +10,58 @@ from PyPDF2.generic import NameObject, createStringObject
+ from odoo import _, api, models
+ from odoo.tools import format_amount, format_date, format_datetime, pdf
+ 
+-from odoo.addons.sale_pdf_quote_builder.const import DEFAULT_FORM_FIELD_PATH_MAPPING
+-
+ 
+ class IrActionsReport(models.Model):
+     _inherit = 'ir.actions.report'
+ 
+     def _render_qweb_pdf_prepare_streams(self, report_ref, data, res_ids=None):
+-        """ Override to add and fill header, footer and product documents to the sale quotation."""
++        """Override to add and fill headers, footers and product documents to the sale quotation."""
+         result = super()._render_qweb_pdf_prepare_streams(report_ref, data, res_ids=res_ids)
+         if self._get_report(report_ref).report_name != 'sale.report_saleorder':
+             return result
+ 
+         orders = self.env['sale.order'].browse(res_ids)
+ 
+-        IrConfigParameter = self.env['ir.config_parameter'].sudo()
+-        param_field_map = json.loads(IrConfigParameter.get_param(
+-            'sale_pdf_quote_builder.form_field_path_mapping', DEFAULT_FORM_FIELD_PATH_MAPPING
+-        ))
+-
+         for order in orders:
+             initial_stream = result[order.id]['stream']
+             if initial_stream:
+-                order_template = order.sale_order_template_id
+-                header_record = order_template if order_template.sale_header else order.company_id
+-                footer_record = order_template if order_template.sale_footer else order.company_id
+-                has_header = bool(header_record.sale_header)
+-                has_footer = bool(footer_record.sale_footer)
+-                included_product_docs = self.env['product.document']
+-                doc_line_id_mapping = {}
+-                for line in order.order_line:
+-                    product_product_docs = line.product_id.product_document_ids
+-                    product_template_docs = line.product_template_id.product_document_ids
+-                    doc_to_include = (
+-                        product_product_docs.filtered(lambda d: d.attached_on_sale == 'inside')
+-                        or product_template_docs.filtered(lambda d: d.attached_on_sale == 'inside')
+-                    )
+-                    included_product_docs = included_product_docs | doc_to_include
+-                    doc_line_id_mapping.update({doc.id: line.id for doc in doc_to_include})
++                quotation_documents = order.quotation_document_ids
++                headers = quotation_documents.filtered(lambda doc: doc.document_type == 'header')
++                footers = quotation_documents - headers
++                has_product_document = any(line.product_document_ids for line in order.order_line)
+ 
+-                if (not has_header and not included_product_docs and not has_footer):
++                if not headers and not has_product_document and not footers:
+                     continue
+ 
+-                all_form_fields = set()
++                form_fields_values_mapping = {}
+                 writer = PdfFileWriter()
+ 
+-                if has_header:
+-                    decoded_header = base64.b64decode(header_record.sale_header)
+-                    self._add_pages_to_writer(writer, decoded_header, all_form_fields)
+-                if included_product_docs:
+-                    for doc in included_product_docs:
+-                        decoded_doc = base64.b64decode(doc.datas)
+-                        sol_id = doc_line_id_mapping[doc.id]
+-                        self._add_pages_to_writer(
+-                            writer, decoded_doc, all_form_fields, sol_id=sol_id
++                self_with_order_context = self.with_context(
++                    use_babel=True, lang=order._get_lang() or self.env.user.lang
++                )
++
++                if headers:
++                    for header in headers:
++                        prefix = f'quotation_document_id_{header.id}__'
++                        self_with_order_context._update_mapping_and_add_pages_to_writer(
++                            writer, header, form_fields_values_mapping, prefix, order
+                         )
++                if has_product_document:
++                    for line in order.order_line:
++                        for doc in line.product_document_ids:
++                            # Use both the id of the line and the doc as variants could use the same
++                            # document.
++                            prefix = f'sol_id_{line.id}_product_document_id_{doc.id}__'
++                            self_with_order_context._update_mapping_and_add_pages_to_writer(
++                                writer, doc, form_fields_values_mapping, prefix, order, line
++                            )
+                 self._add_pages_to_writer(writer, initial_stream.getvalue())
+-                if has_footer:
+-                    decoded_footer = base64.b64decode(footer_record.sale_footer)
+-                    self._add_pages_to_writer(writer, decoded_footer, all_form_fields)
+-
+-                form_fields_values_mapping = self.with_context(
+-                    use_babel=True,
+-                    lang=order._get_lang() or self.env.user.lang,
+-                )._get_form_fields_values_mapping(
+-                    order, all_form_fields, param_field_map
+-                )
++                if footers:
++                    for footer in footers:
++                        prefix = f'quotation_document_id_{footer.id}__'
++                        self_with_order_context._update_mapping_and_add_pages_to_writer(
++                            writer, footer, form_fields_values_mapping, prefix, order
++                        )
+                 pdf.fill_form_fields_pdf(writer, form_fields=form_fields_values_mapping)
+                 with io.BytesIO() as _buffer:
+                     writer.write(_buffer)
+@@ -85,88 +71,76 @@ class IrActionsReport(models.Model):
+         return result
+ 
+     @api.model
+-    def _add_pages_to_writer(self, writer, document, all_form_fields=None, sol_id=None):
+-        """Add a PDF doc to the writer and fill the form fields present in the pages if needed.
++    def _update_mapping_and_add_pages_to_writer(
++        self, writer, document, form_fields_values_mapping, prefix, order, order_line=None
++    ):
++        """ Update the mapping with the field-value of the document, and add the doc to the writer.
++
++        Note: document.ensure_one(), order.ensure_one(), order_line and order_line.ensure_one()
+ 
+         :param PdfFileWriter writer: the writer to which pages needs to be added
+-        :param bytes document: the document to add in the final pdf
+-        :param set all_form_fields: the set of form fields present in the already added pages. It'll
+-                                    be updated with the new form fields if any when passed. Optional
+-        :param int sol_id: the sale order line id, to ensure the product document are filled with
+-                           the correct line information. Only for product documents.
+-        :return: None
++        :param recordset document: the document that needs to be added to the writer and get its
++                                   form fields mapped. Either a quotation.document or a
++                                   product.document.
++        :param dict form_fields_values_mapping: the existing prefixed form field names - values that
++                                                will be updated to add those of the current document
++        :param str prefix: the prefix needed to update existing form field name, to be able to add
++                           the correct values in fields with the same name but on different
++                           documents, either customizable fields or dynamic fields of different sale
++                           order lines.
++        :param recordset order: the sale order from where to take the values
++        :param recordset order_line: the sale order line from where to take the values (optional)
++        return: None
+         """
+-        prefix = f'sol_id_{sol_id}__' if sol_id else ''
+-        reader = PdfFileReader(io.BytesIO(document), strict=False)
+-
+-        field_names = set()
+-        if all_form_fields is not None:
+-            field_names = reader.getFields()
+-            if field_names:
+-                all_form_fields.update([prefix + field_name for field_name in field_names])
++        document.ensure_one()
++        order.ensure_one()
++        order_line and order_line.ensure_one()
++
++        for form_field in document.form_field_ids:
++            if form_field.path:  # Dynamic field
++                field_value = self._get_value_from_path(form_field, order, order_line)
++            else:  # Customizable field
++                field_value = self._get_custom_value_from_order(
++                    document, form_field.name, order, order_line
++                )
++            form_fields_values_mapping[prefix + form_field.name] = field_value
+ 
+-        for page_id in range(reader.getNumPages()):
+-            page = reader.getPage(page_id)
+-            if all_form_fields and field_names and page.get('/Annots'):
+-                # Prefix all form fields in the product document with the sale order line id.
+-                # This is necessary to know the line from which the value needs to be taken when
+-                # filling the forms.
+-                for j in range(len(page['/Annots'])):
+-                    reader_annot = page['/Annots'][j].getObject()
+-                    if reader_annot.get('/T') in field_names:
+-                        form_key = reader_annot.get('/T')
+-                        new_key = prefix + form_key
+-                        reader_annot.update({NameObject("/T"): createStringObject(new_key)})
+-            writer.addPage(page)
++        # Avoid useless update of the pdf when no form field and just add the pdf
++        prefix = prefix if document.form_field_ids else None
++        decoded_document = base64.b64decode(document.datas)
++        self._add_pages_to_writer(writer, decoded_document, prefix)
+ 
+     @api.model
+-    def _get_form_fields_values_mapping(self, order, all_form_fields, param_field_map):
+-        """Map specific pdf fields name to Odoo fields data values for a sale order.
+-
+-        Note: order.ensure_one()
+-
+-        :param recordset order: sale.order record from which to take the values
+-        :param set(str) all_form_fields: all the form field names present in the PDFs
+-        :param dict param_field_map: the map stored in the config parameter to assign the expected
+-                                     paths to the form fields. A form field not in that map will be
+-                                     ignored.
+-        :return: mapping of fields name to Odoo fields data
+-        :rtype: dict
++    def _get_value_from_path(self, form_field, order, order_line=None):
++        """ Get the string value by following the path indicated in the record form_field.
++
++        :param recordset form_field: sale.pdf.form.field that has a valid path.
++        :param recordset order: sale.order from where the values and timezone need to be taken
++        :param recordset order_line: sale.order.line from where the values need to be taken
++                                     (optional, only for product.document)
++        :return: value that need to be shown in the final pdf. Multiple values are joined by ', '
++        :rtype: str
+         """
+-        order.ensure_one()
+-        tz = order.partner_id.tz or self.env.user.tz or 'UTC'
+-        return {
+-            field: self._get_formatted_field(field, order, tz, param_field_map)
+-            for field in all_form_fields
+-        }
++        tz = order.partner_id.tz or order.env.user.tz or 'UTC'
++        base_record = order_line or order
++        path = form_field.path
+ 
+-    @api.model
+-    def _get_formatted_field(self, form_field_name, order, tz, param_field_map):
+-        """Format a field value from the extracted PDF string.
+-
+-        Note: order.ensure_one()
+-
+-        :param string form_field_name: field path
+-        :param recordset order: sale.order record from which to take the value, following the path
+-        :param dict translated_env: self.env, with the correct translation context to format amount,
+-                                    date and datetime
+-        :param str tz: the timezone used for rendering datetime
+-        :param dict param_field_map: the map stored in the config parameter to assign the expected
+-                                     paths to the form fields. A form field not in that map will be
+-                                     ignored.
+-        :return: formatted field value
+-        :rtype: string
+-        """
+-        def _get_formatted_value(self, field_name):
++        # If path = 'order_id.order_line.product_id.name'
++        path = path.split('.')  # ['order_id', 'order_line', 'product_id', 'name']
++        # Sudo to be able to follow the path set by the admin
++        records = base_record.sudo().mapped('.'.join(path[:-1]))  # product.product(id1, id2, ...)
++        field_name = path[-1]  # 'name'
++
++        def _get_formatted_value(self):
+             # self must be named so to be considered in the translation logic
+             field_ = records._fields[field_name]
+             field_type_ = field_.type
+-            for record in records:
+-                value_ = record[field_name]
++            for record_ in records:
++                value_ = record_[field_name]
+                 if field_type_ == 'boolean':
+                     formatted_value_ = _("Yes") if value_ else _("No")
+                 elif field_type_ == 'monetary':
+-                    currency_id_ = record[field_.get_currency_field(record)]
++                    currency_id_ = record_[field_.get_currency_field(record_)]
+                     formatted_value_ = format_amount(
+                         self.env, value_, currency_id_ or order.currency_id
+                     )
+@@ -185,26 +159,58 @@ class IrActionsReport(models.Model):
+ 
+                 yield formatted_value_
+ 
+-        order.ensure_one()
+-        is_sol = form_field_name.startswith('sol_id_')
++        return ', '.join(_get_formatted_value(self))
+ 
+-        if not is_sol:  # Header or footer
+-            record = order
+-            path = param_field_map.get('header_footer', {}).get(form_field_name)
+-        else:  # Product document
+-            prefix = form_field_name.split('__')[0]
+-            line_id = int(prefix[7:])
+-            record = order.order_line.browse(line_id)
+-            form_field_name = form_field_name.removeprefix(prefix + '__')
+-            path = param_field_map.get('product_document', {}).get(form_field_name)
++    @api.model
++    def _get_custom_value_from_order(self, document, form_field_name, order, order_line):
++        """ Get the custom value of a form field directly from the order.
++
++        :param recordset document: the document that needs to be added to the writer and get its
++                                   form fields mapped. Either a quotation.document or a
++                                   product.document.
++        :param str form_field_name: the name of the form field as present in the PDF.
++        :param recordset order: the sale order from where to take the existing mapping.
++        :param recordset order_line: the sale order line linked to the document (optional)
++        :return: value that need to be shown in the final pdf.
++        :rtype: str
++        """
++        existing_mapping = json.loads(order.customizable_pdf_form_fields)
++        if order_line:
++            base_values = existing_mapping.get('line', {}).get(str(order_line.id), {})
++        elif document.document_type == 'header':
++            base_values = existing_mapping.get('header', {})
++        else:
++            base_values = existing_mapping.get('footer', {})
++        custom_form_fields = base_values.get(str(document.id), {}).get('custom_form_fields')
++        return custom_form_fields.get(form_field_name, "")
+ 
+-        if not path:
+-            return ''
++    @api.model
++    def _add_pages_to_writer(self, writer, document, prefix=None):
++        """Add a PDF doc to the writer and fill the form fields present in the pages if needed.
+ 
+-        # If path = 'order_id.order_line.product_id.name'
+-        path = path.split('.')  # ['order_id', 'order_line', 'product_id', 'name']
+-        # sudo to be able to follow the path set by the admin
+-        records = record.sudo().mapped('.'.join(path[:-1]))  # product.product(id1, id2, ...)
+-        field_name = path[-1]  # 'name'
++        :param PdfFileWriter writer: the writer to which pages needs to be added
++        :param bytes document: the document to add in the final pdf
++        :param str prefix: the prefix needed to update existing form field name, if any, to be able
++                           to add the correct values in fields with the same name but on different
++                           documents, either customizable fields or dynamic fields of different sale
++                           order lines. (optional)
++        :return: None
++        """
++        reader = PdfFileReader(io.BytesIO(document), strict=False)
+ 
+-        return ', '.join(_get_formatted_value(self, field_name))
++        field_names = set()
++        if prefix:
++            field_names = reader.getFields()
++
++        for page_id in range(reader.getNumPages()):
++            page = reader.getPage(page_id)
++            if prefix and page.get('/Annots'):
++                # Prefix all form fields in the document with the document identifier.
++                # This is necessary to know which value needs to be taken when filling the forms.
++                for j in range(len(page['/Annots'])):
++                    reader_annot = page['/Annots'][j].getObject()
++                    if reader_annot.get('/T') in field_names:
++                        form_key = reader_annot.get('/T')
++                        new_key = prefix + form_key
++                        reader_annot.update({NameObject("/T"): createStringObject(new_key)})
++            writer.addPage(page)
+
+--- a/addons/sale_pdf_quote_builder/models/product_document.py
++++ b/addons/sale_pdf_quote_builder/models/product_document.py
+@@ -2,7 +2,7 @@
+ 
+ import base64
+ 
+-from odoo import _, api, fields, models
++from odoo import Command, _, api, fields, models
+ from odoo.exceptions import ValidationError
+ 
+ from odoo.addons.sale_pdf_quote_builder import utils
+@@ -24,6 +24,13 @@ class ProductDocument(models.Model):
+              " the header pages and the quote table. ",
+         ondelete={'inside': 'set default'},
+     )
++    form_field_ids = fields.Many2many(
++        string="Form Fields Included",
++        comodel_name='sale.pdf.form.field',
++        domain=[('document_type', '=', 'product_document')],
++        compute='_compute_form_field_ids',
++        store=True,
++    )
+ 
+     # === CONSTRAINT METHODS ===#
+ 
+@@ -38,14 +45,48 @@ class ProductDocument(models.Model):
+                 raise ValidationError(_("Only PDF documents can be attached inside a quote."))
+             utils._ensure_document_not_encrypted(base64.b64decode(doc.datas))
+ 
++    # === COMPUTE METHODS === #
++
++    @api.depends('datas', 'attached_on_sale')
++    def _compute_form_field_ids(self):
++        # Empty the linked form fields as we want all and only those from the current datas
++        self.form_field_ids = [Command.clear()]
++        document_to_parse = self.filtered(
++            lambda doc: doc.attached_on_sale == 'inside' and doc.datas
++        )
++        if document_to_parse:
++            doc_type = 'product_document'
++            self.env['sale.pdf.form.field']._create_or_update_form_fields_on_pdf_records(
++                document_to_parse, doc_type
++            )
++
+     # === ACTION METHODS ===#
+ 
+-    def action_open_dynamic_fields_wizard(self):
++    def action_open_pdf_form_fields(self):
+         self.ensure_one()
+         return {
+-            'name': _("Configure Dynamic Fields"),
++            'name': _('Form Fields'),
+             'type': 'ir.actions.act_window',
+-            'view_mode': 'form',
+-            'res_model': 'sale.pdf.quote.builder.dynamic.fields.wizard',
+-            'target': 'new',
++            'res_model': 'sale.pdf.form.field',
++            'view_mode': 'tree',
++            'context': {
++                'default_document_type': 'product_document',
++                'default_product_document_ids': self.id,
++                'default_quotation_document_ids': False,
++                'search_default_context_document': True,
++            },
++            'target': 'current',
+         }
++
++    def _update_custom_content_map(self, sol, custom_content_map, existing_mapping):
++        self.ensure_one()
++        doc_name = self.name.rstrip('.pdf')
++        doc_id = str(self.id)
++        sol_id = str(sol.id)
++        existing_document_content = existing_mapping.get(sol_id, {}).get(doc_id, {})
++        if not custom_content_map.get(sol_id):
++            custom_content_map[sol_id] = {'product_name': sol.product_id.name}
++        custom_content_map[sol_id][doc_id] = {'document_name': doc_name, 'custom_form_fields': {}}
++        for form_field in self.form_field_ids.filtered(lambda ff: not ff.path):
++            content = existing_document_content.get('custom_form_fields', {}).get(form_field, "")
++            custom_content_map[sol_id][doc_id]['custom_form_fields'][form_field.name] = content
+
+--- a/None
++++ b/addons/sale_pdf_quote_builder/models/quotation_document.py
+@@ -0,0 +1,99 @@
++# Part of Odoo. See LICENSE file for full copyright and licensing details.
++
++import base64
++
++from odoo import Command, _, api, fields, models
++from odoo.exceptions import ValidationError
++
++from odoo.addons.sale_pdf_quote_builder import utils
++
++
++class QuotationDocument(models.Model):
++    _name = 'quotation.document'
++    _description = "Quotation's Headers & Footers"
++    _inherits = {
++        'ir.attachment': 'ir_attachment_id',
++    }
++    _order = 'document_type desc, sequence, name'
++
++    ir_attachment_id = fields.Many2one(
++        string="Related attachment",
++        comodel_name='ir.attachment',
++        ondelete='cascade',
++        required=True,
++    )
++    document_type = fields.Selection(
++        string="Document Type",
++        selection=[('header', "Header"), ('footer', "Footer")],
++        required=True,
++        default='header',
++    )
++    active = fields.Boolean(
++        help="If unchecked, it will allow you to hide the header or footer without removing it.",
++        default=True,
++    )
++    sequence = fields.Integer(default=10)
++    quotation_template_ids = fields.Many2many(
++        string="Quotation Templates",
++        comodel_name='sale.order.template',
++        relation='header_footer_quotation_template_rel',
++    )
++    form_field_ids = fields.Many2many(
++        string="Form Fields Included",
++        comodel_name='sale.pdf.form.field',
++        domain=[('document_type', '=', 'quotation_document')],
++        compute='_compute_form_field_ids',
++        store=True,
++    )
++
++    # === CONSTRAINT METHODS ===#
++
++    @api.constrains('datas')
++    def _check_pdf_validity(self):
++        for doc in self:
++            if doc.datas and not doc.mimetype.endswith('pdf'):
++                raise ValidationError(_("Only PDF documents can be used as header or footer."))
++            utils._ensure_document_not_encrypted(base64.b64decode(doc.datas))
++
++    # === COMPUTE METHODS === #
++
++    @api.depends('datas')
++    def _compute_form_field_ids(self):
++        # Empty the linked form fields as we want all and only those from the current datas
++        self.form_field_ids = [Command.clear()]
++        document_to_parse = self.filtered(lambda doc: doc.datas)
++        if document_to_parse:
++            doc_type = 'quotation_document'
++            self.env['sale.pdf.form.field']._create_or_update_form_fields_on_pdf_records(
++                document_to_parse, doc_type
++            )
++
++    # === ACTION METHODS ===#
++
++    def action_open_pdf_form_fields(self):
++        self.ensure_one()
++        return {
++            'name': _('Form Fields'),
++            'type': 'ir.actions.act_window',
++            'res_model': 'sale.pdf.form.field',
++            'view_mode': 'tree',
++            'context': {
++                'default_document_type': 'quotation_document',
++                'default_product_document_ids': False,
++                'default_quotation_document_ids': self.id,
++                'search_default_context_document': True,
++            },
++            'target': 'current',
++        }
++
++    def _update_custom_content_map(self, custom_content_map, existing_mapping):
++        self.ensure_one()
++        doc_name = self.name.rstrip('.pdf')
++        doc_id = str(self.id)
++        existing_document_content = existing_mapping.get(doc_id, {})
++        custom_content_map[doc_id] = {'document_name': doc_name, 'custom_form_fields': {}}
++        for form_field in self.form_field_ids.filtered(lambda ff: not ff.path):
++            content = existing_document_content.get(
++                'custom_form_fields', {}
++            ).get(form_field.name, "")
++            custom_content_map[doc_id]['custom_form_fields'][form_field.name] = content
+
+--- a/addons/sale_pdf_quote_builder/models/res_company.py
++++ b/None
+@@ -1,30 +0,0 @@
+-# Part of Odoo. See LICENSE file for full copyright and licensing details.
+-
+-import base64
+-
+-from odoo import api, fields, models
+-
+-from odoo.addons.sale_pdf_quote_builder import utils
+-
+-
+-class ResCompany(models.Model):
+-    _inherit = 'res.company'
+-
+-    sale_header = fields.Binary(string="Header pages")
+-    sale_header_name = fields.Char()
+-    sale_footer = fields.Binary(string="Footer pages")
+-    sale_footer_name = fields.Char()
+-
+-    # === CONSTRAINT METHODS ===#
+-
+-    @api.constrains('sale_header')
+-    def _ensure_header_not_encrypted(self):
+-        for company in self:
+-            if company.sale_header:
+-                utils._ensure_document_not_encrypted(base64.b64decode(company.sale_header))
+-
+-    @api.constrains('sale_footer')
+-    def _ensure_footer_not_encrypted(self):
+-        for company in self:
+-            if company.sale_footer:
+-                utils._ensure_document_not_encrypted(base64.b64decode(company.sale_footer))
+
+--- a/None
++++ b/addons/sale_pdf_quote_builder/models/sale_order.py
+@@ -0,0 +1,186 @@
++# Part of Odoo. See LICENSE file for full copyright and licensing details.
++
++import json
++
++from odoo import _, api, fields, models
++
++DEFAULT_FORM_FIELDS_MAPPING = {'header': {}, 'line': {}, 'footer': {}}
++
++
++class SaleOrder(models.Model):
++    _inherit = 'sale.order'
++
++    is_pdf_quote_builder_active = fields.Boolean(string="Use PDF Quote Builder")
++    quotation_document_ids = fields.Many2many(
++        string="Headers/Footers",
++        comodel_name='quotation.document',
++        compute='_compute_quotation_document_ids',
++        store=True,
++        readonly=False,
++    )
++    customizable_pdf_form_fields = fields.Json(
++        string="Customizable PDF Form Fields",
++        compute='_compute_customizable_pdf_form_fields',
++        store=True,
++        readonly=False,
++    )
++
++    # === COMPUTE METHODS === #
++
++    @api.depends('is_pdf_quote_builder_active', 'sale_order_template_id')
++    def _compute_quotation_document_ids(self):
++        for order in self:
++            if not order.is_pdf_quote_builder_active:
++                order.quotation_document_ids = self.env['quotation.document']
++            elif order.sale_order_template_id:
++                template = order.sale_order_template_id
++                order.quotation_document_ids = template.sale_header_ids + template.sale_footer_ids
++            else:
++                quotation_documents = self.env['quotation.document'].search([], order='sequence')
++                headers = quotation_documents.filtered(lambda doc: doc.document_type == 'header')
++                footers = quotation_documents - headers
++                order.quotation_document_ids = self.env['quotation.document']
++                if headers:
++                    order.quotation_document_ids += headers[0]
++                if footers:
++                    order.quotation_document_ids += footers[0]
++
++    @api.depends('quotation_document_ids', 'order_line.product_document_ids', 'is_pdf_quote_builder_active')
++    def _compute_customizable_pdf_form_fields(self):
++        """ Compute the json of the customizable_pdf_form_fields field.
++
++        The dependencies on the selected documents ensure that a newly added files could be fill
++        immediately.
++
++        The resulting json would look like this:
++        {
++            "header": {
++                document_1.id: {
++                    "document_name": document1.name,
++                    "custom_form_fields": {
++                        "form_field_1": "custom value",
++                        "form_field_2": "Ducks are funny",
++                        ...
++                    }
++                },
++                document_2.id: {...},
++                ...
++            },
++            "line": {
++                sale_order_line_1.id: {document_3.id: {...}, ... }, ...
++            },
++            "footer": {
++                document_4.id: {...}, ...
++            },
++        }
++        """
++        for order in self:
++            if not order.is_pdf_quote_builder_active:
++                continue
++            if not isinstance(order.id, int):
++                # Avoid computing with NewId when adding a line
++                order.customizable_pdf_form_fields = json.dumps(DEFAULT_FORM_FIELDS_MAPPING)
++                continue
++            custom_content_mapping = {'header': {}, 'line': {}, 'footer': {}}
++            existing_mapping = (
++                order.customizable_pdf_form_fields
++                and json.loads(order.customizable_pdf_form_fields)
++                or DEFAULT_FORM_FIELDS_MAPPING
++            )
++
++            existing_mapping = existing_mapping or custom_content_mapping
++
++            quotation_documents = order.quotation_document_ids
++            headers = quotation_documents.filtered(lambda doc: doc.document_type == 'header')
++            footers = quotation_documents - headers
++            for header in headers:
++                header._update_custom_content_map(
++                    custom_content_mapping['header'], existing_mapping['header']
++                )
++            for line in order.order_line:
++                for product_document in line.product_document_ids:
++                    product_document._update_custom_content_map(
++                        line, custom_content_mapping['line'], existing_mapping['line']
++                    )
++            for footer in footers:
++                footer._update_custom_content_map(
++                    custom_content_mapping['footer'], existing_mapping['footer']
++                )
++
++            order.customizable_pdf_form_fields = json.dumps(custom_content_mapping)
++
++    # === ACTION METHODS === #
++
++    def action_toggle_is_pdf_quote_builder_active(self):
++        """ Toggle the field `is_pdf_quote_builder_active`. """
++        self.ensure_one()
++        self.is_pdf_quote_builder_active = not self.is_pdf_quote_builder_active
++
++    def get_update_included_pdf_params(self):
++        self.ensure_one()
++        quotation_documents = self.env['quotation.document'].search([], order='sequence')
++        headers_available = quotation_documents.filtered(lambda doc: doc.document_type == 'header')
++        footers_available = quotation_documents.filtered(lambda doc: doc.document_type == 'footer')
++        selected_documents = self.quotation_document_ids
++        selected_headers = selected_documents.filtered(lambda doc: doc.document_type == 'header')
++        selected_footers = selected_documents - selected_headers
++        lines_params = []
++        for line in self.order_line:
++            if line.available_product_document_ids:
++                lines_params.append({'name': line.name, 'id': line.id, 'files': [{
++                    'name': doc.name.rstrip('.pdf'),
++                    'id': doc.id,
++                    'is_selected': doc in line.product_document_ids,
++                } for doc in line.available_product_document_ids]})
++        dialog_params = {
++            'headers': {'name': _("Header"), 'files': [{
++                'name': header.name, 'id': header.id, 'is_selected': header in selected_headers
++            } for header in headers_available]},
++            'lines': lines_params,
++            'footers': {'name': _("Footer"), 'files': [{
++                'name': footer.name, 'id': footer.id, 'is_selected': footer in selected_footers
++            } for footer in footers_available]},
++        }
++        return dialog_params
++
++    # === BUSINESS METHODS === #
++
++    def save_included_pdf(self, selected_pdf):
++        """ Configure the PDF that should be included in the PDF quote builder for a given quote
++
++        Note: self.ensure_one()
++
++        :param dic selected_pdf: Dictionary of all the sections linked to their header_footer or
++                                 product_document ids, in the format: {
++                                    'header': [doc_id],
++                                    'lines': [{line_id: [doc_id]}],
++                                    'footer': [doc_id]
++                                }
++        :return: None
++        """
++        self.ensure_one()
++        quotation_doc = self.env['quotation.document']
++        selected_headers = quotation_doc.browse(selected_pdf['header'])
++        selected_footers = quotation_doc.browse(selected_pdf['footer'])
++        self.quotation_document_ids = selected_headers.ids + selected_footers.ids
++        for line in self.order_line:
++            selected_lines = self.env['product.document'].browse(
++                selected_pdf['lines'].get(str(line.id))
++            )
++            line.product_document_ids = selected_lines.ids
++
++    def save_new_custom_content(self, document_type, form_field, content):
++        """ Modify the content link to a form field in the custom content mapping of an order.
++
++        Note: self.ensure_one()
++
++        :param str document_type: The document type where the for field is. Either 'header_footer'
++                                  or 'product_document'.
++        :param str form_field: The form field in the custom content mapping.
++        :param str content: The content of the form field in the custom content mapping.
++        :return: None
++        """
++        self.ensure_one()
++        mapping = json.loads(self.customizable_pdf_form_fields)
++        mapping[document_type][form_field] = content
++        self.customizable_pdf_form_fields = json.dumps(mapping)
+
+--- a/None
++++ b/addons/sale_pdf_quote_builder/models/sale_order_line.py
+@@ -0,0 +1,58 @@
++# Part of Odoo. See LICENSE file for full copyright and licensing details.
++
++from odoo import api, fields, models
++
++
++class SaleOrderLine(models.Model):
++    _inherit = 'sale.order.line'
++
++    available_product_document_ids = fields.Many2many(
++        string="Available Product Documents",
++        comodel_name='product.document',
++        relation='available_sale_order_line_product_document_rel',
++        compute='_compute_available_product_document_ids',
++    )
++    product_document_ids = fields.Many2many(
++        string="Product Documents",
++        help="The product documents for this order line that will be merged in the PDF quote.",
++        comodel_name='product.document',
++        relation='sale_order_line_product_document_rel',
++        domain="[('id', 'in', available_product_document_ids)]",
++        compute='_compute_product_document_ids',
++        store=True,
++        readonly=False,
++    )
++
++    # === COMPUTE METHODS === #
++
++    def _compute_available_product_document_ids(self):
++        for line in self:
++            line.available_product_document_ids = self.env['product.document'].search([
++                '|',
++                    '&',
++                        ('res_model', '=', 'product.product'),
++                        ('res_id', '=', line.product_id.id),
++                    '&',
++                        ('res_model', '=', 'product.template'),
++                        ('res_id', '=', line.product_template_id.id),
++                ('attached_on_sale', '=', 'inside')
++            ], order='res_model, sequence').ids
++
++    @api.depends('order_id.is_pdf_quote_builder_active', 'product_id')
++    def _compute_product_document_ids(self):
++        """ Compute the first eligible product document for this SOL when the feature is active. """
++        for line in self:
++            if not line.order_id.is_pdf_quote_builder_active or not line.product_id:
++                line.product_document_ids = self.env['product.document']
++            else:
++                default_docs = line.product_id.product_document_ids.filtered(
++                    lambda d: d.attached_on_sale == 'inside'
++                )
++                if not default_docs:
++                    default_docs = line.product_template_id.product_document_ids.filtered(
++                        lambda d: d.attached_on_sale == 'inside'
++                    )
++                if default_docs:
++                    line.product_document_ids = [default_docs[0].id]
++                else:
++                    line.product_document_ids = self.env['product.document']
+
+--- a/addons/sale_pdf_quote_builder/models/sale_order_template.py
++++ b/addons/sale_pdf_quote_builder/models/sale_order_template.py
+@@ -1,44 +1,43 @@
+ # Part of Odoo. See LICENSE file for full copyright and licensing details.
+ 
+-import base64
+-
+-from odoo import _, api, fields, models
+-
+-from odoo.addons.sale_pdf_quote_builder import utils
++from odoo import fields, models
+ 
+ 
+ class SaleOrderTemplate(models.Model):
+     _inherit = 'sale.order.template'
+ 
+-    sale_header = fields.Binary(
+-        string="Header pages", default=lambda self: self.env.company.sale_header)
+-    sale_header_name = fields.Char(default=lambda self: self.env.company.sale_header_name)
+-    sale_footer = fields.Binary(
+-        string="Footer pages", default=lambda self: self.env.company.sale_footer)
+-    sale_footer_name = fields.Char(default=lambda self: self.env.company.sale_footer_name)
+-
+-    # === CONSTRAINT METHODS ===#
+-
+-    @api.constrains('sale_header')
+-    def _ensure_header_encryption(self):
++    quotation_document_ids = fields.Many2many(
++        string="Headers and footers",
++        comodel_name='quotation.document',
++        relation='header_footer_quotation_template_rel',
++    )
++    sale_header_ids = fields.Many2many(
++        string="Headers",
++        comodel_name='quotation.document',
++        domain=[('document_type', '=', 'header')],
++        compute='_compute_sale_header_and_sale_footer_ids',
++        inverse='_inverse_sale_header_and_sale_footer_ids',
++    )
++    sale_footer_ids = fields.Many2many(
++        string="Footers",
++        comodel_name='quotation.document',
++        domain=[('document_type', '=', 'footer')],
++        compute='_compute_sale_header_and_sale_footer_ids',
++        inverse='_inverse_sale_header_and_sale_footer_ids',
++    )
++
++    # === COMPUTE METHODS === #
++
++    def _compute_sale_header_and_sale_footer_ids(self):
+         for template in self:
+-            if template.sale_header:
+-                utils._ensure_document_not_encrypted(base64.b64decode(template.sale_header))
+-
+-    @api.constrains('sale_footer')
+-    def _ensure_footer_encryption(self):
++            template.sale_header_ids = template.quotation_document_ids.filtered(
++                lambda doc: doc.document_type == 'header'
++            ).ids
++            template.sale_footer_ids = template.quotation_document_ids.filtered(
++                lambda doc: doc.document_type == 'footer'
++            ).ids
++
++    def _inverse_sale_header_and_sale_footer_ids(self):
+         for template in self:
+-            if template.sale_footer:
+-                utils._ensure_document_not_encrypted(base64.b64decode(template.sale_footer))
+-
+-    # === ACTION METHODS ===#
+-
+-    def action_open_dynamic_fields_wizard(self):
+-        self.ensure_one()
+-        return {
+-            'name': _("Configure Dynamic Fields"),
+-            'type': 'ir.actions.act_window',
+-            'view_mode': 'form',
+-            'res_model': 'sale.pdf.quote.builder.dynamic.fields.wizard',
+-            'target': 'new',
+-        }
++            quotation_documents = template.sale_header_ids + template.sale_footer_ids
++            template.quotation_document_ids = quotation_documents.ids
+
+--- a/None
++++ b/addons/sale_pdf_quote_builder/models/sale_pdf_form_field.py
+@@ -0,0 +1,219 @@
++# Part of Odoo. See LICENSE file for full copyright and licensing details.
++
++import re
++
++from odoo import Command, _, api, fields, models
++from odoo.exceptions import ValidationError
++
++from odoo.addons.sale_pdf_quote_builder import utils
++
++
++class SalePdfFormField(models.Model):
++    _name = 'sale.pdf.form.field'
++    _description = "Form fields of inside quotation documents."
++    _order = 'name'
++
++    name = fields.Char(
++        string="Form Field Name",
++        help="The form field name as written in the PDF.",
++        readonly=True,
++        required=True,
++    )
++    document_type = fields.Selection(
++        string="Document Type",
++        selection=[
++            ('quotation_document', "Header/Footer"),
++            ('product_document', "Product Document"),
++        ],
++        readonly=True,
++        required=True,
++    )
++    path = fields.Char(
++        string="Path",
++        help="The path to follow to dynamically fill the form field. \n"
++             "Leave empty to be able to customized it in the quotation form."
++    )
++    product_document_ids = fields.Many2many(
++        string="Product Documents", comodel_name='product.document'
++    )
++    quotation_document_ids = fields.Many2many(
++        string="Quotation Documents", comodel_name='quotation.document'
++    )
++
++    _sql_constraints = [(
++        'unique_name_per_doc_type',
++        'UNIQUE(name, document_type)',
++        "Form field name must be unique for a given document type."
++    )]
++
++    # === CONSTRAINT METHODS ===#
++
++    @api.constrains('name')
++    def _check_form_field_name_follows_pattern(self):
++        """ Ensure the names only contains alphanumerics, hyphens and underscores.
++
++        :return: None
++        :raises: ValidationError if the names aren't alphanumerics, hyphens and underscores.
++        """
++        name_pattern = re.compile(r'^(\w|-)+$')
++        for form_field in self:
++            if not re.match(name_pattern, form_field.name):
++                raise ValidationError(_(
++                    "Invalid form field name %(field_name)s. It should only contain alphanumerics,"
++                    " hyphens or underscores.",
++                    field_name=form_field.name,
++                ))
++            if form_field.name.startswith('sol_id_'):
++                raise ValidationError(_(
++                    "Invalid form field name %(field_name)s. A form field name in a header or a"
++                    " footer can not start with \"sol_id_\".",
++                    field_name=form_field.name,
++                ))
++
++    @api.constrains('path')
++    def _check_valid_and_existing_paths(self):
++        """ Verify that the paths exist and are valid.
++
++        :return: None
++        :raises: ValidationError if at least one of the paths isn't valid.
++        """
++        name_pattern = re.compile(r'^(\w|-|\.)+$')
++        for form_field in self.filtered('path'):
++            if not re.match(name_pattern, form_field.path):
++                raise ValidationError(_(
++                    "Invalid path %(path)s. It should only contain alphanumerics, hyphens,"
++                    " underscores or points.",
++                    path=form_field.path,
++                ))
++
++            path = form_field.path.split('.')
++            is_header_footer = form_field.document_type == 'quotation_document'
++            Model = self.env['sale.order'] if is_header_footer else self.env['sale.order.line']
++            for i in range(len(path)):
++                field_name = path[i]
++                if Model == []:
++                    raise ValidationError(_(
++                        "Please use only relational fields until the last value of your path."
++                    ))
++                if field_name not in Model._fields:
++                    raise ValidationError(_(
++                        "The field %(field_name)s doesn't exist on model %(model_name)s",
++                        field_name=field_name,
++                        model_name=Model._name
++                    ))
++                if i != len(path) - 1:
++                    Model = Model.mapped(field_name)
++
++    @api.constrains('document_type', 'product_document_ids', 'quotation_document_ids')
++    def _check_document_type_and_document_linked_compatibility(self):
++        for form_field in self:
++            doc_type = form_field.document_type
++            if doc_type == 'quotation_document' and form_field.product_document_ids:
++                raise ValidationError(_(
++                    "A form field set as used in product documents can't be linked to a quotation"
++                    " document."
++                ))
++            elif doc_type == 'product_document' and form_field.quotation_document_ids:
++                raise ValidationError(_(
++                    "A form field set as used in quotation documents can't be linked to a product"
++                    " document."
++                ))
++
++    # === BUSINESS METHODS ===#
++
++    @api.model
++    def _add_basic_mapped_form_fields(self):
++        mapped_form_fields = {
++            'quotation_document': {
++                "amount_total": "amount_total",
++                "amount_untaxed": "amount_untaxed",
++                "client_order_ref": "client_order_ref",
++                "delivery_date": "commitment_date",
++                "order_date": "date_order",
++                "name": "name",
++                "partner_id__name": "partner_id.name",
++                "user_id__email": "user_id.login",
++                "user_id__name": "user_id.name",
++                "validity_date": "validity_date",
++            },
++            'product_document': {
++                "amount_total": "order_id.amount_total",
++                "amount_untaxed": "order_id.amount_untaxed",
++                "client_order_ref": "order_id.client_order_ref",
++                "delivery_date": "order_id.commitment_date",
++                "description": "name",
++                "discount": "discount",
++                "name": "order_id.name",
++                "partner_id__name": "order_partner_id.name",
++                "price_unit": "price_unit",
++                "product_sale_price": "product_id.lst_price",
++                "quantity": "product_uom_qty",
++                "tax_excl_price": "price_subtotal",
++                "tax_incl_price": "price_total",
++                "taxes": "tax_id",
++                "uom": "product_uom.name",
++                "user_id__name": "salesman_id.name",
++                "validity_date": "order_id.validity_date",
++            },
++        }
++        quote_doc = list(mapped_form_fields['quotation_document'])
++        product_doc = list(mapped_form_fields['product_document'])
++        existing_mapping = self.env['sale.pdf.form.field'].search([
++            '|',
++            '&', ('document_type', '=', 'quotation_document'), ('name', 'in', quote_doc),
++            '&', ('document_type', '=', 'product_document'), ('name', 'in', product_doc)
++        ])
++        if existing_mapping:
++            form_fields_to_add = {
++                doc_type: {
++                    name: path for name, path in mapped_form_fields[doc_type].items()
++                    if not existing_mapping.filtered(
++                        lambda ff: ff.document_type == doc_type and ff.name == name
++                    )
++                } for doc_type, mapping in mapped_form_fields.items()
++            }
++        else:
++            form_fields_to_add = mapped_form_fields
++        self.env['sale.pdf.form.field'].create([
++            {'name': name, 'document_type': doc_type, 'path': path}
++            for doc_type, mapping in form_fields_to_add.items()
++            for name, path in mapping.items()
++        ])
++
++    @api.model
++    def _cron_post_upgrade_assign_missing_form_fields(self):
++        # Called post-upgrade as we can't access the files during the upgrade process
++        product_documents = self.env['product.document'].search(
++            [('attached_on_sale', '=', 'inside')]
++        )
++        quote_documents = self.env['quotation.document'].search([])
++        self._create_or_update_form_fields_on_pdf_records(product_documents, 'product_document')
++        self._create_or_update_form_fields_on_pdf_records(quote_documents, 'quotation_document')
++
++    @api.model
++    def _create_or_update_form_fields_on_pdf_records(self, records, doc_type):
++        existing_form_fields = self.env['sale.pdf.form.field'].search(
++            [('document_type', '=', doc_type)]
++        )
++        existing_form_fields_name = existing_form_fields.mapped('name')
++        return_bin_size = self.env.context.get('bin_size')
++        if return_bin_size:
++            # guarantees that bin_size is always set to False
++            records = records.with_context(bin_size=False)
++
++        for document in records:
++            if document.datas:
++                form_fields = utils._get_form_fields_from_pdf(document.datas)
++                for field in form_fields:
++                    if field not in existing_form_fields_name:
++                        document.form_field_ids = [
++                            Command.create({
++                                'name': field, 'document_type': doc_type
++                            })
++                        ]
++                        existing_form_fields_name.append(field)
++                        existing_form_fields += document.form_field_ids[-1]
++                    else:
++                        document.form_field_ids = [Command.link(existing_form_fields.filtered(
++                            lambda form_field: form_field.name == field
++                        ).id)]
