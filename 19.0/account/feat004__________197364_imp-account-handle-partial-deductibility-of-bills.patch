@@ -1,0 +1,501 @@
+PR: https://github.com/odoo/odoo/pull/197364
+
+From: a6345d6b431cd4d8607c2408a0414c8910371557
+From: Antoine Boonen
+Date: 2025-02-14 20:21:26
+
+Total Changes: 292
+
+[IMP] account: Handle Partial Deductibility of Bills
+
+Problem
+*--------
+Many self-employees have the right to recognize some expenses in their
+cost of operations (which lowers their revenue and so their income tax)
+even if those expenses are only partially used in the context for their
+profession. 
+
+A good example would be a self-employed person working at home that can
+reduce a part of their electricity bill as a professional expense. As
+their electricity bill is for their entire house and most of it comes
+for private use, they are only allowed to use a partial amount of that
+bill as a professional expense (e.g. : 20%).
+
+It is a bit annoying to handle everything by hand, as you would need to
+manually calculate the proportion of many expenses by hand to then
+encode them in Odoo, with varying income deductibility. Ultimately, the
+encoded amounts will never match the justifying piece, complicating the
+audit.
+
+Objective
+*--------
+Provide that service by allowing the user to specify which percentage
+amount of a bill should really be taken into account (base & tax), and
+which part should be put on a "private" account (aka, to be reimbursed
+by the owner).
+
+Solution
+*--------
+1 - add the basic fields to store and display the deducible percentage
+on the bills.
+2 - add a step in the sync_dynamic_lines before the _sync_tax_lines that
+adds a reverse of deduced lines with the same tax as the original so
+that _sync_tax_lines automatically computes the correct taxes with this
+new base included.
+3 - update _sync_dynamic_lines to compute the correct non deductible
+base and tax amounts.
+4 - update the tax summary computation and tax total so that, the taxed
+and untaxed amounts are not influenced by the non deductible amounts; to
+the users, they pay the same thing untaxed and tax amounts should remain
+the same.
+5 - add some tests
+
+task-4417062
+
+closes odoo/odoo#197364
+
+Signed-off-by: Laurent Smet (las) <las@odoo.com>
+
+================================= pseudo patch: =================================
+
+--- a/addons/account/models/account_journal.py
++++ b/addons/account/models/account_journal.py
+@@ -120,6 +120,15 @@ class AccountJournal(models.Model):
+              "allowing finding the right account.", string='Suspense Account',
+         domain="[('deprecated', '=', False), ('account_type', '=', 'asset_current')]",
+     )
++    non_deductible_account_id = fields.Many2one(
++        comodel_name='account.account',
++        check_company=True,
++        string='Private Part Account',
++        readonly=False,
++        store=True,
++        domain="[('deprecated', '=', False)]",
++        help="Account used to register the private part of mixed expenses.",
++    )
+     restrict_mode_hash_table = fields.Boolean(string="Secure Posted Entries with Hash",
+         help="If ticked, when an entry is posted, we retroactively hash all moves in the sequence from the entry back to the last hashed entry. The hash can also be performed on demand by the Secure Entries wizard.")
+     sequence = fields.Integer(help='Used to order Journals in the dashboard view', default=10)
+
+--- a/addons/account/models/account_move.py
++++ b/addons/account/models/account_move.py
+@@ -2,7 +2,7 @@
+ 
+ import ast
+ import calendar
+-from collections import defaultdict
++from collections import Counter, defaultdict
+ from contextlib import ExitStack, contextmanager
+ from datetime import date, timedelta
+ from dateutil.relativedelta import relativedelta
+@@ -1080,13 +1080,13 @@ class AccountMove(models.Model):
+             for line in move.line_ids:
+                 if move.is_invoice(True):
+                     # === Invoices ===
+-                    if line.display_type == 'tax' or (line.display_type == 'rounding' and line.tax_repartition_line_id):
++                    if line.display_type in ('tax', 'non_deductible_tax') or (line.display_type == 'rounding' and line.tax_repartition_line_id):
+                         # Tax amount.
+                         total_tax += line.balance
+                         total_tax_currency += line.amount_currency
+                         total += line.balance
+                         total_currency += line.amount_currency
+-                    elif line.display_type in ('product', 'rounding'):
++                    elif line.display_type in ('product', 'rounding', 'non_deductible_product', 'non_deductible_product_total'):
+                         # Untaxed amount.
+                         total_untaxed += line.balance
+                         total_untaxed_currency += line.amount_currency
+@@ -1535,6 +1535,76 @@ class AccountMove(models.Model):
+             sign=self.direction_sign,
+         )
+ 
++    def _prepare_non_deductible_base_line_for_taxes_computation(self, non_deductible_line):
++        """ Convert an account.move.line having display_type='non_deductible' into a base line for the taxes computation.
++
++        :param non_deductible_line: An account.move.line.
++        :return: A base line returned by '_prepare_base_line_for_taxes_computation'.
++        """
++        self.ensure_one()
++        sign = self.direction_sign
++        rate = self.invoice_currency_rate
++        return self.env['account.tax']._prepare_base_line_for_taxes_computation(
++            non_deductible_line,
++            price_unit=sign * non_deductible_line.amount_currency,
++            quantity=1.0,
++            sign=sign,
++            special_mode='total_excluded',
++            special_type='non_deductible',
++
++            is_refund=self.move_type in ('out_refund', 'in_refund'),
++            rate=rate,
++        )
++
++    def _prepare_non_deductible_base_lines_for_taxes_computation_from_base_lines(self, base_lines):
++        """ Anticipate the non deductible lines to be generated from the base lines passed as parameter.
++        When the record is in draft (not saved), the accounting items are not there so we can't
++        call '_prepare_non_deductible_base_line_for_taxes_computation'.
++
++        :param base_lines: The base lines generated by '_prepare_product_base_line_for_taxes_computation'.
++        :return: A list of base lines representing the non deductible lines.
++        """
++        self.ensure_one()
++        non_deductible_product_lines = base_lines.filtered(lambda line: line.display_type == 'product' and float_compare(line.deductible_amount, 100, precision_digits=2))
++        if not non_deductible_product_lines:
++            return []
++
++        sign = self.direction_sign
++        rate = self.invoice_currency_rate
++
++        non_deductible_lines_base_total_currency = 0.0
++        non_deductible_lines = []
++        for line in non_deductible_product_lines:
++            percentage = 1 - line.deductible_amount / 100
++            non_deductible_subtotal = line.currency_id.round(line.price_subtotal * percentage)
++            non_deductible_base_currency = line.company_currency_id.round(sign * non_deductible_subtotal / rate) if rate else 0.0
++            non_deductible_lines_base_total_currency += non_deductible_base_currency
++
++            non_deductible_lines += [
++                self.env['account.tax']._prepare_base_line_for_taxes_computation(
++                    None,
++                    price_unit=-non_deductible_base_currency,
++                    quantity=1.0,
++                    sign=1,
++                    special_mode='total_excluded',
++                    special_type='non_deductible',
++                    tax_ids=line.tax_ids.filtered(lambda tax: tax.amount_type != 'fixed'),
++                    currency_id=self.currency_id,
++                )
++            ]
++        non_deductible_lines += [
++            self.env['account.tax']._prepare_base_line_for_taxes_computation(
++                None,
++                price_unit=non_deductible_lines_base_total_currency,
++                quantity=1.0,
++                sign=1,
++                special_mode='total_excluded',
++                special_type=False,
++                currency_id=self.currency_id,
++            )
++        ]
++        return non_deductible_lines
++
+     def _get_rounded_base_and_tax_lines(self, round_from_tax_lines=True):
+         """ Small helper to extract the base and tax lines for the taxes computation from the current move.
+         The move could be stored or not and could have some features generating extra journal items acting as
+@@ -1563,6 +1633,8 @@ class AccountMove(models.Model):
+             cash_rounding_amls = self.line_ids \
+                 .filtered(lambda line: line.display_type == 'rounding' and not line.tax_repartition_line_id)
+             base_lines += [self._prepare_cash_rounding_base_line_for_taxes_computation(line) for line in cash_rounding_amls]
++            non_deductible_base_lines = self.line_ids.filtered(lambda line: line.display_type in ('non_deductible_product', 'non_deductible_product_total'))
++            base_lines += [self._prepare_non_deductible_base_line_for_taxes_computation(line) for line in non_deductible_base_lines]
+             AccountTax._add_tax_details_in_base_lines(base_lines, self.company_id)
+             tax_amls = self.line_ids.filtered('tax_repartition_line_id')
+             tax_lines = [self._prepare_tax_line_for_taxes_computation(tax_line) for tax_line in tax_amls]
+@@ -1570,6 +1642,7 @@ class AccountMove(models.Model):
+         else:
+             # The move is not stored yet so the only thing we have is the invoice lines.
+             base_lines += self._prepare_epd_base_lines_for_taxes_computation_from_base_lines(base_amls)
++            base_lines += self._prepare_non_deductible_base_lines_for_taxes_computation_from_base_lines(base_amls)
+             AccountTax._add_tax_details_in_base_lines(base_lines, self.company_id)
+             AccountTax._round_base_lines_tax_details(base_lines, self.company_id)
+         return base_lines, tax_lines
+@@ -2103,7 +2176,7 @@ class AccountMove(models.Model):
+                             first_tax_line = tax_lines[0]
+                             tax_group_old_amount = sum(tax_lines.mapped('amount_currency'))
+                             sign = -1 if move.is_inbound() else 1
+-                            delta_amount = tax_group_old_amount * sign - tax_group['tax_amount_currency']
++                            delta_amount = (tax_group_old_amount - tax_group.get('non_deductible_tax_amount_currency', 0.0)) * sign - tax_group['tax_amount_currency']
+ 
+                             if not move.currency_id.is_zero(delta_amount):
+                                 first_tax_line.amount_currency -= delta_amount * sign
+@@ -2783,7 +2856,7 @@ class AccountMove(models.Model):
+         fake_base_line = AccountTax._prepare_base_line_for_taxes_computation(None)
+ 
+         def get_base_lines(move):
+-            return move.line_ids.filtered(lambda line: line.display_type in ('product', 'epd', 'rounding', 'cogs'))
++            return move.line_ids.filtered(lambda line: line.display_type in ('product', 'epd', 'rounding', 'cogs', 'non_deductible_product'))
+ 
+         def get_tax_lines(move):
+             return move.line_ids.filtered('tax_repartition_line_id')
+@@ -2897,6 +2970,52 @@ class AccountMove(models.Model):
+             AccountTax._add_accounting_data_in_base_lines_tax_details(base_lines_values, move.company_id, include_caba_tags=move.always_tax_exigible)
+             tax_results = AccountTax._prepare_tax_lines(base_lines_values, move.company_id, tax_lines=tax_lines_values)
+ 
++            non_deductible_tax_line = move.line_ids.filtered(lambda line: line.display_type == 'non_deductible_tax')
++            non_deductible_lines_values = [
++                line_values
++                for line_values in base_lines_values
++                if line_values['special_type'] == 'non_deductible'
++                and line_values['tax_ids']
++            ]
++
++            if not non_deductible_lines_values and non_deductible_tax_line:
++                to_delete.append(non_deductible_tax_line.id)
++
++            elif non_deductible_lines_values:
++                non_deductible_tax_values = {
++                    'tax_amount': 0.0,
++                    'tax_amount_currency': 0.0,
++                }
++                for line_values in non_deductible_lines_values:
++                    non_deductible_tax_values['tax_amount'] += -line_values['sign'] * (line_values['tax_details']['total_included'] - line_values['tax_details']['total_excluded'])
++                    non_deductible_tax_values['tax_amount_currency'] += -line_values['sign'] * (line_values['tax_details']['total_included_currency'] - line_values['tax_details']['total_excluded_currency'])
++
++                # Update the non-deductible tax lines values
++                non_deductable_tax_line_values = {
++                    'move_id': move.id,
++                    'account_id': (
++                        non_deductible_tax_line.account_id
++                        or move.journal_id.non_deductible_account_id
++                        or move.journal_id.default_account_id
++                    ).id,
++                    'display_type': 'non_deductible_tax',
++                    'name': _('private part (taxes)'),
++                    'balance': non_deductible_tax_values['tax_amount'],
++                    'amount_currency': non_deductible_tax_values['tax_amount_currency'],
++                    'sequence': max(move.line_ids.mapped('sequence')) + 1,
++                }
++                if non_deductible_tax_line:
++                    tax_results['tax_lines_to_update'].append((
++                        {'record': non_deductible_tax_line},
++                        'unused_grouping_key',
++                        {
++                            'amount_currency': non_deductable_tax_line_values['amount_currency'],
++                            'balance': non_deductable_tax_line_values['balance'],
++                        }
++                    ))
++                else:
++                    to_create.append(non_deductable_tax_line_values)
++
+             for base_line, to_update in tax_results['base_lines_to_update']:
+                 line = base_line['record']
+                 if is_write_needed(line, to_update):
+@@ -2922,6 +3041,101 @@ class AccountMove(models.Model):
+         if to_create:
+             self.env['account.move.line'].create(to_create)
+ 
++    @contextmanager
++    def _sync_non_deductible_base_lines(self, container):
++        def has_non_deductible_lines(move):
++            return (
++                move.state == 'draft'
++                and move.is_purchase_document()
++                and any(move.line_ids.filtered(lambda line: line.display_type == 'product' and line.deductible_amount < 100))
++            )
++
++        # Collect data to avoid recomputing value unecessarily
++        product_lines_before = {
++            move: Counter(
++                (line.name, line.price_subtotal, line.tax_ids, line.deductible_amount)
++                for line in move.line_ids
++                if line.display_type == 'product'
++            )
++            for move in container['records']
++        }
++
++        yield
++
++        to_delete = []
++        to_create = []
++        for move in container['records']:
++            product_lines_now = Counter(
++                (line.name, line.price_subtotal, line.tax_ids, line.deductible_amount)
++                for line in move.line_ids
++                if line.display_type == 'product'
++            )
++
++            has_changed_product_lines = bool(
++                product_lines_before.get(move, Counter()) - product_lines_now
++                or product_lines_now - product_lines_before.get(move, Counter())
++            )
++            if not has_changed_product_lines:
++                # No difference between before and now, then nothing to do
++                continue
++
++            non_deductible_base_lines = move.line_ids.filtered(lambda line: line.display_type in ('non_deductible_product', 'non_deductible_product_total'))
++            to_delete += non_deductible_base_lines.ids
++
++            if not has_non_deductible_lines(move):
++                continue
++
++            non_deductible_base_total = 0.0
++            non_deductible_base_currency_total = 0.0
++
++            sign = move.direction_sign
++            rate = move.invoice_currency_rate
++
++            for line in move.line_ids.filtered(lambda line: line.display_type == 'product'):
++                if float_compare(line.deductible_amount, 100, precision_rounding=2) == 0:
++                    continue
++
++                percentage = (1 - line.deductible_amount / 100)
++                non_deductible_subtotal = line.currency_id.round(line.price_subtotal * percentage)
++                non_deductible_base = line.currency_id.round(sign * non_deductible_subtotal)
++                non_deductible_base_currency = line.company_currency_id.round(sign * non_deductible_subtotal / rate) if rate else 0.0
++                non_deductible_base_total += non_deductible_base
++                non_deductible_base_currency_total += non_deductible_base_currency
++
++                to_create.append({
++                    'move_id': move.id,
++                    'account_id': line.account_id.id,
++                    'display_type': 'non_deductible_product',
++                    'name': line.name,
++                    'balance': -1 * non_deductible_base,
++                    'amount_currency': -1 * non_deductible_base_currency,
++                    'tax_ids': [Command.set(line.tax_ids.filtered(lambda tax: tax.amount_type != 'fixed').ids)],
++                    'sequence': line.sequence + 1,
++                })
++
++            to_create.append({
++                'move_id': move.id,
++                'account_id': (
++                    move.journal_id.non_deductible_account_id
++                    or move.journal_id.default_account_id
++                ).id,
++                'display_type': 'non_deductible_product_total',
++                'name': _('private part'),
++                'balance': non_deductible_base_total,
++                'amount_currency': non_deductible_base_currency_total,
++                'tax_ids': [Command.clear()],
++                'sequence': max(move.line_ids.mapped('sequence')) + 1,
++            })
++
++        while to_create and to_delete:
++            line_data = to_create.pop()
++            line_id = to_delete.pop()
++            self.env['account.move.line'].browse(line_id).write(line_data)
++        if to_create:
++            self.env['account.move.line'].create(to_create)
++        if to_delete:
++            self.env['account.move.line'].browse(to_delete).with_context(dynamic_unlink=True).unlink()
++
+     @contextmanager
+     def _sync_dynamic_line(self, existing_key_fname, needed_vals_fname, needed_dirty_fname, line_type, container):
+         def existing():
+@@ -3073,6 +3287,7 @@ class AccountMove(models.Model):
+                     container=invoice_container,
+                 ))
+                 stack.enter_context(self._sync_tax_lines(tax_container))
++                stack.enter_context(self._sync_non_deductible_base_lines(invoice_container))
+                 stack.enter_context(self._sync_dynamic_line(
+                     existing_key_fname='epd_key',
+                     needed_vals_fname='line_ids.epd_needed',
+@@ -4992,6 +5207,15 @@ class AccountMove(models.Model):
+             'posted_before': True,
+         })
+ 
++        # Add the move number to the non_deductible lines for easier auditing
++        if non_deductible_lines := self.line_ids.filtered(lambda line: (line.display_type in ('non_deductible_product_total', 'non_deductible_tax'))):
++            for line in non_deductible_lines:
++                line.name = (
++                    _('%s - private part', line.move_id.name)
++                    if line.display_type == 'non_deductible_product_total'
++                    else _('%s - private part (taxes)', line.move_id.name)
++                )
++
+         draft_reverse_moves.reversed_entry_id._reconcile_reversed_moves(draft_reverse_moves, self._context.get('move_reverse_cancel', False))
+         to_post.line_ids._reconcile_marked()
+ 
+
+--- a/addons/account/models/account_move_line.py
++++ b/addons/account/models/account_move_line.py
+@@ -306,7 +306,10 @@ class AccountMoveLine(models.Model):
+             ('payment_term', 'Payment Term'),
+             ('line_section', 'Section'),
+             ('line_note', 'Note'),
+-            ('epd', 'Early Payment Discount')
++            ('epd', 'Early Payment Discount'),
++            ('non_deductible_product_total', 'Non Deductible Products Total'),
++            ('non_deductible_product', 'Non Deductible Products'),
++            ('non_deductible_tax', 'Non Deductible Tax'),
+         ],
+         compute='_compute_display_type', store=True, readonly=False, precompute=True,
+         required=True,
+@@ -363,6 +366,8 @@ class AccountMoveLine(models.Model):
+     tax_calculation_rounding_method = fields.Selection(
+         related='company_id.tax_calculation_rounding_method',
+         string='Tax calculation rounding method', readonly=True)
++    deductible_amount = fields.Float("Deductibility", default=100)
++
+     # === Invoice sync fields === #
+     term_key = fields.Binary(compute='_compute_term_key', exportable=False)
+     epd_key = fields.Binary(compute='_compute_epd_key', exportable=False)
+@@ -812,7 +817,7 @@ class AccountMoveLine(models.Model):
+         AccountTax = self.env['account.tax']
+         for line in self:
+             # TODO remove the need of cogs lines to have a price_subtotal/price_total
+-            if line.display_type not in ('product', 'cogs'):
++            if line.display_type not in ('product', 'cogs', 'non_deductible_product', 'non_deductible_product_total'):
+                 line.price_total = line.price_subtotal = False
+                 continue
+ 
+@@ -1299,6 +1304,14 @@ class AccountMoveLine(models.Model):
+             elif line.matched_debit_ids or line.matched_credit_ids:
+                 raise Exception("Should have number")
+ 
++    @api.constrains('deductible_amount')
++    def _constrains_deductible_amount(self):
++        for line in self:
++            if not line.move_id.is_purchase_document() and float_compare(line.deductible_amount, 100, precision_digits=2):
++                raise ValidationError(_("Only vendor bills allow for deductibility of product/services."))
++            if line.deductible_amount < 0 or line.deductible_amount > 100:
++                raise ValidationError(_("The deductibility must be a value between 0 and 100."))
++
+     # -------------------------------------------------------------------------
+     # CRUD/ORM
+     # -------------------------------------------------------------------------
+
+--- a/addons/account/models/account_tax.py
++++ b/addons/account/models/account_tax.py
+@@ -1264,6 +1264,7 @@ class AccountTax(models.Model):
+             # - False for the normal behavior.
+             # - early_payment if the base line represent an early payment in mixed mode.
+             # - cash_rounding if the base line is a delta to round the business object for the cash rounding feature.
++            # - non_deductible if the base line is used to compute non deductible amounts in bills.
+             'special_type': kwargs.get('special_type', False),
+ 
+             # All computation are managing the foreign currency and the local one.
+@@ -2107,6 +2108,10 @@ class AccountTax(models.Model):
+                     display_base_amount:                    The base amount to display expressed in local currency.
+                                                             The flat base amount and the amount to be displayed are sometimes different
+                                                             (e.g. division/fixed taxes).
++                    non_deductible_tax_amount_currency:     The tax delta added by 'non_deductible' expressed in foreign currency.
++                                                            If there is no amount added, the key is not in the result.
++                    non_deductible_tax_amount:              The tax delta added by 'non_deductible' expressed in local currency.
++                                                            If there is no amount added, the key is not in the result.
+         """
+         tax_totals_summary = {
+             'currency_id': currency.id,
+@@ -2278,6 +2283,33 @@ class AccountTax(models.Model):
+         encountered_base_amounts.add(float_repr(tax_totals_summary['base_amount_currency'], currency.decimal_places))
+         tax_totals_summary['same_tax_base'] = len(encountered_base_amounts) == 1
+ 
++        # Non deductible lines (this part is not implemented in the JS-part of the tax total summary computation)
++        taxed_non_deductible_lines = [
++            base_line
++            for base_line in base_lines
++            if base_line['special_type'] == 'non_deductible'
++            and base_line['tax_ids']
++        ]
++        if taxed_non_deductible_lines:
++            base_lines_aggregated_values = self._aggregate_base_lines_tax_details(taxed_non_deductible_lines, tax_group_grouping_function)
++            values_per_grouping_key = self._aggregate_base_lines_aggregated_values(base_lines_aggregated_values)
++            for subtotal in tax_totals_summary['subtotals']:
++                for tax_group in subtotal['tax_groups']:
++                    tax_values = values_per_grouping_key[self.env['account.tax.group'].browse(tax_group['id'])]
++                    tax_group['non_deductible_tax_amount'] = tax_values['tax_amount']
++                    tax_group['non_deductible_tax_amount_currency'] = tax_values['tax_amount_currency']
++
++                    tax_group['tax_amount'] -= tax_values['tax_amount']
++                    tax_group['tax_amount_currency'] -= tax_values['tax_amount_currency']
++                    tax_group['base_amount'] -= tax_values['base_amount']
++                    tax_group['base_amount_currency'] -= tax_values['base_amount_currency']
++
++                    subtotal['tax_amount'] -= tax_values['tax_amount']
++                    subtotal['tax_amount_currency'] -= tax_values['tax_amount_currency']
++
++                    tax_totals_summary['tax_amount'] -= tax_values['tax_amount']
++                    tax_totals_summary['tax_amount_currency'] -= tax_values['tax_amount_currency']
++
+         # Total amount.
+         tax_totals_summary['total_amount_currency'] = \
+             tax_totals_summary['base_amount_currency'] + tax_totals_summary['tax_amount_currency'] + cash_rounding_base_amount_currency

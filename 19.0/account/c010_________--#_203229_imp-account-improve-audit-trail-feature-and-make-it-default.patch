@@ -1,0 +1,430 @@
+PR: https://github.com/odoo/odoo/pull/203229
+
+From: f280f762b6417fa1a0b09649ffbdecafcc7e7579
+From: Bryce Burignat
+Date: 2025-04-24 10:46:22
+
+Breaking data model changes scores: del:4.4 + add:0, change matches:
+-    check_account_audit_trail = fields.Boolean(string='Audit Trail')
+-    _inherit = 'ir.ui.menu'
+-    account_audit_log_preview = fields.Text(string="Description", compute="_compute_account_audit_log_preview")
++    account_audit_log_preview = fields.Text(
+-    account_audit_log_activated = fields.Boolean(
+-    check_account_audit_trail = fields.Boolean(string='Audit Trail', related='company_id.check_account_audit_trail', readonly=False)
+
+Total Changes: 230
+
+[IMP] account : Improve Audit Trail feature and make it default
+
+Make Audit Trail a default feature and a bit more exhaustive
+
+Add an optional restricted mode that follows GoBD restrictions (preventing deletion of related records when a journal item is involved) For Germany, this option is hidden and active by default
+
+Now allow grouping, searching and filtering by log message
+
+task-4637051
+
+closes odoo/odoo#203229
+
+Related: odoo/enterprise#82053
+Related: odoo/upgrade#7493
+Signed-off-by: William André (wan) <wan@odoo.com>
+
+================================= pseudo patch: =================================
+
+--- a/addons/account/models/__init__.py
++++ b/addons/account/models/__init__.py
+@@ -38,7 +38,6 @@ from . import res_users
+ from . import ir_attachment
+ from . import ir_actions_report
+ from . import ir_module
+-from . import ir_ui_menu
+ from . import mail_message
+ from . import mail_template
+ from . import mail_tracking_value
+
+--- a/addons/account/models/account_bank_statement_line.py
++++ b/addons/account/models/account_bank_statement_line.py
+@@ -428,7 +428,7 @@ class AccountBankStatementLine(models.Model):
+ 
+     def unlink(self):
+         # OVERRIDE to unlink the inherited account.move (move_id field) as well.
+-        tracked_lines = self.filtered(lambda stl: stl.company_id.check_account_audit_trail)
++        tracked_lines = self.filtered(lambda stl: stl.company_id.restrictive_audit_trail)
+         tracked_lines.move_id.button_cancel()
+         moves_to_delete = (self - tracked_lines).move_id
+         res = super().unlink()
+
+--- a/addons/account/models/account_move.py
++++ b/addons/account/models/account_move.py
+@@ -3523,13 +3523,13 @@ class AccountMove(models.Model):
+         return self.filtered(lambda move: move.name != '/')._is_end_of_seq_chain()
+ 
+     def _get_unlink_logger_message(self):
+-        """ Before unlink, get a log message for audit trail if it's enabled.
++        """ Before unlink, get a log message for audit trail if restricted.
+         Logger is added here because in api ondelete, account.move.line is deleted, and we can't get total amount """
+         if not self._context.get('force_delete'):
+             pass
+ 
+         moves_details = []
+-        for move in self.filtered(lambda m: m.posted_before and m.company_id.check_account_audit_trail):
++        for move in self.filtered(lambda m: m.posted_before and m.company_id.restrictive_audit_trail):
+             entry_details = f"{move.name} ({move.id}) amount {move.amount_total} {move.currency_id.name} and partner {move.partner_id.display_name}"
+             account_balances_per_account = defaultdict(float)
+             for line in move.line_ids:
+@@ -3570,11 +3570,11 @@ class AccountMove(models.Model):
+     @api.ondelete(at_uninstall=False)
+     def _unlink_account_audit_trail_except_once_post(self):
+         if not self._context.get('force_delete') and any(
+-                move.posted_before and move.company_id.check_account_audit_trail
++                move.posted_before and move.company_id.restrictive_audit_trail
+                 for move in self
+         ):
+             raise UserError(_(
+-                "To keep the audit trail, you can not delete journal entries once they have been posted.\n"
++                "To keep the restrictive audit trail, you can not delete journal entries once they have been posted.\n"
+                 "Instead, you can cancel the journal entry."
+             ))
+ 
+@@ -5031,13 +5031,13 @@ class AccountMove(models.Model):
+     def _can_be_unlinked(self):
+         self.ensure_one()
+         lock_date = self.company_id._get_user_fiscal_lock_date(self.journal_id)
+-        is_part_of_audit_trail = self.posted_before and self.company_id.check_account_audit_trail
++        is_part_of_restricted_audit_trail = self.posted_before and self.company_id.restrictive_audit_trail
+         posted_caba_entry = self.state == 'posted' and (self.tax_cash_basis_rec_id or self.tax_cash_basis_origin_move_id)
+         posted_exchange_diff_entry = self.state == 'posted' and self.exchange_diff_partial_ids
+-        return not self.inalterable_hash and self.date > lock_date and not is_part_of_audit_trail and not posted_caba_entry and not posted_exchange_diff_entry
++        return not self.inalterable_hash and self.date > lock_date and not is_part_of_restricted_audit_trail and not posted_caba_entry and not posted_exchange_diff_entry
+ 
+     def _is_protected_by_audit_trail(self):
+-        return any(move.posted_before and move.company_id.check_account_audit_trail for move in self)
++        return any(move.posted_before and move.company_id.restrictive_audit_trail for move in self)
+ 
+     def _unlink_or_reverse(self):
+         if not self:
+
+--- a/addons/account/models/company.py
++++ b/addons/account/models/company.py
+@@ -249,7 +249,15 @@ class ResCompany(models.Model):
+     account_discount_expense_allocation_id = fields.Many2one(comodel_name='account.account', string='Separate account for expense discount')
+ 
+     # Audit trail
+-    check_account_audit_trail = fields.Boolean(string='Audit Trail')
++    restrictive_audit_trail = fields.Boolean(
++        string='Restrictive Audit Trail',
++        tracking=True,
++        help="Enable this option to prevent deletion of journal item related logs",
++    )
++    force_restrictive_audit_trail = fields.Boolean(
++        string='Force Audit Trail',
++        compute='_compute_force_restrictive_audit_trail',
++    )  # Force the restrictive audit trail mode, and hide the corresponding setting.",
+ 
+     # Autopost Wizard
+     autopost_bills = fields.Boolean(string='Auto-validate bills', default=True)
+@@ -296,11 +304,11 @@ class ResCompany(models.Model):
+             'tax_exigibility',
+         ]
+ 
+-    def cache_invalidation_fields(self):
+-        # EXTENDS base
+-        invalidation_fields = super().cache_invalidation_fields()
+-        invalidation_fields.add('check_account_audit_trail')
+-        return invalidation_fields
++    @api.constrains('restrictive_audit_trail')
++    def _check_audit_trail_restriction(self):
++        companies = self.filtered(lambda c: not c.restrictive_audit_trail and c.force_restrictive_audit_trail)
++        if companies:
++            raise ValidationError(_("Can't disable restricted audit trail: forced by localization."))
+ 
+     @api.constrains("account_price_include")
+     def _check_set_account_price_include(self):
+@@ -324,11 +332,9 @@ class ResCompany(models.Model):
+             if rec.fiscalyear_last_day > max_day:
+                 raise ValidationError(_("Invalid fiscal year last day"))
+ 
+-    @api.constrains('check_account_audit_trail')
+-    def _check_audit_trail_records(self):
+-        companies = self.filtered(lambda c: not c.check_account_audit_trail)
+-        if self.env['account.move'].search_count([('company_id', 'in', companies.ids)], limit=1):
+-            raise UserError(_("Can't disable audit trail when there are existing records."))
++    def _compute_force_restrictive_audit_trail(self):
++        for company in self:
++            company.force_restrictive_audit_trail = False
+ 
+     @api.depends('fiscal_position_ids.foreign_vat')
+     def _compute_multi_vat_foreign_country(self):
+
+--- a/addons/account/models/ir_attachment.py
++++ b/addons/account/models/ir_attachment.py
+@@ -1,6 +1,8 @@
+-from odoo import api, models
++from odoo import api, models, fields, _
++from odoo.exceptions import UserError
+ from odoo.tools.pdf import OdooPdfFileReader, PdfReadError
+ from odoo.tools.mimetypes import guess_mimetype
++from odoo.tools.misc import format_date
+ 
+ from lxml import etree
+ from struct import error as StructError
+@@ -22,6 +24,68 @@ class IrAttachment(models.Model):
+                 zipfile_obj.writestr(attachment.display_name, attachment.raw)
+         return buffer.getvalue()
+ 
++    @api.ondelete(at_uninstall=True)
++    def _except_audit_trail(self):
++        audit_trail_attachments = self.filtered(lambda attachment:
++            attachment.res_model == 'account.move'
++            and attachment.res_id
++            and attachment.raw
++            and guess_mimetype(attachment.raw) in (
++                'application/pdf',
++                'application/xml',
++            )
++        )
++        id2move = self.env['account.move'].browse(set(audit_trail_attachments.mapped('res_id'))).exists().grouped('id')
++        for attachment in audit_trail_attachments:
++            move = id2move.get(attachment.res_id)
++            if move and move.posted_before and move.company_id.restrictive_audit_trail:
++                ue = UserError(_("You cannot remove parts of a restricted audit trail."))
++                ue._audit_trail = True
++                raise ue
++
++    def write(self, vals):
++        if vals.keys() & {'res_id', 'res_model', 'raw', 'datas', 'store_fname', 'db_datas', 'company_id'}:
++            try:
++                self._except_audit_trail()
++            except UserError as e:
++                if (
++                    not hasattr(e, '_audit_trail')
++                    or vals.get('res_model') != 'documents.document'
++                    or vals.keys() & {'raw', 'datas', 'store_fname', 'db_datas'}
++                ):
++                    raise  # do not raise if trying to version the attachment through a document
++                vals.pop('res_model', None)
++                vals.pop('res_id', None)
++        return super().write(vals)
++
++    def unlink(self):
++        invoice_pdf_attachments = self.filtered(lambda attachment:
++            attachment.res_model == 'account.move'
++            and attachment.res_id
++            and attachment.res_field in ('invoice_pdf_report_file', 'ubl_cii_xml_file')
++            and attachment.company_id.restrictive_audit_trail
++        )
++        if invoice_pdf_attachments:
++            # only detach the document from the field, but keep it in the database for the audit trail
++            # it shouldn't be an issue as there aren't any security group on the fields as it is the public report
++            invoice_pdf_attachments.res_field = False
++            today = format_date(self.env, fields.Date.context_today(self))
++            for attachment in invoice_pdf_attachments:
++                attachment_name = attachment.name
++                attachment_extension = ''
++                dot_index = attachment_name.rfind('.')
++                if dot_index > 0:
++                    attachment_name = attachment.name[:dot_index]
++                    attachment_extension = attachment.name[dot_index:]
++                attachment.name = _(
++                    '%(attachment_name)s (detached by %(user)s on %(date)s)%(attachment_extension)s',
++                    attachment_name=attachment_name,
++                    attachment_extension=attachment_extension,
++                    user=self.env.user.name,
++                    date=today,
++                )
++        return super(IrAttachment, self - invoice_pdf_attachments).unlink()
++
+     # -------------------------------------------------------------------------
+     # EDI
+     # -------------------------------------------------------------------------
+
+--- a/addons/account/models/ir_ui_menu.py
++++ b/None
+@@ -1,11 +0,0 @@
+-from odoo import models
+-
+-
+-class IrUiMenu(models.Model):
+-    _inherit = 'ir.ui.menu'
+-
+-    def _load_menus_blacklist(self):
+-        res = super()._load_menus_blacklist()
+-        if not any(company.check_account_audit_trail for company in self.env.user.company_ids):
+-            res.append(self.env.ref('account.account_audit_trail_menu').id)
+-        return res
+
+--- a/addons/account/models/mail_message.py
++++ b/addons/account/models/mail_message.py
+@@ -5,21 +5,35 @@ from odoo.fields import Domain
+ 
+ bypass_token = object()
+ DOMAINS = {
+-    'account.move': lambda operator, value: [('company_id.check_account_audit_trail', operator, value)],
+-    'account.account': lambda operator, value: [('company_ids.check_account_audit_trail', operator, value)],
+-    'account.tax': lambda operator, value: [('company_id.check_account_audit_trail', operator, value)],
+-    'res.partner': lambda operator, value: [
+-        '|', ('company_id', '=', False), ('company_id.check_account_audit_trail', operator, value),
+-        '|', ('customer_rank', '>', 0), ('supplier_rank', '>', 0),
+-    ],
+-    'res.company': lambda operator, value: [('check_account_audit_trail', operator, value)],
+-}
++    'res.company':
++        lambda rec, operator, value: [('id', 'in', rec.env['account.move.line']._where_calc([
++            ('company_id.restrictive_audit_trail', operator, value),
++        ], active_test=False).subselect('company_id'))],
++    'account.move':
++        lambda rec, operator, value: [('company_id.restrictive_audit_trail', operator, value)],
++    'account.account':
++        lambda rec, operator, value: [('used', operator, value), ('company_ids.restrictive_audit_trail', operator, value)],
++    'account.tax':
++        lambda rec, operator, value: [('id', 'in', rec.env['account.move.line']._where_calc([
++            ('tax_line_id', '!=', False),
++            ('company_id.restrictive_audit_trail', operator, value),
++        ], active_test=False).subselect('tax_line_id'))],
++    'res.partner':
++        lambda rec, operator, value: [('id', 'in', rec.env['account.move.line']._where_calc([
++            ('partner_id', '!=', False),
++            ('company_id.restrictive_audit_trail', operator, value),
++        ], active_test=False).subselect('partner_id'))],
++    }
+ 
+ 
+ class MailMessage(models.Model):
+     _inherit = 'mail.message'
+ 
+-    account_audit_log_preview = fields.Text(string="Description", compute="_compute_account_audit_log_preview")
++    account_audit_log_preview = fields.Text(
++        string="Description",
++        compute="_compute_account_audit_log_preview",
++        search="_search_account_audit_log_preview",
++    )
+     account_audit_log_move_id = fields.Many2one(
+         comodel_name='account.move',
+         string="Journal Entry",
+@@ -50,15 +64,15 @@ class MailMessage(models.Model):
+         compute="_compute_account_audit_log_company_id",
+         search="_search_account_audit_log_company_id",
+     )
+-    account_audit_log_activated = fields.Boolean(
+-        string="Audit Log Activated",
+-        compute="_compute_account_audit_log_activated",
+-        search="_search_account_audit_log_activated",
++    account_audit_log_restricted = fields.Boolean(
++        string="Protected by restricted Audit Logs",
++        compute="_compute_account_audit_log_restricted",
++        search="_search_account_audit_log_restricted",
+     )
+ 
+     @api.depends('tracking_value_ids')
+     def _compute_account_audit_log_preview(self):
+-        audit_messages = self.filtered('account_audit_log_activated')
++        audit_messages = self.filtered(lambda m: m.message_type == 'notification')
+         (self - audit_messages).account_audit_log_preview = False
+         for message in audit_messages:
+             title = message.subject or message.preview
+@@ -78,6 +92,17 @@ class MailMessage(models.Model):
+             )
+             message.account_audit_log_preview = audit_log_preview
+ 
++    def _search_account_audit_log_preview(self, operator, value):
++        if operator not in ['=', 'like', '=like', 'ilike'] or not isinstance(value, str):
++            return NotImplemented
++
++        return Domain('message_type', '=', 'notification') & Domain.OR([
++            [('tracking_value_ids.old_value_char', operator, value)],
++            [('tracking_value_ids.new_value_char', operator, value)],
++            [('tracking_value_ids.old_value_text', operator, value)],
++            [('tracking_value_ids.new_value_text', operator, value)],
++        ])
++
+     def _compute_account_audit_log_move_id(self):
+         self._compute_audit_log_related_record_id('account.move', 'account_audit_log_move_id')
+ 
+@@ -108,33 +133,26 @@ class MailMessage(models.Model):
+     def _search_account_audit_log_partner_id(self, operator, value):
+         return self._search_audit_log_related_record_id('res.partner', operator, value)
+ 
+-    def _compute_account_audit_log_activated(self):
+-        for message in self:
+-            message.account_audit_log_activated = message.message_type == 'notification' and (
+-                message.account_audit_log_move_id
+-                or message.account_audit_log_account_id
+-                or message.account_audit_log_tax_id
+-                or message.account_audit_log_partner_id
+-                or message.account_audit_log_company_id
+-            )
++    def _compute_account_audit_log_restricted(self):
++        self.account_audit_log_restricted = False
++        if potentially_restricted := self.filtered(lambda r: r.model in DOMAINS):
++            restricted = self.search(Domain('id', 'in', potentially_restricted.ids) + self._search_account_audit_log_restricted('in', [True]))
++            restricted.account_audit_log_restricted = True
+ 
+-    def _search_account_audit_log_activated(self, operator, value):
++    def _search_account_audit_log_restricted(self, operator, value):
+         if operator not in ('in', 'not in'):
+             return NotImplemented
++
+         return Domain('message_type', '=', 'notification') & Domain.OR(
+-            [('model', '=', model), ('res_id', 'in', self.env[model]._search(domain_factory(operator, value)))]
++            [('model', '=', model), ('res_id', 'in', self.env[model]._search(domain_factory(self, operator, value)))]
+             for model, domain_factory in DOMAINS.items()
+         )
+ 
+     def _compute_audit_log_related_record_id(self, model, fname):
+         messages_of_related = self.filtered(lambda m: m.model == model and m.res_id)
+         (self - messages_of_related)[fname] = False
+-        if messages_of_related:
+-            domain = DOMAINS[model](operator='=', value=True)
+-            related_recs = self.env[model].sudo().search([('id', 'in', messages_of_related.mapped('res_id'))] + domain)
+-            recs_by_id = {record.id: record for record in related_recs}
+-            for message in messages_of_related:
+-                message[fname] = recs_by_id.get(message.res_id, False)
++        for message in messages_of_related:
++            message[fname] = message.res_id
+ 
+     def _search_audit_log_related_record_id(self, model, operator, value):
+         if (
+@@ -159,24 +177,11 @@ class MailMessage(models.Model):
+     def _except_audit_log(self):
+         if self.env.context.get('bypass_audit') is bypass_token:
+             return
+-        to_check = self
+-        partner_message = self.filtered(lambda m: m.account_audit_log_partner_id)
+-        if partner_message:
+-            # The audit trail uses the cheaper check on `customer_rank`, but that field could be set
+-            # without actually having an invoice linked (i.e. creation of the contact through the
+-            # Invoicing/Customers menu)
+-            has_related_move = self.env['account.move'].sudo().search_count([
+-                ('partner_id', 'in', partner_message.account_audit_log_partner_id.ids),
+-                ('company_id.check_account_audit_trail', '=', True),
+-            ], limit=1)
+-            if not has_related_move:
+-                to_check -= partner_message
+-        for message in to_check:
+-            if message.account_audit_log_activated and not (
+-                message.account_audit_log_move_id
+-                and not message.account_audit_log_move_id.posted_before
+-            ):
+-                raise UserError(self.env._("You cannot remove parts of the audit trail."))
++        for message in self:
++            if message.account_audit_log_move_id and not message.account_audit_log_move_id.posted_before:
++                continue
++            if message.account_audit_log_restricted:
++                raise UserError(self.env._("You cannot remove parts of a restricted audit trail. Archive the record instead."))
+ 
+     def write(self, vals):
+         # We allow any whitespace modifications in the subject
+
+--- a/addons/account/models/res_config_settings.py
++++ b/addons/account/models/res_config_settings.py
+@@ -204,7 +204,8 @@ class ResConfigSettings(models.TransientModel):
+     ) # technical field used for showing the Peppol settings conditionally
+ 
+     # Audit trail
+-    check_account_audit_trail = fields.Boolean(string='Audit Trail', related='company_id.check_account_audit_trail', readonly=False)
++    restrictive_audit_trail = fields.Boolean(string='Restricted Audit Trail', related='company_id.restrictive_audit_trail', readonly=False)
++    force_restrictive_audit_trail = fields.Boolean(string='Forced Audit Trail', related='company_id.force_restrictive_audit_trail', readonly=False)
+ 
+     # Autopost of bills
+     autopost_bills = fields.Boolean(related='company_id.autopost_bills', readonly=False)

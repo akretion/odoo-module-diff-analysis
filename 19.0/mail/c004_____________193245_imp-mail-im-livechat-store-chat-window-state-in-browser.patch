@@ -1,0 +1,142 @@
+PR: https://github.com/odoo/odoo/pull/193245
+
+From: 55381b54fe6852f23b10029ddea3ed91da9ace8e
+From: Sébastien Theys
+Date: 2025-01-21 19:09:28
+
+Breaking data model changes scores: del:1 + add:0, change matches:
+-    fold_state = fields.Selection([('open', 'Open'), ('folded', 'Folded'), ('closed', 'Closed')], string='Conversation Fold State', default='closed')
+
+Total Changes: 36
+
+[IMP] mail, im_livechat: store chat window state in browser
+
+We currently have very complex code to handle sync of chat window with
+the server. This allows from syncing them cross tab, cross device, and
+cross session (log in/log out).
+
+It feels the only real use case is cross-tab, so we should simplify the
+code by storing it only locally on each browser.
+
+Added benefit: chat windows are now sync in their correct order.
+Non-channel threads are also sync.
+
+Technical change: /mail/data now includes thread/data and channel/info
+to batch calls. The API is adapted to be more batch friendly.
+
+As open chat windows are no longer returned by the server, they need to
+be requested at init by the client (from local storage data) together
+with the rest of the server init data.
+
+task-3707836
+
+closes odoo/odoo#193245
+
+Related: odoo/enterprise#77022
+Related: odoo/upgrade#7056
+Signed-off-by: Sébastien Theys (seb) <seb@odoo.com>
+
+================================= pseudo patch: =================================
+
+--- a/addons/mail/models/discuss/discuss_channel.py
++++ b/addons/mail/models/discuss/discuss_channel.py
+@@ -297,7 +297,7 @@ class DiscussChannel(models.Model):
+                 if cmd[0] != 0:
+                     raise ValidationError(_('Invalid value when creating a channel with memberships, only 0 is allowed.'))
+                 for field_name in cmd[2]:
+-                    if field_name not in ["partner_id", "guest_id", "unpin_dt", "last_interest_dt", "fold_state"]:
++                    if field_name not in ["partner_id", "guest_id", "unpin_dt", "last_interest_dt"]:
+                         raise ValidationError(
+                             _(
+                                 "Invalid field “%(field_name)s” when creating a channel with members.",
+@@ -1024,11 +1024,6 @@ class DiscussChannel(models.Model):
+                     ],
+                     only_data=True,
+                 ),
+-                Store.Attr(
+-                    "state",
+-                    lambda c: c.self_member_id.fold_state or "closed",
+-                    predicate=lambda c: c.self_member_id,
+-                ),
+             ]
+         return res
+ 
+@@ -1038,13 +1033,12 @@ class DiscussChannel(models.Model):
+     # User methods
+ 
+     @api.model
+-    def _get_or_create_chat(self, partners_to, pin=True, force_open=False):
++    def _get_or_create_chat(self, partners_to, pin=True):
+         """ Get the canonical private channel between some partners, create it if needed.
+             To reuse an old channel (conversation), this one must be private, and contains
+             only the given partners.
+             :param partners_to : list of res.partner ids to add to the conversation
+             :param pin : True if getting the channel should pin it for the current user
+-            :param force_open : True if getting the channel should open it for the current user
+             :returns: channel_info of the created or existing channel
+             :rtype: dict
+         """
+@@ -1076,13 +1070,11 @@ class DiscussChannel(models.Model):
+             # get the existing channel between the given partners
+             channel = self.browse(result[0].get('channel_id'))
+             # pin or open the channel for the current partner
+-            if pin or force_open:
++            if pin:
+                 member = self.env['discuss.channel.member'].search([('partner_id', '=', self.env.user.partner_id.id), ('channel_id', '=', channel.id)])
+                 vals = {'last_interest_dt': fields.Datetime.now()}
+                 if pin:
+                     vals['unpin_dt'] = False
+-                if force_open:
+-                    vals['fold_state'] = "open"
+                 member.write(vals)
+             channel._broadcast(self.env.user.partner_id.ids)
+         else:
+
+--- a/addons/mail/models/discuss/discuss_channel_member.py
++++ b/addons/mail/models/discuss/discuss_channel_member.py
+@@ -36,7 +36,6 @@ class DiscussChannelMember(models.Model):
+     seen_message_id = fields.Many2one('mail.message', string='Last Seen', index="btree_not_null")
+     new_message_separator = fields.Integer(help="Message id before which the separator should be displayed", default=0, required=True)
+     message_unread_counter = fields.Integer('Unread Messages Counter', compute='_compute_message_unread', compute_sudo=True)
+-    fold_state = fields.Selection([('open', 'Open'), ('folded', 'Folded'), ('closed', 'Closed')], string='Conversation Fold State', default='closed')
+     custom_notifications = fields.Selection(
+         [("all", "All Messages"), ("mentions", "Mentions Only"), ("no_notif", "Nothing")],
+         "Customized Notifications",
+@@ -287,25 +286,6 @@ class DiscussChannelMember(models.Model):
+         self.ensure_one()
+         return fields
+ 
+-    def _channel_fold(self, state, state_count):
+-        """Update the fold_state of the given member. The change will be
+-        broadcasted to the member channel.
+-
+-        :param state: the new status of the session for the current member.
+-        """
+-        self.ensure_one()
+-        if self.fold_state == state:
+-            return
+-        self.fold_state = state
+-        self._bus_send(
+-            "discuss.Thread/fold_state",
+-            {
+-                "fold_state": self.fold_state,
+-                "foldStateCount": state_count,
+-                "id": self.channel_id.id,
+-                "model": "discuss.channel",
+-            },
+-        )
+     # --------------------------------------------------------------------------
+     # RTC (voice/video)
+     # --------------------------------------------------------------------------
+
+--- a/addons/mail/models/mail_thread.py
++++ b/addons/mail/models/mail_thread.py
+@@ -4794,6 +4794,8 @@ class MailThread(models.AbstractModel):
+                     ]
+                 )
+                 thread._message_followers_to_store(store, filter_recipients=True, reset=True)
++            if request_list and "display_name" in request_list:
++                res["display_name"] = thread.display_name
+             if request_list and "scheduledMessages" in request_list:
+                 res["scheduledMessages"] = Store.Many(self.env['mail.scheduled.message'].search([
+                     ['model', '=', self._name], ['res_id', '=', thread.id]

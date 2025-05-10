@@ -1,0 +1,203 @@
+PR: https://github.com/odoo/odoo/pull/201020
+
+From: c49f3441acdb427ace8b362ebc4df6b697bd7273
+From: Logan Staelens
+Date: 2025-04-23 11:13:35
+
+Breaking data model changes scores: del:2 + add:0, change matches:
+-    filter_fiscal_position = fields.Boolean(
+-    foreign_vat_fiscal_position_id = fields.Many2one(
+
+Total Changes: 81
+
+[IMP] account, l10n_*: Prepare Community for Accounting Returns
+
+Returns are a new feature in Odoo enterprise, allowing to handle the different deadlines of an accounting through time (typically for report submissions, for example).
+
+This PR applies some necessary modifications to the Community code for Enterprise to receive the new feature. Essentially:
+
+* filter_fiscal_position on account.report is renamed to allow_foreign_vat, as it does not correspond to a filter in the UI anymore
+* foreign VAT fiscal positions with different VAT numbers in the same country are not supported anymore, like explained on the Enterprise commit, so we simplify the helpers handling them
+* The dashboard customization showing the next activity set on the tax closing entries disappears
+* account_opening_date does not receive a default value anymore ; it needs to be set in the setup wizard the first time a user tries to access the returns
+
+task-4627315
+
+closes odoo/odoo#201020
+
+Related: odoo/enterprise#81569
+Related: odoo/documentation#12914
+Related: odoo/upgrade#7517
+Signed-off-by: Hugo Poncelet (hupo) <hupo@odoo.com>
+
+================================= pseudo patch: =================================
+
+--- a/addons/account/models/account_report.py
++++ b/addons/account/models/account_report.py
+@@ -59,6 +59,10 @@ class AccountReport(models.Model):
+     search_bar = fields.Boolean(string="Search Bar")
+     prefix_groups_threshold = fields.Integer(string="Prefix Groups Threshold", default=4000)
+     integer_rounding = fields.Selection(string="Integer Rounding", selection=[('HALF-UP', "Nearest"), ('UP', "Up"), ('DOWN', "Down")])
++    allow_foreign_vat = fields.Boolean(
++        string="Allow Foreign VAT",
++        compute=lambda x: x._compute_report_option_filter('allow_foreign_vat'), readonly=False, store=True, depends=['root_report_id', 'section_main_report_ids'],
++    )
+ 
+     default_opening_date_filter = fields.Selection(
+         string="Default Opening",
+@@ -70,8 +74,8 @@ class AccountReport(models.Model):
+             ('previous_month', "Last Month"),
+             ('previous_quarter', "Last Quarter"),
+             ('previous_year', "Last Year"),
+-            ('this_tax_period', "This Tax Period"),
+-            ('previous_tax_period', "Last Tax Period"),
++            ('this_return_period', "This Return Period"),
++            ('previous_return_period', "Last Return Period"),
+         ],
+         compute=lambda x: x._compute_report_option_filter('default_opening_date_filter', 'previous_month'),
+         readonly=False, store=True, depends=['root_report_id', 'section_main_report_ids'],
+@@ -146,10 +150,6 @@ class AccountReport(models.Model):
+         string="Partners",
+         compute=lambda x: x._compute_report_option_filter('filter_partner'), readonly=False, store=True, depends=['root_report_id', 'section_main_report_ids'],
+     )
+-    filter_fiscal_position = fields.Boolean(
+-        string="Filter Multivat",
+-        compute=lambda x: x._compute_report_option_filter('filter_fiscal_position'), readonly=False, store=True, depends=['root_report_id', 'section_main_report_ids'],
+-    )
+     filter_aml_ir_filters = fields.Boolean(
+         string="Favorite Filters", help="If activated, user-defined filters on journal items can be selected on this report",
+         compute=lambda x: x._compute_report_option_filter('filter_aml_ir_filters'), readonly=False, store=True, depends=['root_report_id', 'section_main_report_ids'],
+@@ -562,7 +562,7 @@ class AccountReportExpression(models.Model):
+             ('to_beginning_of_fiscalyear', 'At the beginning of the fiscal year'),
+             ('to_beginning_of_period', 'At the beginning of the period'),
+             ('strict_range', 'Strictly on the given dates'),
+-            ('previous_tax_period', "From previous tax period")
++            ('previous_return_period', "From previous return period")
+         ],
+         required=True,
+         default='strict_range',
+@@ -901,20 +901,6 @@ class AccountReportExternalValue(models.Model):
+ 
+     company_id = fields.Many2one(string='Company', comodel_name='res.company', required=True, default=lambda self: self.env.company)
+ 
+-    foreign_vat_fiscal_position_id = fields.Many2one(
+-        string="Fiscal position",
+-        comodel_name='account.fiscal.position',
+-        domain="[('country_id', '=', report_country_id), ('foreign_vat', '!=', False)]",
+-        check_company=True,
+-        help="The foreign fiscal position for which this external value is made.",
+-    )
+-
+     # Carryover fields
+     carryover_origin_expression_label = fields.Char(string="Origin Expression Label")
+     carryover_origin_report_line_id = fields.Many2one(string="Origin Line", comodel_name='account.report.line')
+-
+-    @api.constrains('foreign_vat_fiscal_position_id', 'target_report_expression_id')
+-    def _check_fiscal_position(self):
+-        for record in self:
+-            if record.foreign_vat_fiscal_position_id and record.foreign_vat_fiscal_position_id.country_id != record.report_country_id:
+-                raise ValidationError(_("The country set on the foreign VAT fiscal position must match the one set on the report."))
+
+--- a/addons/account/models/account_tax.py
++++ b/addons/account/models/account_tax.py
+@@ -69,22 +69,6 @@ class AccountTaxGroup(models.Model):
+         for group in self:
+             group.country_id = group.company_id.account_fiscal_country_id or group.company_id.country_id
+ 
+-    @api.model
+-    def _check_misconfigured_tax_groups(self, company, countries):
+-        """ Searches the tax groups used on the taxes from company in countries that don't have
+-        at least a tax payable account, a tax receivable account or an advance tax payment account.
+-
+-        :return: A boolean telling whether or not there are misconfigured groups for any
+-                 of these countries, in this company
+-        """
+-        return bool(self.env['account.tax'].search([
+-            *self.env['account.tax']._check_company_domain(company),
+-            ('country_id', 'in', countries.ids),
+-            '|',
+-            ('tax_group_id.tax_payable_account_id', '=', False),
+-            ('tax_group_id.tax_receivable_account_id', '=', False),
+-        ], limit=1))
+-
+ 
+ class AccountTax(models.Model):
+     _name = 'account.tax'
+@@ -2375,7 +2359,7 @@ class AccountTax(models.Model):
+                         max_tax_group['tax_amount_currency'] += cash_rounding_base_amount_currency
+                         max_tax_group['tax_amount'] += cash_rounding_base_amount
+                         max_subtotal['tax_amount_currency'] += cash_rounding_base_amount_currency
+-                        max_subtotal['tax_amount'] += cash_rounding_base_amount 
++                        max_subtotal['tax_amount'] += cash_rounding_base_amount
+                         tax_totals_summary['tax_amount_currency'] += cash_rounding_base_amount_currency
+                         tax_totals_summary['tax_amount'] += cash_rounding_base_amount
+                     else:
+
+--- a/addons/account/models/company.py
++++ b/addons/account/models/company.py
+@@ -166,7 +166,7 @@ class ResCompany(models.Model):
+     #Fields of the setup step for opening move
+     account_opening_move_id = fields.Many2one(string='Opening Journal Entry', comodel_name='account.move', help="The journal entry containing the initial balance of all this company's accounts.")
+     account_opening_journal_id = fields.Many2one(string='Opening Journal', comodel_name='account.journal', related='account_opening_move_id.journal_id', help="Journal where the opening entry of this company's accounting has been posted.", readonly=False)
+-    account_opening_date = fields.Date(string='Opening Entry', default=lambda self: fields.Date.context_today(self).replace(month=1, day=1), required=True, help="That is the date of the opening entry.")
++    account_opening_date = fields.Date(string='Opening Entry', help="That is the date of the opening entry.")
+ 
+     invoice_terms = fields.Html(string='Default Terms and Conditions', translate=True)
+     terms_type = fields.Selection([('plain', 'Add a Note'), ('html', 'Add a link to a Web Page')],
+@@ -751,7 +751,7 @@ class ResCompany(models.Model):
+             'ref': _('Opening Journal Entry'),
+             'company_id': self.id,
+             'journal_id': default_journal.id,
+-            'date': self.account_opening_date - timedelta(days=1),
++            'date': (self.account_opening_date or fields.Date.start_of(fields.Date.today(), 'year')) - timedelta(days=1),
+         }
+ 
+     def opening_move_posted(self):
+
+--- a/addons/account/models/exceptions.py
++++ b/None
+@@ -1,7 +0,0 @@
+-class TaxClosingNonPostedDependingMovesError(Exception):
+-    """
+-        This error contains an action that will be used in the case of a tax closing with branches or tax units where
+-        the different companies have non-posted closing moves. The action will be a form view if there is only one dependent move
+-        and a list view if there are more.
+-    """
+-    pass
+
+--- a/addons/account/models/partner.py
++++ b/addons/account/models/partner.py
+@@ -118,28 +118,14 @@ class AccountFiscalPosition(models.Model):
+                     if record.country_id not in record.country_group_id.country_ids:
+                         raise ValidationError(_("You cannot create a fiscal position with a country outside of the selected country group."))
+ 
+-                similar_fpos_domain = [
++                similar_fpos_count = self.env['account.fiscal.position'].search_count([
+                     *self.env['account.fiscal.position']._check_company_domain(record.company_id),
+-                    ('foreign_vat', '!=', False),
++                    ('foreign_vat', 'not in', (False, record.foreign_vat)),
+                     ('id', '!=', record.id),
+-                ]
+-
+-                if record.country_group_id:
+-                    foreign_vat_country = self.country_group_id.country_ids.filtered(lambda c: c.code == record.foreign_vat[:2].upper())
+-                    if not foreign_vat_country:
+-                        raise ValidationError(_("The country code of the foreign VAT number does not match any country in the group."))
+-                    similar_fpos_domain += [('country_group_id', '=', record.country_group_id.id), ('country_id', '=', foreign_vat_country.id)]
+-                elif record.country_id:
+-                    similar_fpos_domain += [('country_id', '=', record.country_id.id), ('country_group_id', '=', False)]
+-
+-                if record.state_ids:
+-                    similar_fpos_domain.append(('state_ids', 'in', record.state_ids.ids))
+-                else:
+-                    similar_fpos_domain.append(('state_ids', '=', False))
+-
+-                similar_fpos_count = self.env['account.fiscal.position'].search_count(similar_fpos_domain)
++                    ('country_id', '=', record.country_id.id),
++                ])
+                 if similar_fpos_count:
+-                    raise ValidationError(_("A fiscal position with a foreign VAT already exists in this region."))
++                    raise ValidationError(_("A fiscal position with a foreign VAT already exists in this country."))
+ 
+     def map_tax(self, taxes):
+         return self.env['account.tax'].browse(unique(

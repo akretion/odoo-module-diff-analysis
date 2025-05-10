@@ -1,0 +1,212 @@
+PR: https://github.com/odoo/odoo/pull/199988
+
+From: 9f43cbe6669239038ecd06361bf7834a40fb8dd3
+From: Gorash
+Date: 2025-04-18 11:23:39
+
+Breaking data model changes scores: del:13 + add:0, change matches:
+-    _inherit = 'res.groups'
+-    sequence = fields.Integer(string='Sequence')
+-    privilege_id = fields.Many2one('res.groups.privilege', string='Privilege', index=True)
+-    view_group_hierarchy = fields.Json(string='Technical field for default group setting', compute='_compute_view_group_hierarchy')
+-    _inherit = 'res.users'
+-    view_group_hierarchy = fields.Json(string='Technical field for user group setting', store=False, default=_default_view_group_hierarchy)
+-    view_disjoint_group_ids = fields.Many2many('res.groups', compute='_compute_view_implied_group_ids', string="Disjoint groups")
+-    view_all_disjoint_group_ids = fields.Many2many('res.groups', compute='_compute_view_implied_group_ids', string="All disjoint groups")
+-    view_visible_implied_group_ids = fields.Many2many('res.groups', compute='_compute_view_implied_group_ids', string="Groups added automatically")
+-    view_show_technical_groups = fields.Boolean(string="Show technical groups", store=False)
+
+Total Changes: 125
+
+[MOV] base: move code linked to the users and groups UI
+
+The code is moved to res_users.py and res_groups.py.  After refactoring
+and introducing a new widget, the number of lines of that code is much
+smaller and no longer deserves a separate file.
+
+Part-of: odoo/odoo#199988
+Related: odoo/enterprise#80581
+Related: odoo/upgrade#7332
+Signed-off-by: Aaron Bohy (aab) <aab@odoo.com>
+
+================================= pseudo patch: =================================
+
+--- a/odoo/addons/base/models/__init__.py
++++ b/odoo/addons/base/models/__init__.py
+@@ -45,7 +45,6 @@ from . import res_company
+ from . import res_groups_privilege
+ from . import res_groups
+ from . import res_users
+-from . import res_users_view
+ from . import res_users_settings
+ from . import res_users_deletion
+ from . import res_device
+
+--- a/odoo/addons/base/models/res_groups.py
++++ b/odoo/addons/base/models/res_groups.py
+@@ -11,6 +11,7 @@ class ResGroups(models.Model):
+     _description = "Access Groups"
+     _rec_name = 'full_name'
+     _allow_sudo_commands = False
++    _order = 'privilege_id, sequence, name, id'
+ 
+     name = fields.Char(required=True, translate=True)
+     user_ids = fields.Many2many('res.users', 'res_groups_users_rel', 'gid', 'uid', help='Users explicitly in this group')
+@@ -31,6 +32,12 @@ class ResGroups(models.Model):
+     api_key_duration = fields.Float(string='API Keys maximum duration days',
+         help="Determines the maximum duration of an api key created by a user belonging to this group.")
+ 
++    sequence = fields.Integer(string='Sequence')
++    privilege_id = fields.Many2one('res.groups.privilege', string='Privilege', index=True)
++    view_group_hierarchy = fields.Json(string='Technical field for default group setting', compute='_compute_view_group_hierarchy')
++
++    _name_uniq = models.Constraint("UNIQUE (privilege_id, name)",
++        'The name of the group must be unique within a group privilege!')
+     _check_api_key_duration = models.Constraint(
+         'CHECK(api_key_duration >= 0)',
+         'The api key duration cannot be a negative value.',
+@@ -296,6 +303,28 @@ class ResGroups(models.Model):
+         groups = self.all_implied_ids.filtered(lambda g: implied_group in g.implied_ids)
+         groups.write({'implied_ids': [Command.unlink(implied_group.id)]})
+ 
++    def _compute_view_group_hierarchy(self):
++        self.view_group_hierarchy = self._get_view_group_hierarchy()
++
++    @api.model
++    @tools.ormcache(cache='groups')
++    def _get_view_group_hierarchy(self):
++        return [
++            {
++                'id': section.id,
++                'name': section.name,
++                'categories': [
++                    {
++                        'id': privilege.id,
++                        'name': privilege.name,
++                        'description': privilege.description,
++                        'groups': [[group.id, group.name]
++                                   for group in privilege.group_ids.sorted(lambda g: (len(g.all_implied_ids & privilege.group_ids), g.sequence, g.id))]
++                    } for privilege in section.privilege_ids.sorted(lambda p: p.sequence) if privilege.group_ids
++                ]
++            } for section in self.env['ir.module.category'].search([('parent_id', '=', False), ('privilege_ids.group_ids', '!=', False)], order="sequence")
++        ]
++
+     @api.model
+     @tools.ormcache(cache='groups')
+     def _get_group_definitions(self):
+
+--- a/odoo/addons/base/models/res_users.py
++++ b/odoo/addons/base/models/res_users.py
+@@ -253,6 +253,12 @@ class ResUsers(models.Model):
+     groups_count = fields.Integer('# Groups', help='Number of groups that apply to the current user',
+                                   compute='_compute_accesses_count', compute_sudo=True)
+ 
++    def _default_view_group_hierarchy(self):
++        return self.env['res.groups']._get_view_group_hierarchy()
++
++    view_group_hierarchy = fields.Json(string='Technical field for user group setting', store=False, default=_default_view_group_hierarchy)
++    role = fields.Selection([('group_user', 'Member'), ('group_system', 'Administrator')], compute='_compute_role', readonly=False, string="Role")
++
+     _login_key = models.Constraint("UNIQUE (login)",
+         'You can not have two users with the same login!')
+ 
+@@ -389,6 +395,24 @@ class ResUsers(models.Model):
+             else:
+                 user.password = user.new_password
+ 
++    @api.depends('group_ids')
++    def _compute_role(self):
++        for user in self:
++            user.role = (
++                'group_system' if user.has_group('base.group_system') else
++                'group_user' if user.has_group('base.group_user') else
++                False
++            )
++
++    @api.onchange('role')
++    def _onchange_role(self):
++        group_admin = self.env['res.groups'].new(origin=self.env.ref('base.group_system'))
++        group_user = self.env['res.groups'].new(origin=self.env.ref('base.group_user'))
++        for user in self:
++            if user.role and user.has_group('base.group_user'):
++                groups = user.group_ids - (group_admin + group_user)
++                user.group_ids = groups + (group_admin if user.role == 'group_system' else group_user)
++
+     @api.depends('group_ids.all_implied_ids')
+     def _compute_all_group_ids(self):
+         for user in self:
+
+--- a/odoo/addons/base/models/res_users_view.py
++++ b/None
+@@ -1,71 +0,0 @@
+-from odoo import api, fields, models, tools
+-
+-
+-class ResGroups(models.Model):
+-    _inherit = 'res.groups'
+-    _order = 'privilege_id, sequence, name, id'
+-
+-    sequence = fields.Integer(string='Sequence')
+-    privilege_id = fields.Many2one('res.groups.privilege', string='Privilege', index=True)
+-
+-    _name_uniq = models.Constraint("UNIQUE (privilege_id, name)",
+-        'The name of the group must be unique within a group privilege!')
+-
+-    # Field used for the widget to define the default group.
+-
+-    view_group_hierarchy = fields.Json(string='Technical field for default group setting', compute='_compute_view_group_hierarchy')
+-
+-    def _compute_view_group_hierarchy(self):
+-        self.view_group_hierarchy = self._get_view_group_hierarchy()
+-
+-    @api.model
+-    @tools.ormcache()
+-    def _get_view_group_hierarchy(self):
+-        return [
+-            {
+-                'id': section.id,
+-                'name': section.name,
+-                'categories': [
+-                    {
+-                        'id': privilege.id,
+-                        'name': privilege.name,
+-                        'description': privilege.description,
+-                        'groups': [[group.id, group.name]
+-                                   for group in privilege.group_ids.sorted(lambda g: (len(g.all_implied_ids & privilege.group_ids), g.sequence, g.id))]
+-                    } for privilege in section.privilege_ids.sorted(lambda p: p.sequence) if privilege.group_ids
+-                ]
+-            } for section in self.env['ir.module.category'].search([('parent_id', '=', False), ('privilege_ids.group_ids', '!=', False)], order="sequence")
+-        ]
+-
+-
+-class ResUsers(models.Model):
+-    _inherit = 'res.users'
+-
+-    # For "classic" administrators
+-
+-    def _default_view_group_hierarchy(self):
+-        return self.env['res.groups']._get_view_group_hierarchy()
+-
+-    view_group_hierarchy = fields.Json(string='Technical field for user group setting', store=False, default=_default_view_group_hierarchy)
+-
+-    # For "technical" administrators
+-
+-    view_disjoint_group_ids = fields.Many2many('res.groups', compute='_compute_view_implied_group_ids', string="Disjoint groups")
+-    view_all_disjoint_group_ids = fields.Many2many('res.groups', compute='_compute_view_implied_group_ids', string="All disjoint groups")
+-    view_visible_implied_group_ids = fields.Many2many('res.groups', compute='_compute_view_implied_group_ids', string="Groups added automatically")
+-    view_show_technical_groups = fields.Boolean(string="Show technical groups", store=False)
+-
+-    @api.depends('group_ids', 'view_show_technical_groups')
+-    def _compute_view_implied_group_ids(self):
+-        group_definitions = self.env['res.groups']._get_group_definitions()
+-
+-        for user in self:
+-            view_disjoint_group_ids = user.group_ids.disjoint_ids
+-            view_all_disjoint_group_ids = group_definitions.get_disjoint_ids(user.all_group_ids.ids)
+-            view_visible_implied_group_ids = user.group_ids.implied_ids.all_implied_ids
+-            if not user.view_show_technical_groups:
+-                view_visible_implied_group_ids = view_visible_implied_group_ids.filtered(lambda g: g.category_id.visible)
+-
+-            user.view_disjoint_group_ids = view_disjoint_group_ids
+-            user.view_all_disjoint_group_ids = view_all_disjoint_group_ids
+-            user.view_visible_implied_group_ids = view_visible_implied_group_ids

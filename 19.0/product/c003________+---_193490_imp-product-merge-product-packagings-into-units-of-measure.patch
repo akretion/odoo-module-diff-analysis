@@ -1,0 +1,315 @@
+PR: https://github.com/odoo/odoo/pull/193490
+
+From: dc24a1d1c93cf6eeb6456b1591a0ab8ccc4086ba
+From: Mohammad Abdulmoneim (abdu)
+Date: 2025-01-14 09:03:42
+
+Breaking data model changes scores: del:9 + add:2, change matches:
+-    name = fields.Char('Product Packaging', required=True)
+-    sequence = fields.Integer('Sequence', default=1, help="The first in the sequence is the default one.")
+-    qty = fields.Float('Contained Quantity', default=1, digits='Product Unit of Measure', help="Quantity of products contained in the packaging.")
+-    product_uom_id = fields.Many2one('uom.uom', related='product_id.uom_id', readonly=True)
++    product_uom_ids = fields.One2many('product.uom', 'product_id', 'Unit Barcode', store=True)
+-    packaging_ids = fields.One2many(
+-    packaging_ids = fields.One2many(
+-    group_stock_packaging = fields.Boolean('Product Packagings',
++    product_uom_ids = fields.One2many('product.uom', 'uom_id', string='Barcodes', domain=lambda self: ['|', ('product_id', '=', self.env.context.get('product_id')), ('product_id', 'in', self.env.context.get('product_ids', []))])
+
+Total Changes: 177
+
+[IMP] product,*: merge product packagings into units of measure
+
+This commit removes `product.packaging` model completely and merges it
+into units of measure feature. Previously, users could define one or
+more packagins for each product which can be used in sale/purchase
+orders in addition to stock transfers. This led to some confusion as
+there is no intrinsic difference between packagings and units of
+measure. Also, sale,purchase order lines and stock moves had two
+different fields for units and quantities, one for the main move unit
+and another for the packaging which introduced some technical complexity
+to ensure the consistency between those fields. After this commit, if a
+user wants to define a packaging for a product, they just need to create
+a `uom_uom` record with the desired name and quantity and add it to the
+`uom_ids` field on the product so that it can be used in
+sale/purchase/stock orders. This commit also adds two new fields to
+`stock_move` model to store the additional packaging unit and quantity
+from sale/purchase/manufacturing orders. It's readonly and only shown in
+reports and barcode in case it was different than the main stock move
+unit.
+
+Task-4252043
+
+Part-of: odoo/odoo#193490
+Related: odoo/enterprise#77092
+Signed-off-by: Arnold Moyaux (arm) <arm@odoo.com>
+Signed-off-by: Mohammad Abdulmoneim (abdu) <abdu@odoo.com>
+
+================================= pseudo patch: =================================
+
+--- a/addons/product/models/__init__.py
++++ b/addons/product/models/__init__.py
+@@ -16,7 +16,6 @@ from . import product_category
+ from . import product_combo
+ from . import product_combo_item
+ from . import product_document
+-from . import product_packaging
+ from . import product_pricelist
+ from . import product_pricelist_item
+ from . import product_supplierinfo
+@@ -24,8 +23,10 @@ from . import product_tag
+ from . import product_template_attribute_line
+ from . import product_template_attribute_exclusion
+ from . import product_template_attribute_value
++from . import product_uom
+ from . import res_company
+ from . import res_config_settings
+ from . import res_country_group
+ from . import res_currency
+ from . import res_partner
++from . import uom_uom
+
+--- a/addons/product/models/product_packaging.py
++++ b/None
+@@ -1,84 +0,0 @@
+-# -*- coding: utf-8 -*-
+-# Part of Odoo. See LICENSE file for full copyright and licensing details.
+-
+-from odoo import api, fields, models, _
+-from odoo.exceptions import ValidationError
+-from odoo.osv import expression
+-
+-
+-from odoo.tools import float_compare, float_round
+-
+-
+-class ProductPackaging(models.Model):
+-    _name = 'product.packaging'
+-    _description = "Product Packaging"
+-    _order = 'product_id, sequence, id'
+-    _check_company_auto = True
+-
+-    name = fields.Char('Product Packaging', required=True)
+-    sequence = fields.Integer('Sequence', default=1, help="The first in the sequence is the default one.")
+-    product_id = fields.Many2one('product.product', string='Product', check_company=True, required=True, ondelete="cascade")
+-    qty = fields.Float('Contained Quantity', default=1, digits='Product Unit of Measure', help="Quantity of products contained in the packaging.")
+-    barcode = fields.Char('Barcode', copy=False, help="Barcode used for packaging identification. Scan this packaging barcode from a transfer in the Barcode app to move all the contained units")
+-    product_uom_id = fields.Many2one('uom.uom', related='product_id.uom_id', readonly=True)
+-    company_id = fields.Many2one('res.company', 'Company', index=True)
+-
+-    _positive_qty = models.Constraint(
+-        'CHECK(qty > 0)',
+-        'Contained Quantity should be positive.',
+-    )
+-    _barcode_uniq = models.Constraint(
+-        'unique(barcode)',
+-        'A barcode can only be assigned to one packaging.',
+-    )
+-
+-    @api.constrains('barcode')
+-    def _check_barcode_uniqueness(self):
+-        """ With GS1 nomenclature, products and packagings use the same pattern. Therefore, we need
+-        to ensure the uniqueness between products' barcodes and packagings' ones"""
+-        domain = [('barcode', 'in', [b for b in self.mapped('barcode') if b])]
+-        if self.env['product.product'].search_count(domain, limit=1):
+-            raise ValidationError(_("A product already uses the barcode"))
+-
+-    def _check_qty(self, product_qty, uom_id, rounding_method="HALF-UP"):
+-        """Check if product_qty in given uom is a multiple of the packaging qty.
+-        If not, rounding the product_qty to closest multiple of the packaging qty
+-        according to the rounding_method "UP", "HALF-UP or "DOWN".
+-        """
+-        self.ensure_one()
+-        default_uom = self.product_id.uom_id
+-        packaging_qty = default_uom._compute_quantity(self.qty, uom_id)
+-        # We do not use the modulo operator to check if qty is a mltiple of q. Indeed the quantity
+-        # per package might be a float, leading to incorrect results. For example:
+-        # 8 % 1.6 = 1.5999999999999996
+-        # 5.4 % 1.8 = 2.220446049250313e-16
+-        if product_qty and packaging_qty:
+-            rounded_qty = float_round(product_qty / packaging_qty, precision_rounding=1.0,
+-                                  rounding_method=rounding_method) * packaging_qty
+-            return rounded_qty if float_compare(rounded_qty, product_qty, precision_rounding=default_uom.rounding) else product_qty
+-        return product_qty
+-
+-    def _find_suitable_product_packaging(self, product_qty, uom_id):
+-        """ try find in `self` if a packaging's qty in given uom is a divisor of
+-        the given product_qty. If so, return the one with greatest divisor.
+-        """
+-        packagings = self.sorted(lambda p: p.qty, reverse=True)
+-        for packaging in packagings:
+-            new_qty = packaging._check_qty(product_qty, uom_id)
+-            if new_qty == product_qty:
+-                return packaging
+-        return self.env['product.packaging']
+-
+-    def _compute_qty(self, qty, qty_uom=False):
+-        """Returns the qty of this packaging that qty converts to.
+-        A float is returned because there are edge cases where some users use
+-        "part" of a packaging
+-
+-        :param qty: float of product quantity (given in product UoM if no qty_uom provided)
+-        :param qty_uom: Optional uom of quantity
+-        :returns: float of packaging qty
+-        """
+-        self.ensure_one()
+-        if qty_uom:
+-            qty = qty_uom._compute_quantity(qty, self.product_uom_id)
+-        return float_round(qty / self.qty, precision_rounding=self.product_uom_id.rounding)
+
+--- a/addons/product/models/product_product.py
++++ b/addons/product/models/product_product.py
+@@ -44,6 +44,7 @@ class ProductProduct(models.Model):
+     barcode = fields.Char(
+         'Barcode', copy=False, index='btree_not_null',
+         help="International Article Number used for product identification.")
++    product_uom_ids = fields.One2many('product.uom', 'product_id', 'Unit Barcode', store=True)
+     product_template_attribute_value_ids = fields.Many2many('product.template.attribute.value', relation='product_variant_combination', string="Attribute Values", ondelete='restrict')
+     product_template_variant_value_ids = fields.Many2many('product.template.attribute.value', relation='product_variant_combination',
+                                                           domain=[('attribute_line_id.value_count', '>', 1)], string="Variant Values", ondelete='restrict')
+@@ -70,10 +71,6 @@ class ProductProduct(models.Model):
+     product_document_count = fields.Integer(
+         string="Documents Count", compute='_compute_product_document_count')
+ 
+-    packaging_ids = fields.One2many(
+-        'product.packaging', 'product_id', 'Product Packages',
+-        help="Gives the different ways to package the same product.")
+-
+     additional_product_tag_ids = fields.Many2many(
+         string="Variant Tags",
+         comodel_name='product.tag',
+@@ -231,7 +228,7 @@ class ProductProduct(models.Model):
+ 
+     def _check_duplicated_packaging_barcodes(self, barcodes_within_company, company_id):
+         packaging_domain = self._get_barcode_search_domain(barcodes_within_company, company_id)
+-        if self.env['product.packaging'].sudo().search_count(packaging_domain, limit=1):
++        if self.env['product.uom'].sudo().search_count(packaging_domain, limit=1):
+             raise ValidationError(_("A packaging already uses the barcode"))
+ 
+     @api.constrains('barcode')
+
+--- a/addons/product/models/product_template.py
++++ b/addons/product/models/product_template.py
+@@ -123,9 +123,6 @@ class ProductTemplate(models.Model):
+     uom_ids = fields.Many2many('uom.uom', string='Packagings', help="Packagings which can be used for sales")
+     company_id = fields.Many2one(
+         'res.company', 'Company', index=True)
+-    packaging_ids = fields.One2many(
+-        'product.packaging', string="Product Packages", compute="_compute_packaging_ids", inverse="_set_packaging_ids",
+-        help="Gives the different ways to package the same product.")
+     seller_ids = fields.One2many('product.supplierinfo', 'product_tmpl_id', 'Vendors', depends_context=('company',))
+     variant_seller_ids = fields.One2many('product.supplierinfo', 'product_tmpl_id')
+ 
+@@ -438,19 +435,6 @@ class ProductTemplate(models.Model):
+     def _set_default_code(self):
+         self._set_product_variant_field('default_code')
+ 
+-    @api.depends('product_variant_ids', 'product_variant_ids.packaging_ids')
+-    def _compute_packaging_ids(self):
+-        for p in self:
+-            if len(p.product_variant_ids) == 1:
+-                p.packaging_ids = p.product_variant_ids.packaging_ids
+-            else:
+-                p.packaging_ids = False
+-
+-    def _set_packaging_ids(self):
+-        for p in self:
+-            if len(p.product_variant_ids) == 1:
+-                p.product_variant_ids.packaging_ids = p.packaging_ids
+-
+     @api.depends('type')
+     def _compute_product_tooltip(self):
+         self.product_tooltip = False
+@@ -508,7 +492,7 @@ class ProductTemplate(models.Model):
+ 
+     def _get_related_fields_variant_template(self):
+         """ Return a list of fields present on template and variants models and that are related"""
+-        return ['barcode', 'default_code', 'standard_price', 'volume', 'weight', 'packaging_ids', 'product_properties']
++        return ['barcode', 'default_code', 'standard_price', 'volume', 'weight', 'product_properties']
+ 
+     @api.model_create_multi
+     def create(self, vals_list):
+
+--- a/None
++++ b/addons/product/models/product_uom.py
+@@ -0,0 +1,32 @@
++# Part of Odoo. See LICENSE file for full copyright and licensing details.
++
++
++from odoo import _, api, fields, models
++from odoo.exceptions import ValidationError
++
++
++class ProductUom(models.Model):
++    _name = 'product.uom'
++    _description = 'Link between products and their UoMs'
++    _rec_name = 'barcode'
++
++    uom_id = fields.Many2one('uom.uom', 'Unit', required=True, ondelete='cascade')
++    product_id = fields.Many2one('product.product', 'Product', required=True, ondelete='cascade')
++    barcode = fields.Char(index='btree_not_null', required=True)
++    company_id = fields.Many2one('res.company', 'Company', default=lambda self: self.env.company)
++
++    _barcode_uniq = models.Constraint('unique(barcode)', 'A barcode can only be assigned to one packaging.')
++
++    @api.constrains('barcode')
++    def _check_barcode_uniqueness(self):
++        """ With GS1 nomenclature, products and packagings use the same pattern. Therefore, we need
++        to ensure the uniqueness between products' barcodes and packagings' ones"""
++        domain = [('barcode', 'in', [b for b in self.mapped('barcode') if b])]
++        if self.env['product.product'].search_count(domain, limit=1):
++            raise ValidationError(_("A product already uses the barcode"))
++
++    def _compute_display_name(self):
++        if not self.env.context.get('show_variant_name'):
++            return super()._compute_display_name()
++        for record in self:
++            record.display_name = f"{record.barcode} for: {record.product_id.display_name}"
+
+--- a/addons/product/models/res_config_settings.py
++++ b/addons/product/models/res_config_settings.py
+@@ -6,11 +6,9 @@ from odoo import _, api, fields, models
+ class ResConfigSettings(models.TransientModel):
+     _inherit = 'res.config.settings'
+ 
+-    group_uom = fields.Boolean("Units of Measure", implied_group='uom.group_uom')
++    group_uom = fields.Boolean("Units of Measure & Packagings", implied_group='uom.group_uom')
+     group_product_variant = fields.Boolean("Variants", implied_group='product.group_product_variant')
+     module_loyalty = fields.Boolean("Promotions, Coupons, Gift Card & Loyalty Program")
+-    group_stock_packaging = fields.Boolean('Product Packagings',
+-        implied_group='product.group_stock_packaging')
+     group_product_pricelist = fields.Boolean("Pricelists",
+         implied_group='product.group_product_pricelist')
+     product_weight_in_lbs = fields.Selection([
+
+--- a/None
++++ b/addons/product/models/uom_uom.py
+@@ -0,0 +1,29 @@
++# -*- coding: utf-8 -*-
++# Part of Odoo. See LICENSE file for full copyright and licensing details.
++
++from odoo import api, models, fields, _
++
++
++class UomUom(models.Model):
++    _inherit = 'uom.uom'
++
++    product_uom_ids = fields.One2many('product.uom', 'uom_id', string='Barcodes', domain=lambda self: ['|', ('product_id', '=', self.env.context.get('product_id')), ('product_id', 'in', self.env.context.get('product_ids', []))])
++    packaging_barcodes_count = fields.Integer('Packaging Barcodes', compute='_compute_packaging_barcodes_count')
++
++    @api.depends('product_uom_ids')
++    def _compute_packaging_barcodes_count(self):
++        uom_to_barcode_count = self.env['product.uom'].read_group([('uom_id', 'in', self.ids)], ['barcode:count'], ['uom_id'])
++        uom_to_barcode_count = {data['uom_id'][0]: data['barcode'] for data in uom_to_barcode_count}
++        for uom in self:
++            uom.packaging_barcodes_count = uom_to_barcode_count.get(uom.id, 0)
++
++    def action_open_packaging_barcodes(self):
++        self.ensure_one()
++        return {
++            'type': 'ir.actions.act_window',
++            'name': _('Packaging Barcodes'),
++            'res_model': 'product.uom',
++            'view_mode': 'list',
++            'view_id': self.env.ref('product.product_uom_list_view').id,
++            'domain': [('uom_id', '=', self.id)],
++        }

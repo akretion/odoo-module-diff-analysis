@@ -1,0 +1,362 @@
+PR: https://github.com/odoo/odoo/pull/205191
+
+From: 9a97157920c845120861dda49d81d3150e015974
+From: Habib (ayh)
+Date: 2025-04-24 18:17:06
+
+Breaking data model changes scores: del:7 + add:3, change matches:
++    fiscal_position_ids = fields.Many2many(
++    original_tax_ids = fields.Many2many(
+-    tax_ids = fields.One2many('account.fiscal.position.tax', 'position_id', string='Tax Mapping', copy=True)
++    tax_ids = fields.Many2many(
+-    position_id = fields.Many2one('account.fiscal.position', string='Fiscal Position',
+-    company_id = fields.Many2one('res.company', string='Company', related='position_id.company_id', store=True)
+-    tax_src_id = fields.Many2one('account.tax', string='Tax on Product', required=True, check_company=True)
+-    tax_dest_id = fields.Many2one('account.tax', string='Tax to Apply', check_company=True)
+-    tax_dest_active = fields.Boolean(related="tax_dest_id.active")
+
+Total Changes: 151
+
+[IMP] account, *: fiscalpo-calypse
+
+Remove the tax mapping from a fiscal position.
+Instead the mapping is now defined on taxes themselves.
+
+Why?
+* No longer have a one to one mapping of taxes, which allows for the removal of unnecessary duplicated taxes in the chart.
+* Fiscal Position management is simplified (controlled through the tax configuration)
+* Easily identify which taxes belong to which fiscal position.
+
+How it works:
+* Local/Domestic taxes will be assigned to the Local/Domestic Fiscal Position (the domestic fiscal position is the first fiscal position having a country that matches the company's fiscal country)
+* Foreign taxes will be assigned to their respective Fiscal Positions
+* A tax could also belong to multiple fiscal positions (see the case of EU B2C taxes)
+* Foreign Taxes (in a fiscal position that is not the dometic one) can replace domestic taxes.
+* When a foreign fiscal position applies, the same map_tax function is used, which replaces any tax that replaces the provided tax.
+* The only way to map a tax to Nothing (no tax, not 0%) is to leave the fiscal position empty (no tax belongs to it). This case is used for VAT Units.
+
+Task-4422708
+
+Part-of: odoo/odoo#205191
+Related: odoo/enterprise#83056
+Related: odoo/documentation#13019
+Related: odoo/upgrade#7528
+Signed-off-by: William André (wan) <wan@odoo.com>
+
+================================= pseudo patch: =================================
+
+--- a/addons/account/models/account_move_line.py
++++ b/addons/account/models/account_move_line.py
+@@ -889,7 +889,7 @@ class AccountMoveLine(models.Model):
+             tax_ids = filtered_supplier_taxes_id or self.account_id.tax_ids.filtered(lambda tax: tax.type_tax_use == 'purchase')
+ 
+         else:
+-            tax_ids = False if self.env.context.get('skip_computed_taxes') else self.account_id.tax_ids
++            tax_ids = False if self.env.context.get('skip_computed_taxes') or self.move_id.is_entry() else self.account_id.tax_ids
+ 
+         if self.company_id and tax_ids:
+             tax_ids = tax_ids._filter_taxes_by_company(self.company_id)
+
+--- a/addons/account/models/account_tax.py
++++ b/addons/account/models/account_tax.py
+@@ -99,6 +99,27 @@ class AccountTax(models.Model):
+         e.g 180 / (1 - 10%) = 200 (not price included)
+         e.g 200 * (1 - 10%) = 180 (price included)
+         """)
++    fiscal_position_ids = fields.Many2many(
++        comodel_name='account.fiscal.position',
++        relation='account_fiscal_position_account_tax_rel',
++        column1='account_tax_id',
++        column2='account_fiscal_position_id',
++    )
++    original_tax_ids = fields.Many2many(
++        comodel_name='account.tax',
++        relation='account_tax_alternatives',
++        column1='dest_tax_id',  # This Replacement tax
++        column2='src_tax_id',  # Domestic Tax to replace
++        string="Replaces",
++        domain="""[
++            ('type_tax_use', '=', type_tax_use),
++            ('id', '!=', id),
++            ('is_domestic', '=', True),
++        ]""",
++        ondelete='cascade',
++    )
++    display_alternative_taxes_field = fields.Boolean(compute='_compute_display_alternative_taxes_field')
++    is_domestic = fields.Boolean(compute='_compute_is_domestic', store=True, precompute=True)
+     active = fields.Boolean(default=True, help="Set active to false to hide the tax without removing it.")
+     company_id = fields.Many2one('res.company', string='Company', required=True, readonly=True, default=lambda self: self.env.company)
+     children_tax_ids = fields.Many2many('account.tax',
+@@ -229,6 +250,14 @@ class AccountTax(models.Model):
+             ):
+                 raise ValidationError(_("The cash basis transition account needs to allow reconciliation."))
+ 
++    @api.model
++    def search_read(self, domain=None, fields=None, offset=0, limit=None, order=None, **read_kwargs):
++        if 'search_default_domestictax' in self.env.context:
++            domain = expression.AND([domain, ['|', ('fiscal_position_ids', '=', False), ('fiscal_position_ids.is_domestic', '=', True)]])
++        if fp_id := self.env.context.get('dynamic_fiscal_position_id'):
++            domain = expression.AND([domain, [('fiscal_position_ids', 'in', [int(fp_id)])]])
++        return super().search_read(domain, fields, offset, limit, order, **read_kwargs)
++
+     @api.depends('company_id')
+     def _compute_country_id(self):
+         for tax in self:
+@@ -281,6 +310,22 @@ class AccountTax(models.Model):
+         '''
+         return set()
+ 
++    @api.depends('company_id', 'company_id.domestic_fiscal_position_id', 'fiscal_position_ids')
++    def _compute_is_domestic(self):
++        for tax in self:
++            tax.is_domestic = not tax.fiscal_position_ids or tax.company_id.domestic_fiscal_position_id in tax.fiscal_position_ids
++
++    @api.depends('fiscal_position_ids')
++    def _compute_display_alternative_taxes_field(self):
++        for tax in self:
++            tax.display_alternative_taxes_field = (
++                tax.original_tax_ids
++                or (
++                    tax.fiscal_position_ids
++                    and tax.fiscal_position_ids._origin != tax.company_id.domestic_fiscal_position_id  # _origin used to get the actual records
++                )
++            )
++
+     def _compute_is_used(self):
+         used_taxes = set()
+ 
+
+--- a/addons/account/models/chart_template.py
++++ b/addons/account/models/chart_template.py
+@@ -22,11 +22,11 @@ _logger = logging.getLogger(__name__)
+ TEMPLATE_MODELS = (
+     'account.group',
+     'account.account',
++    'account.fiscal.position',
+     'account.tax.group',
+     'account.tax',
+     'account.journal',
+     'account.reconcile.model',
+-    'account.fiscal.position',
+ )
+ 
+ TAX_TAG_DELIMITER = '||'
+@@ -257,7 +257,6 @@ class AccountChartTemplate(models.AbstractModel):
+         When we reload the chart of accounts, we only want to update fields that are main
+         configuration, like:
+         - tax tags
+-        - fiscal position mappings linked to new records
+         """
+         for prop in list(template_data):
+             if prop.startswith('property_'):
+@@ -335,21 +334,7 @@ class AccountChartTemplate(models.AbstractModel):
+                     if xmlid not in xmlid2fiscal_position and not force_create:
+                         skip_update.add((model_name, xmlid))
+                         continue
+-                    # Only add tax mappings containing new taxes
+-                    if old_tax_ids := values.pop('tax_ids', []):
+-                        new_tax_ids = []
+-                        for element in old_tax_ids:
+-                            match element:
+-                                case Command.CREATE, _, {'tax_src_id': src_id, 'tax_dest_id': dest_id} if (
+-                                    not self.ref(src_id, raise_if_not_found=False)
+-                                    or (dest_id and not self.ref(dest_id, raise_if_not_found=False))
+-                                ):
+-                                    new_tax_ids.append(element)
+-                        if new_tax_ids:
+-                            values['tax_ids'] = new_tax_ids
+-
+                 elif model_name == 'account.tax':
+-                    # Only update the tags of existing taxes
+                     if xmlid not in xmlid2tax or tax_template_changed(xmlid2tax[xmlid], values):
+                         if not force_create:
+                             skip_update.add((model_name, xmlid))
+@@ -372,8 +357,24 @@ class AccountChartTemplate(models.AbstractModel):
+                             if rename_idx:
+                                 tax_to_rename.name = f"[old{rename_idx - 1 if rename_idx > 1 else ''}] {tax_to_rename.name}"
+                     else:
++                        fiscal_position_ids = values.get('fiscal_position_ids')
++                        original_tax_ids = values.get('original_tax_ids')
+                         repartition_lines = values.get('repartition_line_ids')
+                         values.clear()
++                        # taxes will always be (re)linked to fiscal positions (unless the fp doesn't exist and won't be created)
++                        if fiscal_position_ids:
++                            link_commands = [
++                                Command.link(xml_id)
++                                for xml_id in fiscal_position_ids.split(',') if force_create or xml_id in xmlid2fiscal_position
++                            ]
++                            if link_commands:
++                                values['fiscal_position_ids'] = link_commands
++                        # Only add tax mappings containing new taxes
++                        if original_tax_ids and (new_taxes := [xml_id for xml_id in original_tax_ids.split(',') if xml_id not in xmlid2tax]):
++                            values['original_tax_ids'] = [
++                                Command.link(alt_xml_id)
++                                for alt_xml_id in new_taxes
++                            ]
+                         if repartition_lines:
+                             values['repartition_line_ids'] = repartition_lines
+                             for element in values.get('repartition_line_ids', []):
+@@ -419,9 +420,6 @@ class AccountChartTemplate(models.AbstractModel):
+                 ('module', '=', 'account'),
+             ]).unlink()
+ 
+-        custom_fields = {  # Don't alter values that can be changed by the users
+-            'account.fiscal.position.tax_ids',
+-        }
+         for model_name, records in data.items():
+             _fields = self.env[model_name]._fields
+             for xmlid, values in records.items():
+@@ -429,7 +427,6 @@ class AccountChartTemplate(models.AbstractModel):
+                     fname
+                     for fname in values
+                     if fname in _fields
+-                    and f"{model_name}.{fname}" not in custom_fields
+                     and _fields[fname].type in ('one2many', 'many2many')
+                     and isinstance(values[fname], (list, tuple))
+                 ]
+@@ -997,6 +994,10 @@ class AccountChartTemplate(models.AbstractModel):
+             for _command, _id, rep_line in tax_template.get('repartition_line_ids', []):
+                 rep_line['account_id'] = existing_accounts.get(rep_line.get('account_id'))
+ 
++            # Since Foreign Fiscal Positions and Replacement Taxes are not relevant to the OSS company
++            tax_template.pop('fiscal_position_ids', None)
++            tax_template.pop('original_tax_ids', None)
++
+             account_xml_id = tax_template.get('cash_basis_transition_account_id')
+             tax_template['cash_basis_transition_account_id'] = existing_accounts[account_xml_id]
+ 
+
+--- a/addons/account/models/company.py
++++ b/addons/account/models/company.py
+@@ -193,6 +193,11 @@ class ResCompany(models.Model):
+     )
+ 
+     # Taxes
++    domestic_fiscal_position_id = fields.Many2one(
++        comodel_name='account.fiscal.position',
++        compute='_compute_domestic_fiscal_position_id',
++        store=True,
++    )
+     account_fiscal_country_id = fields.Many2one(
+         string="Fiscal Country",
+         comodel_name='res.country',
+@@ -333,6 +338,12 @@ class ResCompany(models.Model):
+         for company in self:
+             company.force_restrictive_audit_trail = False
+ 
++    @api.depends('fiscal_position_ids', 'fiscal_position_ids.sequence', 'fiscal_position_ids.country_id')
++    def _compute_domestic_fiscal_position_id(self):
++        for company in self:
++            potential_domestic_fps = company.fiscal_position_ids.filtered_domain([('country_id', '=', company.country_id.id)]).sorted('sequence')
++            company.domestic_fiscal_position_id = potential_domestic_fps[0] if potential_domestic_fps else False
++
+     @api.depends('fiscal_position_ids.foreign_vat')
+     def _compute_multi_vat_foreign_country(self):
+         company_to_foreign_vat_country = {
+
+--- a/addons/account/models/partner.py
++++ b/addons/account/models/partner.py
+@@ -38,7 +38,14 @@ class AccountFiscalPosition(models.Model):
+         default=lambda self: self.env.company)
+     account_ids = fields.One2many('account.fiscal.position.account', 'position_id', string='Account Mapping', copy=True)
+     account_map = fields.Binary(compute='_compute_account_map')
+-    tax_ids = fields.One2many('account.fiscal.position.tax', 'position_id', string='Tax Mapping', copy=True)
++    tax_ids = fields.Many2many(
++        comodel_name='account.tax',
++        relation='account_fiscal_position_account_tax_rel',
++        column1='account_fiscal_position_id',
++        column2='account_tax_id',
++        string='Taxes',
++        context={'active_test': False},
++    )
+     tax_map = fields.Binary(compute='_compute_tax_map')
+     note = fields.Html('Notes', translate=True, help="Legal mentions that have to be printed on the invoices.")
+     auto_apply = fields.Boolean(string='Detect Automatically', help="Apply tax & account mappings on invoices automatically if the matching criterias (VAT/Country) are met.")
+@@ -47,6 +54,7 @@ class AccountFiscalPosition(models.Model):
+     fiscal_country_codes = fields.Char(string="Company Fiscal Country Code", related='company_country_id.code')
+     country_id = fields.Many2one('res.country', string='Country',
+         help="Apply only if delivery country matches.")
++    is_domestic = fields.Boolean(compute='_compute_is_domestic', store=True)
+     country_group_id = fields.Many2one('res.country.group', string='Country Group',
+         help="Apply only if delivery country matches the group.")
+     state_ids = fields.Many2many('res.country.state', string='Federal States')
+@@ -66,6 +74,11 @@ class AccountFiscalPosition(models.Model):
+         # Hook for extension
+         pass
+ 
++    @api.depends('company_id.domestic_fiscal_position_id')
++    def _compute_is_domestic(self):
++        for position in self:
++            position.is_domestic = position == position.company_id.domestic_fiscal_position_id
++
+     def _compute_states_count(self):
+         for position in self:
+             position.states_count = len(position.country_id.state_ids)
+@@ -85,15 +98,13 @@ class AccountFiscalPosition(models.Model):
+                 # 'no_template' kept for compatibility in stable. To remove in master
+                 fiscal_position.foreign_vat_header_mode = 'templates_found' if template['installed'] else 'no_template'
+ 
+-    @api.depends('tax_ids.tax_src_id', 'tax_ids.tax_dest_id')
++    @api.depends('tax_ids')
+     def _compute_tax_map(self):
+         for position in self:
+             tax_map = defaultdict(list)
+-            for tl in position.tax_ids:
+-                if tl.tax_dest_id:
+-                    tax_map[tl.tax_src_id.id].append(tl.tax_dest_id.id)
+-                else:
+-                    tax_map[tl.tax_src_id.id]  # map to an empty list
++            for dest_tax in position.tax_ids:
++                for src_tax in dest_tax.original_tax_ids:
++                    tax_map[src_tax.id].append(dest_tax.id)
+             position.tax_map = dict(tax_map)
+ 
+     @api.depends('account_ids.account_src_id', 'account_ids.account_dest_id')
+@@ -129,6 +140,10 @@ class AccountFiscalPosition(models.Model):
+                     raise ValidationError(_("A fiscal position with a foreign VAT already exists in this country."))
+ 
+     def map_tax(self, taxes):
++        if not self:
++            return taxes
++        if not self.tax_ids:  # empty fiscal positions (like those created by tax units) remove all taxes
++            return self.env['account.tax']
+         return self.env['account.tax'].browse(unique(
+             tax_id
+             for tax in taxes
+@@ -269,6 +284,9 @@ class AccountFiscalPosition(models.Model):
+             default=(self.env['account.fiscal.position'], False)
+         )[0]
+ 
++    def action_open_related_taxes(self):
++        return self.tax_ids._get_records_action(name=_("%s taxes", self.display_name))
++
+     def action_create_foreign_taxes(self):
+         self.ensure_one()
+         template_code = self.env['account.chart.template']._guess_chart_template(self.country_id)
+@@ -279,26 +297,6 @@ class AccountFiscalPosition(models.Model):
+         self.env["account.chart.template"]._instantiate_foreign_taxes(self.country_id, self.company_id)
+ 
+ 
+-class AccountFiscalPositionTax(models.Model):
+-    _name = 'account.fiscal.position.tax'
+-    _description = 'Tax Mapping of Fiscal Position'
+-    _rec_name = 'position_id'
+-    _check_company_auto = True
+-    _check_company_domain = models.check_company_domain_parent_of
+-
+-    position_id = fields.Many2one('account.fiscal.position', string='Fiscal Position',
+-        required=True, index=True, ondelete='cascade')
+-    company_id = fields.Many2one('res.company', string='Company', related='position_id.company_id', store=True)
+-    tax_src_id = fields.Many2one('account.tax', string='Tax on Product', required=True, check_company=True)
+-    tax_dest_id = fields.Many2one('account.tax', string='Tax to Apply', check_company=True)
+-    tax_dest_active = fields.Boolean(related="tax_dest_id.active")
+-
+-    _tax_src_dest_uniq = models.Constraint(
+-        'unique (position_id,tax_src_id,tax_dest_id)',
+-        'A tax fiscal position could be defined only one time on same taxes.',
+-    )
+-
+-
+ class AccountFiscalPositionAccount(models.Model):
+     _name = 'account.fiscal.position.account'
+     _description = 'Accounts Mapping of Fiscal Position'

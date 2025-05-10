@@ -1,4 +1,4 @@
-# Dude, what did they do to my Odoo at version 18.0 (future version spoiler)?
+# Dude, what did they do to my Odoo at version 18.0?
 
 You can see below the Odoo addons that got the largest data model changes between versions 17.0 and 18.0:
 (this is just summing the size of the data model impacting commits addon per addon)
