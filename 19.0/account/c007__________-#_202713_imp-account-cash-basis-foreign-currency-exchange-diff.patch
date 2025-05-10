@@ -1,0 +1,460 @@
+PR: https://github.com/odoo/odoo/pull/202713
+
+From: edf184bfcb3aef550c2d25added9f3da9f39f97b
+From: aizu-odoo
+Date: 2025-04-15 21:39:49
+
+Breaking data model changes scores: del:1 + add:0, change matches:
+-    exchange_move_id = fields.Many2one('account.move', index="btree_not_null")
+
+Total Changes: 332
+
+[IMP] account: cash basis foreign currency exchange diff
+
+*-Purpose--
+
+If you use Cash Basis taxes, at confirmation of the invoice the tax is put on a temporary account (Cash Basis Transition Account). On payment, that tax amount is moved to another account, amount due, for the next Tax report. If you are using invoices in foreign currency, the currency rate can be different between the invoice date and the payment date. In Odoo, this will create a discrepancy because the tax amounts are not the same. It's missing a foreign currency difference to explain the difference. This is the case when the Cash Basis Transition Account is not set as reconcilable.
+
+*-Implementation--
+
+*Cash Basis Transition Account now has to be reconcilable (error is raised when setting up tax account)
+
+*The disable_partial_exchange_diff parameter is removed
+
+*The 'full exchange reconciliation' is removed as it will always be covered by the 'partial exchange reconciliation'
+
+*Rounding errors for cash basis taxes are now covered during the creation of the tax cash basis moves of the partials instead of during the 'full exchange reconciliation' (where it used to create an exchange diff even if there wasn't in order to fix rounding issues). It is now prevented by setting the amount_currency of the tax line to the amount_residual_currency when the journal entry is fully paid or when it's not fully paid yet but has a higher calculated amount_currency than what is needed to pay the residual tax.
+
+*In AccountTestInvoicingCommon, armageddon_tax child 2 needs to have tax egibility 'on_invoice' when tests are run at install in order to not trigger the constraint as the cash_basis_transition_account is an empty record in those cases
+
+odoo/enterprise/pull/81847
+odoo/upgrade/pull/7513
+
+task-4404035
+
+closes odoo/odoo#202713
+
+Related: odoo/enterprise#81847
+Related: odoo/upgrade#7513
+Signed-off-by: Laurent Smet (las) <las@odoo.com>
+
+================================= pseudo patch: =================================
+
+--- a/addons/account/models/account_full_reconcile.py
++++ b/addons/account/models/account_full_reconcile.py
+@@ -1,5 +1,5 @@
+ # -*- coding: utf-8 -*-
+-from odoo import api, fields, models, _, Command
++from odoo import api, fields, models, Command
+ 
+ 
+ class AccountFullReconcile(models.Model):
+@@ -8,32 +8,6 @@ class AccountFullReconcile(models.Model):
+ 
+     partial_reconcile_ids = fields.One2many('account.partial.reconcile', 'full_reconcile_id', string='Reconciliation Parts')
+     reconciled_line_ids = fields.One2many('account.move.line', 'full_reconcile_id', string='Matched Journal Items')
+-    exchange_move_id = fields.Many2one('account.move', index="btree_not_null")
+-
+-    def unlink(self):
+-        """ When removing a full reconciliation, we need to revert the eventual journal entries we created to book the
+-            fluctuation of the foreign currency's exchange rate.
+-            We need also to reconcile together the origin currency difference line and its reversal in order to completely
+-            cancel the currency difference entry on the partner account (otherwise it will still appear on the aged balance
+-            for example).
+-        """
+-        # Avoid cyclic unlink calls when removing partials.
+-        if not self:
+-            return True
+-
+-        moves_to_reverse = self.exchange_move_id
+-
+-        res = super().unlink()
+-
+-        # Reverse all exchange moves at once.
+-        if moves_to_reverse:
+-            default_values_list = [{
+-                'date': move._get_accounting_date(move.date, move._affect_tax_report()),
+-                'ref': _('Reversal of: %s', move.name),
+-            } for move in moves_to_reverse]
+-            moves_to_reverse._reverse_moves(default_values_list, cancel=True)
+-
+-        return res
+ 
+     @api.model_create_multi
+     def create(self, vals_list):
+
+--- a/addons/account/models/account_move.py
++++ b/addons/account/models/account_move.py
+@@ -5584,24 +5584,14 @@ class AccountMove(models.Model):
+     def _check_draftable(self):
+         exchange_move_ids = set()
+         if self:
+-            self.env['account.full.reconcile'].flush_model(['exchange_move_id'])
+             self.env['account.partial.reconcile'].flush_model(['exchange_move_id'])
+             sql = SQL(
+                 """
+-                    SELECT DISTINCT sub.exchange_move_id
+-                    FROM (
+-                        SELECT exchange_move_id
+-                        FROM account_full_reconcile
+-                        WHERE exchange_move_id IN %s
+-
+-                        UNION ALL
+-
+-                        SELECT exchange_move_id
+-                        FROM account_partial_reconcile
+-                        WHERE exchange_move_id IN %s
+-                    ) AS sub
++                    SELECT DISTINCT exchange_move_id
++                    FROM account_partial_reconcile
++                    WHERE exchange_move_id IN %s
+                 """,
+-                tuple(self.ids), tuple(self.ids),
++                tuple(self.ids),
+             )
+             exchange_move_ids = {id_ for id_, in self.env.execute_query(sql)}
+ 
+
+--- a/addons/account/models/account_move_line.py
++++ b/addons/account/models/account_move_line.py
+@@ -2385,9 +2385,6 @@ class AccountMoveLine(models.Model):
+             self._reconcile_plan_with_sync(plan_list, all_amls)
+ 
+     def _reconcile_plan_with_sync(self, plan_list, all_amls):
+-        # Parameter allowing to disable the exchange journal entries on partials.
+-        disable_partial_exchange_diff = bool(self.env['ir.config_parameter'].sudo().get_param('account.disable_partial_exchange_diff'))
+-
+         # ==== Prefetch the fields all at once to speedup the reconciliation ====
+         # All of those fields will be cached by the orm. Since the amls are split into multiple batches, the orm is not
+         # able to prefetch the data for all of them at once. For that reason, we force the orm to populate the cache
+@@ -2422,7 +2419,7 @@ class AccountMoveLine(models.Model):
+         for plan in plan_list:
+             plan_results = self\
+                 .with_context(
+-                    no_exchange_difference=self._context.get('no_exchange_difference') or disable_partial_exchange_diff,
++                    no_exchange_difference=self._context.get('no_exchange_difference'),
+                     no_exchange_difference_no_recursive=self._context.get('no_exchange_difference_no_recursive', False),
+                 )\
+                 ._prepare_reconciliation_plan(plan, aml_values_map)
+@@ -2508,63 +2505,6 @@ class AccountMoveLine(models.Model):
+         all_amls.matched_debit_ids
+         all_amls.matched_credit_ids
+ 
+-        # ==== Prepare the full exchange journal entries ====
+-        # This part could be bypassed using the 'no_exchange_difference' key inside the context. This is useful
+-        # when importing a full accounting including the reconciliation like Winbooks.
+-
+-        exchange_diff_values_list = []
+-        exchange_diff_full_batch_index = []
+-        if not self._context.get('no_exchange_difference'):
+-            for full_batch_index, full_batch in enumerate(full_batches):
+-                involved_amls = full_batch['amls']
+-                if not full_batch['is_fully_reconciled']:
+-                    continue
+-
+-                # In normal cases, the exchange differences are already generated by the partial at this point meaning
+-                # there is no journal item left with a zero amount residual in one currency but not in the other.
+-                # However, after a migration coming from an older version with an older partial reconciliation or due to
+-                # some rounding issues (when dealing with different decimal places for example), we could need an extra
+-                # exchange difference journal entry to handle them.
+-                exchange_lines_to_fix = self.env['account.move.line']
+-                amounts_list = []
+-                exchange_max_date = date.min
+-                for aml in involved_amls:
+-                    if not aml.company_currency_id.is_zero(aml.amount_residual):
+-                        exchange_lines_to_fix += aml
+-                        amounts_list.append({'amount_residual': aml.amount_residual})
+-                    elif not aml.currency_id.is_zero(aml.amount_residual_currency):
+-                        exchange_lines_to_fix += aml
+-                        amounts_list.append({'amount_residual_currency': aml.amount_residual_currency})
+-                    exchange_max_date = max(exchange_max_date, aml.date)
+-                exchange_diff_values = exchange_lines_to_fix._prepare_exchange_difference_move_vals(
+-                    amounts_list,
+-                    company=involved_amls.company_id,
+-                    exchange_date=exchange_max_date,
+-                )
+-                exchange_diff_values['to_post'] = all([aml.parent_state == 'posted' for aml in exchange_lines_to_fix])
+-
+-                # Exchange difference for cash basis entries.
+-                # If we are fully reversing the entry, no need to fix anything since the journal entry
+-                # is exactly the mirror of the source journal entry.
+-                caba_lines_to_reconcile = None
+-                if is_cash_basis_needed(involved_amls) and not self._context.get('move_reverse_cancel') and not self._context.get('no_cash_basis'):
+-                    caba_lines_to_reconcile = involved_amls._add_exchange_difference_cash_basis_vals(exchange_diff_values)
+-
+-                # Prepare the exchange difference.
+-                if exchange_diff_values['move_values']['line_ids']:
+-                    exchange_diff_full_batch_index.append(full_batch_index)
+-                    exchange_diff_values_list.append(exchange_diff_values)
+-                    full_batch['caba_lines_to_reconcile'] = caba_lines_to_reconcile
+-
+-        # ==== Create the full exchange journal entries ====
+-        exchange_moves = self._create_exchange_difference_moves(exchange_diff_values_list)
+-        for full_batch_index, exchange_move in zip(exchange_diff_full_batch_index, exchange_moves):
+-            full_batch = full_batches[full_batch_index]
+-            amls = full_batch['amls']
+-            full_batch['exchange_move'] = exchange_move
+-            exchange_move_lines = exchange_move.line_ids.filtered(lambda line: line.account_id == amls.account_id)
+-            full_batch['amls'] |= exchange_move_lines
+-
+         # ==== Create the full reconcile ====
+         # Note we are using Command.link and not Command.set because Command.set is triggering an unlink that is
+         # slowing down the assignation of the co-fields. Indeed, unlink is forcing a flush.
+@@ -2575,7 +2515,6 @@ class AccountMoveLine(models.Model):
+             involved_partials = amls.matched_debit_ids + amls.matched_credit_ids
+             if full_batch['is_fully_reconciled']:
+                 full_reconcile_values_list.append({
+-                    'exchange_move_id': full_batch.get('exchange_move') and full_batch['exchange_move'].id,
+                     'partial_reconcile_ids': [Command.link(partial.id) for partial in involved_partials],
+                     'reconciled_line_ids': [Command.link(aml.id) for aml in amls],
+                 })
+@@ -2761,211 +2700,6 @@ class AccountMoveLine(models.Model):
+ 
+         return exchange_moves
+ 
+-    def _add_exchange_difference_cash_basis_vals(self, exchange_diff_vals):
+-        """ Generate the exchange difference values used to create the journal items
+-        in order to fix the cash basis lines using the transfer account in a multi-currencies
+-        environment when this account is not a reconcile one.
+-        When the tax cash basis journal entries are generated and all involved
+-        transfer account set on taxes are all reconcilable, the account balance
+-        will be reset to zero by the exchange difference journal items generated
+-        above. However, this mechanism will not work if there is any transfer
+-        accounts that are not reconcile and we are generating the cash basis
+-        journal items in a foreign currency. In that specific case, we need to
+-        generate extra journal items at the generation of the exchange difference
+-        journal entry to ensure this balance is reset to zero and then, will not
+-        appear on the tax report leading to erroneous tax base amount / tax amount.
+-        :param exchange_diff_vals:  The current vals of the exchange difference journal entry created by the
+-                                    '_prepare_exchange_difference_move_vals' method.
+-        """
+-        caba_lines_to_reconcile = defaultdict(lambda: self.env['account.move.line']) # in the form {(move, account, repartition_line): move_lines}
+-        move_vals = exchange_diff_vals['move_values']
+-        for move in self.move_id:
+-            account_vals_to_fix = {}
+-
+-            move_values = move._collect_tax_cash_basis_values()
+-
+-            # The cash basis doesn't need to be handled for this move because there is another payment term
+-            # line that is not yet fully paid.
+-            if not move_values or not move_values['is_fully_paid']:
+-                continue
+-
+-            # ==========================================================================
+-            # Add the balance of all tax lines of the current move in order in order
+-            # to compute the residual amount for each of them.
+-            # ==========================================================================
+-
+-            caba_rounding_diff_label = _("Cash basis rounding difference")
+-            move_vals['date'] = max(move_vals['date'], move.date)
+-            move_vals['journal_id'] = self.company_id.tax_cash_basis_journal_id.id
+-            for caba_treatment, line in move_values['to_process_lines']:
+-
+-                vals = {
+-                    'name': caba_rounding_diff_label,
+-                    'currency_id': line.currency_id.id,
+-                    'partner_id': line.partner_id.id,
+-                    'tax_ids': [Command.set(line.tax_ids.ids)],
+-                    'tax_tag_ids': [Command.set(line.tax_tag_ids.ids)],
+-                    'debit': line.debit,
+-                    'credit': line.credit,
+-                    'amount_currency': line.amount_currency,
+-                }
+-
+-                if caba_treatment == 'tax':
+-                    # Tax line.
+-                    grouping_key = self.env['account.partial.reconcile']._get_cash_basis_tax_line_grouping_key_from_record(line)
+-                    if grouping_key in account_vals_to_fix:
+-                        debit = account_vals_to_fix[grouping_key]['debit'] + vals['debit']
+-                        credit = account_vals_to_fix[grouping_key]['credit'] + vals['credit']
+-                        balance = debit - credit
+-
+-                        account_vals_to_fix[grouping_key].update({
+-                            'debit': balance if balance > 0 else 0,
+-                            'credit': -balance if balance < 0 else 0,
+-                            'tax_base_amount': account_vals_to_fix[grouping_key]['tax_base_amount'] + line.tax_base_amount,
+-                            'amount_currency': account_vals_to_fix[grouping_key]['amount_currency'] + line.amount_currency,
+-                        })
+-                    else:
+-                        account_vals_to_fix[grouping_key] = {
+-                            **vals,
+-                            'account_id': line.account_id.id,
+-                            'tax_base_amount': line.tax_base_amount,
+-                            'tax_repartition_line_id': line.tax_repartition_line_id.id,
+-                        }
+-
+-                    if line.account_id.reconcile:
+-                        caba_lines_to_reconcile[(move, line.account_id, line.tax_repartition_line_id)] |= line
+-
+-                elif caba_treatment == 'base':
+-                    # Base line.
+-                    account_to_fix = line.company_id.account_cash_basis_base_account_id
+-                    if not account_to_fix:
+-                        continue
+-
+-                    grouping_key = self.env['account.partial.reconcile']._get_cash_basis_base_line_grouping_key_from_record(line, account=account_to_fix)
+-
+-                    if grouping_key not in account_vals_to_fix:
+-                        account_vals_to_fix[grouping_key] = {
+-                            **vals,
+-                            'account_id': account_to_fix.id,
+-                        }
+-                    else:
+-                        # Multiple base lines could share the same key, if the same
+-                        # cash basis tax is used alone on several lines of the invoices
+-                        account_vals_to_fix[grouping_key]['debit'] += vals['debit']
+-                        account_vals_to_fix[grouping_key]['credit'] += vals['credit']
+-                        account_vals_to_fix[grouping_key]['amount_currency'] += vals['amount_currency']
+-
+-            # ==========================================================================
+-            # Subtract the balance of all previously generated cash basis journal entries
+-            # in order to retrieve the residual balance of each involved transfer account.
+-            # ==========================================================================
+-
+-            cash_basis_moves = self.env['account.move'].search([('tax_cash_basis_origin_move_id', '=', move.id)])
+-            caba_transition_accounts = self.env['account.account']
+-            for line in cash_basis_moves.line_ids:
+-                grouping_key = None
+-                if line.tax_repartition_line_id:
+-                    # Tax line.
+-                    transition_account = line.tax_line_id.cash_basis_transition_account_id
+-                    grouping_key = self.env['account.partial.reconcile']._get_cash_basis_tax_line_grouping_key_from_record(
+-                        line,
+-                        account=transition_account,
+-                    )
+-                    caba_transition_accounts |= transition_account
+-                elif line.tax_ids:
+-                    # Base line.
+-                    grouping_key = self.env['account.partial.reconcile']._get_cash_basis_base_line_grouping_key_from_record(
+-                        line,
+-                        account=line.company_id.account_cash_basis_base_account_id,
+-                    )
+-
+-                if grouping_key not in account_vals_to_fix:
+-                    continue
+-
+-                account_vals_to_fix[grouping_key]['debit'] -= line.debit
+-                account_vals_to_fix[grouping_key]['credit'] -= line.credit
+-                account_vals_to_fix[grouping_key]['amount_currency'] -= line.amount_currency
+-
+-            # Collect the caba lines affecting the transition account.
+-            for transition_line in filter(lambda x: x.account_id in caba_transition_accounts, cash_basis_moves.line_ids):
+-                caba_reconcile_key = (transition_line.move_id, transition_line.account_id, transition_line.tax_repartition_line_id)
+-                caba_lines_to_reconcile[caba_reconcile_key] |= transition_line
+-
+-            # ==========================================================================
+-            # Generate the exchange difference journal items:
+-            # - to reset the balance of all transfer account to zero.
+-            # - fix rounding issues on the tax account/base tax account.
+-            # ==========================================================================
+-
+-            currency = move_values['currency']
+-
+-            # To know which rate to use for the adjustment, get the rate used by the most recent cash basis move
+-            last_caba_move = max(cash_basis_moves, key=lambda m: m.date) if cash_basis_moves else self.env['account.move']
+-            currency_line = last_caba_move.line_ids.filtered(lambda x: x.currency_id == currency)[:1]
+-            currency_rate = currency_line.balance / currency_line.amount_currency if currency_line.amount_currency else 1.0
+-
+-            existing_line_vals_list = move_vals['line_ids']
+-            next_sequence = len(existing_line_vals_list)
+-            for values in account_vals_to_fix.values():
+-
+-                if currency.is_zero(values['amount_currency']):
+-                    continue
+-
+-                # There is a rounding error due to multiple payments on the foreign currency amount
+-                balance = currency.round(currency_rate * values['amount_currency'])
+-
+-                if values.get('tax_repartition_line_id'):
+-                    # Tax line
+-                    tax_repartition_line = self.env['account.tax.repartition.line'].browse(values['tax_repartition_line_id'])
+-                    account = tax_repartition_line.account_id or self.env['account.account'].browse(values['account_id'])
+-
+-                    existing_line_vals_list.extend([
+-                        Command.create({
+-                            **values,
+-                            'debit': balance if balance > 0.0 else 0.0,
+-                            'credit': -balance if balance < 0.0 else 0.0,
+-                            'amount_currency': values['amount_currency'],
+-                            'account_id': account.id,
+-                            'sequence': next_sequence,
+-                        }),
+-                        Command.create({
+-                            **values,
+-                            'debit': -balance if balance < 0.0 else 0.0,
+-                            'credit': balance if balance > 0.0 else 0.0,
+-                            'amount_currency': -values['amount_currency'],
+-                            'account_id': values['account_id'],
+-                            'tax_ids': [],
+-                            'tax_tag_ids': [],
+-                            'tax_base_amount': 0,
+-                            'tax_repartition_line_id': False,
+-                            'sequence': next_sequence + 1,
+-                        }),
+-                    ])
+-                else:
+-                    # Base line
+-                    existing_line_vals_list.extend([
+-                        Command.create({
+-                            **values,
+-                            'debit': balance if balance > 0.0 else 0.0,
+-                            'credit': -balance if balance < 0.0 else 0.0,
+-                            'amount_currency': values['amount_currency'],
+-                            'sequence': next_sequence,
+-                        }),
+-                        Command.create({
+-                            **values,
+-                            'debit': -balance if balance < 0.0 else 0.0,
+-                            'credit': balance if balance > 0.0 else 0.0,
+-                            'amount_currency': -values['amount_currency'],
+-                            'tax_ids': [],
+-                            'tax_tag_ids': [],
+-                            'sequence': next_sequence + 1,
+-                        }),
+-                    ])
+-
+-                next_sequence += 2
+-
+-        return caba_lines_to_reconcile
+-
+     def reconcile(self):
+         """ Reconcile the current move lines all together. """
+         return self._reconcile_plan([self])
+
+--- a/addons/account/models/account_partial_reconcile.py
++++ b/addons/account/models/account_partial_reconcile.py
+@@ -548,6 +548,14 @@ class AccountPartialReconcile(models.Model):
+ 
+                     # Percentage expressed in the foreign currency.
+                     amount_currency = line.currency_id.round(line.amount_currency * partial_values['percentage'])
++                    if (
++                        caba_treatment == 'tax'
++                        and (
++                            move_values['is_fully_paid']
++                            or line.currency_id.compare_amounts(abs(line.amount_residual_currency), abs(amount_currency)) < 0
++                        )
++                    ):
++                        amount_currency = line.amount_residual_currency
+                     balance = partial_values['payment_rate'] and amount_currency / partial_values['payment_rate'] or 0.0
+ 
+                     # ==========================================================================
+
+--- a/addons/account/models/account_tax.py
++++ b/addons/account/models/account_tax.py
+@@ -236,6 +236,16 @@ class AccountTax(models.Model):
+             if record.tax_group_id.country_id and record.tax_group_id.country_id != record.country_id:
+                 raise ValidationError(_("The tax group must have the same country_id as the tax using it."))
+ 
++    @api.constrains('tax_exigibility', 'cash_basis_transition_account_id')
++    def _constrains_cash_basis_transition_account(self):
++        for record in self:
++            if (
++                record.tax_exigibility == 'on_payment'
++                and not record.cash_basis_transition_account_id.reconcile
++                and not self._context.get('chart_template_load')
++            ):
++                raise ValidationError(_("The cash basis transition account needs to allow reconciliation."))
++
+     @api.depends('company_id')
+     def _compute_country_id(self):
+         for tax in self:

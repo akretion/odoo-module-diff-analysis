@@ -1,0 +1,940 @@
+PR: https://github.com/odoo/odoo/pull/205945
+
+From: 367464d9a3e4d90666a65d86dab5d12f99798137
+From: amdi-odoo
+Date: 2025-04-24 01:50:24
++    event_slot_ids = fields.One2many("event.slot", "event_id", "Slots", copy=True)
++    mail_slot_ids = fields.One2many(
+-    event_begin_date = fields.Datetime(string="Event Start Date", related='event_id.date_begin', readonly=True)
+-    event_end_date = fields.Datetime(string="Event End Date", related='event_id.date_end', readonly=True)
++    event_begin_date = fields.Datetime("Event Start Date", compute="_compute_event_begin_date")
++    event_end_date = fields.Datetime("Event End Date", compute="_compute_event_end_date")
++    registration_ids = fields.One2many("event.registration", "event_slot_id", string="Attendees")
+
+Total Changes: 544
+
+[IMP] {website_}event{_sale}: support slot-based events
+
+Purpose
+=======
+Adding the possibility to have events with multiple time slots.
+For example, creating an event for a Museum exposition, a movie in a Cinema or
+a Theater piece and have multiple time slots for users to register to.
+At registration, the selection of a specific time slot will be required.
+
+Specification
+=============
+Adding slots support when registering to an event via the registration desk,
+the website and a sale order (separate commit for point of sale).
+
+To activate the multi-slots option, a boolean is added on the event form and a new "Slots"
+status bar button will appear. This button will open the new multi create calendar view to quickly
+manage and add slots on large time period.
+
+Events used to only support tickets. They can now also have slots.
+An event can have slots without tickets, or both slots and tickets.
+For example, if an event go from the 1st of January 2025 to the 31st of December 2025,
+a user will be able to register for the Saturday 26th of April 2025 from 12PM to 6PM
+with a Standard ticket.
+
+To handle these scenarios, an event registration can now be linked to a slot (with or without ticket).
+The slot dates with their start and end hours are expressed in the event tz, but
+their datetimes are expressed in UTC (converted back to the event tz on the front-end).
+
+When an event is multi slots, everything will be organized per slot:
+* Mailings and communications
+e.g. Sending an email 1 hour before the event will send the email 1 hour before each slot
+to the attendees registered to the slot.
+* Seats management ('seats_max' field on event)
+e.g. Limiting Registration to 2 Attendees, means 2 attendees maximum per slot.
+* Maximum tickets registration ('seats_max' field on ticket)
+e.g. Max registration for the Standard Ticket is 2, means 2 Standard Tickets
+registration maximum per slot.
+
+When both seats and tickets limitations are specified, they can limit each other.
+For example with an event having only one ticket:
+* Max event seats = 5
+* Max ticket seats = 10
+=> The event won't be able to have more than 5 attendees for each slot even if there are tickets left.
+
+Same logic the other way around:
+* Max event seats = 10
+* Max ticket seats = 5
+=> The event won't be able to have more than 5 registrations for this ticket on each slot even if there
+are seats remaining (registrations without tickets can still be added but only via the back-end).
+
+As the seats availabilities can now be tricky to compute, the availability check is changed to be
+performed using a check on the registrations instead of splitting the checks on different models.
+A new event method will handle the checks on (slot, ticket, count) tuples in batch so that
+every combinations of slot and ticket (not necessarily set) can have their availability checked.
+
+It is now possible to change the event 'seats_max' to set it below the current number of registrations
+(a warning is displayed). The event will be marked as sold out, the existing registrations will
+still exist and won't be archived. The users will need to take responsibility for the change and handle
+the extra registrations as they want.
+
+For website, the slot selection will happen first so that the ticket availabilities can be computed
+based on the selected slot. The availabilities will then be used to restrict the selectable tickets
+on the ticket selection modal.
+
+related:
+odoo/enterprise#83411
+odoo/upgrade#7565
+
+Task-4307566
+
+Part-of: odoo/odoo#205945
+Signed-off-by: Thibault Delavallee (tde) <tde@openerp.com>
+
+================================= pseudo patch: =================================
+
+--- a/addons/event/models/__init__.py
++++ b/addons/event/models/__init__.py
+@@ -9,7 +9,9 @@ from . import event_type_ticket
+ from . import event_event
+ from . import event_mail
+ from . import event_mail_registration
++from . import event_mail_slot
+ from . import event_registration
++from . import event_slot
+ from . import event_stage
+ from . import event_tag
+ from . import event_ticket
+
+--- a/addons/event/models/event_event.py
++++ b/addons/event/models/event_event.py
+@@ -108,7 +108,8 @@ class EventEvent(models.Model):
+     seats_max = fields.Integer(
+         string='Maximum Attendees',
+         compute='_compute_seats_max', readonly=False, store=True,
+-        help="For each event you can define a maximum registration of seats(number of attendees), above this numbers the registrations are not accepted.")
++        help="For each event you can define a maximum registration of seats(number of attendees), above this number the registrations are not accepted. "
++        "If the event has multiple slots, this maximum number is applied per slot.")
+     seats_limited = fields.Boolean('Limit Attendees', required=True, compute='_compute_seats_limited',
+                                    precompute=True, readonly=False, store=True)
+     seats_reserved = fields.Integer(
+@@ -125,6 +126,12 @@ class EventEvent(models.Model):
+         store=False, readonly=True, compute='_compute_seats')
+     # Registration fields
+     registration_ids = fields.One2many('event.registration', 'event_id', string='Attendees')
++    is_multi_slots = fields.Boolean("Is Multi Slots", copy=True,
++        help="Allow multiple time slots. "
++        "The communications, the maximum number of attendees and the maximum number of tickets registrations "
++        "are defined for each time slot instead of the whole event.")
++    event_slot_ids = fields.One2many("event.slot", "event_id", "Slots", copy=True)
++    event_slot_count = fields.Integer("Slots Count", compute="_compute_event_slot_count")
+     event_ticket_ids = fields.One2many(
+         'event.event.ticket', 'event_id', string='Event Ticket', copy=True,
+         compute='_compute_event_ticket_ids', readonly=False, store=True, precompute=True)
+@@ -253,7 +260,7 @@ class EventEvent(models.Model):
+             else:
+                 event.kanban_state_label = event.stage_id.legend_done
+ 
+-    @api.depends('seats_max', 'registration_ids.state', 'registration_ids.active')
++    @api.depends('event_slot_count', 'is_multi_slots', 'seats_max', 'registration_ids.state', 'registration_ids.active')
+     def _compute_seats(self):
+         """ Determine available, reserved, used and taken seats. """
+         # initialize fields to 0
+@@ -281,8 +288,9 @@ class EventEvent(models.Model):
+         # compute seats_available and expected
+         for event in self:
+             event.update(results.get(event._origin.id or event.id, base_vals))
+-            if event.seats_max > 0:
+-                event.seats_available = event.seats_max - (event.seats_reserved + event.seats_used)
++            seats_max = event.seats_max * event.event_slot_count if event.is_multi_slots else event.seats_max
++            if seats_max > 0:
++                event.seats_available = seats_max - (event.seats_reserved + event.seats_used)
+ 
+             event.seats_taken = event.seats_reserved + event.seats_used
+ 
+@@ -315,7 +323,25 @@ class EventEvent(models.Model):
+             event.event_registrations_open = event.event_registrations_started and \
+                 (date_end_tz >= current_datetime if date_end_tz else True) and \
+                 (not event.seats_limited or not event.seats_max or event.seats_available) and \
+-                (not event.event_ticket_ids or any(ticket.sale_available for ticket in event.event_ticket_ids))
++                (
++                    # Not multi slots: open if no tickets or at least a sale available ticket
++                    (not event.is_multi_slots and
++                        (not event.event_ticket_ids or any(ticket.sale_available for ticket in event.event_ticket_ids)))
++                    or
++                    # Multi slots: open if at least a slot and no tickets or at least an ongoing ticket with availability
++                    (event.is_multi_slots and event.event_slot_count and (
++                        not event.event_ticket_ids or any(
++                            ticket.is_launched and not ticket.is_expired and (
++                                any(availability is None or availability > 0
++                                    for availability in event._get_seats_availability([
++                                        (slot, ticket)
++                                        for slot in event.event_slot_ids
++                                    ])
++                                )
++                            ) for ticket in event.event_ticket_ids
++                        )
++                    ))
++                )
+ 
+     @api.depends('event_ticket_ids.start_sale_datetime')
+     def _compute_start_sale_date(self):
+@@ -325,18 +351,30 @@ class EventEvent(models.Model):
+             start_dates = [ticket.start_sale_datetime for ticket in event.event_ticket_ids if not ticket.is_expired]
+             event.start_sale_datetime = min(start_dates) if start_dates and all(start_dates) else False
+ 
+-    @api.depends('event_ticket_ids.sale_available', 'seats_available', 'seats_limited')
++    @api.depends('event_slot_ids', 'event_ticket_ids.sale_available', 'seats_available', 'seats_limited')
+     def _compute_event_registrations_sold_out(self):
+         """Note that max seats limits for events and sum of limits for all its tickets may not be
+         equal to enable flexibility.
+         E.g. max 20 seats for ticket A, 20 seats for ticket B
+             * With max 20 seats for the event
+             * Without limit set on the event (=40, but the customer didn't explicitly write 40)
++        When the event is multi slots, instead of checking if every tickets is sold out,
++        checking if every slot-ticket combination is sold out.
+         """
+         for event in self:
+             event.event_registrations_sold_out = (
+-                (event.seats_limited and event.seats_max and not event.seats_available)
+-                or (event.event_ticket_ids and all(ticket.is_sold_out for ticket in event.event_ticket_ids))
++                (event.seats_limited and event.seats_max and not event.seats_available > 0)
++                or (event.event_ticket_ids and (
++                    not any(availability is None or availability > 0
++                        for availability in event._get_seats_availability([
++                            (slot, ticket)
++                            for slot in event.event_slot_ids
++                            for ticket in event.event_ticket_ids
++                        ])
++                    )
++                    if event.is_multi_slots else
++                    all(ticket.is_sold_out for ticket in event.event_ticket_ids)
++                ))
+             )
+ 
+     @api.depends('date_begin', 'date_end')
+@@ -385,6 +423,16 @@ class EventEvent(models.Model):
+             if not event.date_tz:
+                 event.date_tz = self.env.user.tz or 'UTC'
+ 
++    @api.depends("event_slot_ids")
++    def _compute_event_slot_count(self):
++        slot_count_per_event = dict(self.env['event.slot']._read_group(
++            domain=[('event_id', 'in', self.ids)],
++            groupby=['event_id'],
++            aggregates=['__count']
++        ))
++        for event in self:
++            event.event_slot_count = slot_count_per_event.get(event, 0)
++
+     @api.depends('address_id')
+     def _compute_address_search(self):
+         for event in self:
+@@ -534,19 +582,29 @@ class EventEvent(models.Model):
+         """Reset url field as it should only be used for events with no physical location."""
+         self.filtered('address_id').event_url = ''
+ 
+-    @api.constrains('seats_max', 'seats_limited', 'registration_ids')
+-    def _check_seats_availability(self, minimal_availability=0):
+-        sold_out_events = []
+-        for event in self:
+-            if event.seats_limited and event.seats_max and event.seats_available < minimal_availability:
+-                sold_out_events.append(_(
+-                    '- "%(event_name)s": Missing %(nb_too_many)i seats.',
+-                    event_name=event.name,
+-                    nb_too_many=minimal_availability - event.seats_available,
+-                ))
+-        if sold_out_events:
+-            raise ValidationError(_('There are not enough seats available for:')
+-                                  + '\n%s\n' % '\n'.join(sold_out_events))
++    @api.constrains("date_begin", "date_end", "event_slot_ids", "is_multi_slots")
++    def _check_slots_dates(self):
++        multi_slots_event_ids = self.filtered(lambda event: event.is_multi_slots).ids
++        if not multi_slots_event_ids:
++            return
++        min_max_slot_dates_per_event = {
++            event: (min_start, max_end)
++            for event, min_start, max_end in self.env['event.slot']._read_group(
++                domain=[('event_id', 'in', multi_slots_event_ids)],
++                groupby=['event_id'],
++                aggregates=['start_datetime:min', 'end_datetime:max']
++            )
++        }
++        events_w_slots_outside_bounds = []
++        for event, (min_start, max_end) in min_max_slot_dates_per_event.items():
++            if (not (event.date_begin <= min_start <= event.date_end) or
++                not (event.date_begin <= max_end <= event.date_end)):
++                events_w_slots_outside_bounds.append(event)
++        if events_w_slots_outside_bounds:
++            raise ValidationError(_(
++                "These events cannot have slots scheduled outside of their time range:\n%(event_names)s",
++                event_names="\n".join(f"- {event.name}" for event in events_w_slots_outside_bounds)
++            ))
+ 
+     @api.constrains('date_begin', 'date_end')
+     def _check_closing_date(self):
+@@ -569,6 +627,19 @@ class EventEvent(models.Model):
+             if parsed_url.scheme not in ('http', 'https'):
+                 event.event_url = 'https://' + event.event_url
+ 
++    @api.onchange('seats_max')
++    def _onchange_seats_max(self):
++        for event in self:
++            if event.seats_limited and event.seats_max and event.seats_available <= 0 and \
++                (event.event_slot_ids if event.is_multi_slots else True):
++                return {
++                    'warning': {
++                        'title': _("Update the limit of registrations?"),
++                        'message': _("There are more registrations than this limit, "
++                                    "the event will be sold out and the extra registrations will remain."),
++                    }
++                }
++
+     def write(self, vals):
+         if 'stage_id' in vals and 'kanban_state' not in vals:
+             # reset kanban state when changing stage
+@@ -616,6 +687,86 @@ class EventEvent(models.Model):
+         self.ensure_one()
+         return self.with_context(tz=self.date_tz or 'UTC')
+ 
++    def _get_seats_availability(self, slot_tickets):
++        """ Get availabilities for given combinations of slot / ticket. Returns
++        a list following input order. None denotes no limit. """
++        self.ensure_one()
++        if not (all(len(item) == 2 for item in slot_tickets)):
++            raise ValueError('Input should be a list of tuples containing slot, ticket')
++
++        if any(slot for (slot, _ticket) in slot_tickets):
++            slot_tickets_nb_registrations = {
++                (slot.id, ticket.id): count
++                for (slot, ticket, count) in self.env['event.registration'].sudo()._read_group(
++                    domain=[('event_slot_id', '!=', False), ('event_id', 'in', self.ids),
++                            ('state', 'in', ['open', 'done']), ('active', '=', True)],
++                    groupby=['event_slot_id', 'event_ticket_id'],
++                    aggregates=['__count']
++                )
++            }
++
++        availabilities = []
++        for slot, ticket in slot_tickets:
++            available = None
++            # event is constrained: max stands for either each slot, either global (no slots)
++            if self.seats_limited and self.seats_max:
++                if slot:
++                    available = slot.seats_available
++                else:
++                    available = self.seats_available
++            # ticket is constrained: max standard for either each slot / ticket, either global (no slots)
++            if available != 0 and ticket and ticket.seats_max:
++                if slot:
++                    ticket_available = ticket.seats_max - slot_tickets_nb_registrations.get((slot.id, ticket.id), 0)
++                else:
++                    ticket_available = ticket.seats_available
++                available = ticket_available if available is None else min(available, ticket_available)
++            availabilities.append(available)
++        return availabilities
++
++    def _verify_seats_availability(self, slot_tickets):
++        """ Check event seats availability, for combinations of slot / ticket.
++
++        :slot_tickets: a list of tuples(slot, ticket, count). SLot and ticket
++          are optional, depending on event configuration. If count is 0
++          it is a simple check current values do not overflow limit. If count
++          is given, it serves as a check there are enough remaining seats.
++
++        Raises:
++            ValidationError: if the event / slot / ticket do not have enough
++            available seats
++        """
++        self.ensure_one()
++        if not (all(len(item) == 3 for item in slot_tickets)):
++            raise ValueError('Input should be a list of tuples containing slot, ticket, count')
++
++        sold_out = []
++        availabilities = self._get_seats_availability([(item[0], item[1]) for item in slot_tickets])
++        for (slot, ticket, count), available in zip(slot_tickets, availabilities, strict=True):
++            if available is None:  # unconstrained
++                continue
++            if available < count:
++                if slot and ticket:
++                    name = f'{ticket.name} - {slot.display_name}'
++                elif slot:
++                    name = slot.display_name
++                elif ticket:
++                    name = ticket.name
++                else:
++                    name = self.name
++                sold_out.append((name, count - available))
++
++        if sold_out:
++            info = []  # note: somehow using list comprehension make translate.py crash in default lang
++            for item in sold_out:
++                info.append(_('%(slot_name)s: missing %(count)s seat(s)', slot_name=item[0], count=item[1]))
++            raise ValidationError(
++                _('There are not enough seats available for %(event_name)s:\n%(sold_out_info)s',
++                  event_name=self.name,
++                  sold_out_info='\n'.join(info),
++                )
++            )
++
+     # ------------------------------------------------------------
+     # ACTIONS
+     # ------------------------------------------------------------
+@@ -630,10 +781,11 @@ class EventEvent(models.Model):
+         if first_ended_stage:
+             self.write({'stage_id': first_ended_stage.id})
+ 
+-    def _get_date_range_str(self, lang_code=False):
++    def _get_date_range_str(self, start_datetime=False, lang_code=False):
+         self.ensure_one()
++        datetime = start_datetime or self.date_begin
+         today_tz = pytz.utc.localize(fields.Datetime.now()).astimezone(pytz.timezone(self.date_tz))
+-        event_date_tz = pytz.utc.localize(self.date_begin).astimezone(pytz.timezone(self.date_tz))
++        event_date_tz = pytz.utc.localize(datetime).astimezone(pytz.timezone(self.date_tz))
+         diff = (event_date_tz.date() - today_tz.date())
+         if diff.days <= 0:
+             return _('today')
+@@ -645,7 +797,7 @@ class EventEvent(models.Model):
+             return _('next week')
+         if event_date_tz.month == (today_tz + relativedelta(months=+1)).month:
+             return _('next month')
+-        return _('on %(date)s', date=format_date(self.env, self.date_begin, lang_code=lang_code, date_format='medium'))
++        return _('on %(date)s', date=format_date(self.env, datetime, lang_code=lang_code, date_format='medium'))
+ 
+     def _get_external_description(self):
+         """
+@@ -662,8 +814,9 @@ class EventEvent(models.Model):
+         description += textwrap.shorten(html_to_inner_content(self.description), 1900)
+         return description
+ 
+-    def _get_ics_file(self):
++    def _get_ics_file(self, slot=False):
+         """ Returns iCalendar file for the event invitation.
++            :param slot: If a slot is given, schedule with the given slot datetimes
+             :returns a dict of .ics file content for each event
+         """
+         result = {}
+@@ -674,10 +827,12 @@ class EventEvent(models.Model):
+             cal = vobject.iCalendar()
+             cal.add('method').value = 'PUBLISH'
+             cal_event = cal.add('vevent')
++            start = slot.start_datetime or event.date_begin
++            end = slot.end_datetime or event.date_end
+ 
+             cal_event.add('created').value = fields.Datetime.now().replace(tzinfo=pytz.timezone('UTC'))
+-            cal_event.add('dtstart').value = event.date_begin.astimezone(pytz.timezone(event.date_tz))
+-            cal_event.add('dtend').value = event.date_end.astimezone(pytz.timezone(event.date_tz))
++            cal_event.add('dtstart').value = start.astimezone(pytz.timezone(event.date_tz))
++            cal_event.add('dtend').value = end.astimezone(pytz.timezone(event.date_tz))
+             cal_event.add('summary').value = event.name
+             cal_event.add('description').value = event._get_external_description()
+             if event.address_id:
+
+--- a/addons/event/models/event_mail.py
++++ b/addons/event/models/event_mail.py
+@@ -47,7 +47,9 @@ class EventMail(models.Model):
+         # event based: end date
+         ('after_event', 'After the event ended'),
+         ('before_event_end', 'Before the event ends')],
+-        string='Trigger ', default="before_event", required=True)
++        string='Trigger ', default="before_event", required=True,
++        help="Indicates when the communication is sent. "
++        "If the event has multiple slots, the interval is related to each time slot instead of the whole event.")
+     scheduled_date = fields.Datetime('Schedule Date', compute='_compute_scheduled_date', store=True)
+     error_datetime = fields.Datetime('Last Error')
+     # contact and status
+@@ -55,6 +57,9 @@ class EventMail(models.Model):
+     mail_registration_ids = fields.One2many(
+         'event.mail.registration', 'scheduler_id',
+         help='Communication related to event registrations')
++    mail_slot_ids = fields.One2many(
++        'event.mail.slot', 'scheduler_id',
++        help='Slot-based communication')
+     mail_done = fields.Boolean("Sent", copy=False, readonly=True)
+     mail_state = fields.Selection(
+         [('running', 'Running'), ('scheduled', 'Scheduled'), ('sent', 'Sent'), ('error', 'Error')],
+@@ -104,6 +109,8 @@ class EventMail(models.Model):
+         for scheduler in self._filter_template_ref():
+             if scheduler.interval_type == 'after_sub':
+                 scheduler._execute_attendee_based()
++            elif scheduler.event_id.is_multi_slots:
++                scheduler._execute_slot_based()
+             else:
+                 # before or after event -> one shot communication, once done skip
+                 if scheduler.mail_done:
+@@ -114,11 +121,17 @@ class EventMail(models.Model):
+             scheduler.error_datetime = False
+         return True
+ 
+-    def _execute_event_based(self):
++    def _execute_event_based(self, mail_slot=False):
+         """ Main scheduler method when running in event-based mode aka
+         'after_event' or 'before_event' (and their negative counterparts).
+         This is a global communication done once i.e. we do not track each
+-        registration individually. """
++        registration individually.
++
++        :param mail_slot: optional <event.mail.slot> slot-specific event communication,
++          when event uses slots. In that case, it works like the classic event
++          communication (iterative, ...) but information is specific to each
++          slot (last registration, scheduled datetime, ...)
++        """
+         auto_commit = not modules.module.current_test
+         batch_size = int(
+             self.env['ir.config_parameter'].sudo().get_param('mail.batch_size')
+@@ -126,19 +139,22 @@ class EventMail(models.Model):
+         cron_limit = int(
+             self.env['ir.config_parameter'].sudo().get_param('mail.render.cron.limit')
+         ) or 1000  # be sure to not have 0, as otherwise we will loop
++        scheduler_record = mail_slot or self
+ 
+         # fetch registrations to contact
+         registration_domain = [
+             ('event_id', '=', self.event_id.id),
+             ('state', 'not in', ["draft", "cancel"]),
+         ]
+-        if self.last_registration_id:
++        if mail_slot:
++            registration_domain += [('event_slot_id', '=', mail_slot.event_slot_id.id)]
++        if scheduler_record.last_registration_id:
+             registration_domain += [('id', '>', self.last_registration_id.id)]
+         registrations = self.env["event.registration"].search(registration_domain, limit=(cron_limit + 1), order="id ASC")
+ 
+         # no registrations -> done
+         if not registrations:
+-            self.mail_done = True
++            scheduler_record.mail_done = True
+             return
+ 
+         # there are more than planned for the cron -> reschedule
+@@ -148,9 +164,9 @@ class EventMail(models.Model):
+ 
+         for registrations_chunk in tools.split_every(batch_size, registrations.ids, self.env["event.registration"].browse):
+             self._execute_event_based_for_registrations(registrations_chunk)
+-            self.last_registration_id = registrations_chunk[-1]
++            scheduler_record.last_registration_id = registrations_chunk[-1]
+ 
+-            self._refresh_mail_count_done()
++            self._refresh_mail_count_done(mail_slot=mail_slot)
+             if auto_commit:
+                 self.env.cr.commit()
+                 # invalidate cache, no need to keep previous content in memory
+@@ -167,6 +183,29 @@ class EventMail(models.Model):
+             self._send_mail(registrations)
+         return True
+ 
++    def _execute_slot_based(self):
++        """ Main scheduler method when running in slot-based mode aka
++        'after_event' or 'before_event' (and their negative counterparts) on
++        events with slots. This is a global communication done once i.e. we do
++        not track each registration individually. """
++        # create slot-specific schedulers if not existing
++        missing_slots = self.event_id.event_slot_ids - self.mail_slot_ids.event_slot_id
++        if missing_slots:
++            self.write({'mail_slot_ids': [
++                (0, 0, {'event_slot_id': slot.id})
++                for slot in missing_slots
++            ]})
++
++        # filter slots to contact
++        now = fields.Datetime.now()
++        for mail_slot in self.mail_slot_ids:
++            # before or after event -> one shot communication, once done skip
++            if mail_slot.mail_done:
++                continue
++            # do not send emails if the mailing was scheduled before the slot but the slot is over
++            if mail_slot.scheduled_date <= now and (self.interval_type not in ('before_event', 'after_event_start') or mail_slot.event_slot_id.end_datetime > now):
++                self._execute_event_based(mail_slot=mail_slot)
++
+     def _execute_attendee_based(self):
+         """ Main scheduler method when running in attendee-based mode aka
+         'after_sub'. This relies on a sub model allowing to know which
+@@ -254,7 +293,7 @@ class EventMail(models.Model):
+                 } for registration in registrations])
+         return new
+ 
+-    def _refresh_mail_count_done(self):
++    def _refresh_mail_count_done(self, mail_slot=False):
+         for scheduler in self:
+             if scheduler.interval_type == "after_sub":
+                 total_sent = self.env["event.mail.registration"].search_count([
+@@ -262,6 +301,17 @@ class EventMail(models.Model):
+                     ("mail_sent", "=", True),
+                 ])
+                 scheduler.mail_count_done = total_sent
++            elif mail_slot and mail_slot.last_registration_id:
++                total_sent = self.env["event.registration"].search_count([
++                    ("id", "<=", mail_slot.last_registration_id.id),
++                    ("event_id", "=", scheduler.event_id.id),
++                    ("event_slot_id", "=", mail_slot.event_slot_id.id),
++                    ("state", "not in", ["draft", "cancel"]),
++                ])
++                mail_slot.mail_count_done = total_sent
++                mail_slot.mail_done = total_sent >= mail_slot.event_slot_id.seats_taken
++                scheduler.mail_count_done = sum(scheduler.mail_slot_ids.mapped('mail_count_done'))
++                scheduler.mail_done = scheduler.mail_count_done >= scheduler.event_id.seats_taken
+             elif scheduler.last_registration_id:
+                 total_sent = self.env["event.registration"].search_count([
+                     ("id", "<=", self.last_registration_id.id),
+
+--- a/None
++++ b/addons/event/models/event_mail_slot.py
+@@ -0,0 +1,31 @@
++from odoo import api, fields, models
++from odoo.addons.event.models.event_mail import _INTERVALS
++
++
++class EventMailRegistration(models.Model):
++    _name = 'event.mail.slot'
++    _description = 'Slot Mail Scheduler'
++    _rec_name = 'scheduler_id'
++    _order = 'scheduled_date DESC, id ASC'
++
++    event_slot_id = fields.Many2one('event.slot', 'Slot', ondelete='cascade', required=True)
++    scheduled_date = fields.Datetime('Schedule Date', compute='_compute_scheduled_date', store=True)
++    scheduler_id = fields.Many2one('event.mail', 'Mail Scheduler', ondelete='cascade', required=True)
++    # contact and status
++    last_registration_id = fields.Many2one('event.registration', 'Last Attendee')
++    mail_count_done = fields.Integer('# Sent', copy=False, readonly=True)
++    mail_done = fields.Boolean("Sent", copy=False, readonly=True)
++
++    @api.depends('event_slot_id.start_datetime', 'event_slot_id.end_datetime', 'scheduler_id.interval_unit', 'scheduler_id.interval_type')
++    def _compute_scheduled_date(self):
++        for mail_slot in self:
++            scheduler = mail_slot.scheduler_id
++            if scheduler.interval_type in ('before_event', 'after_event_start'):
++                date, sign = mail_slot.event_slot_id.start_datetime, (scheduler.interval_type == 'before_event' and -1) or 1
++            else:
++                date, sign = mail_slot.event_slot_id.end_datetime, (scheduler.interval_type == 'after_event' and 1) or -1
++            mail_slot.scheduled_date = date.replace(microsecond=0) + _INTERVALS[scheduler.interval_unit](sign * scheduler.interval_nbr) if date else False
++
++        next_schedule = self.filtered('scheduled_date').mapped('scheduled_date')
++        if next_schedule and (cron := self.env.ref('event.event_mail_scheduler', raise_if_not_found=False)):
++            cron._trigger(next_schedule)
+
+--- a/addons/event/models/event_registration.py
++++ b/addons/event/models/event_registration.py
+@@ -33,6 +33,10 @@ class EventRegistration(models.Model):
+     # event
+     event_id = fields.Many2one(
+         'event.event', string='Event', required=True, tracking=True, index=True)
++    is_multi_slots = fields.Boolean(string="Is Event Multi Slots", related="event_id.is_multi_slots")
++    event_slot_id = fields.Many2one(
++        "event.slot", string="Slot", ondelete='restrict', tracking=True, index="btree_not_null",
++        domain="[('event_id', '=', event_id)]")
+     event_ticket_id = fields.Many2one(
+         'event.event.ticket', string='Ticket Type', ondelete='restrict', tracking=True, index='btree_not_null')
+     active = fields.Boolean(default=True)
+@@ -54,8 +58,8 @@ class EventRegistration(models.Model):
+     date_closed = fields.Datetime(
+         string='Attended Date', compute='_compute_date_closed',
+         readonly=False, store=True)
+-    event_begin_date = fields.Datetime(string="Event Start Date", related='event_id.date_begin', readonly=True)
+-    event_end_date = fields.Datetime(string="Event End Date", related='event_id.date_end', readonly=True)
++    event_begin_date = fields.Datetime("Event Start Date", compute="_compute_event_begin_date")
++    event_end_date = fields.Datetime("Event End Date", compute="_compute_event_end_date")
+     event_date_range = fields.Char("Date Range", compute="_compute_date_range")
+     event_organizer_id = fields.Many2one(string='Event Organizer', related='event_id.organizer_id', readonly=True)
+     event_user_id = fields.Many2one(string='Event Responsible', related='event_id.user_id', readonly=True)
+@@ -90,11 +94,17 @@ class EventRegistration(models.Model):
+         'Barcode should be unique',
+     )
+ 
+-    @api.constrains('state', 'event_id', 'event_ticket_id')
++    @api.constrains('active', 'state', 'event_id', 'event_slot_id', 'event_ticket_id')
+     def _check_seats_availability(self):
+-        registrations_confirmed = self.filtered(lambda registration: registration.state in ('open', 'done'))
+-        registrations_confirmed.event_id._check_seats_availability()
+-        registrations_confirmed.event_ticket_id._check_seats_availability()
++        tocheck = self.filtered(lambda registration: registration.state in ('open', 'done') and registration.active)
++        for event, registrations in tocheck.grouped('event_id').items():
++            event._verify_seats_availability([
++                (slot, ticket, 0)
++                for slot, ticket in self.env['event.registration']._read_group(
++                    [('id', 'in', registrations.ids)],
++                    ['event_slot_id', 'event_ticket_id']
++                )
++            ])
+ 
+     def default_get(self, fields):
+         ret_vals = super().default_get(fields)
+@@ -154,10 +164,30 @@ class EventRegistration(models.Model):
+                 else:
+                     registration.date_closed = False
+ 
+-    @api.depends("event_id", "partner_id")
++    @api.depends("event_id", "event_slot_id", "partner_id")
+     def _compute_date_range(self):
+         for registration in self:
+-            registration.event_date_range = registration.event_id._get_date_range_str(registration.partner_id.lang)
++            registration.event_date_range = registration.event_id._get_date_range_str(
++                start_datetime=registration.event_slot_id.start_datetime,
++                lang_code=registration.partner_id.lang,
++            )
++
++    @api.depends("event_id", "event_slot_id")
++    def _compute_event_begin_date(self):
++        for registration in self:
++            registration.event_begin_date = registration.event_slot_id.start_datetime or registration.event_id.date_begin
++
++    @api.depends("event_id", "event_slot_id")
++    def _compute_event_end_date(self):
++        for registration in self:
++            registration.event_end_date = registration.event_slot_id.end_datetime or registration.event_id.date_end
++
++    @api.constrains('event_id', 'event_slot_id')
++    def _check_event_slot(self):
++        if any(registration.event_id != registration.event_slot_id.event_id for registration in self if registration.event_slot_id):
++            raise ValidationError(_('Invalid event / slot choice'))
++        if any(not registration.event_slot_id for registration in self if registration.is_multi_slots):
++            raise ValidationError(_('Slot choice is mandatory on multi-slots events.'))
+ 
+     @api.constrains('event_id', 'event_ticket_id')
+     def _check_event_ticket(self):
+@@ -174,6 +204,13 @@ class EventRegistration(models.Model):
+                 return dict((fname, contact[fname]) for fname in fnames if contact[fname])
+         return {}
+ 
++    @api.onchange('event_id')
++    def _onchange_event(self):
++        if self.event_slot_id and self.event_id != self.event_slot_id.event_id:
++            self.event_slot_id = False
++        if self.event_ticket_id and self.event_id != self.event_ticket_id.event_id:
++            self.event_ticket_id = False
++
+     @api.onchange('phone', 'event_id', 'partner_id')
+     def _onchange_phone_validation(self):
+         if self.phone:
+@@ -225,7 +262,7 @@ class EventRegistration(models.Model):
+                 related_country = self.env.company.country_id
+             values['phone'] = self._phone_format(number=values['phone'], country=related_country) or values['phone']
+ 
+-        registrations = super(EventRegistration, self).create(vals_list)
++        registrations = super().create(vals_list)
+         registrations._update_mail_schedulers()
+         return registrations
+ 
+@@ -233,7 +270,7 @@ class EventRegistration(models.Model):
+         confirming = vals.get('state') in {'open', 'done'}
+         to_confirm = (self.filtered(lambda registration: registration.state in {'draft', 'cancel'})
+                       if confirming else None)
+-        ret = super(EventRegistration, self).write(vals)
++        ret = super().write(vals)
+         if confirming:
+             to_confirm._update_mail_schedulers()
+ 
+@@ -245,15 +282,6 @@ class EventRegistration(models.Model):
+         for registration in self:
+             registration.display_name = registration.name or f"#{registration.id}"
+ 
+-    def action_unarchive(self):
+-        res = super().action_unarchive()
+-        # Necessary triggers as changing registration states cannot be used as triggers for the
+-        # Event(Ticket) models constraints.
+-        if unarchived := self.filtered(self._active_name):
+-            unarchived.event_id._check_seats_availability()
+-            unarchived.event_ticket_id._check_seats_availability()
+-        return res
+-
+     # ------------------------------------------------------------
+     # ACTIONS / BUSINESS
+     # ------------------------------------------------------------
+@@ -413,6 +441,7 @@ class EventRegistration(models.Model):
+             'id': self.id,
+             'name': self.name,
+             'partner_id': self.partner_id.id,
++            'slot_name': self.event_slot_id.display_name,
+             'ticket_name': self.event_ticket_id.name,
+             'event_id': self.event_id.id,
+             'event_display_name': self.event_id.display_name,
+
+--- a/None
++++ b/addons/event/models/event_slot.py
+@@ -0,0 +1,144 @@
++import pytz
++from datetime import datetime
++
++from odoo import _, api, fields, models
++from odoo.exceptions import UserError, ValidationError
++from odoo.tools.date_intervals import float_to_time
++from odoo.tools import (
++    format_date,
++    format_datetime,
++    formatLang,
++    format_time,
++)
++
++
++class EventSlot(models.Model):
++    _name = "event.slot"
++    _description = "Event Slot"
++    _order = "event_id, date, start_hour, end_hour, id"
++
++    event_id = fields.Many2one("event.event", "Event", required=True, ondelete="cascade")
++    color = fields.Integer("Color", default=0)
++    date = fields.Date("Date", required=True)
++    date_tz = fields.Selection(related="event_id.date_tz")
++    start_hour = fields.Float("Starting Hour", required=True, help="Expressed in the event timezone.")
++    end_hour = fields.Float("Ending Hour", required=True, help="Expressed in the event timezone.")
++    start_datetime = fields.Datetime("Start Datetime", compute="_compute_datetimes", store=True)
++    end_datetime = fields.Datetime("End Datetime", compute="_compute_datetimes", store=True)
++
++    # Registrations
++    is_sold_out = fields.Boolean(
++        "Sold Out", compute="_compute_is_sold_out",
++        help="Whether seats are sold out for this slot.")
++    registration_ids = fields.One2many("event.registration", "event_slot_id", string="Attendees")
++    seats_available = fields.Integer(
++        string="Available Seats",
++        store=False, readonly=True, compute="_compute_seats")
++    seats_reserved = fields.Integer(
++        string="Number of Registrations",
++        store=False, readonly=True, compute="_compute_seats")
++    seats_taken = fields.Integer(
++        string="Number of Taken Seats",
++        store=False, readonly=True, compute="_compute_seats")
++    seats_used = fields.Integer(
++        string="Number of Attendees",
++        store=False, readonly=True, compute="_compute_seats")
++
++    @api.constrains("start_hour", "end_hour")
++    def _check_hours(self):
++        for slot in self:
++            if not (0 <= slot.start_hour <= 23.99 and 0 <= slot.end_hour <= 23.99):
++                raise ValidationError(_("A slot hour must be between 0:00 and 23:59."))
++            if slot.end_hour <= slot.start_hour:
++                raise ValidationError(_("A slot end hour must be later than its start hour.\n%s", slot.display_name))
++
++    @api.constrains("date", "start_hour", "end_hour")
++    def _check_time_range(self):
++        for slot in self:
++            event_start = slot.event_id.date_begin
++            event_end = slot.event_id.date_end
++            if not (event_start <= slot.start_datetime <= event_end) or not (event_start <= slot.end_datetime <= event_end):
++                raise ValidationError(_(
++                    "A slot cannot be scheduled outside of its event time range.\n\n"
++                    "Event:\t\t%(event_start)s - %(event_end)s\n"
++                    "Slot:\t\t%(slot_name)s",
++                    event_start=format_datetime(self.env, event_start, tz=slot.date_tz, dt_format='medium'),
++                    event_end=format_datetime(self.env, event_end, tz=slot.date_tz, dt_format='medium'),
++                    slot_name=slot.display_name,
++                ))
++
++    @api.depends("date", "date_tz", "start_hour", "end_hour")
++    def _compute_datetimes(self):
++        for slot in self:
++            event_tz = pytz.timezone(slot.date_tz)
++            start = datetime.combine(slot.date, float_to_time(slot.start_hour))
++            end = datetime.combine(slot.date, float_to_time(slot.end_hour))
++            slot.start_datetime = event_tz.localize(start).astimezone(pytz.UTC).replace(tzinfo=None)
++            slot.end_datetime = event_tz.localize(end).astimezone(pytz.UTC).replace(tzinfo=None)
++
++    @api.depends("seats_available")
++    @api.depends_context('name_with_seats_availability')
++    def _compute_display_name(self):
++        """Adds slot seats availability if requested by context.
++        Always display the name without availabilities if the event is multi slots
++        because the availability displayed won't be relative to the possible ticket combinations
++        but only relative to the event and this will confuse the user.
++        """
++        for slot in self:
++            date = format_date(self.env, slot.date, date_format="medium")
++            start = format_time(self.env, float_to_time(slot.start_hour), time_format="short")
++            end = format_time(self.env, float_to_time(slot.end_hour), time_format="short")
++            name = f"{date}, {start} - {end}"
++            if (
++                self.env.context.get('name_with_seats_availability') and slot.event_id.seats_limited
++                and not slot.event_id.is_multi_slots
++            ):
++                name = _('%(slot_name)s (Sold out)', slot_name=name) if not slot.seats_available else \
++                    _(
++                        '%(slot_name)s (%(count)s seats remaining)',
++                        slot_name=name,
++                        count=formatLang(self.env, slot.seats_available, digits=0),
++                    )
++            slot.display_name = name
++
++    @api.depends("event_id.seats_limited", "seats_available")
++    def _compute_is_sold_out(self):
++        for slot in self:
++            slot.is_sold_out = slot.event_id.seats_limited and not slot.seats_available
++
++    @api.depends("event_id", "event_id.seats_max", "registration_ids.state", "registration_ids.active")
++    def _compute_seats(self):
++        # initialize fields to 0
++        for slot in self:
++            slot.seats_reserved = slot.seats_used = slot.seats_available = 0
++        # aggregate registrations by slot and by state
++        state_field = {
++            'open': 'seats_reserved',
++            'done': 'seats_used',
++        }
++        base_vals = dict.fromkeys(state_field.values(), 0)
++        results = {slot_id: dict(base_vals) for slot_id in self.ids}
++        if self.ids:
++            query = """ SELECT event_slot_id, state, count(event_slot_id)
++                        FROM event_registration
++                        WHERE event_slot_id IN %s AND state IN ('open', 'done') AND active = true
++                        GROUP BY event_slot_id, state
++                    """
++            self.env['event.registration'].flush_model(['event_slot_id', 'state', 'active'])
++            self._cr.execute(query, (tuple(self.ids),))
++            res = self._cr.fetchall()
++            for slot_id, state, num in res:
++                results[slot_id][state_field[state]] = num
++        # compute seats_available
++        for slot in self:
++            slot.update(results.get(slot._origin.id or slot.id, base_vals))
++            if slot.event_id.seats_max > 0:
++                slot.seats_available = slot.event_id.seats_max - (slot.seats_reserved + slot.seats_used)
++            slot.seats_taken = slot.seats_reserved + slot.seats_used
++
++    @api.ondelete(at_uninstall=False)
++    def _unlink_except_if_registrations(self):
++        if self.registration_ids:
++            raise UserError(_(
++                "The following slots cannot be deleted while they have one or more registrations linked to them:\n- %s",
++                '\n- '.join(self.mapped('display_name'))))
+
+--- a/addons/event/models/event_ticket.py
++++ b/addons/event/models/event_ticket.py
+@@ -1,7 +1,7 @@
+ # Part of Odoo. See LICENSE file for full copyright and licensing details.
+ 
+ from odoo import api, fields, models, _
+-from odoo.exceptions import ValidationError, UserError
++from odoo.exceptions import UserError
+ from odoo.tools.misc import formatLang
+ 
+ 
+@@ -117,29 +117,18 @@ class EventEventTicket(models.Model):
+                 raise UserError(_('The stop date cannot be earlier than the start date. '
+                                   'Please check ticket %(ticket_name)s', ticket_name=ticket.name))
+ 
+-    @api.constrains('registration_ids', 'seats_max')
+-    def _check_seats_availability(self, minimal_availability=0):
+-        sold_out_tickets = []
+-        for ticket in self:
+-            if ticket.seats_max and ticket.seats_available < minimal_availability:
+-                sold_out_tickets.append(_(
+-                    '- the ticket "%(ticket_name)s" (%(event_name)s): Missing %(nb_too_many)i seats.',
+-                    ticket_name=ticket.name,
+-                    event_name=ticket.event_id.name,
+-                    nb_too_many=minimal_availability - ticket.seats_available,
+-                ))
+-        if sold_out_tickets:
+-            raise ValidationError(_('There are not enough seats available for:')
+-                                  + '\n%s\n' % '\n'.join(sold_out_tickets))
+-
+     @api.depends('seats_max', 'seats_available')
+     @api.depends_context('name_with_seats_availability')
+     def _compute_display_name(self):
+-        """Adds ticket seats availability if requested by context."""
++        """Adds ticket seats availability if requested by context.
++        Always display the name without availabilities if the event is multi slots
++        because the availability displayed won't be relative to the possible slot combinations
++        but only relative to the event and this will confuse the user.
++        """
+         if not self.env.context.get('name_with_seats_availability'):
+             return super()._compute_display_name()
+         for ticket in self:
+-            if not ticket.seats_max:
++            if not ticket.seats_max or ticket.event_id.is_multi_slots:
+                 name = ticket.name
+             elif not ticket.seats_available:
+                 name = _('%(ticket_name)s (Sold out)', ticket_name=ticket.name)

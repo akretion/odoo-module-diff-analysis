@@ -1,0 +1,189 @@
+PR: https://github.com/odoo/odoo/pull/193490
+
+From: 28b69daefddbb74ad9ac3fd55df88028e6de972b
+From: Mohammad Abdulmoneim (abdu)
+Date: 2025-01-14 09:03:42
+
+Breaking data model changes scores: del:4 + add:2, change matches:
+-    product_uom_category_id = fields.Many2one(related='product_tmpl_id.uom_id.category_id')
++    allowed_uom_ids = fields.Many2many('uom.uom', compute='_compute_allowed_uom_ids')
+-    product_uom_category_id = fields.Many2one(related='product_id.uom_id.category_id')
+-    product_uom_category_id = fields.Many2one(related='product_id.uom_id.category_id')
++    allowed_uom_ids = fields.Many2many('uom.uom', compute='_compute_allowed_uom_ids')
+-    product_uom_category_id = fields.Many2one(related='product_id.uom_id.category_id')
+
+Total Changes: 55
+
+[IMP] uom,*: remove units of measure categories
+
+Previous to this commit, units were classified into categories such as
+length, weight, etc. If the user defined a base unit for a product, any
+movement on that product (stock move, order line, etc.) can be only done
+in a unit in the same category of the base unit of the product. This
+commit removes unit categories and the previously mentioned enforcement.
+This is useful for some business cases that need more flexibility (for
+example: buying from vendors in pieces and selling in kilograms, etc.).
+To allow for some structure, a new field is added to uom.uom model to
+define a reference unit for any unit. Therefore, users can define a
+hierarchy of units. A side effect of this change is that the `uom_uom`
+model is restructured completely to be much simpler. The fields
+`uom_type`, `color`, `factor_inv`, `ratio` are no longer needed. Each
+`uom_uom` record now has only two fields that define its quantity:
+`relative_factor` which is the quantity that this unit contains of its
+reference unit (if exists), and `factor` which is the absolute quantity
+of this unit all the way up to the most ancestor unit. The latter cannot
+be controlled by users and not shown in any view but used in all
+quantity computations. It's also not allowed to create a unit with a
+`relative_factor` != 1 without setting a reference unit.Another side
+effect related to point of sale app is that the field `is_pos_groupable`
+is now set on the unit level instead of category level. The value of
+this field is set in odoo/upgrade#6629 to preserve the current behavior
+for users. Products also now have a new field `uom_ids` labelled as
+"Packagings" where users can define the units that this product can be
+sold/moved in.
+
+Task-4252043
+
+Part-of: odoo/odoo#193490
+Related: odoo/enterprise#77092
+Signed-off-by: Arnold Moyaux (arm) <arm@odoo.com>
+Signed-off-by: Mohammad Abdulmoneim (abdu) <abdu@odoo.com>
+
+================================= pseudo patch: =================================
+
+--- a/addons/mrp/models/mrp_bom.py
++++ b/addons/mrp/models/mrp_bom.py
+@@ -47,8 +47,7 @@ class MrpBom(models.Model):
+     product_uom_id = fields.Many2one(
+         'uom.uom', 'Unit of Measure',
+         default=_get_default_product_uom_id, required=True,
+-        help="Unit of Measure (Unit of Measure) is the unit of measurement for the inventory control", domain="[('category_id', '=', product_uom_category_id)]")
+-    product_uom_category_id = fields.Many2one(related='product_tmpl_id.uom_id.category_id')
++        help="Unit of Measure (Unit of Measure) is the unit of measurement for the inventory control")
+     sequence = fields.Integer('Sequence')
+     operation_ids = fields.One2many('mrp.routing.workcenter', 'bom_id', 'Operations', copy=True)
+     ready_to_produce = fields.Selection([
+@@ -203,22 +202,12 @@ class MrpBom(models.Model):
+                 }
+             }
+ 
+-    @api.onchange('product_uom_id')
+-    def onchange_product_uom_id(self):
+-        res = {}
+-        if not self.product_uom_id or not self.product_tmpl_id:
+-            return
+-        if self.product_uom_id.category_id.id != self.product_tmpl_id.uom_id.category_id.id:
+-            self.product_uom_id = self.product_tmpl_id.uom_id.id
+-            res['warning'] = {'title': _('Warning'), 'message': _('The Product Unit of Measure you chose has a different category than in the product form.')}
+-        return res
+-
+     @api.onchange('product_tmpl_id')
+     def onchange_product_tmpl_id(self):
+         if self.product_tmpl_id:
+             default_uom_id = self.env.context.get('default_product_uom_id')
+             # Avoids updating the BoM's UoM in case a specific UoM was passed through as a default value.
+-            if self.product_uom_id.category_id != self.product_tmpl_id.uom_id.category_id or self.product_uom_id.id != default_uom_id:
++            if self.product_uom_id.id != default_uom_id:
+                 self.product_uom_id = self.product_tmpl_id.uom_id.id
+             if self.product_id.product_tmpl_id != self.product_tmpl_id:
+                 self.product_id = False
+@@ -538,12 +527,11 @@ class MrpBomLine(models.Model):
+     product_qty = fields.Float(
+         'Quantity', default=1.0,
+         digits='Product Unit of Measure', required=True)
++    allowed_uom_ids = fields.Many2many('uom.uom', compute='_compute_allowed_uom_ids')
+     product_uom_id = fields.Many2one(
+         'uom.uom', 'Product Unit of Measure',
+         default=_get_default_product_uom_id,
+-        required=True,
+-        help="Unit of Measure (Unit of Measure) is the unit of measurement for the inventory control", domain="[('category_id', '=', product_uom_category_id)]")
+-    product_uom_category_id = fields.Many2one(related='product_id.uom_id.category_id')
++        domain="[('id', 'in', allowed_uom_ids)]", required=True)
+     sequence = fields.Integer(
+         'Sequence', default=1,
+         help="Gives the sequence order when displaying.")
+@@ -579,6 +567,11 @@ class MrpBomLine(models.Model):
+         'All product quantities must be greater or equal to 0.\nLines with 0 quantities can be used as optional lines. \nYou should install the mrp_byproduct module if you want to manage extra products on BoMs!',
+     )
+ 
++    @api.depends('product_id', 'product_id.uom_id', 'product_id.uom_ids', 'product_id.seller_ids', 'product_id.seller_ids.product_uom_id')
++    def _compute_allowed_uom_ids(self):
++        for line in self:
++            line.allowed_uom_ids = line.product_id.uom_id | line.product_id.uom_ids | line.product_id.seller_ids.product_uom_id
++
+     @api.depends('product_id', 'bom_id')
+     def _compute_child_bom_id(self):
+         products = self.product_id
+@@ -605,16 +598,6 @@ class MrpBomLine(models.Model):
+         for line in self:
+             line.child_line_ids = line.child_bom_id.bom_line_ids.ids or False
+ 
+-    @api.onchange('product_uom_id')
+-    def onchange_product_uom_id(self):
+-        res = {}
+-        if not self.product_uom_id or not self.product_id:
+-            return res
+-        if self.product_uom_id.category_id != self.product_id.uom_id.category_id:
+-            self.product_uom_id = self.product_id.uom_id.id
+-            res['warning'] = {'title': _('Warning'), 'message': _('The Product Unit of Measure you chose has a different category than in the product form.')}
+-        return res
+-
+     @api.onchange('product_id')
+     def onchange_product_id(self):
+         if self.product_id:
+@@ -738,10 +721,8 @@ class MrpBomByproduct(models.Model):
+     product_qty = fields.Float(
+         'Quantity',
+         default=1.0, digits='Product Unit of Measure', required=True)
+-    product_uom_category_id = fields.Many2one(related='product_id.uom_id.category_id')
+-    product_uom_id = fields.Many2one('uom.uom', 'Unit of Measure', required=True,
+-                                     compute="_compute_product_uom_id", store=True, readonly=False, precompute=True,
+-                                     domain="[('category_id', '=', product_uom_category_id)]")
++    product_uom_id = fields.Many2one('uom.uom', 'Unit', required=True,
++                                     compute="_compute_product_uom_id", store=True, readonly=False, precompute=True)
+     bom_id = fields.Many2one('mrp.bom', 'BoM', ondelete='cascade', index=True)
+     allowed_operation_ids = fields.One2many('mrp.routing.workcenter', related='bom_id.operation_ids')
+     operation_id = fields.Many2one(
+
+--- a/addons/mrp/models/mrp_production.py
++++ b/addons/mrp/models/mrp_production.py
+@@ -84,15 +84,14 @@ class MrpProduction(models.Model):
+         'Quantity To Produce', digits='Product Unit of Measure',
+         readonly=False, required=True, tracking=True, precompute=True,
+         compute='_compute_product_qty', store=True, copy=True)
++    allowed_uom_ids = fields.Many2many('uom.uom', compute='_compute_allowed_uom_ids')
+     product_uom_id = fields.Many2one(
+-        'uom.uom', 'Product Unit of Measure',
+-        readonly=False, required=True, compute='_compute_uom_id', store=True, copy=True, precompute=True,
+-        domain="[('category_id', '=', product_uom_category_id)]")
++        'uom.uom', 'Product Unit of Measure', domain="[('id', 'in', allowed_uom_ids)]",
++        readonly=False, required=True, compute='_compute_uom_id', store=True, copy=True, precompute=True)
+     lot_producing_id = fields.Many2one(
+         'stock.lot', string='Lot/Serial Number', copy=False,
+         domain="[('product_id', '=', product_id)]", check_company=True)
+     qty_producing = fields.Float(string="Quantity Producing", digits='Product Unit of Measure', copy=False)
+-    product_uom_category_id = fields.Many2one(related='product_id.uom_id.category_id')
+     product_uom_qty = fields.Float(string='Total Quantity', compute='_compute_product_uom_qty', store=True)
+     picking_type_id = fields.Many2one(
+         'stock.picking.type', 'Operation Type', copy=True, readonly=False,
+@@ -403,6 +402,11 @@ class MrpProduction(models.Model):
+             ):
+                 production.product_id = bom.product_id or bom.product_tmpl_id.product_variant_id
+ 
++    @api.depends('product_id', 'product_id.uom_id', 'product_id.uom_ids', 'product_id.bom_ids', 'product_id.bom_ids.product_uom_id')
++    def _compute_allowed_uom_ids(self):
++        for production in self:
++            production.allowed_uom_ids = production.product_id.uom_id | production.product_id.uom_ids | production.product_id.bom_ids.product_uom_id
++
+     @api.depends('product_id', 'never_product_template_attribute_value_ids')
+     def _compute_bom_id(self):
+         mo_by_company_id = defaultdict(lambda: self.env['mrp.production'])
+@@ -1182,7 +1186,7 @@ class MrpProduction(models.Model):
+         for production in self:
+             if not production.bom_id:
+                 continue
+-            factor = production.product_uom_id._compute_quantity(production.product_qty, production.bom_id.product_uom_id) / production.bom_id.product_qty
++            factor = production.product_uom_id._compute_quantity(production.product_qty, production.bom_id.product_uom_id, round=False) / production.bom_id.product_qty
+             _boms, lines = production.bom_id.explode(production.product_id, factor, picking_type=production.bom_id.picking_type_id, never_attribute_values=production.never_product_template_attribute_value_ids)
+             for bom_line, line_data in lines:
+                 if bom_line.child_bom_id and bom_line.child_bom_id.type == 'phantom' or\

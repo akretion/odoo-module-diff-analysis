@@ -1,0 +1,219 @@
+PR: https://github.com/odoo/odoo/pull/199988
+
+From: 33637d137ed52f5faabaafd5c208e187042be8eb
+From: Gorash
+Date: 2025-04-18 11:23:39
+
+Breaking data model changes scores: del:2 + add:1, change matches:
++    privilege_ids = fields.One2many('res.groups.privilege', 'category_id', string='Privileges')
+-    visible = fields.Boolean(related='category_id.visible', readonly=True)
+-    color = fields.Integer(string='Color Index')
+
+Total Changes: 88
+
+[IMP] base: update res.groups UI with new model 'res.groups.privilege'
+
+Admins can now change the display of groups linked to `ir.model.category`.
+
+Task: 4341594
+Part-of: odoo/odoo#199988
+Related: odoo/enterprise#80581
+Related: odoo/upgrade#7332
+Signed-off-by: Aaron Bohy (aab) <aab@odoo.com>
+
+================================= pseudo patch: =================================
+
+--- a/odoo/addons/base/models/__init__.py
++++ b/odoo/addons/base/models/__init__.py
+@@ -42,6 +42,7 @@ from . import res_bank
+ from . import res_config
+ from . import res_currency
+ from . import res_company
++from . import res_groups_privilege
+ from . import res_groups
+ from . import res_users
+ from . import res_users_view
+
+--- a/odoo/addons/base/models/ir_model.py
++++ b/odoo/addons/base/models/ir_model.py
+@@ -1994,7 +1994,7 @@ class IrModelAccess(models.Model):
+               FROM ir_model_access a
+               JOIN ir_model m ON (a.model_id = m.id)
+               JOIN res_groups g ON (a.group_id = g.id)
+-         LEFT JOIN ir_module_category c ON (c.id = g.category_id)
++         LEFT JOIN res_groups_privilege c ON (c.id = g.privilege_id)
+              WHERE m.model = %s
+                AND a.active = TRUE
+                AND a.perm_{access_mode} = TRUE
+
+--- a/odoo/addons/base/models/ir_module.py
++++ b/odoo/addons/base/models/ir_module.py
+@@ -71,14 +71,14 @@ def assert_log_admin_access(method):
+ class IrModuleCategory(models.Model):
+     _name = 'ir.module.category'
+     _description = "Application"
+-    _order = 'name, id'
++    _order = 'sequence, name, id'
+     _allow_sudo_commands = False
+ 
+     name = fields.Char(string='Name', required=True, translate=True, index=True)
+     parent_id = fields.Many2one('ir.module.category', string='Parent Application', index=True)
+     child_ids = fields.One2many('ir.module.category', 'parent_id', string='Child Applications')
+     module_ids = fields.One2many('ir.module.module', 'category_id', string='Modules')
+-    group_ids = fields.One2many('res.groups', 'category_id', string='Group set')
++    privilege_ids = fields.One2many('res.groups.privilege', 'category_id', string='Privileges')
+     description = fields.Text(string='Description', translate=True)
+     sequence = fields.Integer(string='Sequence')
+     visible = fields.Boolean(string='Visible', default=True)
+
+--- a/odoo/addons/base/models/res_groups.py
++++ b/odoo/addons/base/models/res_groups.py
+@@ -26,14 +26,11 @@ class ResGroups(models.Model):
+     menu_access = fields.Many2many('ir.ui.menu', 'ir_ui_menu_group_rel', 'gid', 'menu_id', string='Access Menu')
+     view_access = fields.Many2many('ir.ui.view', 'ir_ui_view_group_rel', 'group_id', 'view_id', string='Views')
+     comment = fields.Text(translate=True)
+-    category_id = fields.Many2one('ir.module.category', string='Application', index=True)
+     full_name = fields.Char(compute='_compute_full_name', string='Group Name', search='_search_full_name')
+     share = fields.Boolean(string='Share Group', help="Group created to set access rights for sharing data with some users.")
+     api_key_duration = fields.Float(string='API Keys maximum duration days',
+         help="Determines the maximum duration of an api key created by a user belonging to this group.")
+ 
+-    _name_uniq = models.Constraint("UNIQUE (category_id, name)",
+-        'The name of the group must be unique within an application!')
+     _check_api_key_duration = models.Constraint(
+         'CHECK(api_key_duration >= 0)',
+         'The api key duration cannot be a negative value.',
+@@ -65,7 +62,8 @@ class ResGroups(models.Model):
+     implied_ids = fields.Many2many('res.groups', 'res_groups_implied_rel', 'gid', 'hid',
+         string='Implied Groups', help='Users of this group are also implicitly part of those groups')
+     all_implied_ids = fields.Many2many('res.groups', string='Transitively Implied Groups', recursive=True,
+-        compute='_compute_all_implied_ids', compute_sudo=True, search='_search_all_implied_ids')
++        compute='_compute_all_implied_ids', compute_sudo=True, search='_search_all_implied_ids',
++        help="The group itself with all its implied groups.")
+     implied_by_ids = fields.Many2many('res.groups', 'res_groups_implied_rel', 'hid', 'gid',
+         string='Implying Groups', help="Users in those groups are implicitly part of this group.")
+     all_implied_by_ids = fields.Many2many('res.groups', string='Transitively Implying Groups', recursive=True,
+@@ -109,43 +107,39 @@ class ResGroups(models.Model):
+             if implied_group.id in self.ids:
+                 raise ValidationError(self.env._('You cannot delete a group linked with a settings field.'))
+ 
+-    @api.depends('category_id.name', 'name')
++    @api.depends('privilege_id.name', 'name')
++    @api.depends_context('short_display_name')
+     def _compute_full_name(self):
+         # Important: value must be stored in environment of group, not group1!
+         for group, group1 in zip(self, self.sudo()):
+-            if group1.category_id:
+-                group.full_name = '%s / %s' % (group1.category_id.name, group1.name)
++            if group1.privilege_id and not self.env.context.get('short_display_name'):
++                group.full_name = '%s / %s' % (group1.privilege_id.name, group1.name)
+             else:
+                 group.full_name = group1.name
+ 
+     def _search_full_name(self, operator, operand):
++        if Domain.is_negative_operator(operator):
++            return NotImplemented
++
+         lst = True
+-        if isinstance(operand, bool):
+-            return Domain('name', operator, operand)
+         if isinstance(operand, str):
+             lst = False
+             operand = [operand]
+-        where_domains = []
+-        is_negative = Domain.is_negative_operator(operator)
++
++        where_domains = [Domain('name', operator, operand)]
+         for group in operand:
++            if not group:
++                continue
+             values = [v for v in group.split('/') if v]
+             group_name = values.pop().strip()
+-            category_name = '/'.join(values).strip() if values else group_name
++            privilege_name = '/'.join(values).strip() if values else group_name
+             group_domain = Domain('name', operator, [group_name] if lst else group_name)
+-            category_ids = self.env['ir.module.category'].sudo()._search(
+-                Domain('name', operator, [category_name] if lst else category_name))
+-            category_domain = Domain('category_id', 'in', category_ids)
+-            if is_negative and not values:
+-                category_domain |= Domain('category_id', '=', False)
+-            if is_negative == (not values):
+-                where = group_domain & category_domain
+-            else:
+-                where = group_domain | category_domain
+-            where_domains.append(where)
+-        if is_negative:
+-            return Domain.AND(where_domains)
+-        else:
+-            return Domain.OR(where_domains)
++            privilege_ids = self.env['res.groups.privilege'].sudo()._search(
++                Domain('name', operator, [privilege_name] if lst else privilege_name))
++            privilege_domain = Domain('privilege_id', 'in', privilege_ids)
++            where_domains.append(group_domain | privilege_domain)
++
++        return Domain.OR(where_domains)
+ 
+     @api.model
+     def _search(self, domain, offset=0, limit=None, order=None):
+
+--- a/None
++++ b/odoo/addons/base/models/res_groups_privilege.py
+@@ -0,0 +1,14 @@
++from odoo import fields, models
++
++
++class ResGroupsPrivilege(models.Model):
++    _name = 'res.groups.privilege'
++    _description = "Privileges"
++    _order = 'sequence, name, id'
++
++    name = fields.Char(string='Name', required=True, translate=True)
++    description = fields.Text(string='Description')
++    placeholder = fields.Char(string='Placeholder', default="No", help="Text that is displayed as placeholder in the selection field of the user form.")
++    sequence = fields.Integer(string='Sequence', default=100)
++    category_id = fields.Many2one('ir.module.category', string='Category', index=True)
++    group_ids = fields.One2many('res.groups', 'privilege_id', string='Groups')
+
+--- a/odoo/addons/base/models/res_users_view.py
++++ b/odoo/addons/base/models/res_users_view.py
+@@ -1,14 +1,15 @@
+-
+ from odoo import api, fields, models, tools
+ 
+ 
+ class ResGroups(models.Model):
+     _inherit = 'res.groups'
+-    _order = 'category_id, sequence, name, id'
++    _order = 'privilege_id, sequence, name, id'
+ 
+     sequence = fields.Integer(string='Sequence')
+-    visible = fields.Boolean(related='category_id.visible', readonly=True)
+-    color = fields.Integer(string='Color Index')
++    privilege_id = fields.Many2one('res.groups.privilege', string='Privilege', index=True)
++
++    _name_uniq = models.Constraint("UNIQUE (privilege_id, name)",
++        'The name of the group must be unique within a group privilege!')
+ 
+     # Field used for the widget to define the default group.
+ 
+@@ -26,14 +27,14 @@ class ResGroups(models.Model):
+                 'name': section.name,
+                 'categories': [
+                     {
+-                        'id': category.id,
+-                        'name': category.name,
+-                        'description': category.description,
++                        'id': privilege.id,
++                        'name': privilege.name,
++                        'description': privilege.description,
+                         'groups': [[group.id, group.name]
+-                                   for group in category.group_ids.sorted(lambda g: (len(g.all_implied_ids & category.group_ids), g.sequence, g.id))]
+-                    } for category in section.child_ids.sorted(lambda c: c.sequence) if category.group_ids
++                                   for group in privilege.group_ids.sorted(lambda g: (len(g.all_implied_ids & privilege.group_ids), g.sequence, g.id))]
++                    } for privilege in section.privilege_ids.sorted(lambda p: p.sequence) if privilege.group_ids
+                 ]
+-            } for section in self.env['ir.module.category'].search([('parent_id', '=', False), ('child_ids.group_ids', '!=', False)], order="sequence")
++            } for section in self.env['ir.module.category'].search([('parent_id', '=', False), ('privilege_ids.group_ids', '!=', False)], order="sequence")
+         ]
+ 
+ 

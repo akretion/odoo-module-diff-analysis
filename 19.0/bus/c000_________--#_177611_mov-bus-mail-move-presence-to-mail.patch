@@ -1,0 +1,380 @@
+PR: https://github.com/odoo/odoo/pull/177611
+
+From: 7100c69c9ab1d5d87240a4ec95b39c9268a84b55
+From: Giorgio Tocco (gito)
+Date: 2025-02-11 08:32:11
+
+Breaking data model changes scores: del:6 + add:0, change matches:
+-    user_id = fields.Many2one('res.users', 'Users', ondelete='cascade')
+-    last_poll = fields.Datetime('Last Poll', default=lambda self: fields.Datetime.now())
+-    last_presence = fields.Datetime('Last Presence', default=lambda self: fields.Datetime.now())
+-    status = fields.Selection([('online', 'Online'), ('away', 'Away'), ('offline', 'Offline')], 'IM Status', default='offline')
+-    im_status = fields.Char('IM Status', compute='_compute_im_status')
+-    im_status = fields.Char("IM Status", compute="_compute_im_status")
+
+Total Changes: 260
+
+[MOV] bus, mail, *: move presence to mail
+
+* = base, cloud_storage, crm_livechat, gamification, hr, hr_holidays,
+  hr_homeworking, hr_presence, im_livechat, mail, test_discuss_full,
+  website_livechat
+
+`bus` module should be technical with focus on establishing connection
+and transmitting messages.
+
+Presence is a business concept, which is therefore moved to `mail` as
+the first module in the dependency chain to make use of the feature.
+
+Part of task-3208257
+
+closes odoo/odoo#177611
+
+Related: odoo/enterprise#71696
+Related: odoo/upgrade#6460
+Signed-off-by: Matthieu Stockbauer (tsm) <tsm@odoo.com>
+
+================================= pseudo patch: =================================
+
+--- a/addons/bus/models/__init__.py
++++ b/addons/bus/models/__init__.py
+@@ -2,7 +2,6 @@
+ 
+ from . import bus
+ from . import bus_listener_mixin
+-from . import bus_presence
+ from . import ir_attachment
+ from . import ir_http
+ from . import ir_model
+
+--- a/addons/bus/models/bus_presence.py
++++ b/None
+@@ -1,118 +0,0 @@
+-# -*- coding: utf-8 -*-
+-from datetime import timedelta
+-
+-from odoo import api, fields, models
+-from odoo import tools
+-from odoo.service.model import PG_CONCURRENCY_EXCEPTIONS_TO_RETRY
+-
+-UPDATE_PRESENCE_DELAY = 60
+-DISCONNECTION_TIMER = UPDATE_PRESENCE_DELAY + 5
+-AWAY_TIMER = 1800  # 30 minutes
+-PRESENCE_OUTDATED_TIMER = 12 * 60 * 60  # 12 hours
+-
+-
+-class BusPresence(models.Model):
+-    """ User Presence
+-        Its status is 'online', 'away' or 'offline'. This model should be a one2one, but is not
+-        attached to res_users to avoid database concurrence errors. Since the 'update_presence' method is executed
+-        at each poll, if the user have multiple opened tabs, concurrence errors can happend, but are 'muted-logged'.
+-    """
+-
+-    _name = 'bus.presence'
+-    _description = 'User Presence'
+-    _log_access = False
+-
+-    user_id = fields.Many2one('res.users', 'Users', ondelete='cascade')
+-    last_poll = fields.Datetime('Last Poll', default=lambda self: fields.Datetime.now())
+-    last_presence = fields.Datetime('Last Presence', default=lambda self: fields.Datetime.now())
+-    status = fields.Selection([('online', 'Online'), ('away', 'Away'), ('offline', 'Offline')], 'IM Status', default='offline')
+-
+-    _user_unique = models.UniqueIndex("(user_id) WHERE user_id IS NOT NULL")
+-
+-    def create(self, values):
+-        presences = super().create(values)
+-        presences._invalidate_im_status()
+-        presences._send_presence()
+-        return presences
+-
+-    def write(self, values):
+-        status_by_user = {presence._get_identity_field_name(): presence.status for presence in self}
+-        result = super().write(values)
+-        updated = self.filtered(lambda p: status_by_user[p._get_identity_field_name()] != p.status)
+-        updated._invalidate_im_status()
+-        updated._send_presence()
+-        return result
+-
+-    def unlink(self):
+-        self._send_presence("offline")
+-        return super().unlink()
+-
+-    @api.model
+-    def update_presence(self, inactivity_period, identity_field, identity_value):
+-        """ Updates the last_poll and last_presence of the current user
+-            :param inactivity_period: duration in milliseconds
+-        """
+-        # This method is called in method _poll() and cursor is closed right
+-        # after; see bus/controllers/main.py.
+-        try:
+-            # Hide transaction serialization errors, which can be ignored, the presence update is not essential
+-            # The errors are supposed from presence.write(...) call only
+-            with tools.mute_logger('odoo.sql_db'):
+-                self._update_presence(inactivity_period=inactivity_period, identity_field=identity_field, identity_value=identity_value)
+-                # commit on success
+-                self.env.cr.commit()
+-        except PG_CONCURRENCY_EXCEPTIONS_TO_RETRY:
+-            # ignore concurrency error
+-            return self.env.cr.rollback()
+-
+-    def _get_bus_target(self):
+-        self.ensure_one()
+-        return self.user_id.partner_id if self.user_id else None
+-
+-    def _get_identity_field_name(self):
+-        self.ensure_one()
+-        return "user_id" if self.user_id else None
+-
+-    def _get_identity_data(self):
+-        self.ensure_one()
+-        return {"partner_id": self.user_id.partner_id.id} if self.user_id else None
+-
+-    @api.model
+-    def _update_presence(self, inactivity_period, identity_field, identity_value):
+-        presence = self.search([(identity_field, "=", identity_value)])
+-        values = {
+-            "last_poll": fields.Datetime.now(),
+-            "last_presence": fields.Datetime.now() - timedelta(milliseconds=inactivity_period),
+-            "status": "away" if inactivity_period > AWAY_TIMER * 1000 else "online",
+-        }
+-        if not presence:
+-            values[identity_field] = identity_value
+-            presence = self.create(values)
+-        else:
+-            presence.write(values)
+-
+-    def _invalidate_im_status(self):
+-        self.user_id.invalidate_recordset(["im_status"])
+-        self.user_id.partner_id.invalidate_recordset(["im_status"])
+-
+-    def _send_presence(self, im_status=None, bus_target=None):
+-        """Send notification related to bus presence update.
+-
+-        :param im_status: 'online', 'away' or 'offline'
+-        """
+-        for presence in self:
+-            identity_data = presence._get_identity_data()
+-            target = presence._get_bus_target()
+-            target = bus_target or (target and (target, "presence"))
+-            if identity_data and target:
+-                self.env["bus.bus"]._sendone(
+-                    target,
+-                    "bus.bus/im_status_updated",
+-                    {"im_status": im_status or presence.status, **identity_data},
+-                )
+-
+-    @api.autovacuum
+-    def _gc_bus_presence(self):
+-        self.search(
+-            [("last_poll", "<", fields.Datetime.now() - timedelta(seconds=PRESENCE_OUTDATED_TIMER))]
+-        ).unlink()
+
+--- a/addons/bus/models/ir_websocket.py
++++ b/addons/bus/models/ir_websocket.py
+@@ -1,9 +1,8 @@
+-from datetime import datetime, timedelta
++# Part of Odoo. See LICENSE file for full copyright and licensing details.
+ 
+ from odoo import models
+ from odoo.http import request, SessionExpiredException
+-from odoo.tools import OrderedSet
+-from odoo.osv import expression
++from odoo.tools.misc import OrderedSet
+ from odoo.service import security
+ from ..models.bus import dispatch
+ from ..websocket import wsrequest
+@@ -13,46 +12,6 @@ class IrWebsocket(models.AbstractModel):
+     _name = 'ir.websocket'
+     _description = 'websocket message handling'
+ 
+-    def _get_missed_presences_identity_domains(self, presence_channels):
+-        """
+-        Return a list of domains that will be combined with `expression.OR` to
+-        find presences related to `presence_channels`. This is used to find
+-        missed presences when subscribing to presence channels.
+-
+-        :param typing.List[typing.Tuple[recordset, str]] presence_channels: The
+-            presence channels the user subscribed to.
+-        """
+-        partners = self.env["res.partner"].browse(
+-            [p.id for p, _ in presence_channels if isinstance(p, self.pool["res.partner"])]
+-        )
+-        # sudo: res.partner - can acess users of partner channels to find
+-        # their presences as those channels were already verified during
+-        # `_build_bus_channel_list`.
+-        return [[("user_id", "in", partners.with_context(active_test=False).sudo().user_ids.ids)]]
+-
+-    def _get_missed_presences_bus_target(self):
+-        return (
+-            self.env.user.partner_id if self.env.user and not self.env.user._is_public() else None
+-        )
+-
+-    def _build_presence_channel_list(self, presences):
+-        """
+-        Return the list of presences to subscribe to.
+-
+-        :param typing.List[typing.Tuple[str, int]] presences: The presence
+-            list sent by the client where the first element is the model
+-            name and the second is the record id.
+-        """
+-        channels = []
+-        if self.env.user and self.env.user._is_internal():
+-            channels.extend(
+-                (partner, "presence")
+-                for partner in self.env["res.partner"]
+-                .with_context(active_test=False)
+-                .search([("id", "in", [int(p[1]) for p in presences if p[0] == "res.partner"])])
+-            )
+-        return channels
+-
+     def _build_bus_channel_list(self, channels):
+         """
+             Return the list of channels to subscribe to. Override this
+@@ -68,12 +27,20 @@ class IrWebsocket(models.AbstractModel):
+             channels.append(self.env.user.partner_id)
+         return channels
+ 
++    def _serve_ir_websocket(self, event_name, data):
++        """Process websocket events.
++        Modules can override this method to handle their own events. But overriding this method is
++        not recommended and should be carefully considered, because at the time of writing this
++        message, Odoo.sh does not use this method. Each new event should have a corresponding http
++        route and Odoo.sh infrastructure should be updated to reflect it. On top of that, the
++        event processing is very time, ressource and error sensitive."""
++
+     def _prepare_subscribe_data(self, channels, last):
+         """
+-        Parse the data sent by the client and return the list of channels,
+-        missed presences and the last known notification id. This will be used
+-        both by the websocket controller and the websocket request class when
+-        the `subscribe` event is received.
++        Parse the data sent by the client and return the list of channels
++        and the last known notification id. This will be used both by the
++        websocket controller and the websocket request class when the
++        `subscribe` event is received.
+ 
+         :param typing.List[str] channels: List of channels to subscribe to sent
+             by the client.
+@@ -83,7 +50,6 @@ class IrWebsocket(models.AbstractModel):
+             A dict containing the following keys:
+             - channels (set of str): The list of channels to subscribe to.
+             - last (int): The last known notification id.
+-            - missed_presences (odoo.models.Recordset): The missed presences.
+ 
+         :raise ValueError: If the list of channels is not a list of strings.
+         """
+@@ -91,46 +57,20 @@ class IrWebsocket(models.AbstractModel):
+             raise ValueError("bus.Bus only string channels are allowed.")
+         # sudo - bus.bus: reading non-sensitive last bus id.
+         last = 0 if last > self.env["bus.bus"].sudo()._bus_last_id() else last
+-        str_presence_channels = {
+-            c for c in channels if isinstance(c, str) and c.startswith("odoo-presence-")
+-        }
+-        presence_channels = self._build_presence_channel_list(
+-            [tuple(c.replace("odoo-presence-", "").split("_")) for c in str_presence_channels]
+-        )
+-        # There is a gap between a subscription client side (which is debounced)
+-        # and the actual subcription thus presences can be missed. Send a
+-        # notification to avoid missing presences during a subscription.
+-        domain = expression.AND(
+-            [
+-                [("last_poll", ">", datetime.now() - timedelta(seconds=2))],
+-                expression.OR(self._get_missed_presences_identity_domains(presence_channels)),
+-            ]
+-        )
+-        # sudo: bus.presence: can access presences linked to presence channels.
+-        missed_presences = self.env["bus.presence"].sudo().search(domain)
+-        all_channels = OrderedSet(presence_channels)
+-        all_channels.update(
+-            self._build_bus_channel_list([c for c in channels if c not in str_presence_channels])
+-        )
+-        return {"channels": all_channels, "last": last, "missed_presences": missed_presences}
++        return {"channels": OrderedSet(self._build_bus_channel_list(list(channels))), "last": last}
++
++    def _after_subscribe_data(self, data):
++        """Function invoked after subscribe data have been processed.
++        Modules can override this method to add custom behavior."""
+ 
+     def _subscribe(self, og_data):
+         data = self._prepare_subscribe_data(og_data["channels"], og_data["last"])
+         dispatch.subscribe(data["channels"], data["last"], self.env.registry.db_name, wsrequest.ws)
+-        if bus_target := self._get_missed_presences_bus_target():
+-            data["missed_presences"]._send_presence(bus_target=bus_target)
+-
+-    def _update_bus_presence(self, inactivity_period):
+-        if self.env.user and not self.env.user._is_public():
+-            self.env['bus.presence'].update_presence(
+-                inactivity_period,
+-                identity_field='user_id',
+-                identity_value=self.env.uid
+-            )
++        self._after_subscribe_data(data)
+ 
+     def _on_websocket_closed(self, cookies):
+-        if self.env.user and not self.env.user._is_public():
+-            self.env["bus.presence"].search([("user_id", "=", self.env.uid)]).status = "offline"
++        """Function invoked upon WebSocket termination.
++        Modules can override this method to add custom behavior."""
+ 
+     @classmethod
+     def _authenticate(cls):
+
+--- a/addons/bus/models/res_partner.py
++++ b/addons/bus/models/res_partner.py
+@@ -1,23 +1,8 @@
+ # Part of Odoo. See LICENSE file for full copyright and licensing details.
+ 
+-from odoo import fields, models
++from odoo import models
+ 
+ 
+ class ResPartner(models.Model):
+-    _name = 'res.partner'
++    _name = "res.partner"
+     _inherit = ["res.partner", "bus.listener.mixin"]
+-
+-    im_status = fields.Char('IM Status', compute='_compute_im_status')
+-
+-    def _compute_im_status(self):
+-        status_by_partner = {}
+-        for presence in self.env["bus.presence"].search([("user_id", "in", self.user_ids.ids)]):
+-            partner = presence.user_id.partner_id
+-            if (
+-                status_by_partner.get(partner, "offline") == "offline"
+-                or presence.status == "online"
+-            ):
+-                status_by_partner[partner] = presence.status
+-        for partner in self:
+-            default_status = "offline" if partner.user_ids else "im_partner"
+-            partner.im_status = status_by_partner.get(partner, default_status)
+
+--- a/addons/bus/models/res_users.py
++++ b/addons/bus/models/res_users.py
+@@ -1,25 +1,11 @@
+ # Part of Odoo. See LICENSE file for full copyright and licensing details.
+ 
+-from odoo import fields, models
++from odoo import models
+ 
+ 
+ class ResUsers(models.Model):
+-    _name = 'res.users'
++    _name = "res.users"
+     _inherit = ["res.users", "bus.listener.mixin"]
+ 
+-    im_status = fields.Char("IM Status", compute="_compute_im_status")
+-
+-    def _compute_im_status(self):
+-        """Compute the im_status of the users"""
+-        presence_by_user = {
+-            presence.user_id: presence.status
+-            for presence in self.env["bus.presence"].search([("user_id", "in", self.ids)])
+-        }
+-        for user in self:
+-            user.im_status = presence_by_user.get(user, "offline")
+-
+     def _bus_channel(self):
+         return self.partner_id._bus_channel()
+-
+-    def _is_user_available(self):
+-        return self.im_status == 'online'

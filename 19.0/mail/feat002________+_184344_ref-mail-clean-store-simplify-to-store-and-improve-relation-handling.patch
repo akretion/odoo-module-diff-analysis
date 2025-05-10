@@ -1,0 +1,1711 @@
+PR: https://github.com/odoo/odoo/pull/184344
+
+From: 3d7130f9e3c713f0542ae86d81d65b16535caafa
+From: Sébastien Theys
+Date: 2024-12-10 06:46:39
++    invited_member_ids = fields.One2many("discuss.channel.member", compute="_compute_invited_member_ids", compute_sudo=True)
+
+Total Changes: 1037
+
+[REF] mail, *: clean Store, simplify _to_store and improve relation handling
+
+* = crm_livechat, hr_holidays, im_livechat, portal, project, rating,
+  test_discuss_full, test_mail, website_livechat
+
+1. Use class for Store relations rather than magic tuple
+
+Having a method returning a tuple is confusing and error-prone,
+especially when de-structuring it.
+
+This will also ease the reading of the main Store methods by delegating
+some processing to the type-specific classes.
+
+Finally, it allows re-using the relation structure to define the
+relation in list of fields given as param.
+
+2. Handle relations in Store directly rather than on each individual
+_to_store of each model.
+
+This allows to factorize the logic and to avoid having to re-implement
+it on each model that needs to support it. The _to_store of each model
+is significantly simplified as a result, while being also more powerful
+and less error prone.
+
+3. Split Store.add() in multiple methods.
+
+Store.add() becomes too bloated. The goal was to have a single method
+that could handle all cases, but it is now too complex to be easily
+understandable. More specific methods are now easier to use and to
+maintain.
+
+4. _to_store is now optional
+
+Any record can now be given to Store methods, and it will be added
+following ORM _read_format. _to_store is now only used to add custom
+code, and the goal is to remove this custom code as much as possible.
+
+All _to_store methods now have the same shape and behavior, which is to
+return nothing if empty array is given as fields.
+
+5. Start to clean channel _to_store to make it more like the others,
+which is to support a specific list of fields rather than doing a lot of
+custom code.
+
+The rest of the cleanup for channel can be done when moving self-member
+fields to member rather than on channel in JS. This will be done in a
+follow up.
+
+Most other remaining cleanup of _to_store are about partner/user/persona
+which will also be done in another follow up.
+
+closes odoo/odoo#184344
+
+Related: odoo/enterprise#72312
+Signed-off-by: Matthieu Stockbauer (tsm) <tsm@odoo.com>
+
+================================= pseudo patch: =================================
+
+--- a/addons/mail/models/discuss/bus_listener_mixin.py
++++ b/addons/mail/models/discuss/bus_listener_mixin.py
+@@ -3,7 +3,6 @@
+ from markupsafe import Markup
+ 
+ from odoo import models
+-from odoo.addons.mail.tools.discuss import Store
+ 
+ 
+ class BusListenerMixin(models.AbstractModel):
+@@ -15,6 +14,6 @@ class BusListenerMixin(models.AbstractModel):
+             "discuss.channel/transient_message",
+             {
+                 "body": Markup("<span class='o_mail_notification'>%s</span>") % content,
+-                "thread": Store.one_id(channel, as_thread=True),
++                "channel_id": channel.id,
+             },
+         )
+
+--- a/addons/mail/models/discuss/discuss_channel.py
++++ b/addons/mail/models/discuss/discuss_channel.py
+@@ -11,9 +11,10 @@ from odoo import _, api, fields, models, tools, Command
+ from odoo.addons.base.models.avatar_mixin import get_hsl_from_seed
+ from odoo.addons.mail.tools.discuss import Store
+ from odoo.addons.mail.tools.web_push import PUSH_NOTIFICATION_TYPE
+-from odoo.exceptions import AccessError, UserError, ValidationError
++from odoo.exceptions import UserError, ValidationError
+ from odoo.osv import expression
+ from odoo.tools import format_list, get_lang, html_escape
++from odoo.tools.misc import OrderedSet
+ 
+ channel_avatar = '''<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 530.06 530.06">
+ <circle cx="265.03" cy="265.03" r="265.03" fill="#875a7b"/>
+@@ -67,7 +68,11 @@ class DiscussChannel(models.Model):
+     sfu_channel_uuid = fields.Char(groups="base.group_system")
+     sfu_server_url = fields.Char(groups="base.group_system")
+     rtc_session_ids = fields.One2many('discuss.channel.rtc.session', 'channel_id', groups="base.group_system")
+-    is_member = fields.Boolean('Is Member', compute='_compute_is_member', search='_search_is_member')
++    is_member = fields.Boolean("Is Member", compute="_compute_is_member", search="_search_is_member", compute_sudo=True)
++    # sudo: discuss.channel - sudo for performance, self member can be accessed on accessible channel
++    self_member_id = fields.Many2one("discuss.channel.member", compute="_compute_self_member_id", compute_sudo=True)
++    # sudo: discuss.channel - sudo for performance, invited members can be accessed on accessible channel
++    invited_member_ids = fields.One2many("discuss.channel.member", compute="_compute_invited_member_ids", compute_sudo=True)
+     member_count = fields.Integer(string="Member Count", compute='_compute_member_count', compute_sudo=True)
+     last_interest_dt = fields.Datetime("Last Interest", index=True, help="Contains the date and time of the last interesting event that happened in this channel. This updates itself when new message posted.")
+     group_ids = fields.Many2many(
+@@ -205,12 +210,8 @@ class DiscussChannel(models.Model):
+     @api.depends_context('uid', 'guest')
+     @api.depends('channel_member_ids')
+     def _compute_is_member(self):
+-        if not self:
+-            return
+-        members = self.env['discuss.channel.member'].search([('channel_id', 'in', self.ids), ('is_self', '=', True)])
+-        is_member_channels = members.channel_id
+         for channel in self:
+-            channel.is_member = channel in is_member_channels
++            channel.is_member = bool(channel.self_member_id)
+ 
+     def _search_is_member(self, operator, operand):
+         is_in = (operator == '=' and operand) or (operator == '!=' and not operand)
+@@ -230,6 +231,31 @@ class DiscussChannel(models.Model):
+             channels = self.env["discuss.channel"]
+         return [('id', "in" if is_in else "not in", channels.ids)]
+ 
++    @api.depends_context("uid", "guest")
++    @api.depends("channel_member_ids")
++    def _compute_self_member_id(self):
++        member_by_channel = {
++            channel: self.env["discuss.channel.member"].browse(member_id)
++            for channel, member_id in self.env["discuss.channel.member"]._read_group(
++                [("channel_id", "in", self.ids), ("is_self", "=", True)], ["channel_id"], ["id:max"]
++            )
++        }
++        for channel in self:
++            channel.self_member_id = member_by_channel.get(channel)
++
++    @api.depends("channel_member_ids.rtc_inviting_session_id")
++    def _compute_invited_member_ids(self):
++        members_by_channel = {
++            channel: self.env["discuss.channel.member"].browse(member_ids)
++            for channel, member_ids in self.env["discuss.channel.member"]._read_group(
++                [("channel_id", "in", self.ids), ("rtc_inviting_session_id", "!=", False)],
++                ["channel_id"],
++                ["id:array_agg"],
++            )
++        }
++        for channel in self:
++            channel.invited_member_ids = members_by_channel.get(channel)
++
+     @api.depends('channel_member_ids')
+     def _compute_member_count(self):
+         read_group_res = self.env['discuss.channel.member']._read_group(domain=[('channel_id', 'in', self.ids)], groupby=['channel_id'], aggregates=['__count'])
+@@ -405,10 +431,10 @@ class DiscussChannel(models.Model):
+         member.unlink()
+         self._bus_send_store(
+             self,
+-            {
+-                "channel_member_ids": Store.many(member, "DELETE", only_id=True),
+-                "member_count": self.member_count,
+-            },
++            [
++                Store.Many("channel_member_ids", [], mode="DELETE", value=member),
++                "member_count",
++            ],
+         )
+ 
+     def add_members(self, partner_ids=None, guest_ids=None, invite_to_rtc_call=False, open_chat_window=False, post_joined_message=True):
+@@ -460,16 +486,12 @@ class DiscussChannel(models.Model):
+                         subtype_xmlid="mail.mt_comment",
+                     )
+             if new_members:
+-                channel._bus_send_store(
+-                    Store(channel, {"member_count": channel.member_count}).add(new_members)
+-                )
+-            if existing_members and (current_partner or current_guest):
++                channel._bus_send_store(Store(channel, "member_count").add(new_members))
++            if existing_members and (target := current_partner or current_guest):
+                 # If the current user invited these members but they are already present, notify the current user about their existence as well.
+                 # In particular this fixes issues where the current user is not aware of its own member in the following case:
+                 # create channel from form view, and then join from discuss without refreshing the page.
+-                (current_partner or current_guest)._bus_send_store(
+-                    Store(channel, {"member_count": channel.member_count}).add(existing_members)
+-                )
++                target._bus_send_store(Store(channel, "member_count").add(existing_members))
+         if invite_to_rtc_call:
+             for channel in self:
+                 current_channel_member = self.env['discuss.channel.member'].search([('channel_id', '=', channel.id), ('is_self', '=', True)])
+@@ -507,10 +529,13 @@ class DiscussChannel(models.Model):
+             self._bus_send_store(
+                 self,
+                 {
+-                    "invitedMembers": Store.many(
++                    "invitedMembers": Store.Many(
+                         members,
+-                        "DELETE",
+-                        fields={"channel": [], "persona": ["name", "im_status", "write_date"]},
++                        [
++                            Store.One("channel_id", [], as_thread=True, rename="thread"),
++                            *self.env["discuss.channel.member"]._to_store_persona("avatar_card"),
++                        ],
++                        mode="DELETE",
+                     ),
+                 },
+             )
+@@ -816,7 +841,7 @@ class DiscussChannel(models.Model):
+                             (fields.Datetime.now() if pinned else None, message_to_update.id))
+         message_to_update.invalidate_recordset(['pinned_at'])
+ 
+-        self._bus_send_store(message_to_update, {"pinned_at": message_to_update.pinned_at})
++        self._bus_send_store(message_to_update, "pinned_at")
+         if pinned:
+             notification_text = '''
+                 <div data-oe-type="pin" class="o_mail_notification">
+@@ -910,93 +935,107 @@ class DiscussChannel(models.Model):
+         data["group_based_subscription"] = bool(self.group_ids)
+         return data
+ 
+-    def _to_store(self, store: Store):
+-        """Adds channel data to the given store."""
+-        if not self:
+-            return []
++    def _to_store_defaults(self):
++        # As the method uses partial recordsets with filtered (that lose the prefetch ids) it is
++        # best to prefetch these computed fields once to avoid doing partial queries multiple times,
++        # especially because these 2 fields are used in ACL too.
++        self.fetch(["is_member", "self_member_id"])
++        # Avoid sending potentially a lot of members for big channels: exclude chat and other small
++        # channels from this optimization because they are assumed to be smaller and it's important
++        # to know the member list for them.
++        channels_with_all_members = self.filtered(lambda channel: channel.channel_type != "channel")
++        all_members = (
++            self.self_member_id
++            | self.invited_member_ids
++            # sudo: discuss.channel - reading sessions of accessible channel is acceptable
++            | self.sudo().rtc_session_ids.channel_member_id
++            | channels_with_all_members.channel_member_ids
++        )
++        # Prefetch all members at once. The first field accessed on a member will be channel_id
++        # (in _to_store_defaults of livechat), but the field is known for some of the members
++        # (through inverse of channels_with_all_members.channel_member_ids), so the ORM will only
++        # prefetch all fields for members with unknown channel_id. The following line force a
++        # single fetch for all fields of all members.
++        all_members.mapped("create_date")  # any field in table will do except channel_id
++        Store(all_members)  # prefetch in batch, including nested relations (member, guest, ...)
+         # sudo: bus.bus: reading non-sensitive last id
+         bus_last_id = self.env["bus.bus"].sudo()._bus_last_id()
+-        current_partner, current_guest = self.env["res.partner"]._get_current_persona()
+-        self.env['discuss.channel'].flush_model()
+-        self.env['discuss.channel.member'].flush_model()
+-        # Query instead of ORM for performance reasons: "LEFT JOIN" is more
+-        # efficient than "id IN" for the cross-table condition between channel
+-        # (for channel_type) and member (for other fields).
+-        self.env.cr.execute("""
+-                 SELECT discuss_channel_member.id
+-                   FROM discuss_channel_member
+-              LEFT JOIN discuss_channel
+-                     ON discuss_channel.id = discuss_channel_member.channel_id
+-                    AND discuss_channel.channel_type != 'channel'
+-                  WHERE discuss_channel_member.channel_id in %(channel_ids)s
+-                    AND (
+-                        discuss_channel.id IS NOT NULL
+-                     OR discuss_channel_member.rtc_inviting_session_id IS NOT NULL
+-                     OR discuss_channel_member.partner_id = %(current_partner_id)s
+-                     OR discuss_channel_member.guest_id = %(current_guest_id)s
+-                    )
+-               ORDER BY discuss_channel_member.id ASC
+-        """, {'channel_ids': tuple(self.ids), 'current_partner_id': current_partner.id or None, 'current_guest_id': current_guest.id or None})
+-        all_needed_members = self.env['discuss.channel.member'].browse([m['id'] for m in self.env.cr.dictfetchall()])
+-        Store(all_needed_members)  # prefetch in batch
+-        members_by_channel = defaultdict(lambda: self.env['discuss.channel.member'])
+-        invited_members_by_channel = defaultdict(lambda: self.env['discuss.channel.member'])
+-        member_of_current_user_by_channel = defaultdict(lambda: self.env['discuss.channel.member'])
+-        for member in all_needed_members:
+-            members_by_channel[member.channel_id] += member
+-            if member.rtc_inviting_session_id:
+-                invited_members_by_channel[member.channel_id] += member
+-            if (current_partner and member.partner_id == current_partner) or (current_guest and member.guest_id == current_guest):
+-                member_of_current_user_by_channel[member.channel_id] = member
+-        for channel in self:
+-            member = member_of_current_user_by_channel.get(channel, self.env['discuss.channel.member']).with_prefetch([m.id for m in member_of_current_user_by_channel.values()])
+-            info = channel._channel_basic_info()
+-            info["is_editable"] = channel.is_editable
+-            info["fetchChannelInfoState"] = "fetched"
+-            info["parent_channel_id"] = Store.one(channel.parent_channel_id)
+-            info["from_message_id"] = Store.one(channel.from_message_id)
+-            # find the channel member state
+-            if current_partner or current_guest:
+-                info['message_needaction_counter'] = channel.message_needaction_counter
+-                info["message_needaction_counter_bus_id"] = bus_last_id
+-                if member:
+-                    store.add(
+-                        member,
+-                        extra_fields={
+-                            "last_interest_dt": True,
+-                            "message_unread_counter": True,
+-                            "message_unread_counter_bus_id": bus_last_id,
+-                            "new_message_separator": True
+-                        },
+-                    )
+-                    info['state'] = member.fold_state or 'closed'
+-                    info['custom_notifications'] = member.custom_notifications
+-                    info['mute_until_dt'] = fields.Datetime.to_string(member.mute_until_dt)
+-                    info['custom_channel_name'] = member.custom_channel_name
+-                    info['is_pinned'] = member.is_pinned
+-                    if member.rtc_inviting_session_id:
+-                        # sudo: discuss.channel.rtc.session - reading sessions of accessible channel is acceptable
+-                        info["rtcInvitingSession"] = Store.one(member.rtc_inviting_session_id.sudo())
+-            # add members info
+-            if channel.channel_type != 'channel':
+-                # avoid sending potentially a lot of members for big channels
+-                # exclude chat and other small channels from this optimization because they are
+-                # assumed to be smaller and it's important to know the member list for them
+-                store.add(members_by_channel[channel] - member)
+-            # add RTC sessions info
+-            invited_members = invited_members_by_channel[channel]
+-            info["invitedMembers"] = Store.many(
+-                invited_members,
+-                "ADD",
+-                fields={"channel": [], "persona": ["name", "im_status", "write_date"]},
++
++        def forward_member_field(field_name):
++            return Store.Attr(
++                field_name,
++                lambda channel: channel.self_member_id[field_name],
++                predicate=lambda channel: channel.self_member_id,
+             )
+-            # sudo: discuss.channel.rtc.session - reading sessions of accessible channel is acceptable
+-            info["rtcSessions"] = Store.many(channel.sudo().rtc_session_ids, "ADD", extra=True)
+-            store.add(channel, info)
++
++        return [
++            "allow_public_upload",
++            Store.Attr("authorizedGroupFullName", lambda c: c.group_public_id.full_name),
++            "avatar_cache_key",
++            "channel_type",
++            "create_uid",
++            Store.Many(
++                "channel_member_ids",
++                only_data=True,
++                sort="id",
++                predicate=lambda channel: channel in channels_with_all_members,
++            ),
++            forward_member_field("custom_channel_name"),
++            forward_member_field("custom_notifications"),
++            "default_display_mode",
++            "description",
++            Store.Attr("fetchChannelInfoState", "fetched"),
++            Store.One("from_message_id"),
++            Store.Attr("group_based_subscription", lambda c: bool(c.group_ids)),
++            Store.Many(
++                "invited_member_ids",
++                [
++                    Store.One("channel_id", [], as_thread=True, rename="thread"),
++                    *self.env["discuss.channel.member"]._to_store_persona("avatar_card"),
++                ],
++                mode="ADD",
++                rename="invitedMembers",
++            ),
++            "is_editable",
++            forward_member_field("is_pinned"),
++            "last_interest_dt",
++            "member_count",
++            forward_member_field("mute_until_dt"),
++            "message_needaction_counter",
++            Store.Attr("message_needaction_counter_bus_id", bus_last_id),
++            "name",
++            Store.One("parent_channel_id"),
++            Store.Many("rtc_session_ids", mode="ADD", extra=True, rename="rtcSessions"),
++                # sudo: discuss.channel.rtc.session - reading sessions of accessible channel is acceptable
++            Store.One(
++                "rtcInvitingSession",
++                value=lambda c: c.self_member_id.rtc_inviting_session_id.sudo(),
++                predicate=lambda c: c.self_member_id.rtc_inviting_session_id,
++            ),
++            Store.One(
++                "self_member_id",
++                extra_fields=[
++                    "last_interest_dt",
++                    "message_unread_counter",
++                    Store.Attr("message_unread_counter_bus_id", bus_last_id),
++                    "new_message_separator",
++                ],
++                only_data=True,
++            ),
++            Store.Attr(
++                "state",
++                lambda c: c.self_member_id.fold_state or "closed",
++                predicate=lambda c: c.self_member_id,
++            ),
++            "uuid",
++        ]
++
++    def _to_store(self, store: Store, fields):
++        store.add_records_fields(self, fields)
+ 
+     # User methods
+     @api.model
+-    @api.returns('self', lambda channels: Store(channels).get_result())
++    @api.returns("self", lambda channels: Store(channels).get_result())
+     def channel_get(self, partners_to, pin=True, force_open=False):
+         """ Get the canonical private channel between some partners, create it if needed.
+             To reuse an old channel (conversation), this one must be private, and contains
+@@ -1119,7 +1158,7 @@ class DiscussChannel(models.Model):
+         self.ensure_one()
+         member = self.env['discuss.channel.member'].search([('partner_id', '=', self.env.user.partner_id.id), ('channel_id', '=', self.id)])
+         member.write({'custom_channel_name': name})
+-        member._bus_send_store(self, {"custom_channel_name": name})
++        member._bus_send_store(self, {"custom_channel_name": member.custom_channel_name})
+ 
+     def channel_rename(self, name):
+         self.ensure_one()
+@@ -1136,7 +1175,7 @@ class DiscussChannel(models.Model):
+         self.add_members(self.env.user.partner_id.ids)
+ 
+     @api.model
+-    @api.returns('self', lambda channels: Store(channels).get_result())
++    @api.returns("self", lambda channels: Store(channels).get_result())
+     def channel_create(self, name, group_id):
+         """ Create a channel and add the current partner, broadcast it (to make the user directly
+             listen to it when polling)
+@@ -1158,7 +1197,7 @@ class DiscussChannel(models.Model):
+         return new_channel
+ 
+     @api.model
+-    @api.returns('self', lambda channels: Store(channels).get_result())
++    @api.returns("self", lambda channels: Store(channels).get_result())
+     def create_group(self, partners_to, default_display_mode=False, name=''):
+         """ Creates a group channel.
+ 
+@@ -1168,7 +1207,7 @@ class DiscussChannel(models.Model):
+             :returns: channel_info of the created channel
+             :rtype: dict
+         """
+-        partners_to = set(partners_to)
++        partners_to = OrderedSet(partners_to)
+         channel = self.create({
+             'channel_member_ids': [Command.create({'partner_id': partner_id}) for partner_id in partners_to],
+             'channel_type': 'group',
+@@ -1192,7 +1231,7 @@ class DiscussChannel(models.Model):
+                 "parent_channel_id": self.id,
+             }
+         )
+-        self.env.user.partner_id._bus_send_store(Store(sub_channel))
++        self.env.user._bus_send_store(sub_channel)
+         notification = (
+             Markup('<div class="o_mail_notification">%s</div>')
+             % _(
+@@ -1269,10 +1308,7 @@ class DiscussChannel(models.Model):
+             domain=[('id', 'not in', known_member_ids), ('channel_id', '=', self.id)],
+             limit=100
+         )
+-        count = self.env['discuss.channel.member'].search_count(
+-            domain=[('channel_id', '=', self.id)],
+-        )
+-        return Store(unknown_members).add(self, {"member_count": count}).get_result()
++        return Store(unknown_members).add(self, "member_count").get_result()
+ 
+     # ------------------------------------------------------------
+     # COMMANDS
+
+--- a/addons/mail/models/discuss/discuss_channel_member.py
++++ b/addons/mail/models/discuss/discuss_channel_member.py
+@@ -235,7 +235,7 @@ class DiscussChannelMember(models.Model):
+             :param is_typing: (boolean) tells whether the members are typing or not
+         """
+         for member in self:
+-            member.channel_id._bus_send_store(Store(member).add(member, {"isTyping": is_typing}))
++            member.channel_id._bus_send_store(member, extra_fields={"isTyping": is_typing})
+ 
+     def _notify_mute(self):
+         for member in self:
+@@ -257,42 +257,31 @@ class DiscussChannelMember(models.Model):
+         members.write({"mute_until_dt": False})
+         members._notify_mute()
+ 
+-    def _to_store(self, store: Store, /, *, fields=None, extra_fields=None):
+-        if fields is None:
+-            fields = {
+-                "channel": [],
+-                "create_date": True,
+-                "fetched_message_id": True,
+-                "persona": None,
+-                "seen_message_id": True,
+-                "last_seen_dt": True,
+-            }
+-        if extra_fields:
+-            fields.update(extra_fields)
+-        bus_last_id = fields.pop("message_unread_counter_bus_id", None)
+-        if "message_unread_counter" in fields and bus_last_id is None:
+-            # sudo: bus.bus: reading non-sensitive last id
+-            bus_last_id = self.env["bus.bus"].sudo()._bus_last_id()
+-        for member in self:
+-            data = member._read_format(
+-                [field for field in fields if field not in ["channel", "persona"]],
+-                load=False,
+-            )[0]
+-            if "channel" in fields:
+-                data["thread"] = Store.one(member.channel_id, as_thread=True, only_id=True)
+-            if "persona" in fields:
+-                if member.partner_id:
+-                    # sudo: res.partner - reading partner related to a member is considered acceptable
+-                    data["persona"] = Store.one(
+-                        member.partner_id.sudo(),
+-                        fields=member._get_store_partner_fields(fields["persona"]),
+-                    )
+-                if member.guest_id:
+-                    # sudo: mail.guest - reading guest related to a member is considered acceptable
+-                    data["persona"] = Store.one(member.guest_id.sudo(), fields=fields["persona"])
+-            if "message_unread_counter" in fields:
+-                data["message_unread_counter_bus_id"] = bus_last_id
+-            store.add(member, data)
++    def _to_store_persona(self, fields=None):
++        if fields == "avatar_card":
++            fields = ["im_status", "name", "write_date"]
++        return [
++            # sudo: res.partner - reading partner related to a member is considered acceptable
++            Store.Attr(
++                "persona",
++                lambda m: Store.One(m.partner_id.sudo(), m._get_store_partner_fields(fields)),
++                predicate=lambda m: m.partner_id,
++            ),
++            # sudo: mail.guest - reading guest related to a member is considered acceptable
++            Store.One(
++                "guest_id", fields, predicate=lambda m: m.guest_id, rename="persona", sudo=True
++            ),
++        ]
++
++    def _to_store_defaults(self):
++        return [
++            Store.One("channel_id", [], as_thread=True, rename="thread"),
++            "create_date",
++            "fetched_message_id",
++            "last_seen_dt",
++            "seen_message_id",
++            *self.env["discuss.channel.member"]._to_store_persona(),
++        ]
+ 
+     def _get_store_partner_fields(self, fields):
+         self.ensure_one()
+@@ -321,7 +310,7 @@ class DiscussChannelMember(models.Model):
+     # RTC (voice/video)
+     # --------------------------------------------------------------------------
+ 
+-    def _rtc_join_call(self, store=None, check_rtc_session_ids=None):
++    def _rtc_join_call(self, store: Store = None, check_rtc_session_ids=None):
+         self.ensure_one()
+         check_rtc_session_ids = (check_rtc_session_ids or []) + self.rtc_session_ids.ids
+         self.channel_id._rtc_cancel_invitations(member_ids=self.ids)
+@@ -331,16 +320,18 @@ class DiscussChannelMember(models.Model):
+         ice_servers = self.env["mail.ice.server"]._get_ice_servers()
+         self._join_sfu(ice_servers)
+         if store:
+-            store.add(self.channel_id, {"rtcSessions": Store.many(current_rtc_sessions, "ADD")})
+             store.add(
+-                self.channel_id,
+-                {"rtcSessions": Store.many(outdated_rtc_sessions, "DELETE", only_id=True)},
++                self.channel_id, {"rtcSessions": Store.Many(current_rtc_sessions, mode="ADD")}
+             )
+             store.add(
++                self.channel_id,
++                {"rtcSessions": Store.Many(outdated_rtc_sessions, [], mode="DELETE")},
++            )
++            store.add_singleton_values(
+                 "Rtc",
+                 {
+                     "iceServers": ice_servers or False,
+-                    "selfSession": Store.one(rtc_session),
++                    "selfSession": Store.One(rtc_session),
+                     "serverInfo": self._get_rtc_server_info(rtc_session, ice_servers),
+                 },
+             )
+@@ -455,16 +446,19 @@ class DiscussChannelMember(models.Model):
+         for member in members:
+             member.rtc_inviting_session_id = self.rtc_session_ids.id
+             member._bus_send_store(
+-                self.channel_id, {"rtcInvitingSession": Store.one(member.rtc_inviting_session_id)}
++                self.channel_id, {"rtcInvitingSession": Store.One(member.rtc_inviting_session_id)}
+             )
+         if members:
+             self.channel_id._bus_send_store(
+                 self.channel_id,
+                 {
+-                    "invitedMembers": Store.many(
++                    "invitedMembers": Store.Many(
+                         members,
+-                        "ADD",
+-                        fields={"channel": [], "persona": ["name", "im_status", "write_date"]},
++                        [
++                            Store.One("channel_id", [], as_thread=True, rename="thread"),
++                            *self.env["discuss.channel.member"]._to_store_persona("avatar_card"),
++                        ],
++                        mode="ADD",
+                     ),
+                 },
+             )
+@@ -552,7 +546,12 @@ class DiscussChannelMember(models.Model):
+         if self.channel_id.channel_type in self.channel_id._types_allowing_seen_infos():
+             target = self.channel_id
+         target._bus_send_store(
+-            self, fields={"channel": [], "persona": ["name"], "seen_message_id": True}
++            self,
++            [
++                Store.One("channel_id", [], as_thread=True, rename="thread"),
++                *self.env["discuss.channel.member"]._to_store_persona("avatar_card"),
++                "seen_message_id",
++            ],
+         )
+ 
+     def _set_new_message_separator(self, message_id, sync=False):
+@@ -567,16 +566,18 @@ class DiscussChannelMember(models.Model):
+         if message_id == self.new_message_separator:
+             return
+         self.new_message_separator = message_id
++        # sudo: bus.bus: reading non-sensitive last id
++        bus_last_id = self.env["bus.bus"].sudo()._bus_last_id()
+         self._bus_send_store(
+-            Store(
+-                self,
+-                fields={
+-                    "channel": [],
+-                    "message_unread_counter": True,
+-                    "new_message_separator": True,
+-                    "persona": ["name"],
+-                },
+-            ).add(self, {"syncUnread": sync})
++            self,
++            [
++                Store.One("channel_id", [], as_thread=True, rename="thread"),
++                "message_unread_counter",
++                Store.Attr("message_unread_counter_bus_id", bus_last_id),
++                "new_message_separator",
++                *self.env["discuss.channel.member"]._to_store_persona([]),
++                Store.Attr("syncUnread", sync),
++            ],
+         )
+ 
+     def _get_html_link(self, *args, for_persona=False, **kwargs):
+
+--- a/addons/mail/models/discuss/discuss_channel_rtc_session.py
++++ b/addons/mail/models/discuss/discuss_channel_rtc_session.py
+@@ -43,7 +43,7 @@ class DiscussChannelRtcSession(models.Model):
+         for rtc_session in rtc_sessions:
+             rtc_sessions_by_channel[rtc_session.channel_id] += rtc_session
+         for channel, rtc_sessions in rtc_sessions_by_channel.items():
+-            channel._bus_send_store(channel, {"rtcSessions": Store.many(rtc_sessions, "ADD")})
++            channel._bus_send_store(channel, {"rtcSessions": Store.Many(rtc_sessions, mode="ADD")})
+         return rtc_sessions
+ 
+     def unlink(self):
+@@ -64,7 +64,7 @@ class DiscussChannelRtcSession(models.Model):
+             rtc_sessions_by_channel[rtc_session.channel_id] += rtc_session
+         for channel, rtc_sessions in rtc_sessions_by_channel.items():
+             channel._bus_send_store(
+-                channel, {"rtcSessions": Store.many(rtc_sessions, "DELETE", only_id=True)}
++                channel, {"rtcSessions": Store.Many(rtc_sessions, [], mode="DELETE")}
+             )
+         for rtc_session in self:
+             rtc_session._bus_send(
+@@ -136,17 +136,19 @@ class DiscussChannelRtcSession(models.Model):
+         for target, payload in payload_by_target.items():
+             target._bus_send("discuss.channel.rtc.session/peer_notification", payload)
+ 
+-    def _to_store(self, store: Store, extra=False):
+-        fields = []
++    def _to_store_defaults(self):
++        return Store.One(
++            "channel_member_id",
++            [
++                Store.One("channel_id", [], as_thread=True, rename="thread"),
++                *self.env["discuss.channel.member"]._to_store_persona("avatar_card"),
++            ],
++        )
++
++    def _to_store(self, store: Store, fields, *, extra=False):
+         if extra:
+             fields += ["is_camera_on", "is_deaf", "is_muted", "is_screen_sharing_on"]
+-        for rtc_session in self:
+-            data = rtc_session._read_format(fields, load=False)[0]
+-            data["channel_member_id"] = Store.one(
+-                rtc_session.channel_member_id,
+-                fields={"channel": [], "persona": ["name", "im_status", "write_date"]},
+-            )
+-            store.add(rtc_session, data)
++        store.add_records_fields(self, fields)
+ 
+     @api.model
+     def _inactive_rtc_session_domain(self):
+
+--- a/addons/mail/models/discuss/ir_attachment.py
++++ b/addons/mail/models/discuss/ir_attachment.py
+@@ -18,13 +18,12 @@ class IrAttachment(models.Model):
+             return guest._bus_channel()
+         return super()._bus_channel()
+ 
+-    def _to_store(self, store: Store, **kwargs):
+-        super()._to_store(store, **kwargs)
+-        for attachment in self:
+-            # TODO master: make a real computed / inverse field and stop propagating
+-            # kwargs through hook methods
+-            # sudo: discuss.voice.metadata - checking the existence of voice metadata for accessible attachments is fine
+-            store.add(attachment, {"voice": bool(attachment.sudo().voice_ids)})
++    def _to_store_defaults(self):
++        # sudo: discuss.voice.metadata - checking the existence of voice metadata for accessible
++        # attachments is fine
++        return super()._to_store_defaults() + [
++            Store.Attr("voice", lambda a: bool(a.sudo().voice_ids))
++        ]
+ 
+     def _post_add_create(self, **kwargs):
+         super()._post_add_create(**kwargs)
+
+--- a/addons/mail/models/discuss/mail_guest.py
++++ b/addons/mail/models/discuss/mail_guest.py
+@@ -97,7 +97,7 @@ class MailGuest(models.Model):
+         if len(name) > 512:
+             raise UserError(_("Guest's name is too long."))
+         self.name = name
+-        store = Store(self, fields=["name", "write_date"])
++        store = Store(self, ["name", "write_date"])
+         self.channel_ids._bus_send_store(store)
+         self._bus_send_store(store)
+ 
+@@ -112,10 +112,8 @@ class MailGuest(models.Model):
+         """
+         self.env.cr.execute(query, (timezone, self.id))
+ 
+-    def _to_store(self, store: Store, /, *, fields=None):
+-        if fields is None:
+-            fields = ["im_status", "name", "write_date"]
+-        store.add("mail.guest", self._read_format(fields, load=False))
++    def _to_store_defaults(self):
++        return ["im_status", "name", "write_date"]
+ 
+     def _set_auth_cookie(self):
+         """Add a cookie to the response to identify the guest. Every route
+
+--- a/addons/mail/models/discuss/mail_message.py
++++ b/addons/mail/models/discuss/mail_message.py
+@@ -11,10 +11,10 @@ class MailMessage(models.Model):
+         super()._extras_to_store(store, format_reply=format_reply)
+         if format_reply:
+             # sudo: mail.message: access to parent is allowed
+-            for message in self.sudo().filtered(lambda message: message.model == "discuss.channel"):
+-                store.add(
+-                    message, {"parentMessage": Store.one(message.parent_id, format_reply=False)}
+-                )
++            store.add(
++                self.sudo().filtered(lambda message: message.model == "discuss.channel"),
++                Store.One("parent_id", format_reply=False, rename="parentMessage"),
++            )
+ 
+     def _bus_channel(self):
+         self.ensure_one()
+
+--- a/addons/mail/models/discuss/res_partner.py
++++ b/addons/mail/models/discuss/res_partner.py
+@@ -82,13 +82,13 @@ class ResPartner(models.Model):
+             ]
+         )
+         partners = self._search_mention_suggestions(domain, limit)
+-        members = self.env["discuss.channel.member"].search(
+-            [
+-                ("channel_id", "=", channel.id),
+-                ("partner_id", "in", partners.ids),
+-            ]
+-        )
+-        return Store(members, fields={"channel": [], "persona": []}).add(partners).get_result()
++        members_domain = [("channel_id", "=", channel.id), ("partner_id", "in", partners.ids)]
++        members = self.env["discuss.channel.member"].search(members_domain)
++        member_fields = [
++            Store.One("channel_id", [], as_thread=True, rename="thread"),
++            *self.env["discuss.channel.member"]._to_store_persona([]),
++        ]
++        return Store(members, member_fields).add(partners).get_result()
+ 
+     def _can_return_content(self, field_name=None, access_token=None):
+         if field_name == "avatar_128":
+
+--- a/addons/mail/models/discuss/res_users.py
++++ b/addons/mail/models/discuss/res_users.py
+@@ -2,6 +2,7 @@
+ 
+ from odoo import api, models
+ from odoo.addons.base.models.res_users import is_selection_groups
++from odoo.addons.mail.tools.discuss import Store
+ 
+ 
+ class ResUsers(models.Model):
+@@ -42,20 +43,20 @@ class ResUsers(models.Model):
+             lambda cm: (cm.channel_id.channel_type == "channel" and cm.channel_id.group_public_id)
+         ).unlink()
+ 
+-    def _init_store_data(self, store):
++    def _init_store_data(self, store: Store):
+         super()._init_store_data(store)
+         # sudo: ir.config_parameter - reading hard-coded keys to check their existence, safe to
+         # return whether the features are enabled
+         get_param = self.env["ir.config_parameter"].sudo().get_param
+-        store.add(
+-            {
+-                "hasGifPickerFeature": get_param("discuss.tenor_api_key"),
+-                "hasMessageTranslationFeature": get_param("mail.google_translate_api_key"),
+-                "channel_types_with_seen_infos": sorted(self.env["discuss.channel"]._types_allowing_seen_infos()),
+-            }
++        store.add_global_values(
++            hasGifPickerFeature=get_param("discuss.tenor_api_key"),
++            hasMessageTranslationFeature=get_param("mail.google_translate_api_key"),
++            channel_types_with_seen_infos=sorted(
++                self.env["discuss.channel"]._types_allowing_seen_infos()
++            ),
+         )
+ 
+-    def _init_messaging(self, store):
++    def _init_messaging(self, store: Store):
+         self = self.with_user(self)
+         channels = self.env["discuss.channel"]._get_channels_as_member()
+         domain = [("channel_id", "in", channels.ids), ("is_self", "=", True)]
+@@ -64,4 +65,4 @@ class ResUsers(models.Model):
+         # fetch channels data before calling super to benefit from prefetching (channel info might
+         # prefetch a lot of data that super could use, about the current user in particular)
+         super()._init_messaging(store)
+-        store.add({"initChannelsUnreadCounter": len(members_with_unread)})
++        store.add_global_values(initChannelsUnreadCounter=len(members_with_unread))
+
+--- a/addons/mail/models/ir_attachment.py
++++ b/addons/mail/models/ir_attachment.py
+@@ -76,32 +76,14 @@ class IrAttachment(models.Model):
+             )
+         self.unlink()
+ 
+-    def _to_store(self, store: Store, /, *, fields=None, extra_fields=None):
+-        if fields is None:
+-            fields = [
+-                "checksum",
+-                "create_date",
+-                "mimetype",
+-                "name",
+-                "res_name",
+-                "thread",
+-                "type",
+-                "url",
+-            ]
+-        if extra_fields:
+-            fields.extend(extra_fields)
+-        for attachment in self:
+-            data = attachment._read_format(
+-                [field for field in fields if field != "thread"], load=False
+-            )[0]
+-            if "thread" in fields:
+-                data["thread"] = (
+-                    Store.one(
+-                        self.env[attachment.res_model].browse(attachment.res_id),
+-                        as_thread=True,
+-                        only_id=True,
+-                    )
+-                    if attachment.res_model != "mail.compose.message" and attachment.res_id
+-                    else False
+-                )
+-            store.add(attachment, data)
++    def _to_store_defaults(self):
++        return [
++            "checksum",
++            "create_date",
++            "mimetype",
++            "name",
++            "res_name",
++            Store.One("thread", [], as_thread=True),
++            "type",
++            "url",
++        ]
+
+--- a/addons/mail/models/mail_activity.py
++++ b/addons/mail/models/mail_activity.py
+@@ -586,16 +586,23 @@ class MailActivity(models.Model):
+     def activity_format(self):
+         return Store(self).get_result()
+ 
+-    def _to_store(self, store: Store):
+-        for activity in self:
+-            data = activity.read()[0]
+-            data["mail_template_ids"] = [
+-                {"id": mail_template.id, "name": mail_template.name}
+-                for mail_template in activity.mail_template_ids
+-            ]
+-            data["attachment_ids"] = Store.many(activity.attachment_ids, fields=["name"])
+-            data["persona"] = Store.one(activity.user_id.partner_id)
+-            store.add(activity, data)
++    def _to_store_defaults(self):
++        return [
++            "all",
++            Store.Many("attachment_ids", ["name"]),
++            Store.Attr(
++                "mail_template_ids",
++                lambda activity: activity.mail_template_ids._read_format(["name"]),
++            ),
++            Store.One("persona", value=lambda activity: activity.user_id.partner_id),
++        ]
++
++    def _to_store(self, store: Store, fields):
++        if "all" in fields:
++            fields.remove("all")
++            for activity in self:
++                store.add(activity, activity.read()[0])
++        store.add_records_fields(self, fields)
+ 
+     @api.readonly
+     @api.model
+
+--- a/addons/mail/models/mail_canned_response.py
++++ b/addons/mail/models/mail_canned_response.py
+@@ -65,11 +65,15 @@ class MailCannedResponse(models.Model):
+ 
+     def _broadcast(self, /, *, delete=False):
+         for canned_response in self:
+-            store = Store(canned_response, delete=delete)
+-            (self.env.user | canned_response.create_uid)._bus_send_store(store)
++            store = Store()
++            if delete:
++                store.delete(canned_response)
++            else:
++                store.add(canned_response)
++            user = self.env.user | canned_response.create_uid
++            if not (user.groups_id & canned_response.group_ids):
++                user._bus_send_store(store)
+             canned_response.group_ids._bus_send_store(store)
+ 
+-    def _to_store(self, store: Store, /, *, fields=None):
+-        if fields is None:
+-            fields = ["source", "substitution"]
+-        store.add(self._name, self._read_format(fields))
++    def _to_store_defaults(self):
++        return ["source", "substitution"]
+
+--- a/addons/mail/models/mail_followers.py
++++ b/addons/mail/models/mail_followers.py
+@@ -519,26 +519,12 @@ GROUP BY fol.id%s%s""" % (
+     # Misc discuss
+     # --------------------------------------------------
+ 
+-    def _to_store(self, store: Store, fields=None):
+-        if fields is None:
+-            fields = {
+-                "display_name": True,
+-                "email": True,
+-                "is_active": True,
+-                "name": True,
+-                "partner": None,
+-                "thread": [],
+-            }
+-        for follower in self:
+-            data = follower._read_format(
+-                [field for field in fields if field not in ["partner", "thread"]], load=False
+-            )[0]
+-            if "partner" in fields:
+-                data["partner"] = Store.one(follower.partner_id, fields=fields["partner"])
+-            if "thread" in fields:
+-                data["thread"] = Store.one(
+-                    self.env[follower.res_model].browse(follower.res_id),
+-                    as_thread=True,
+-                    only_id=True,
+-                )
+-            store.add(follower, data)
++    def _to_store_defaults(self):
++        return [
++            "display_name",
++            "email",
++            "is_active",
++            "name",
++            Store.One("partner_id", rename="partner"),
++            Store.One("thread", [], as_thread=True),
++        ]
+
+--- a/addons/mail/models/mail_link_preview.py
++++ b/addons/mail/models/mail_link_preview.py
+@@ -64,7 +64,7 @@ class MailLinkPreview(models.Model):
+         if link_preview_values:
+             link_previews += link_previews.create(link_preview_values)
+         if link_previews := link_previews.sorted(key=lambda p: list(urls).index(p.source_url)):
+-            message._bus_send_store(message, {"link_preview_ids": Store.many(link_previews)})
++            message._bus_send_store(message, {"link_preview_ids": Store.Many(link_previews)})
+ 
+     def _hide_and_notify(self):
+         if not self:
+@@ -72,7 +72,7 @@ class MailLinkPreview(models.Model):
+         for link_preview in self:
+             link_preview._bus_send_store(
+                 link_preview.message_id,
+-                {"link_preview_ids": Store.many(link_preview, "DELETE", only_id=True)},
++                {"link_preview_ids": Store.Many(link_preview, [], mode="DELETE")},
+             )
+         self.is_hidden = True
+ 
+@@ -82,7 +82,7 @@ class MailLinkPreview(models.Model):
+         for link_preview in self:
+             link_preview._bus_send_store(
+                 link_preview.message_id,
+-                {"link_preview_ids": Store.many(link_preview, "DELETE", only_id=True)},
++                {"link_preview_ids": Store.Many(link_preview, [], mode="DELETE")},
+             )
+         self.unlink()
+ 
+@@ -106,23 +106,18 @@ class MailLinkPreview(models.Model):
+             preview = self.env['mail.link.preview'].create(preview_values)
+         return preview
+ 
+-    def _to_store(self, store: Store, /):
+-        for preview in self:
+-            data = preview._read_format(
+-                [
+-                    "image_mimetype",
+-                    "message_id",
+-                    "og_description",
+-                    "og_image",
+-                    "og_mimetype",
+-                    "og_site_name",
+-                    "og_title",
+-                    "og_type",
+-                    "source_url",
+-                ],
+-                load=False,
+-            )[0]
+-            store.add(preview, data)
++    def _to_store_defaults(self):
++        return [
++            "image_mimetype",
++            "message_id",
++            "og_description",
++            "og_image",
++            "og_mimetype",
++            "og_site_name",
++            "og_title",
++            "og_type",
++            "source_url",
++        ]
+ 
+     @api.autovacuum
+     def _gc_mail_link_preview(self):
+
+--- a/addons/mail/models/mail_message.py
++++ b/addons/mail/models/mail_message.py
+@@ -898,7 +898,7 @@ class MailMessage(models.Model):
+         group_domain = [("message_id", "=", self.id), ("content", "=", content)]
+         reactions = self.env["mail.message.reaction"].search(group_domain)
+         reaction_group = (
+-            Store.many(reactions, "ADD")
++            Store.Many(reactions, mode="ADD")
+             if reactions
+             else [("DELETE", {"message": self.id, "content": content})]
+         )
+@@ -908,7 +908,46 @@ class MailMessage(models.Model):
+     # STORE / NOTIFICATIONS
+     # ------------------------------------------------------
+ 
+-    def _to_store(self, store, /, *, fields=None, format_reply=True, msg_vals=None,
++    def _to_store_defaults(self):
++        com_id = self.env["ir.model.data"]._xmlid_to_res_id("mail.mt_comment")
++        note_id = self.env["ir.model.data"]._xmlid_to_res_id("mail.mt_note")
++        field_names = [
++            # sudo: mail.message - reading attachments on accessible message is allowed
++            Store.Many("attachment_ids", sort="id", sudo=True),
++            "body",
++            "create_date",
++            "date",
++            Store.Attr("is_note", lambda m: m.subtype_id.id == note_id),
++            Store.Attr("is_discussion", lambda m: m.subtype_id.id == com_id),
++            # sudo: mail.message - reading link preview on accessible message is allowed
++            Store.Many(
++                "link_preview_ids",
++                value=lambda m: m.sudo().link_preview_ids.filtered(lambda l: not l.is_hidden),
++            ),
++            "message_format",
++            "message_type",
++            "model",  # keep for iOS app
++            "pinned_at",
++            # sudo: mail.message - reading reactions on accessible message is allowed
++            Store.Many("reaction_ids", rename="reactions", sudo=True),
++            # sudo: res.partner: reading limited data of recipients is acceptable
++            Store.Many("partner_ids", ["name", "write_date"], rename="recipients", sudo=True),
++            "res_id",  # keep for iOS app
++            "subject",
++            # sudo: mail.message.subtype - reading description on accessible message is allowed
++            Store.Attr("subtype_description", lambda m: m.subtype_id.sudo().description),
++            "write_date",
++        ]
++        if self.env.user._is_internal():
++            field_names.append(
++                Store.Many(
++                    "notification_ids",
++                    value=lambda m: m.notification_ids._filtered_for_web_client(),
++                )
++            )
++        return field_names
++
++    def _to_store(self, store: Store, fields, *, format_reply=True, msg_vals=None,
+                   for_current_user=False, add_followers=False, followers=None):
+         """Add the messages to the given store.
+ 
+@@ -930,20 +969,10 @@ class MailMessage(models.Model):
+             them. It lessen query count in some optimized use cases.
+             Only applicable if ``add_followers`` is True.
+         """
+-        if fields is None:
+-            fields = [
+-                "body",
+-                "create_date",
+-                "date",
+-                "message_type",
+-                "model",  # keep for iOS app
+-                "pinned_at",
+-                "res_id",  # keep for iOS app
+-                "subject",
+-                "write_date",
+-            ]
+-        com_id = self.env["ir.model.data"]._xmlid_to_res_id("mail.mt_comment")
+-        note_id = self.env["ir.model.data"]._xmlid_to_res_id("mail.mt_note")
++        if "message_format" not in fields:
++            store.add_records_fields(self, fields)
++            return
++        fields.remove("message_format")
+         # fetch scheduled notifications once, only if msg_vals is not given to
+         # avoid useless queries when notifying Inbox right after a message_post
+         scheduled_dt_by_msg_id = {}
+@@ -960,15 +989,14 @@ class MailMessage(models.Model):
+         record_by_message = self._record_by_message()
+         records = record_by_message.values()
+         non_channel_records = filter(lambda record: record._name != "discuss.channel", records)
++        current_partner = self.env.user.partner_id
+         if for_current_user and add_followers and non_channel_records:
+             if followers is None:
+                 domain = expression.OR(
+                     [("res_model", "=", model), ("res_id", "in", [r.id for r in records])]
+                     for model, records in groupby(non_channel_records, key=lambda r: r._name)
+                 )
+-                domain = expression.AND(
+-                    [domain, [("partner_id", "=", self.env.user.partner_id.id)]]
+-                )
++                domain = expression.AND([domain, [("partner_id", "=", current_partner.id)]])
+                 # sudo: mail.followers - reading followers of current partner
+                 followers = self.env["mail.followers"].sudo().search(domain)
+             follower_by_record_and_partner = {
+@@ -978,24 +1006,34 @@ class MailMessage(models.Model):
+                 ): follower
+                 for follower in followers
+             }
+-        for record in records:
+-            thread_data = {}
+-            if record._name != "discuss.channel":
+-                # sudo: mail.thread - if mentionned in a non accessible thread, name is allowed
+-                thread_data["name"] = record.sudo().display_name
+-            if self.env[record._name]._original_module:
+-                thread_data["module_icon"] = modules.module.get_module_icon(
+-                    self.env[record._name]._original_module
+-                )
+-            if for_current_user and add_followers:
+-                thread_data["selfFollower"] = Store.one(
+-                    follower_by_record_and_partner.get((record, self.env.user.partner_id)),
+-                    fields={"is_active": True, "partner": []},
++        record_fields = [
++            # sudo: mail.thread - if mentionned in a non accessible thread, name is allowed
++            Store.Attr(
++                "name",
++                lambda record: record.sudo().display_name,
++                predicate=lambda record: record._name != "discuss.channel",
++            ),
++            Store.Attr(
++                "module_icon",
++                lambda record: modules.module.get_module_icon(self.env[record._name]._original_module),
++                predicate=lambda record: self.env[record._name]._original_module,
++            ),
++        ]
++        if for_current_user and add_followers and non_channel_records:
++            record_fields.append(
++                Store.One(
++                    "selfFollower",
++                    ["is_active", Store.One("partner_id", [], rename="partner")],
++                    value=lambda r: follower_by_record_and_partner.get((r, current_partner)),
+                 )
+-            store.add(record, thread_data, as_thread=True)
++            )
++        for record in records:
++            store.add(record, record_fields, as_thread=True)
++        if for_current_user:
++            fields.append("starred")
++        store.add(self, fields)
+         for message in self:
+             # model, res_id, record_name need to be kept for mobile app as iOS app cannot be updated
+-            data = message._read_format(fields, load=False)[0]
+             record = record_by_message.get(message)
+             if record:
+                 # sudo: if mentionned in a non accessible thread, user should be able to see the name
+@@ -1007,28 +1045,12 @@ class MailMessage(models.Model):
+             else:
+                 record_name = False
+                 default_subject = False
+-            data["default_subject"] = default_subject
+-            vals = {
+-                # sudo: mail.message - reading attachments on accessible message is allowed
+-                "attachment_ids": Store.many(message.sudo().attachment_ids.sorted("id")),
+-                # sudo: mail.message - reading link preview on accessible message is allowed
+-                "link_preview_ids": Store.many(
+-                    message.sudo().link_preview_ids.filtered(lambda l: not l.is_hidden)
+-                ),
+-                # sudo: mail.message - reading reactions on accessible message is allowed
+-                "reactions": Store.many(message.sudo().reaction_ids),
++            data = {
++                "default_subject": default_subject,
+                 "record_name": record_name,  # keep for iOS app
+-                "is_note": message.subtype_id.id == note_id,
+-                "is_discussion": message.subtype_id.id == com_id,
+-                # sudo: mail.message.subtype - reading description on accessible message is allowed
+-                "subtype_description": message.subtype_id.sudo().description,
+-                # sudo: res.partner: reading limited data of recipients is acceptable
+-                "recipients": Store.many(message.sudo().partner_ids, fields=["name", "write_date"]),
+                 "scheduledDatetime": scheduled_dt_by_msg_id.get(message.id, False),
+-                "thread": Store.one(record, as_thread=True, only_id=True),
++                "thread": Store.One(record, [], as_thread=True),
+             }
+-            if self.env.user._is_internal():
+-                vals["notification_ids"] = Store.many(message.notification_ids._filtered_for_web_client())
+             if for_current_user:
+                 # sudo: mail.message - filtering allowed tracking values
+                 displayed_tracking_ids = message.sudo().tracking_value_ids._filter_has_field_access(
+@@ -1042,13 +1064,10 @@ class MailMessage(models.Model):
+                 notifications_partners = message.sudo().notification_ids.filtered(
+                     lambda n: not n.is_read
+                 ).res_partner_id
+-                vals["needaction"] = (
+-                    not self.env.user._is_public()
+-                    and self.env.user.partner_id in notifications_partners
++                data["needaction"] = (
++                    not self.env.user._is_public() and current_partner in notifications_partners
+                 )
+-                vals["starred"] = message.starred
+-                vals["trackingValues"] = displayed_tracking_ids._tracking_value_format()
+-            data.update(vals)
++                data["trackingValues"] = displayed_tracking_ids._tracking_value_format()
+             store.add(message, data)
+         # sudo: mail.message: access to author is allowed
+         self.sudo()._author_to_store(store)
+@@ -1065,12 +1084,10 @@ class MailMessage(models.Model):
+             }
+             # sudo: mail.message: access to author is allowed
+             if guest_author := message.sudo().author_guest_id:
+-                data["author"] = Store.one(guest_author, fields=["name", "write_date"])
++                data["author"] = Store.One(guest_author, ["name", "write_date"])
+             # sudo: mail.message: access to author is allowed
+             elif author := message.sudo().author_id:
+-                data["author"] = Store.one(
+-                    author, fields=["name", "is_company", "user", "write_date"]
+-                )
++                data["author"] = Store.One(author, ["name", "is_company", "user", "write_date"])
+             store.add(message, data)
+ 
+     def _extras_to_store(self, store: Store, format_reply):
+@@ -1083,22 +1100,27 @@ class MailMessage(models.Model):
+         Notifications hold the information about each recipient of a message: if
+         the message was successfully sent or if an exception or bounce occurred.
+         """
+-        for message in self:
+-            message_data = {
+-                "author": Store.one(message.author_id, only_id=True),
+-                "date": message.date,
+-                "message_type": message.message_type,
+-                "body": message.body,
+-                "notification_ids": Store.many(message.notification_ids._filtered_for_web_client()),
+-                "thread": (
+-                    Store.one(
+-                        self.env[message.model].browse(message.res_id) if message.model else False,
+-                        as_thread=True,
+-                        fields=["modelName"],
+-                    )
++        store.add(
++            self,
++            [
++                Store.One("author_id", [], rename="author"),
++                "body",
++                "date",
++                "message_type",
++                Store.Many(
++                    "notification_ids",
++                    value=lambda m: m.notification_ids._filtered_for_web_client(),
+                 ),
+-            }
+-            store.add(message, message_data)
++                Store.One(
++                    "thread",
++                    Store.Attr(
++                        "modelName",
++                        lambda thread: self.env["ir.model"]._get(thread._name).display_name,
++                    ),
++                    as_thread=True,
++                ),
++            ],
++        )
+ 
+     def _notify_message_notification_update(self):
+         """Send bus notifications to update status of notifications in the web
+@@ -1152,14 +1174,16 @@ class MailMessage(models.Model):
+             star_count_by_partner_id = dict(self.env.cr.fetchall())
+             for partner in outdated_starred_partners:
+                 partner._bus_send_store(
+-                    "mail.thread",
+-                    {
+-                        "counter": star_count_by_partner_id.get(partner.id, 0),
+-                        "counter_bus_id": bus_last_id,
+-                        "id": "starred",
+-                        "messages": Store.many(self, "DELETE", only_id=True),
+-                        "model": "mail.box",
+-                    },
++                    Store().add_model_values(
++                        "mail.thread",
++                        {
++                            "counter": star_count_by_partner_id.get(partner.id, 0),
++                            "counter_bus_id": bus_last_id,
++                            "id": "starred",
++                            "messages": Store.Many(self, [], mode="DELETE"),
++                            "model": "mail.box",
++                        },
++                    )
+                 )
+ 
+     def _filter_empty(self):
+
+--- a/addons/mail/models/mail_message_reaction.py
++++ b/addons/mail/models/mail_message_reaction.py
+@@ -24,17 +24,19 @@ class MailMessageReaction(models.Model):
+         'A message reaction must be from a partner or from a guest.',
+     )
+ 
+-    def _to_store(self, store: Store):
++    def _to_store(self, store: Store, fields):
++        if fields:
++            raise NotImplementedError("Fields are not supported for reactions.")
++        store.add(self.guest_id, ["name", "write_date"])
++        store.add(self.partner_id, ["name", "write_date"])
+         for (message_id, content), reactions in groupby(self, lambda r: (r.message_id, r.content)):
+             reactions = self.env["mail.message.reaction"].union(*reactions)
+-            store.add(reactions.guest_id, fields=["name", "write_date"])
+-            store.add(reactions.partner_id, fields=["name", "write_date"])
+             data = {
+                 "content": content,
+                 "count": len(reactions),
+                 "sequence": min(reactions.ids),
+-                "personas": Store.many_ids(reactions.guest_id)
+-                + Store.many_ids(reactions.partner_id),
+-                "message": Store.one_id(message_id),
++                "personas": Store.Many(reactions.guest_id)._get_id()
++                + Store.Many(reactions.partner_id)._get_id(),
++                "message": message_id.id,
+             }
+-            store.add("MessageReactions", data)
++            store.add_model_values("MessageReactions", data)
+
+--- a/addons/mail/models/mail_notification.py
++++ b/addons/mail/models/mail_notification.py
+@@ -119,13 +119,11 @@ class MailNotification(models.Model):
+ 
+         return self.filtered(_filter_unimportant_notifications)
+ 
+-    def _to_store(self, store: Store, /):
+-        """Returns the current notifications in the format expected by the web
+-        client."""
+-        for notif in self:
+-            data = notif._read_format(
+-                ["failure_type", "mail_message_id", "notification_status", "notification_type"],
+-                load=False,
+-            )[0]
+-            data["persona"] = Store.one(notif.res_partner_id, fields=["name"])
+-            store.add(notif, data)
++    def _to_store_defaults(self):
++        return [
++            "failure_type",
++            "mail_message_id",
++            "notification_status",
++            "notification_type",
++            Store.One("res_partner_id", ["name"], rename="persona"),
++        ]
+
+--- a/addons/mail/models/mail_scheduled_message.py
++++ b/addons/mail/models/mail_scheduled_message.py
+@@ -251,9 +251,12 @@ class MailScheduledMessage(models.Model):
+         if self.search_count(domain, limit=1):
+             self.env('mail.ir_cron_post_scheduled_message')._trigger()
+ 
+-    def _to_store(self, store: Store):
+-        for scheduled_message in self:
+-            data = scheduled_message._read_format(['body', 'is_note', 'scheduled_date', 'subject'])[0]
+-            data['attachment_ids'] = Store.many(scheduled_message.attachment_ids)
+-            data['author'] = Store.one(scheduled_message.author_id)
+-            store.add(scheduled_message, data)
++    def _to_store_defaults(self):
++        return [
++            Store.Many("attachment_ids"),
++            Store.One("author_id", rename="author"),
++            "body",
++            "is_note",
++            "scheduled_date",
++            "subject",
++        ]
+
+--- a/addons/mail/models/mail_thread.py
++++ b/addons/mail/models/mail_thread.py
+@@ -4399,9 +4399,9 @@ class MailThread(models.AbstractModel):
+         store.add(
+             self,
+             {
+-                "recipients" if filter_recipients else "followers": Store.many(
++                "recipients" if filter_recipients else "followers": Store.Many(
+                     self.env["mail.followers"].search(domain, limit=limit, order="id ASC"),
+-                    "ADD" if not reset else "REPLACE",
++                    mode="ADD" if not reset else "REPLACE",
+                 ),
+             },
+             as_thread=True,
+@@ -4519,53 +4519,46 @@ class MailThread(models.AbstractModel):
+         empty_messages = message.sudo()._filter_empty()
+         empty_messages._cleanup_side_records()
+         empty_messages.write({'pinned_at': None})
+-        res = {
+-            "attachment_ids": Store.many(message.attachment_ids.sorted("id")),
+-            "body": message.body,
+-            "pinned_at": message.pinned_at,
+-            "recipients": Store.many(message.partner_ids, fields=["name", "write_date"]),
+-            "write_date": message.write_date,
+-        }
++        res = [
++            Store.Many("attachment_ids", sort="id"),
++            "body",
++            Store.Many("partner_ids", ["name", "write_date"], rename="recipients"),
++            "pinned_at",
++            "write_date",
++        ]
+         if body is not None:
+             # sudo: mail.message.translation - discarding translations of message after editing it
+             self.env["mail.message.translation"].sudo().search([("message_id", "=", message.id)]).unlink()
+-            res["translationValue"] = False
++            res.append(Store.Attr("translationValue", False))
+         message._bus_send_store(message, res)
+ 
+     # ------------------------------------------------------
+     # STORE
+     # ------------------------------------------------------
+ 
+-    def _thread_to_store(self, store: Store, /, *, fields=None, request_list=None):
+-        if fields is None:
+-            fields = []
++    def _thread_to_store(self, store: Store, fields, *, request_list=None):
++        store.add_records_fields(self, fields, as_thread=True)
+         for thread in self:
+-            res = thread._read_format(
+-                [field for field in fields if field not in ["display_name", "modelName"]],
+-                load=False,
+-            )[0]
++            res = {}
+             if request_list:
+                 res["hasReadAccess"] = True
+                 res["hasWriteAccess"] = False
+                 res["canPostOnReadonly"] = self._mail_post_access == "read"
+-            try:
+-                thread.check_access("write")
+-                if request_list:
++                try:
++                    thread.check_access("write")
+                     res["hasWriteAccess"] = True
+-            except AccessError:
+-                pass
++                except AccessError:
++                    pass
+             if (
+                 request_list
+                 and "activities" in request_list
+                 and isinstance(self.env[self._name], self.env.registry["mail.activity.mixin"])
+             ):
+-                res["activities"] = Store.many(thread.with_context(active_test=True).activity_ids)
++                res["activities"] = Store.Many(thread.with_context(active_test=True).activity_ids)
+             if request_list and "attachments" in request_list:
+-                res["attachments"] = Store.many(thread._get_mail_thread_data_attachments())
++                res["attachments"] = Store.Many(thread._get_mail_thread_data_attachments())
+                 res["areAttachmentsLoaded"] = True
+                 res["isLoadingAttachments"] = False
+-            if "display_name" in fields:
+-                res["name"] = thread.display_name
+             if request_list and "followers" in request_list:
+                 res["followersCount"] = self.env["mail.followers"].search_count(
+                     [("res_id", "=", thread.id), ("res_model", "=", self._name)]
+@@ -4577,7 +4570,7 @@ class MailThread(models.AbstractModel):
+                         ["partner_id", "=", self.env.user.partner_id.id],
+                     ]
+                 )
+-                res["selfFollower"] = Store.one(self_follower)
++                res["selfFollower"] = Store.One(self_follower)
+                 thread._message_followers_to_store(store, reset=True)
+                 subtype_id = self.env["ir.model.data"]._xmlid_to_res_id("mail.mt_comment")
+                 res["recipientsCount"] = self.env["mail.followers"].search_count(
+@@ -4590,15 +4583,14 @@ class MailThread(models.AbstractModel):
+                     ]
+                 )
+                 thread._message_followers_to_store(store, filter_recipients=True, reset=True)
+-            if "modelName" in fields:
+-                res["modelName"] = self.env["ir.model"]._get(self._name).display_name
+             if request_list and "scheduledMessages" in request_list:
+-                res["scheduledMessages"] = Store.many(self.env['mail.scheduled.message'].search([
++                res["scheduledMessages"] = Store.Many(self.env['mail.scheduled.message'].search([
+                     ['model', '=', self._name], ['res_id', '=', thread.id]
+                 ]))
+             if request_list and "suggestedRecipients" in request_list:
+                 res["suggestedRecipients"] = thread._message_get_suggested_recipients()
+-            store.add(thread, res, as_thread=True)
++            if res:
++                store.add(thread, res, as_thread=True)
+ 
+     def _get_mail_thread_data_attachments(self):
+         self.ensure_one()
+
+--- a/addons/mail/models/mail_thread_main_attachment.py
++++ b/addons/mail/models/mail_thread_main_attachment.py
+@@ -48,11 +48,11 @@ class MailThreadMainAttachment(models.AbstractModel):
+                     key=lambda r: (r.mimetype.endswith('pdf'), r.mimetype.startswith('image'))
+                 ).id
+ 
+-    def _thread_to_store(self, store: Store, /, *, request_list=None, **kwargs):
+-        super()._thread_to_store(store, request_list=request_list, **kwargs)
++    def _thread_to_store(self, store: Store, fields, *, request_list=None):
++        super()._thread_to_store(store, fields, request_list=request_list)
+         if request_list and "attachments" in request_list:
+             store.add(
+                 self,
+-                {"mainAttachment": Store.one(self.message_main_attachment_id, only_id=True)},
++                Store.One("message_main_attachment_id", [], rename="mainAttachment"),
+                 as_thread=True,
+             )
+
+--- a/addons/mail/models/res_partner.py
++++ b/addons/mail/models/res_partner.py
+@@ -213,43 +213,38 @@ class ResPartner(models.Model):
+     # DISCUSS
+     # ------------------------------------------------------------
+ 
+-    def _to_store(self, store: Store, /, *, fields=None, main_user_by_partner=None):
+-        if fields is None:
+-            fields = ["active", "email", "im_status", "is_company", "name", "user", "write_date"]
++    def _to_store_defaults(self):
++        return ["active", "email", "im_status", "is_company", "name", "user", "write_date"]
++
++    def _to_store(self, store: Store, fields, *, main_user_by_partner=None):
+         if not self.env.user._is_internal() and "email" in fields:
+             fields.remove("email")
++        store.add_records_fields(
++            self,
++            [
++                field
++                for field in fields
++                if field not in ["display_name", "isAdmin", "notification_type", "user"]
++            ],
++        )
+         for partner in self:
+-            data = partner._read_format(
+-                [
+-                    field
+-                    for field in fields
+-                    if field
+-                    not in ["country", "display_name", "isAdmin", "notification_type", "user"]
+-                ],
+-                load=False,
+-            )[0]
+-            if "country" in fields:
+-                c = partner.country_id
+-                data["country"] = {"code": c.code, "id": c.id, "name": c.name} if c else False
++            data = {}
+             if "display_name" in fields:
+                 data["displayName"] = partner.display_name
+-            if 'user' in fields:
++            if "user" in fields:
+                 main_user = main_user_by_partner and main_user_by_partner.get(partner)
+                 if not main_user:
+                     users = partner.with_context(active_test=False).user_ids
+                     internal_users = users - users.filtered("share")
+-                    main_user = (
+-                        internal_users[0]
+-                        if len(internal_users) > 0
+-                        else users[0] if len(users) > 0 else self.env["res.users"]
+-                    )
+-                data['userId'] = main_user.id
++                    main_user = internal_users[:1] or users[:1]
++                data["userId"] = main_user.id
+                 data["isInternalUser"] = not main_user.share if main_user else False
+                 if "isAdmin" in fields:
+                     data["isAdmin"] = main_user._is_admin()
+                 if "notification_type" in fields:
+                     data["notification_preference"] = main_user.notification_type
+-            store.add(partner, data)
++            if data:
++                store.add(partner, data)
+ 
+     @api.readonly
+     @api.model
+
+--- a/addons/mail/models/res_users.py
++++ b/addons/mail/models/res_users.py
+@@ -145,7 +145,7 @@ class ResUsers(models.Model):
+             for user in user_notification_type_modified:
+                 user._bus_send_store(
+                     user.partner_id,
+-                    fields=["notification_type"],
++                    "notification_type",
+                     main_user_by_partner={user.partner_id: user},
+                 )
+ 
+@@ -258,63 +258,50 @@ class ResUsers(models.Model):
+     # ------------------------------------------------------------
+ 
+     @api.model
+-    def _init_store_data(self, store: Store, /):
++    def _init_store_data(self, store: Store):
+         """Initialize the store of the user."""
+         xmlid_to_res_id = self.env["ir.model.data"]._xmlid_to_res_id
+-        store.add(
+-            {
+-                "action_discuss_id": xmlid_to_res_id("mail.action_discuss"),
+-                "hasLinkPreviewFeature": self.env["mail.link.preview"]._is_link_preview_enabled(),
+-                "internalUserGroupId": self.env.ref("base.group_user").id,
+-                "mt_comment_id": xmlid_to_res_id("mail.mt_comment"),
+-                # sudo: res.partner - exposing OdooBot data is considered acceptable
+-                "odoobot": Store.one(self.env.ref("base.partner_root").sudo()),
+-            }
++        store.add_global_values(
++            action_discuss_id=xmlid_to_res_id("mail.action_discuss"),
++            hasLinkPreviewFeature=self.env["mail.link.preview"]._is_link_preview_enabled(),
++            internalUserGroupId=self.env.ref("base.group_user").id,
++            mt_comment_id=xmlid_to_res_id("mail.mt_comment"),
++            # sudo: res.partner - exposing OdooBot data is considered acceptable
++            odoobot=Store.One(self.env.ref("base.partner_root").sudo()),
+         )
+         if not self.env.user._is_public():
+             settings = self.env["res.users.settings"]._find_or_create_for_user(self.env.user)
+-            store.add(
+-                {
+-                    "self": Store.one(
+-                        self.env.user.partner_id,
+-                        fields=[
+-                            "active",
+-                            "isAdmin",
+-                            "name",
+-                            "notification_type",
+-                            "user",
+-                            "write_date",
+-                        ],
+-                        main_user_by_partner={self.env.user.partner_id: self.env.user},
+-                    ),
+-                    "settings": settings._res_users_settings_format(),
+-                }
++            store.add_global_values(
++                store_self=Store.One(
++                    self.env.user.partner_id,
++                    ["active", "isAdmin", "name", "notification_type", "user", "write_date"],
++                    main_user_by_partner={self.env.user.partner_id: self.env.user},
++                ),
++                settings=settings._res_users_settings_format(),
+             )
+         elif guest := self.env["mail.guest"]._get_guest_from_context():
+-            store.add({"self": Store.one(guest, fields=["name", "write_date"])})
++            store.add_global_values(store_self=Store.One(guest, ["name", "write_date"]))
+ 
+-    def _init_messaging(self, store):
++    def _init_messaging(self, store: Store):
+         self.ensure_one()
+         self = self.with_user(self)
+         # sudo: bus.bus: reading non-sensitive last id
+         bus_last_id = self.env["bus.bus"].sudo()._bus_last_id()
+-        store.add(
+-            {
+-                "inbox": {
+-                    "counter": self.partner_id._get_needaction_count(),
+-                    "counter_bus_id": bus_last_id,
+-                    "id": "inbox",
+-                    "model": "mail.box",
+-                },
+-                "starred": {
+-                    "counter": self.env["mail.message"].search_count(
+-                        [("starred_partner_ids", "in", self.partner_id.ids)]
+-                    ),
+-                    "counter_bus_id": bus_last_id,
+-                    "id": "starred",
+-                    "model": "mail.box",
+-                },
+-            }
++        store.add_global_values(
++            inbox={
++                "counter": self.partner_id._get_needaction_count(),
++                "counter_bus_id": bus_last_id,
++                "id": "inbox",
++                "model": "mail.box",
++            },
++            starred={
++                "counter": self.env["mail.message"].search_count(
++                    [("starred_partner_ids", "in", self.partner_id.ids)]
++                ),
++                "counter_bus_id": bus_last_id,
++                "id": "starred",
++                "model": "mail.box",
++            },
+         )
+ 
+     @api.model

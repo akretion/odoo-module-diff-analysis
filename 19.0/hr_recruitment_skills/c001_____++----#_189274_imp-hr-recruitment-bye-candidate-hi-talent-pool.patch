@@ -1,0 +1,395 @@
+PR: https://github.com/odoo/odoo/pull/189274
+
+From: 66856ad6a4dae3289593b55451e6c668a221fb8e
+From: Einar Andersen (eian)
+Date: 2025-02-17 11:58:20
+
+Breaking data model changes scores: del:16 + add:4, change matches:
+-    _inherit = 'hr.applicant'
++    applicant_skill_ids = fields.One2many(
++    skill_ids = fields.Many2many("hr.skill", compute="_compute_skill_ids", store=True)
++    matching_skill_ids = fields.Many2many(
++    missing_skill_ids = fields.Many2many(
+-    candidate_skill_ids = fields.One2many(related="candidate_id.candidate_skill_ids", readonly=False)
+-    skill_ids = fields.Many2many(related="candidate_id.skill_ids", readonly=False)
+-    candidate_id = fields.Many2one(
+-    _inherit = 'hr.candidate'
+-    candidate_skill_ids = fields.One2many('hr.candidate.skill', 'candidate_id', string="Skills")
+-    skill_ids = fields.Many2many('hr.skill', compute='_compute_skill_ids', store=True)
+-    matching_skill_ids = fields.Many2many(comodel_name='hr.skill', string="Matching Skills", compute="_compute_matching_skill_ids")
+-    missing_skill_ids = fields.Many2many(comodel_name='hr.skill', string="Missing Skills", compute="_compute_matching_skill_ids")
+-    matching_score = fields.Float(string="Matching Score(%)", compute="_compute_matching_skill_ids")
+
+Total Changes: 357
+
+[IMP] hr_recruitment: Bye Candidate, Hi Talent Pool
+
+The goal of this PR can be split into three sections:
+
+1. Remove the hr.candidate model
+   The removal of the hr.candidate model required migrating information previously
+   attached to the candidate over to the applicant. This change aims to simplify
+   the flow of the recruitment app, as most SMEs don't need extensive complex
+   recruitment workflows for hiring a few people occasionally.
+
+2. Introduce the hr.talent.pool model
+   While removing hr.candidate means losing features useful for industries like
+   headhunting, the new talent pool system aims to re-introduce these features.
+   It enables creating application templates (talents) from existing applications
+   and using these talents to generate applications for other jobs.
+
+3. Other minor UI/UX/DX tweaks
+   - Improved job position form view for better user experience
+   - Improved applicant form view to integrate with talent pool system
+   - Renamed appraisal_goal_date/timeless_date to 'timeless_datetime' and moved
+     it to 'hr' so it can be used in both appraisal and recruitment
+
+These changes make the recruitment app more versatile. Smaller companies with
+simple recruitment processes can use basic applications and recruitment flows
+(similar to 17.4), while companies with complex needs can leverage talent pools
+to manage applications as they did with the candidate model.
+
+Task-4307229
+
+closes odoo/odoo#189274
+
+Related: odoo/enterprise#77118
+Related: odoo/upgrade#7116
+Signed-off-by: Yannick Tivisse (yti) <yti@odoo.com>
+
+================================= pseudo patch: =================================
+
+--- a/addons/hr_recruitment_skills/models/__init__.py
++++ b/addons/hr_recruitment_skills/models/__init__.py
+@@ -2,6 +2,5 @@
+ # Part of Odoo. See LICENSE file for full copyright and licensing details.
+ 
+ from . import hr_applicant
+-from . import hr_candidate
+-from . import hr_candidate_skill
++from . import hr_applicant_skill
+ from . import hr_job
+
+--- a/addons/hr_recruitment_skills/models/hr_applicant.py
++++ b/addons/hr_recruitment_skills/models/hr_applicant.py
+@@ -1,10 +1,150 @@
+ # Part of Odoo. See LICENSE file for full copyright and licensing details.
+ 
+-from odoo import fields, models
++from ast import literal_eval
++
++from odoo import fields, models, Command, api
+ 
+ 
+ class HrApplicant(models.Model):
+-    _inherit = 'hr.applicant'
++    _inherit = "hr.applicant"
++
++    applicant_skill_ids = fields.One2many(
++        "hr.applicant.skill", "applicant_id", string="Skills", copy=True
++    )
++    skill_ids = fields.Many2many("hr.skill", compute="_compute_skill_ids", store=True)
++    matching_skill_ids = fields.Many2many(
++        comodel_name="hr.skill",
++        string="Matching Skills",
++        compute="_compute_matching_skill_ids",
++    )
++    missing_skill_ids = fields.Many2many(
++        comodel_name="hr.skill",
++        string="Missing Skills",
++        compute="_compute_matching_skill_ids",
++    )
++    matching_score = fields.Float(
++        string="Matching Score(%)", compute="_compute_matching_skill_ids"
++    )
++
++    @api.depends("applicant_skill_ids.skill_id")
++    def _compute_skill_ids(self):
++        for applicant in self:
++            applicant.skill_ids = applicant.applicant_skill_ids.skill_id
++
++    @api.depends_context("active_id")
++    @api.depends("skill_ids")
++    def _compute_matching_skill_ids(self):
++        job_id = self.env.context.get("active_id")
++        if not job_id:
++            self.matching_skill_ids = False
++            self.missing_skill_ids = False
++            self.matching_score = 0
++        else:
++            for applicant in self:
++                job_skills = self.env["hr.job"].browse(job_id).skill_ids
++                applicant.matching_skill_ids = job_skills & applicant.skill_ids
++                applicant.missing_skill_ids = job_skills - applicant.skill_ids
++                applicant.matching_score = (
++                    (len(applicant.matching_skill_ids) / len(job_skills)) * 100
++                    if job_skills
++                    else 0
++                )
++
++    def _get_employee_create_vals(self):
++        vals = super()._get_employee_create_vals()
++        vals["employee_skill_ids"] = [
++            (
++                0,
++                0,
++                {
++                    "skill_id": applicant_skill.skill_id.id,
++                    "skill_level_id": applicant_skill.skill_level_id.id,
++                    "skill_type_id": applicant_skill.skill_type_id.id,
++                },
++            )
++            for applicant_skill in self.applicant_skill_ids
++        ]
++        return vals
++
++    def action_add_to_job(self):
++        self.with_context(just_moved=True).write(
++            {
++                "job_id": self.env["hr.job"]
++                .browse(self.env.context.get("active_id"))
++                .id,
++                "stage_id": self.env.ref("hr_recruitment.stage_job0"),
++            }
++        )
++        action = self.env["ir.actions.actions"]._for_xml_id(
++            "hr_recruitment.action_hr_job_applications"
++        )
++        action["context"] = literal_eval(
++            action["context"].replace("active_id", str(self.job_id.id))
++        )
++        return action
+ 
+-    candidate_skill_ids = fields.One2many(related="candidate_id.candidate_skill_ids", readonly=False)
+-    skill_ids = fields.Many2many(related="candidate_id.skill_ids", readonly=False)
++    def write(self, vals):
++        if (
++            "applicant_skill_ids" in vals
++            and self.pool_applicant_id
++            and (not self.is_pool_applicant)
++        ):
++            for applicant in self:
++                # The applicant_skills_ids contains a list of ORM tuples i.e (command, record ID, {values})
++                # The challenge lies in the uniqueness of the record ID in this tuple. Each skill (e.g., 'arabic')
++                # has a distinct ID per applicant, i.e arabic in applicant 1 will have a different id from arabic in
++                # applicant 2. This means the content of applicant_skills_ids is unique for each record and attempting
++                # to pass it directly (e.g., applicant.pool_applicant_id.write(vals)) won't yield results so we must
++                # update each tuple to have the correct command and record ID for the talent pool applicant
++                applicant_skills = {
++                    a.id: a.skill_id.id for a in applicant.applicant_skill_ids
++                }
++                applicant_skills_type = {
++                    a.id: a.skill_type_id.id for a in applicant.applicant_skill_ids
++                }
++                talent_skills = {
++                    a.skill_id.id: a.id
++                    for a in applicant.pool_applicant_id.applicant_skill_ids
++                }
++                translated_skills = []
++                for skill in vals["applicant_skill_ids"]:
++                    command = skill[0]
++                    record_id = skill[1]
++                    if command == 0:
++                        values = skill[2]
++                        if values["skill_id"] in talent_skills:
++                            translated_skill = Command.update(
++                                talent_skills[values["skill_id"]],
++                                {"skill_level_id": values["skill_level_id"]},
++                            )
++                            translated_skills.append(translated_skill)
++                        else:
++                            translated_skills.append(skill)
++                    elif command == 1:
++                        values = skill[2]
++                        if applicant_skills[record_id] in talent_skills:
++                            translated_skill = Command.update(
++                                talent_skills[applicant_skills[record_id]],
++                                values
++                            )
++                            translated_skills.append(translated_skill)
++                        else:
++                            translated_skill = Command.create(
++                                {
++                                    "skill_id": applicant_skills[record_id],
++                                    "skill_type_id": applicant_skills_type[record_id],
++                                    "skill_level_id": values["skill_level_id"],
++                                }
++                            )
++                            translated_skills.append(translated_skill)
++                    elif command == 2:
++                        if applicant_skills[record_id] in talent_skills:
++                            translated_skill = Command.delete(
++                                talent_skills[applicant_skills[record_id]]
++                            )
++                            translated_skills.append(translated_skill)
++                applicant.pool_applicant_id.write(
++                    {"applicant_skill_ids": translated_skills}
++                )
++        res = super().write(vals)
++        return res
+
+--- a/addons/hr_recruitment_skills/models/hr_candidate_skill.py
++++ b/addons/hr_recruitment_skills/models/hr_applicant_skill.py
+@@ -4,14 +4,14 @@ from odoo import api, fields, models, _
+ from odoo.exceptions import ValidationError
+ 
+ 
+-class HrCandidateSkill(models.Model):
+-    _name = 'hr.candidate.skill'
+-    _description = "Skill level for a candidate"
++class HrApplicantSkill(models.Model):
++    _name = 'hr.applicant.skill'
++    _description = "Skill level for an applicant"
+     _rec_name = 'skill_id'
+     _order = "skill_level_id"
+ 
+-    candidate_id = fields.Many2one(
+-        comodel_name='hr.candidate',
++    applicant_id = fields.Many2one(
++        comodel_name='hr.applicant',
+         required=True,
+         ondelete='cascade')
+     skill_id = fields.Many2one(
+@@ -35,33 +35,33 @@ class HrCandidateSkill(models.Model):
+         related='skill_level_id.level_progress')
+ 
+     __unique_skill = models.Constraint(
+-        'unique (candidate_id, skill_id)',
++        'unique (applicant_id, skill_id)',
+         'Two levels for the same skill is not allowed',
+     )
+ 
+     @api.constrains('skill_id', 'skill_type_id')
+     def _check_skill_type(self):
+-        for candidate_skill in self:
+-            if candidate_skill.skill_id not in candidate_skill.skill_type_id.skill_ids:
+-                raise ValidationError(_("The skill %(name)s and skill type %(type)s doesn't match", name=candidate_skill.skill_id.name, type=candidate_skill.skill_type_id.name))
++        for applicant_skill in self:
++            if applicant_skill.skill_id not in applicant_skill.skill_type_id.skill_ids:
++                raise ValidationError(_("The skill %(name)s and skill type %(type)s doesn't match", name=applicant_skill.skill_id.name, type=applicant_skill.skill_type_id.name))
+ 
+     @api.constrains('skill_type_id', 'skill_level_id')
+     def _check_skill_level(self):
+-        for candidate_skill in self:
+-            if candidate_skill.skill_level_id not in candidate_skill.skill_type_id.skill_level_ids:
+-                raise ValidationError(_("The skill level %(level)s is not valid for skill type: %(type)s", level=candidate_skill.skill_level_id.name, type=candidate_skill.skill_type_id.name))
++        for applicant_skill in self:
++            if applicant_skill.skill_level_id not in applicant_skill.skill_type_id.skill_level_ids:
++                raise ValidationError(_("The skill level %(level)s is not valid for skill type: %(type)s", level=applicant_skill.skill_level_id.name, type=applicant_skill.skill_type_id.name))
+ 
+     @api.depends('skill_type_id')
+     def _compute_skill_id(self):
+-        for candidate_skill in self:
+-            if candidate_skill.skill_id.skill_type_id != candidate_skill.skill_type_id:
+-                candidate_skill.skill_id = False
++        for applicant_skill in self:
++            if applicant_skill.skill_id.skill_type_id != applicant_skill.skill_type_id:
++                applicant_skill.skill_id = False
+ 
+     @api.depends('skill_id')
+     def _compute_skill_level_id(self):
+-        for candidate_skill in self:
+-            if not candidate_skill.skill_id:
+-                candidate_skill.skill_level_id = False
++        for applicant_skill in self:
++            if not applicant_skill.skill_id:
++                applicant_skill.skill_level_id = False
+             else:
+-                skill_levels = candidate_skill.skill_type_id.skill_level_ids
+-                candidate_skill.skill_level_id = skill_levels.filtered('default_level') or skill_levels[0] if skill_levels else False
++                skill_levels = applicant_skill.skill_type_id.skill_level_ids
++                applicant_skill.skill_level_id = skill_levels.filtered('default_level') or skill_levels[0] if skill_levels else False
+
+--- a/addons/hr_recruitment_skills/models/hr_candidate.py
++++ b/None
+@@ -1,54 +0,0 @@
+-# Part of Odoo. See LICENSE file for full copyright and licensing details.
+-
+-from ast import literal_eval
+-
+-from odoo import fields, models, api
+-
+-
+-class HrCandidate(models.Model):
+-    _inherit = 'hr.candidate'
+-
+-    candidate_skill_ids = fields.One2many('hr.candidate.skill', 'candidate_id', string="Skills")
+-    skill_ids = fields.Many2many('hr.skill', compute='_compute_skill_ids', store=True)
+-    matching_skill_ids = fields.Many2many(comodel_name='hr.skill', string="Matching Skills", compute="_compute_matching_skill_ids")
+-    missing_skill_ids = fields.Many2many(comodel_name='hr.skill', string="Missing Skills", compute="_compute_matching_skill_ids")
+-    matching_score = fields.Float(string="Matching Score(%)", compute="_compute_matching_skill_ids")
+-
+-    @api.depends_context('active_id')
+-    @api.depends('skill_ids')
+-    def _compute_matching_skill_ids(self):
+-        job_id = self.env.context.get('active_id')
+-        if not job_id:
+-            self.matching_skill_ids = False
+-            self.missing_skill_ids = False
+-            self.matching_score = 0
+-        else:
+-            for candidate in self:
+-                job_skills = self.env['hr.job'].browse(job_id).skill_ids
+-                candidate.matching_skill_ids = job_skills & candidate.skill_ids
+-                candidate.missing_skill_ids = job_skills - candidate.skill_ids
+-                candidate.matching_score = (len(candidate.matching_skill_ids) / len(job_skills)) * 100 if job_skills else 0
+-
+-    @api.depends('candidate_skill_ids.skill_id')
+-    def _compute_skill_ids(self):
+-        for candidate in self:
+-            candidate.skill_ids = candidate.candidate_skill_ids.skill_id
+-
+-    def _get_employee_create_vals(self):
+-        vals = super()._get_employee_create_vals()
+-        vals['employee_skill_ids'] = [(0, 0, {
+-            'skill_id': candidate_skill.skill_id.id,
+-            'skill_level_id': candidate_skill.skill_level_id.id,
+-            'skill_type_id': candidate_skill.skill_type_id.id,
+-        }) for candidate_skill in self.candidate_skill_ids]
+-        return vals
+-
+-    def action_create_application(self):
+-        job = self.env['hr.job'].browse(self.env.context.get('active_id'))
+-        self.env['hr.applicant'].with_context(just_moved=True).create([{
+-            'candidate_id': candidate.id,
+-            'job_id': job.id,
+-        } for candidate in self])
+-        action = self.env['ir.actions.actions']._for_xml_id('hr_recruitment.action_hr_job_applications')
+-        action['context'] = literal_eval(action['context'].replace('active_id', str(job.id)))
+-        return action
+
+--- a/addons/hr_recruitment_skills/models/hr_job.py
++++ b/addons/hr_recruitment_skills/models/hr_job.py
+@@ -9,22 +9,24 @@ class HrJob(models.Model):
+ 
+     skill_ids = fields.Many2many(comodel_name='hr.skill', string="Expected Skills")
+ 
+-    def action_search_matching_candidates(self):
++    def action_search_matching_applicants(self):
+         self.ensure_one()
+-        help_message_1 = _("No Matching Candidates")
+-        help_message_2 = _("We do not have any candidates who meet the skill requirements for this job position in the database at the moment.")
+-        action = self.env['ir.actions.actions']._for_xml_id('hr_recruitment.action_hr_candidate')
++        help_message_1 = _("No Matching Applicants")
++        help_message_2 = _("We do not have any applicants who meet the skill requirements for this job position in the database at the moment.")
++        action = self.env['ir.actions.actions']._for_xml_id('hr_recruitment.crm_case_categ0_act_job')
+         context = literal_eval(action['context'])
+         context['active_id'] = self.id
+-        matching_candidates = self.env['hr.candidate'].search([('skill_ids', 'in', self.skill_ids.ids)]).filtered(lambda c: self.id not in c.applicant_ids.job_id.ids)
+         action.update({
+-            'name': _("Matching Candidates"),
++            'name': _("Matching Applicants"),
+             'views': [
+-                (self.env.ref('hr_recruitment_skills.hr_candidate_view_tree').id, 'list'),
++                (self.env.ref('hr_recruitment_skills.crm_case_tree_view_inherit_hr_recruitment_skills').id, 'list'),
+                 (False, 'form'),
+             ],
+             'context': context,
+-            'domain': [('id', 'in', matching_candidates.ids)],
++            'domain': [
++                ('job_id', '!=', self.id),
++                ('skill_ids', 'in', self.skill_ids.ids)
++            ],
+             'help': Markup("<p class='o_view_nocontent_empty_folder'>%s</p><p>%s</p>") % (help_message_1, help_message_2),
+         })
+         return action

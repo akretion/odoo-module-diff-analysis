@@ -1,0 +1,163 @@
+PR: https://github.com/odoo/odoo/pull/165674
+
+From: 4f887a878b1ef23b0fd8eb7b440fd2aa04c9d36c
+From: Prakash Prajapati
+Date: 2024-12-12 06:12:29
+
+Breaking data model changes scores: del:4 + add:0, change matches:
+-    _inherit = "hr.leave.type"
+-    timesheet_generate = fields.Boolean(
+-    timesheet_project_id = fields.Many2one('project.project', string="Project", domain="[('company_id', 'in', [False, company_id])]",
+-    timesheet_task_id = fields.Many2one(
+
+Total Changes: 77
+
+[IMP] project_timesheet_holidays: improve Generate Timesheets Feature
+
+Before this commit:
+By default, the current company is set on time off types. As such, the internal
+project of the current company is set.
+
+After this commit:
+This commit improves the functionality related to generating timesheets within
+the project_timesheet_holidays module. Specifically,  it removes the association
+of projects and tasks from the time-off type.
+Removed timesheet generate field, as it is not used in any inherited view.
+
+Reason:
+ if we set the company of the time off type to false, we either have:
+* no project -> meaning the user will disable the feature without realizing as
+the field is only visible in debug mode;
+* the internal project of the current company that remains set ->
+ meaning the feature won't work for the other companies in which a time off
+ request is created.
+
+task-3605962
+
+closes odoo/odoo#165674
+
+Related: odoo/enterprise#62577
+Related: odoo/upgrade#6027
+Signed-off-by: Xavier Bol (xbo) <xbo@odoo.com>
+
+================================= pseudo patch: =================================
+
+--- a/addons/project_timesheet_holidays/models/hr_holidays.py
++++ b/addons/project_timesheet_holidays/models/hr_holidays.py
+@@ -5,73 +5,20 @@ from odoo import api, fields, models, _
+ from odoo.exceptions import ValidationError
+ 
+ 
+-class HrLeaveType(models.Model):
+-    _inherit = "hr.leave.type"
+-
+-    timesheet_generate = fields.Boolean(
+-        'Generate Timesheets', compute='_compute_timesheet_generate', store=True, readonly=False,
+-        help="If checked, when validating a time off, timesheet will be generated in the Vacation Project of the company.")
+-    timesheet_project_id = fields.Many2one('project.project', string="Project", domain="[('company_id', 'in', [False, company_id])]",
+-        compute="_compute_timesheet_project_id", store=True, readonly=False)
+-    timesheet_task_id = fields.Many2one(
+-        'project.task', string="Task", compute='_compute_timesheet_task_id',
+-        store=True, readonly=False,
+-        domain="[('project_id', '=', timesheet_project_id),"
+-                "('project_id', '!=', False),"
+-                "('company_id', 'in', [False, company_id])]")
+-
+-    @api.depends('timesheet_task_id', 'timesheet_project_id')
+-    def _compute_timesheet_generate(self):
+-        for leave_type in self:
+-            leave_type.timesheet_generate = not leave_type.company_id or (leave_type.timesheet_task_id and leave_type.timesheet_project_id)
+-
+-    @api.depends('company_id')
+-    def _compute_timesheet_project_id(self):
+-        for leave in self:
+-            leave.timesheet_project_id = leave.company_id.internal_project_id
+-
+-    @api.depends('timesheet_project_id')
+-    def _compute_timesheet_task_id(self):
+-        for leave_type in self:
+-            default_task_id = leave_type.company_id.leave_timesheet_task_id
+-
+-            if default_task_id and default_task_id.project_id == leave_type.timesheet_project_id:
+-                leave_type.timesheet_task_id = default_task_id
+-            else:
+-                leave_type.timesheet_task_id = False
+-
+-    @api.constrains('timesheet_generate', 'timesheet_project_id', 'timesheet_task_id')
+-    def _check_timesheet_generate(self):
+-        for holiday_status in self:
+-            if holiday_status.timesheet_generate and holiday_status.company_id:
+-                if not holiday_status.timesheet_project_id or not holiday_status.timesheet_task_id:
+-                    raise ValidationError(_("Both the internal project and task are required to "
+-                    "generate a timesheet for the time off %s. If you don't want a timesheet, you should "
+-                    "leave the internal project and task empty.", holiday_status.name))
+-
+-
+ class HrLeave(models.Model):
+     _inherit = "hr.leave"
+ 
+     timesheet_ids = fields.One2many('account.analytic.line', 'holiday_id', string="Analytic Lines")
+ 
+     def _validate_leave_request(self):
+-        """ Timesheet will be generated on leave validation only if timesheet_generate is True
+-            If company is set, timesheet_project_id and timesheet_task_id from leave type are
+-            used as project_id and task_id.
+-            Else, internal_project_id and leave_timesheet_task_id are used.
++        """ Timesheet will be generated on leave validation
++            internal_project_id and leave_timesheet_task_id are used.
+             The generated timesheet will be attached to this project/task.
+         """
+         vals_list = []
+         leave_ids = []
+         for leave in self:
+-            if not leave.holiday_status_id.timesheet_generate:
+-                continue
+-
+-            if leave.holiday_status_id.company_id:
+-                project, task = leave.holiday_status_id.timesheet_project_id, leave.holiday_status_id.timesheet_task_id
+-            else:
+-                project, task = leave.employee_id.company_id.internal_project_id, leave.employee_id.company_id.leave_timesheet_task_id
++            project, task = leave.employee_id.company_id.internal_project_id, leave.employee_id.company_id.leave_timesheet_task_id
+ 
+             if not project or not task:
+                 continue
+
+--- a/addons/project_timesheet_holidays/models/project_task.py
++++ b/addons/project_timesheet_holidays/models/project_task.py
+@@ -11,14 +11,14 @@ class ProjectTask(models.Model):
+     is_timeoff_task = fields.Boolean("Is Time off Task", compute="_compute_is_timeoff_task", search="_search_is_timeoff_task", export_string_translation=False)
+ 
+     def _compute_leave_types_count(self):
+-        time_off_type_read_group = self.env['hr.leave.type']._read_group(
+-            [('timesheet_task_id', 'in', self.ids)],
+-            ['timesheet_task_id'],
++        timesheet_read_group = self.env['account.analytic.line']._read_group(
++            [('task_id', 'in', self.ids), '|', ('holiday_id', '!=', False), ('global_leave_id', '!=', False)],
++            ['task_id'],
+             ['__count'],
+         )
+-        time_off_type_count_per_task = {timesheet_task.id: count for timesheet_task, count in time_off_type_read_group}
++        timesheet_count_per_task = {timesheet_task.id: count for timesheet_task, count in timesheet_read_group}
+         for task in self:
+-            task.leave_types_count = time_off_type_count_per_task.get(task.id, 0)
++            task.leave_types_count = timesheet_count_per_task.get(task.id, 0)
+ 
+     def _compute_is_timeoff_task(self):
+         timeoff_tasks = self.filtered(lambda task: task.leave_types_count or task.company_id.leave_timesheet_task_id == task)
+@@ -28,12 +28,12 @@ class ProjectTask(models.Model):
+     def _search_is_timeoff_task(self, operator, value):
+         if operator not in ['=', '!='] or not isinstance(value, bool):
+             raise NotImplementedError(_('Operation not supported'))
+-        leave_type_read_group = self.env['hr.leave.type']._read_group(
+-            [('timesheet_task_id', '!=', False)],
++        timesheet_read_group = self.env['account.analytic.line']._read_group(
++            [('task_id', '!=', False), '|', ('holiday_id', '!=', False), ('global_leave_id', '!=', False)],
+             [],
+-            ['timesheet_task_id:recordset'],
++            ['task_id:recordset'],
+         )
+-        [timeoff_tasks] = leave_type_read_group[0]
++        [timeoff_tasks] = timesheet_read_group[0]
+         if self.env.company.leave_timesheet_task_id:
+             timeoff_tasks |= self.env.company.leave_timesheet_task_id
+         if operator == '!=':
