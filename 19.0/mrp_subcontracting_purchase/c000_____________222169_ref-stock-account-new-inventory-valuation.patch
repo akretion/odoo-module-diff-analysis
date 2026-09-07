@@ -1,0 +1,123 @@
+PR: https://github.com/odoo/odoo/pull/222169
+
+From: 08b62a4bbcc6f9a391b2cc00a621ef4c76100229
+From: Arnold Moyaux
+Date: 2025-08-09 04:39:25
+
+Breaking data model changes scores: del:1 + add:0, change matches:
+-    _inherit = 'stock.valuation.layer'
+
+Total Changes: 29
+
+[REF] stock_account: New inventory valuation
+
+Functional:
+* Automated handling of periodic valuation
+* Closing report with managment of good delivered not invoiced and bill
+  to receive
+* Realtime valuation only at invoice/bill (no more at delivery/receipt)
+* Removal of input/output accounts
+* Automatic periodic/realtime closing
+* Error management at closing (back dating, rounding issue,...)
+* Back dating
+* Inventory value is justify from last documents rather than the full
+  history (fifo)
+
+Technical:
+* Removal of `stock.valuation.layer`
+* value is stored on the `stock.move`
+* value is compute base on accounting documents
+* value priority order is: manual val > bill/inv > po/so > std price
+* value could be use with a context at date to get the value at date
+* `product.value` to log manual update from the user without real
+  justification
+* It doesn't try to replay and correct the past. Instead it focus on the
+  current situation and match it
+
+The new valuation aims to reduce the complexity of realtime accounting
+and improve the simple periodic valuation.
+
+The value for move in is always computed base on account.move/so/po or
+standard price if none are available. In periodic, we compare the
+balance of valuation account and the computed value of product. We
+suggest the difference. In real time, the COGS are posted with the
+know value of the goods at the time, they are post. The possible error
+(back dating,...) are erased with the closing entries (same as periodic)
+
+There is no more account for input and output. Instead in the closing
+report, we show the po/so that are delivered but not invoiced. This way
+the user can create the accrual for it. If you have good receipt not
+billed. The inventory value will be greater than stock value. It result
+by an entry that debit stock account and credit the variation account.
+Then an accrual entry is posted to debit the variation account and
+credit a bill to receive account.
+
+There is a lot of skip test in this PR. We will try to remove them asap.
+We decided to merge it in this state since it's already functional and
+we can get feedbacks sooner.
+
+Remaining work:
+* Clean the test and remove all the skip (priority to module not in our
+  scope)
+* Analytic accounting
+* Adapt report for cost of good sold.
+* Accrual entries in report and closing account move
+
+closes odoo/odoo#222169
+
+Related: odoo/enterprise#91890
+Related: odoo/upgrade#8189
+Signed-off-by: Arnold Moyaux (arm) <arm@odoo.com>
+
+================================= pseudo patch: =================================
+
+--- a/addons/mrp_subcontracting_purchase/models/__init__.py
++++ b/addons/mrp_subcontracting_purchase/models/__init__.py
+@@ -7,4 +7,3 @@ from . import purchase_order
+ from . import stock_move
+ from . import stock_picking
+ from . import stock_rule
+-from . import stock_valuation_layer
+
+--- a/addons/mrp_subcontracting_purchase/models/account_move_line.py
++++ b/addons/mrp_subcontracting_purchase/models/account_move_line.py
+@@ -11,14 +11,8 @@ class AccountMoveLine(models.Model):
+         if self.product_id.cost_method == 'standard' and self.purchase_line_id:
+             components_cost = 0
+             subcontract_production = self.purchase_line_id.move_ids._get_subcontract_production()
+-            components_cost -= sum(subcontract_production.move_raw_ids.stock_valuation_layer_ids.mapped('value'))
++            components_cost -= sum(subcontract_production.move_raw_ids.mapped('value'))
+             qty = sum(mo.product_uom_id._compute_quantity(mo.qty_producing, self.product_uom_id) for mo in subcontract_production if mo.state == 'done')
+             if not self.product_uom_id.is_zero(qty):
+                 price_unit_val_dif = price_unit_val_dif + components_cost / qty
+         return price_unit_val_dif, relevant_qty
+-
+-    def _get_valued_in_moves(self):
+-        res = super()._get_valued_in_moves()
+-        # subcontracted move valuations are not linked to the PO move but its orig move (the MO finished move)
+-        res |= res.filtered(lambda m: m.is_subcontract).move_orig_ids
+-        return res
+
+--- a/addons/mrp_subcontracting_purchase/models/stock_valuation_layer.py
++++ b/None
+@@ -1,20 +0,0 @@
+-
+-
+-from odoo import models
+-
+-
+-class StockValuationLayer(models.Model):
+-    _inherit = 'stock.valuation.layer'
+-
+-    def _get_layer_price_unit(self):
+-        """ For a subcontracted product, we want a way to get the subcontracting cost (the price on the PO)
+-            This override deducts the value of subcomponents from the layer price.
+-        """
+-        components_price = 0
+-        production = self.stock_move_id.production_id
+-        if production.subcontractor_id and production.state == 'done':
+-            # each layer has a quantity and price for each move, to get the correct component price for each move
+-            # we need to get the components used for each quantity
+-            for move in production.move_raw_ids:
+-                components_price += abs(sum(move.sudo().stock_valuation_layer_ids.mapped('value'))) / production.product_uom_qty
+-        return super()._get_layer_price_unit() - components_price

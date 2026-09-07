@@ -1,0 +1,337 @@
+PR: https://github.com/odoo/odoo/pull/222226
+
+From: 3b928478c4da9ec94ec44a7d9bc7b87e4ebd9f2b
+From: 3amo-magdy
+Date: 2025-09-06 09:29:10
+
+Breaking data model changes scores: del:4 + add:4, change matches:
+-    bank_account_id = fields.Many2one(
++    bank_account_ids = fields.Many2many(
+-    employee_id = fields.Many2one('hr.employee', 'Employee', compute="_compute_employee_id")
++    employee_id = fields.Many2many('hr.employee', 'Employee', compute="_compute_employee_id", search="_search_employee_id")
+-    employee_bank_account_id = fields.Many2one(related='employee_id.bank_account_id', string="Employee's Bank Account Number", related_sudo=False, readonly=False)
++    employee_bank_account_ids = fields.Many2many('res.partner.bank', related='employee_id.bank_account_ids', string="Employee's Bank Accounts", related_sudo=False, readonly=False)
+-    bank_account_id = fields.Many2one(related="employee_id.bank_account_id")
++    bank_account_ids = fields.Many2many(related="employee_id.bank_account_ids")
+
+Total Changes: 210
+
+[IMP] hr: Employees can have multiple bank accounts
+
+Changing `bank_account_id` m2o field into `bank_account_ids` m2m field,
+within `hr.employee`, allowing employees to associate with than one bank account.
+
+New wizard:
+* A wizard to let HR users distribute the salary of an employee over their bank accounts and allocate either a fixed amount or a percentage of the remaining to each bank account.
+* HR can reorder the bank accounts within the wizard to indicate an order of priority, the top bank account will be considered as the primary bank account.
+
+New widget:
+* Overriding the many2many widget to showing the amount allocated to each bank account.
+
+Expenses receipts and payments will use the primary bank account of the employee.
+
+Task-4908556
+
+closes odoo/odoo#222226
+
+Related: odoo/enterprise#91934
+Related: odoo/upgrade#8272
+Signed-off-by: Yannick Tivisse (yti) <yti@odoo.com>
+
+================================= pseudo patch: =================================
+
+--- a/addons/hr/models/hr_employee.py
++++ b/addons/hr/models/hr_employee.py
+@@ -18,6 +18,7 @@ from odoo.tools import convert, format_time, email_normalize, SQL, Query
+ from odoo.tools.intervals import Intervals
+ from odoo.addons.hr.models.hr_version import format_date_abbr
+ from odoo.addons.mail.tools.discuss import Store
++from odoo.tools.float_utils import float_is_zero
+ 
+ 
+ class HrEmployee(models.Model):
+@@ -125,12 +126,30 @@ class HrEmployee(models.Model):
+     birthday = fields.Date('Birthday', groups="hr.group_hr_user", tracking=True)
+     birthday_public_display = fields.Boolean('Show to all employees', groups="hr.group_hr_user", default=False)
+     birthday_public_display_string = fields.Char("Public Date of Birth", compute="_compute_birthday_public_display_string", default="hidden")
+-    bank_account_id = fields.Many2one(
+-        'res.partner.bank', 'Bank Account',
++    bank_account_ids = fields.Many2many(
++        'res.partner.bank',
++        relation='employee_bank_account_rel',
++        column1='employee_id',
++        column2='bank_account_id',
+         domain="[('partner_id', '=', work_contact_id), '|', ('company_id', '=', False), ('company_id', '=', company_id)]",
+         groups="hr.group_hr_user",
+         tracking=True,
+-        help='Employee bank account to pay salaries')
++        string='Bank Accounts',
++        help='Employee bank accounts to pay salaries')
++    is_trusted_bank_account = fields.Boolean(compute="_compute_is_trusted_bank_account", groups="hr.group_hr_user")
++    primary_bank_account_id = fields.Many2one('res.partner.bank', compute="_compute_primary_bank_account_id", groups="hr.group_hr_user")
++    has_multiple_bank_accounts = fields.Boolean(compute="_compute_has_multiple_bank_accounts", default=False, groups="hr.group_hr_user")
++    salary_distribution = fields.Json(string="Salary Distribution", compute='_sync_salary_distribution', groups='hr.group_hr_user', store=True, readonly=False)
++    """
++    {
++    `bank_account_id`: {
++        'sequence': int,
++        'amount': float,
++        'amount_is_percentage': boolean,
++        }
++    }
++    """
++
+     permit_no = fields.Char('Work Permit No', groups="hr.group_hr_user", tracking=True)
+     visa_no = fields.Char('Visa No', groups="hr.group_hr_user", tracking=True)
+     visa_expire = fields.Date('Visa Expiration Date', groups="hr.group_hr_user", tracking=True)
+@@ -241,6 +260,85 @@ class HrEmployee(models.Model):
+             })
+         return new_vals_list
+ 
++    @api.depends('bank_account_ids.allow_out_payment')
++    def _compute_is_trusted_bank_account(self):
++        for employee in self:
++            employee.is_trusted_bank_account = employee.primary_bank_account_id.allow_out_payment
++
++    @api.depends('bank_account_ids')
++    def _compute_has_multiple_bank_accounts(self):
++        for employee in self:
++            if employee.bank_account_ids and len(employee.bank_account_ids) > 1:
++                employee.has_multiple_bank_accounts = True
++            else:
++                employee.has_multiple_bank_accounts = False
++
++    @api.depends('bank_account_ids')
++    def _sync_salary_distribution(self):
++        for employee in self:
++            current_salary_distribution = employee.salary_distribution or {}
++            current_ids = set(map(int, current_salary_distribution.keys()))
++            account_ids = set(employee.bank_account_ids.ids)
++
++            added_ids = account_ids - current_ids
++            removed_ids = current_ids - account_ids
++            unchanged_ids = account_ids & current_ids
++
++            # Preserve existing data and order
++            ordered = sorted([
++                (int(i), data) for i, data in current_salary_distribution.items()
++                if int(i) in unchanged_ids
++            ], key=lambda x: (not x[1].get('amount_is_percentage'), x[1].get('sequence', float('inf'))))
++
++            new_salary_distribution = {str(i): data for i, data in ordered}
++
++            # Redistribute removed % to first item
++            removed_percentage = sum(current_salary_distribution[str(i)]['amount']
++                for i in removed_ids if str(i) in current_salary_distribution and current_salary_distribution[str(i)]['amount_is_percentage'])
++            if removed_percentage and ordered:
++                first_id = str(ordered[0][0])
++                if new_salary_distribution[first_id]['amount_is_percentage']:
++                    new_salary_distribution[first_id]['amount'] += removed_percentage
++
++            # Add new entries with remaining %
++            total_allocated = sum(d['amount'] for d in new_salary_distribution.values() if d['amount_is_percentage'])
++            remaining = max(0.0, 100.0 - total_allocated)
++            seq = max((d.get('sequence', 0) for d in new_salary_distribution.values()), default=0)
++            amount = employee.currency_id.round(remaining / len(added_ids)) if added_ids else 0.0
++            for i, new_id in enumerate(added_ids):
++                seq += 1
++                if i == len(added_ids) - 1:
++                    amount = remaining
++                new_salary_distribution[str(new_id)] = {
++                    'amount': amount,
++                    'amount_is_percentage': True,
++                    'sequence': seq,
++                }
++                remaining -= amount
++
++            employee.salary_distribution = new_salary_distribution
++
++    @api.constrains('salary_distribution')
++    def _check_salary_distribution(self):
++        for employee in self:
++            dist = employee.salary_distribution
++            if not dist:
++                continue
++
++            total = 0
++            check_total = False
++            for ba_values in dist.values():
++                amount = ba_values.get('amount')
++                is_percentage = ba_values.get('amount_is_percentage', True)
++                if is_percentage and (not isinstance(amount, (float, int)) or not (0 <= amount <= 100)):
++                    raise ValidationError(self.env._("Each amount percentage must be a number between 0 and 100."))
++                if is_percentage:
++                    check_total = True
++                    total += amount
++
++            if check_total and not float_is_zero(total - 100.0, precision_digits=4):
++                raise ValidationError(self.env._("Total salary distribution on bank accounts must be exactly 100%."))
++
+     @api.model
+     def _create(self, data_list):
+         versions = [vals['stored'].pop('version_id', None) for vals in data_list]
+@@ -1220,15 +1318,6 @@ class HrEmployee(models.Model):
+ 
+     def write(self, vals):
+         if 'work_contact_id' in vals:
+-            account_ids = vals.get('bank_account_id') or self.bank_account_id.ids
+-            if account_ids:
+-                bank_accounts = self.env['res.partner.bank'].sudo().browse(account_ids)
+-                for bank_account in bank_accounts:
+-                    if vals['work_contact_id'] != bank_account.partner_id.id:
+-                        if bank_account.allow_out_payment:
+-                            bank_account.allow_out_payment = False
+-                        if vals['work_contact_id']:
+-                            bank_account.partner_id = vals['work_contact_id']
+             self.message_unsubscribe(self.work_contact_id.ids)
+         if 'user_id' in vals:
+             # Update the profile pictures with user, except if provided
+@@ -1259,6 +1348,16 @@ class HrEmployee(models.Model):
+         new_vals = vals.copy()
+         version_vals = {val: new_vals.pop(val) for val in vals if val in self._fields and self._fields[val].inherited}
+         res = super().write(new_vals)
++        if 'work_contact_id' in vals:
++            account_ids = self.bank_account_ids.ids
++            if account_ids:
++                bank_accounts = self.env['res.partner.bank'].sudo().browse(account_ids)
++                for bank_account in bank_accounts:
++                    if vals['work_contact_id'] != bank_account.partner_id.id:
++                        if bank_account.allow_out_payment:
++                            bank_account.allow_out_payment = False
++                        if vals['work_contact_id']:
++                            bank_account.partner_id = vals['work_contact_id']
+         if version_vals:
+             version_vals['last_modified_date'] = fields.Datetime.now()
+             version_vals['last_modified_uid'] = self.env.uid
+@@ -1604,3 +1703,56 @@ class HrEmployee(models.Model):
+                 for field in employee_fields
+             ])
+         return employee_fields
++
++    @api.depends('bank_account_ids')
++    def _compute_primary_bank_account_id(self):
++        for employee in self:
++            if employee.bank_account_ids:
++                primary_account = min(
++                    employee.bank_account_ids,
++                    key=lambda acc: employee.salary_distribution.get(str(acc.id), {}).get("sequence", float("inf")),
++                )
++                employee.primary_bank_account_id = primary_account
++            else:
++                employee.primary_bank_account_id = False
++
++    def get_accounts_with_fixed_allocations(self):
++        self.ensure_one()
++        return self.bank_account_ids.filtered(
++            lambda a: not self.salary_distribution.get(str(a.id), {}).get('amount_is_percentage', True)
++        )
++
++    def get_bank_account_salary_allocation(self, account_id):
++        ba_info = self.salary_distribution.get(str(account_id), {})
++        return ba_info.get('amount', 0), ba_info.get('amount_is_percentage')
++
++    def get_remaining_percentage(self):
++        self.ensure_one()
++        distribution = self.salary_distribution or {}
++        allocated = 0.0
++
++        for ba_id, vals in distribution.items():
++            if vals.get('amount_is_percentage'):
++                allocated += vals.get('amount', 0.0)
++
++        remaining = 100.0 - allocated
++        return max(0.0, remaining)
++
++    def action_open_allocation_wizard(self):
++        self.ensure_one()
++        wizard = self.env['hr.bank.account.allocation.wizard'].create({
++            'employee_id': self.id,
++        })
++        return {
++            'type': 'ir.actions.act_window',
++            'name': self.env._('Bank Account Allocation'),
++            'res_model': 'hr.bank.account.allocation.wizard',
++            'res_id': wizard.id,
++            'view_mode': 'form',
++            'target': 'new',
++        }
++
++    def action_toggle_primary_bank_account_trust(self):
++        self.ensure_one()
++        current_val = self.primary_bank_account_id.allow_out_payment
++        self.primary_bank_account_id.allow_out_payment = not current_val
+
+--- a/addons/hr/models/res_partner_bank.py
++++ b/addons/hr/models/res_partner_bank.py
+@@ -14,7 +14,31 @@ class ResPartnerBank(models.Model):
+     bank_country = fields.Many2one(related='bank_id.country', readonly=False)
+     bank_email = fields.Char(related='bank_id.email', readonly=False)
+     bank_phone = fields.Char(related='bank_id.phone', readonly=False)
+-    employee_id = fields.Many2one('hr.employee', 'Employee', compute="_compute_employee_id")
++    employee_id = fields.Many2many('hr.employee', 'Employee', compute="_compute_employee_id", search="_search_employee_id")
++    employee_salary_amount = fields.Float(string='Salary Allocation', compute='_compute_salary_amount', digits=(16, 4), readonly=True, store=False)
++    employee_salary_amount_is_percentage = fields.Boolean(compute='_compute_salary_amount', readonly=True, store=False)
++    currency_symbol = fields.Char(related='currency_id.symbol')
++    employee_has_multiple_bank_accounts = fields.Boolean(related="employee_id.has_multiple_bank_accounts")
++
++    @api.depends('employee_id.salary_distribution')
++    def _compute_salary_amount(self):
++        for bank in self:
++            if bank.employee_id and bank.employee_id.salary_distribution:
++                bank.employee_salary_amount, bank.employee_salary_amount_is_percentage = bank.employee_id.get_bank_account_salary_allocation(bank.id)
++                continue
++            bank.employee_salary_amount_is_percentage = True
++            if bank.employee_id.salary_distribution:
++                bank.employee_salary_amount = bank.employee_id.get_remaining_percentage()
++            else:
++                bank.employee_salary_amount = 0
++
++    def _search_employee_id(self, operator, value):
++        matching_employees = self.env['hr.employee'].sudo().search([('id', operator, value)])
++        return [('id', 'in', matching_employees.bank_account_ids.ids)]
++
++    def action_open_allocation_wizard(self):
++        self.ensure_one()
++        return self.employee_id.action_open_allocation_wizard()
+ 
+     @api.depends('partner_id')
+     def _compute_employee_id(self):
+
+--- a/addons/hr/models/res_users.py
++++ b/addons/hr/models/res_users.py
+@@ -25,7 +25,7 @@ HR_READABLE_FIELDS = [
+     'is_system',
+     'employee_resource_calendar_id',
+     'work_contact_id',
+-    'bank_account_id',
++    'bank_account_ids',
+ ]
+ 
+ HR_WRITABLE_FIELDS = [
+@@ -50,7 +50,7 @@ HR_WRITABLE_FIELDS = [
+     'display_name',
+     'emergency_contact',
+     'emergency_phone',
+-    'employee_bank_account_id',
++    'employee_bank_account_ids',
+     'employee_country_id',
+     'sex',
+     'identification_id',
+@@ -122,7 +122,7 @@ class ResUsers(models.Model):
+     distance_home_work = fields.Integer(related='employee_id.distance_home_work', readonly=False, related_sudo=False)
+     distance_home_work_unit = fields.Selection(related='employee_id.distance_home_work_unit', readonly=False, related_sudo=False)
+     # res.users already have a field bank_account_id and country_id from the res.partner inheritance: don't redefine them
+-    employee_bank_account_id = fields.Many2one(related='employee_id.bank_account_id', string="Employee's Bank Account Number", related_sudo=False, readonly=False)
++    employee_bank_account_ids = fields.Many2many('res.partner.bank', related='employee_id.bank_account_ids', string="Employee's Bank Accounts", related_sudo=False, readonly=False)
+     employee_country_id = fields.Many2one(related='employee_id.country_id', string="Employee's Country", readonly=False, related_sudo=False)
+     identification_id = fields.Char(related='employee_id.identification_id', readonly=False, related_sudo=False)
+     ssnid = fields.Char(related='employee_id.ssnid', readonly=False, related_sudo=False)
+@@ -153,7 +153,7 @@ class ResUsers(models.Model):
+     last_activity_time = fields.Char(related='employee_id.last_activity_time')
+     employee_type = fields.Selection(related='employee_id.employee_type', readonly=False, related_sudo=False)
+     employee_resource_calendar_id = fields.Many2one(related='employee_id.resource_calendar_id', string="Employee's Working Hours", readonly=True)
+-    bank_account_id = fields.Many2one(related="employee_id.bank_account_id")
++    bank_account_ids = fields.Many2many(related="employee_id.bank_account_ids")
+ 
+     create_employee = fields.Boolean(store=False, default=False, copy=False, string="Technical field, whether to create an employee")
+     create_employee_id = fields.Many2one('hr.employee', store=False, copy=False, string="Technical field, bind user to this employee on create")

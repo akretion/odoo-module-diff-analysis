@@ -1,0 +1,199 @@
+PR: https://github.com/odoo/odoo/pull/214704
+
+From: 9bf0107fb72e7adcbad926a6749bdd0537d24418
+From: std-odoo
+Date: 2025-07-04 16:57:19
+
+Breaking data model changes scores: del:1 + add:0, change matches:
+-    _inherit = ['format.address.mixin', 'format.vat.label.mixin', 'avatar.mixin']
+
+Total Changes: 127
+
+[IMP] orm, base, web: make the properties work without parent
+
+Purpose
+=======
+Make the properties work when there's no parent (mainly for `res.partner`).
+
+Technical
+=========
+The definition of those records is stored in a dedicated model.
+That way, we will re-use the code of the `PropertiesDefinition`
+field (with all the verification, etc).
+
+The simplest way to implement that (without adding complexity in
+the `Properties` field code), is to use what already exist in the ORM,
+and to make a computed / searchable field for the definition record
+(so all records of that model will share the same definition record,
+without adding a new column).
+
+For now, only admin can change the properties definition of those records.
+
+To not repeat the code, we created a mixin that is responsible to add
+the properties on a record (and manage the search / compute on the
+"virtual parent").
+
+Because we now need to fetch the base definition of partner, it adds
+one more query when reading the partners.
+
+Task-4865894
+
+Part-of: odoo/odoo#214704
+Signed-off-by: Thibault Delavallee (tde) <tde@openerp.com>
+
+================================= pseudo patch: =================================
+
+--- a/odoo/addons/base/models/__init__.py
++++ b/odoo/addons/base/models/__init__.py
+@@ -28,6 +28,8 @@ from . import ir_logging
+ from . import ir_module
+ from . import ir_demo
+ from . import ir_demo_failure
++from . import properties_base_definition
++from . import properties_base_definition_mixin
+ from . import report_layout
+ from . import report_paperformat
+ 
+
+--- a/None
++++ b/odoo/addons/base/models/properties_base_definition.py
+@@ -0,0 +1,67 @@
++from odoo import _, api, fields, models
++from odoo.exceptions import AccessError, ValidationError
++from odoo.tools import ormcache
++
++
++class PropertiesBaseDefinition(models.Model):
++    """Models storing the properties definition of the record without parent."""
++
++    _name = "properties.base.definition"
++    _description = "Properties Base Definition"
++
++    properties_field_id = fields.Many2one(
++        "ir.model.fields",
++        required=True,
++        ondelete="cascade",
++    )
++    properties_definition = fields.PropertiesDefinition("Properties Definition")
++
++    _unique_properties_field_id = models.Constraint(
++        "UNIQUE(properties_field_id)",
++        "Only one definition per properties field",
++    )
++
++    @api.depends("properties_field_id")
++    def _compute_display_name(self):
++        for definition in self:
++            if not definition.properties_field_id.model:
++                definition.display_name = False
++                continue
++
++            definition.display_name = _(
++                "%s Properties",
++                self.env[definition.properties_field_id.model]._description,
++            )
++
++    @api.constrains("properties_field_id")
++    def _check_properties_field_id(self):
++        if invalid_fields := self.mapped("properties_field_id").filtered(lambda f: f.ttype != 'properties'):
++            raise ValidationError(
++                _("The definition needs to be linked to a properties field. Those fields are not: %s.", ', '.join(invalid_fields.mapped('name')))
++            )
++
++    def write(self, vals):
++        if 'properties_field_id' in vals:
++            raise AccessError(_("You can not change the field of a base definition"))
++        return super().write(vals)
++
++    def _get_definition_for_property_field(self, model_name, field_name):
++        return self.browse(self._get_definition_id_for_property_field(model_name, field_name))
++
++    @ormcache("model_name", "field_name")
++    def _get_definition_id_for_property_field(self, model_name, field_name):
++        definition_record = self.sudo().search(
++            [
++                ("properties_field_id.model", "=", model_name),
++                ("properties_field_id.name", "=", field_name),
++            ],
++            limit=1,
++        )
++        if not definition_record:
++            field = self.env["ir.model.fields"].sudo()._get(model_name, field_name)
++            definition_record = self.sudo().create(
++                {
++                    "properties_field_id": field.id,
++                },
++            )
++        return definition_record.id
+
+--- a/None
++++ b/odoo/addons/base/models/properties_base_definition_mixin.py
+@@ -0,0 +1,56 @@
++from collections.abc import Iterable
++
++from odoo import models, api, fields
++from odoo.fields import Domain
++from odoo.tools import SQL
++
++
++class PropertiesBaseDefinitionMixin(models.AbstractModel):
++    """Mixin that add properties without parent on a model."""
++
++    _name = "properties.base.definition.mixin"
++    _description = "Properties Base Definition Mixin"
++
++    properties = fields.Properties(
++        string="Properties",
++        definition="properties_base_definition_id.properties_definition",
++        copy=True,
++    )
++    properties_base_definition_id = fields.Many2one(
++        "properties.base.definition",
++        compute="_compute_properties_base_definition_id",
++        search="_search_properties_base_definition_id",
++    )
++
++    def _compute_properties_base_definition_id(self):
++        self.properties_base_definition_id = self.env["properties.base.definition"] \
++            .sudo()._get_definition_for_property_field(self._name, "properties")
++
++    def _search_properties_base_definition_id(self, operator, value):
++        if operator != "in":
++            return NotImplemented
++
++        properties_base_definition_id = self.env["properties.base.definition"] \
++            .sudo()._get_definition_id_for_property_field(self._name, "properties")
++
++        if not isinstance(value, Iterable):
++            value = (value,)
++        return Domain.TRUE if properties_base_definition_id in value else Domain.FALSE
++
++    @api.model_create_multi
++    def create(self, vals_list):
++        parent = self.env["properties.base.definition"] \
++            ._get_definition_id_for_property_field(self._name, "properties")
++        for vals in vals_list:
++            # Needed to add the default properties values
++            vals["properties_base_definition_id"] = parent
++        return super().create(vals_list)
++
++    def _field_to_sql(self, alias, fname, query=None, flush: bool = True):
++        if fname == 'properties_base_definition_id':
++            # Allow the export to work
++            parent = self.env["properties.base.definition"] \
++                ._get_definition_id_for_property_field(self._name, "properties")
++            return SQL("%s", parent)
++
++        return super()._field_to_sql(alias, fname, query, flush)
+
+--- a/odoo/addons/base/models/res_partner.py
++++ b/odoo/addons/base/models/res_partner.py
+@@ -183,7 +183,7 @@ class ResPartnerCategory(models.Model):
+ class ResPartner(models.Model):
+     _name = 'res.partner'
+     _description = 'Contact'
+-    _inherit = ['format.address.mixin', 'format.vat.label.mixin', 'avatar.mixin']
++    _inherit = ['format.address.mixin', 'format.vat.label.mixin', 'avatar.mixin', 'properties.base.definition.mixin']
+     _order = "complete_name ASC, id DESC"
+     _rec_names_search = ['complete_name', 'email', 'ref', 'vat', 'company_registry']  # TODO vat must be sanitized the same way for storing/searching
+     _allow_sudo_commands = False

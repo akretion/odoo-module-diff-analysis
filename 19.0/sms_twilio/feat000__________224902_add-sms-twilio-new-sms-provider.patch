@@ -1,0 +1,289 @@
+PR: https://github.com/odoo/odoo/pull/224902
+
+From: 64925a398def2635367ef8775b4415abfa9725e1
+From: Ricardo Gomes Rodrigues
+Date: 2025-08-31 14:54:55
++    sms_twilio_number_ids = fields.One2many("sms.twilio.number", "company_id", "Numbers")
+
+Total Changes: 200
+
+[ADD] sms_twilio: new SMS provider
+
+Current situation
+
+We provide a SMS service for our clients through an IAP service. I
+has almost no annoying configuration, the Odoo database sends data
+to an IAP proxy, that sends the SMS to our providers for them. It
+is easy to use and user friendly.
+
+Issue
+
+For this to work, Odoo "registers" itself to our providers in behalf
+of our clients. The problem with Mobile operators in many countries
+it is often asked for the clients to register themselves and submit
+an authorization request to be able to send SMS on their network.
+
+As such, Odoo is not supposed to register itself in place of their
+customers. In some countries like USA, Australia, UK and soon France
+this service is not working well or even at all.
+
+Solution
+
+Registration process is fastidious, and on top of them it changes
+from country to country. We do not want to start implementing
+registration processes by countries just for SMS sending.
+
+For that reason, we will start to provide a new module where we
+remove the IAP part and connect directly to a new provider: Twilio.
+Clients will do all the registration themselves directly with the
+provider, and setup their account in Odoo to send those SMS.
+Twilio is a well known provider with extensive coverage, ideal
+for a global solution like Odoo.
+
+Stable target
+
+This module targets 17.0 which is going to be the oldest supported
+version soonish. It is going to be forward ported until master. It
+should be stable compliant and should not break any flow involving
+IAP contact.
+
+Bridge support for SMS marketing and therefore marketing automation
+is provided.
+
+Task-4658352
+
+X-original-commit: aa04aebff05b4c57668808376ef5ef4b7745d8fb
+Part-of: odoo/odoo#224902
+Related: odoo/enterprise#93573
+Signed-off-by: Thibault Delavallee (tde) <tde@openerp.com>
+Co-authored-by: Thibault Delavallee <tde@odoo.com>
+
+================================= pseudo patch: =================================
+
+--- a/None
++++ b/addons/sms_twilio/models/__init__.py
+@@ -0,0 +1,6 @@
++from . import res_company
++from . import res_config_settings
++from . import sms_composer
++from . import sms_sms
++from . import sms_tracker
++from . import sms_twilio_number
+
+--- a/None
++++ b/addons/sms_twilio/models/res_company.py
+@@ -0,0 +1,48 @@
++import re
++
++from odoo import fields, models, _
++from odoo.exceptions import UserError
++
++from odoo.addons.sms_twilio.tools.sms_api import SmsApiTwilio
++
++
++class ResCompany(models.Model):
++    _inherit = 'res.company'
++
++    sms_provider = fields.Selection(
++        string='SMS Provider',
++        selection=[
++            ('iap', 'Send via Odoo'),
++            ('twilio', 'Send via Twilio'),
++        ],
++        default='iap',
++    )
++    sms_twilio_account_sid = fields.Char("Account SID", groups='base.group_system')
++    sms_twilio_auth_token = fields.Char("Auth Token", groups='base.group_system')
++    sms_twilio_number_ids = fields.One2many("sms.twilio.number", "company_id", "Numbers")
++
++    def _get_sms_api_class(self):
++        self.ensure_one()
++        if self.sms_provider == 'twilio':
++            return SmsApiTwilio
++        return super()._get_sms_api_class()
++
++    def _assert_twilio_sid(self):
++        self.ensure_one()
++        account_sid = self.sms_twilio_account_sid
++        if not account_sid or len(account_sid) != 34 or not account_sid.startswith('AC'):
++            raise UserError(_("Invalid Twilio Account SID: must start with 'AC' and be 34 characters long."))
++        if not re.match(r'^[A-Za-z0-9]{32}$', account_sid[2:]):
++            raise UserError(_("Invalid Twilio Account SID: must only contain alphanumeric characters after 'AC'."))
++
++    def _action_open_sms_twilio_account_manage(self):
++        return {
++            'name': _('Manage Twilio SMS'),
++            'res_model': 'sms.twilio.account.manage',
++            'res_id': False,
++            'context': self.env.context,
++            'type': 'ir.actions.act_window',
++            'views': [(False, 'form')],
++            'view_mode': 'form',
++            'target': 'new',
++        }
+
+--- a/None
++++ b/addons/sms_twilio/models/res_config_settings.py
+@@ -0,0 +1,10 @@
++from odoo import fields, models
++
++
++class ResConfigSettings(models.TransientModel):
++    _inherit = 'res.config.settings'
++
++    sms_provider = fields.Selection(related='company_id.sms_provider', required=True, readonly=False)
++
++    def action_open_sms_twilio_account_manage(self):
++        return self.company_id._action_open_sms_twilio_account_manage()
+
+--- a/None
++++ b/addons/sms_twilio/models/sms_composer.py
+@@ -0,0 +1,16 @@
++from odoo import models
++
++
++class SendSMS(models.TransientModel):
++    _inherit = 'sms.composer'
++
++    def _prepare_mass_sms_values(self, records):
++        results = super()._prepare_mass_sms_values(records)
++        for record, result in zip(records, results):
++            company = self.env.company
++            if "company_id" in record._fields:
++                company = record.company_id
++            elif "record_company_id" in record._fields:
++                company = record.record_company_id
++            results[record.id]["record_company_id"] = company.id
++        return results
+
+--- a/None
++++ b/addons/sms_twilio/models/sms_sms.py
+@@ -0,0 +1,71 @@
++from collections import defaultdict
++
++from odoo import fields, models, api
++
++
++class SmsSms(models.Model):
++    _inherit = 'sms.sms'
++
++    sms_twilio_sid = fields.Char(related="sms_tracker_id.sms_twilio_sid", depends=['sms_tracker_id'])
++    record_company_id = fields.Many2one('res.company', 'Company', ondelete='set null')
++    failure_type = fields.Selection(
++        selection_add=[
++            ('twilio_authentication', 'Authentication Error"'),
++            ('twilio_callback', 'Incorrect callback URL'),
++        ],
++    )
++
++    # CRUD
++    # ------------------------------------------------------------
++
++    @api.model_create_multi
++    def create(self, vals_list):
++        for vals in vals_list:
++            vals['record_company_id'] = vals.get('record_company_id') or self.env.company.id  # TODO RIGR in master: move this field to SmsSms, and populate it via vals_list from all flows
++        return super().create(vals_list)
++
++    # SEND
++    # ------------------------------------------------------------
++
++    def _split_by_api(self):
++        # override to handle twilio or IAP choice, which is company dependent
++        # even twilio accounts may differ between companies
++        sms_by_company = defaultdict(lambda: self.env['sms.sms'])  # TODO RIGR: in master, let's be smarter and group by provider/twilio account (e.g.: IAP/twilio1/twilio2)
++        todo_via_super = self.browse()
++        for sms in self:
++            sms_by_company[sms._get_sms_company()] += sms
++        for company, company_sms in sms_by_company.items():
++            if company.sms_provider == "twilio":
++                sms_api = company._get_sms_api_class()(self.env)
++                sms_api._set_company(company)
++                yield sms_api, company_sms
++            else:
++                todo_via_super += company_sms
++        if todo_via_super:
++            yield from super(SmsSms, todo_via_super)._split_by_api()
++
++    def _get_sms_company(self):
++        return self.mail_message_id.record_company_id or self.record_company_id or super()._get_sms_company()
++
++    def _get_send_batch_size(self):
++        companies = self._get_sms_company()
++        if companies and any(company.sms_provider == 'twilio' for company in companies):
++            return int(self.env['ir.config_parameter'].sudo().get_param('sms_twilio.session.batch.size', 10))
++        return super()._get_send_batch_size()
++
++    def _handle_call_result_hook(self, results):
++        """
++        Store the sid of Twilio on the SMS tracking record (as SMS will be deleted)
++        :param results: a list of dict in the form [{
++            'uuid': Odoo's id of the SMS,
++            'state': State of the SMS in Odoo,
++            'sms_twilio_sid': Twilio's id of the SMS,
++        }, ...]
++        """
++        twilio_sms = self.filtered(lambda s: s._get_sms_company().sms_provider == 'twilio')
++        grouped_twilio_sms = twilio_sms.grouped("uuid")
++        for result in results:
++            sms = grouped_twilio_sms.get(result.get('uuid'))
++            if sms and sms.sms_tracker_id and result.get('sms_twilio_sid'):
++                sms.sms_tracker_id.sms_twilio_sid = result['sms_twilio_sid']
++        super(SmsSms, self - twilio_sms)._handle_call_result_hook(results)
+
+--- a/None
++++ b/addons/sms_twilio/models/sms_tracker.py
+@@ -0,0 +1,26 @@
++from odoo import models, fields
++
++TWILIO_CODE_TO_FAILURE_TYPE = {
++    # https://www.twilio.com/docs/messaging/guides/debugging-tools#error-codes
++    '30002': "expired",  # Account suspended
++    '30003': "invalid_destination",  # Unreachable destination handset
++    '30004': "rejected",  # Message blocked
++    '30005': "invalid_destination",  # Unknown destination handset
++    '30006': "not_allowed",  # Landline or unreachable carrier
++    '30007': "rejected",  # Carrier violation
++    '30008': "not_delivered",  # Unknown error
++}
++
++
++class SmsTracker(models.Model):
++    _inherit = 'sms.tracker'
++
++    sms_twilio_sid = fields.Char(string='Twilio SMS SID', readonly=True)
++
++    def _action_update_from_twilio_error(self, sms_status, error_code, error_message):
++        """Update the SMS tracker with the Twilio Status and Error code/msg"""
++        failure_type = (
++            TWILIO_CODE_TO_FAILURE_TYPE.get(error_code)
++            or (None if sms_status == "failed" else "not_delivered")
++        )
++        return self.with_context(sms_known_failure_reason=error_message)._action_update_from_provider_error(failure_type)
+
+--- a/None
++++ b/addons/sms_twilio/models/sms_twilio_number.py
+@@ -0,0 +1,23 @@
++from odoo import models, fields
++
++
++class SmsTwilioNumber(models.Model):
++    _name = 'sms.twilio.number'
++    _description = 'Twilio Number'
++    _order = 'sequence'
++
++    company_id = fields.Many2one('res.company', string='Company', default=lambda self: self.env.company)
++    sequence = fields.Integer(default=1)
++    number = fields.Char(string='Twilio Number', required=True)
++    country_id = fields.Many2one("res.country", string='Country', required=True)
++    country_code = fields.Char(related='country_id.code', string='Country Code')
++
++    def _compute_display_name(self):
++        for record in self:
++            record.display_name = f"{record.number} ({record.country_id.name})"
++
++    def action_unlink(self):
++        # First create the action while self exists as it's going to be unlink right after
++        action = self.company_id._action_open_sms_twilio_account_manage()
++        self.unlink()
++        return action

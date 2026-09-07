@@ -1,0 +1,263 @@
+PR: https://github.com/odoo/odoo/pull/215517
+
+From: 53181c7ac4d940d889370da61d39150560cdb0d8
+From: chha-odoo
+Date: 2025-09-07 06:44:57
+
+Breaking data model changes scores: del:3 + add:0, change matches:
+-    scrap_location = fields.Boolean('Is a Scrap Location?', default=False, help='Check this box to allow using this location to put scrapped/damaged goods.')
+-    scrapped = fields.Boolean(
+-    is_scrap = fields.Boolean(related='move_id.scrapped')
+
+Total Changes: 54
+
+[IMP] stock,*: replace is scrap location with inventory loss type
+
+*: l10n_ec_stock, mrp, mrp_repair, purchase_mrp, purchase_stock, repair,
+   sale_mrp, sale_stock, stock_account
+
+With this commit:
+*----------------------------------------------
+* Removed the Is `scrap_location` field and replaced it with the `Inventory Loss`
+  location type because `Is scrap location` is useless when we already have an
+  location type of `inventory Loss`.
+
+also removed fields related to `scrap_location`.
+* removed `scrapped` field from `stock.move`
+* removed `is_scrap` field from `stock.move.line`
+* removed `is_scrap` field from `stock.valuation.layer`
+
+Task ID: [4728397](https://www.odoo.com/odoo/project/966/tasks/4728397)
+
+Part-of: odoo/odoo#215517
+Related: odoo/enterprise#88319
+Related: odoo/upgrade#7991
+Signed-off-by: Arnold Moyaux (arm) <arm@odoo.com>
+
+================================= pseudo patch: =================================
+
+--- a/addons/stock/models/res_company.py
++++ b/addons/stock/models/res_company.py
+@@ -102,7 +102,6 @@ class ResCompany(models.Model):
+                 'usage': 'inventory',
+                 'location_id': parent_location.id,
+                 'company_id': company.id,
+-                'scrap_location': True,
+             })
+ 
+     def _create_scrap_sequence(self):
+@@ -158,7 +157,7 @@ class ResCompany(models.Model):
+     @api.model
+     def create_missing_scrap_location(self):
+         company_ids  = self.env['res.company'].search([])
+-        companies_having_scrap_loc = self.env['stock.location'].search([('scrap_location', '=', True)]).mapped('company_id')
++        companies_having_scrap_loc = self.env['stock.location'].search([('usage', '=', 'inventory')]).mapped('company_id')
+         company_without_property = company_ids - companies_having_scrap_loc
+         company_without_property._create_scrap_location()
+ 
+
+--- a/addons/stock/models/stock_location.py
++++ b/addons/stock/models/stock_location.py
+@@ -61,7 +61,6 @@ class StockLocation(models.Model):
+         'res.company', 'Company',
+         default=lambda self: self.env.company, index=True,
+         help='Let this field empty if this location is shared between companies')
+-    scrap_location = fields.Boolean('Is a Scrap Location?', default=False, help='Check this box to allow using this location to put scrapped/damaged goods.')
+     replenish_location = fields.Boolean('Replenishments', copy=False, compute="_compute_replenish_location", readonly=False, store=True,
+                                         help='Trigger replenishment suggestions for this location when required')
+     removal_strategy_id = fields.Many2one(
+@@ -177,11 +176,6 @@ class StockLocation(models.Model):
+         for loc in self:
+             loc.child_internal_location_ids = self.search([('id', 'child_of', loc.id), ('usage', '=', 'internal')])
+ 
+-    @api.onchange('usage')
+-    def _onchange_usage(self):
+-        if self.usage not in ('internal', 'inventory'):
+-            self.scrap_location = False
+-
+     @api.depends('usage')
+     def _compute_replenish_location(self):
+         for loc in self:
+@@ -197,10 +191,10 @@ class StockLocation(models.Model):
+                 if replenish_wh_location:
+                     raise ValidationError(_('Another parent/sub replenish location %s exists, if you wish to change it, uncheck it first', replenish_wh_location.name))
+ 
+-    @api.constrains('scrap_location')
++    @api.constrains('usage')
+     def _check_scrap_location(self):
+         for record in self:
+-            if record.scrap_location and self.env['stock.picking.type'].search_count([('code', '=', 'mrp_operation'), ('default_location_dest_id', '=', record.id)], limit=1):
++            if record.usage == 'inventory' and self.env['stock.picking.type'].search_count([('code', '=', 'mrp_operation'), ('default_location_dest_id', '=', record.id)], limit=1):
+                 raise ValidationError(_("You cannot set a location as a scrap location when it is assigned as a destination location for a manufacturing type operation."))
+ 
+     @api.ondelete(at_uninstall=False)
+@@ -231,10 +225,8 @@ class StockLocation(models.Model):
+         if 'usage' in values and values['usage'] == 'view':
+             if self.mapped('quant_ids'):
+                 raise UserError(_("This location's usage cannot be changed to view as it contains products."))
+-        if 'usage' in values or 'scrap_location' in values:
+-            modified_locations = self.filtered(
+-                lambda l: any(l[f] != values[f] if f in values else False
+-                              for f in {'usage', 'scrap_location'}))
++        if 'usage' in values:
++            modified_locations = self.filtered(lambda l: l.usage != values['usage'])
+             reserved_quantities = self.env['stock.quant'].search_count([
+                 ('location_id', 'in', modified_locations.ids),
+                 ('quantity', '>', 0),
+@@ -415,7 +407,7 @@ class StockLocation(models.Model):
+ 
+     def should_bypass_reservation(self):
+         self.ensure_one()
+-        return self.usage in ('supplier', 'customer', 'inventory', 'production') or self.scrap_location
++        return self.usage in ('supplier', 'customer', 'inventory', 'production')
+ 
+     def _check_access_putaway(self):
+         return self
+
+--- a/addons/stock/models/stock_move.py
++++ b/addons/stock/models/stock_move.py
+@@ -138,8 +138,6 @@ class StockMove(models.Model):
+              "The other possibility allows you to directly create a procurement on the source location (and thus ignore "
+              "its current stock) to gather products. If we want to chain moves and have this one to wait for the previous, "
+              "this second option should be chosen.")
+-    scrapped = fields.Boolean(
+-        'Scrapped', related='location_dest_id.scrap_location', readonly=True, store=True)
+     scrap_id = fields.Many2one('stock.scrap', 'Scrap operation', readonly=True, check_company=True, index='btree_not_null')
+     group_id = fields.Many2one('procurement.group', 'Procurement Group', default=_default_group_id, index=True)
+     procurement_values = fields.Json(store=False, help="Dummy field to store procurement values to propagate them to later steps")
+@@ -348,10 +346,10 @@ class StockMove(models.Model):
+         for move in self:
+             move.is_quantity_done_editable = move.product_id
+ 
+-    @api.depends('picking_id.name', 'scrap_id.name', 'scrapped', 'is_inventory', 'inventory_name')
++    @api.depends('picking_id.name', 'scrap_id.name', 'location_dest_usage', 'is_inventory', 'inventory_name')
+     def _compute_reference(self):
+         for move in self:
+-            if move.scrapped:
++            if move.scrap_id:
+                 move.reference = move.scrap_id.name
+             elif move.is_inventory:
+                 if move.inventory_name:
+@@ -921,7 +919,7 @@ Please change the quantity done or the rounding precision in your settings.""",
+     def _do_unreserve(self):
+         moves_to_unreserve = OrderedSet()
+         for move in self:
+-            if move.state == 'cancel' or (move.state == 'done' and move.scrapped) or move.picked:
++            if move.state == 'cancel' or (move.state == 'done' and move.location_dest_usage == 'inventory') or move.picked:
+                 # We may have cancelled move in an open picking in a "propagate_cancel" scenario.
+                 # We may have done move in an open picking in a scrap scenario.
+                 continue
+@@ -1161,7 +1159,7 @@ Please change the quantity done or the rounding precision in your settings.""",
+     def _prepare_merge_moves_distinct_fields(self):
+         fields = [
+             'product_id', 'price_unit', 'procure_method', 'location_id', 'location_dest_id', 'location_final_id',
+-            'product_uom', 'restrict_partner_id', 'scrapped', 'origin_returned_move_id',
++            'product_uom', 'restrict_partner_id', 'origin_returned_move_id',
+             'propagate_cancel', 'description_picking', 'never_product_template_attribute_value_ids',
+         ]
+         if self.env['ir.config_parameter'].sudo().get_param('stock.merge_only_same_date'):
+@@ -2008,9 +2006,9 @@ Please change the quantity done or the rounding precision in your settings.""",
+         StockMove.browse(moves_to_redirect).move_line_ids._apply_putaway_strategy()
+ 
+     def _action_cancel(self):
+-        if any(move.state == 'done' and not move.scrapped for move in self):
++        if any(move.state == 'done' and move.location_dest_usage != 'inventory' for move in self):
+             raise UserError(_('You cannot cancel a stock move that has been set to \'Done\'. Create a return in order to reverse the moves which took place.'))
+-        moves_to_cancel = self.filtered(lambda m: m.state != 'cancel' and not (m.state == 'done' and m.scrapped))
++        moves_to_cancel = self.filtered(lambda m: m.state != 'cancel' and not (m.state == 'done' and m.location_dest_usage == 'inventory'))
+         moves_to_cancel.picked = False
+         # self cannot contain moves that are either cancelled or done, therefore we can safely
+         # unlink all associated move_line_ids
+@@ -2474,7 +2472,7 @@ Please change the quantity done or the rounding precision in your settings.""",
+         """ Open the form view of the move's reference document, if one exists, otherwise open form view of self
+         """
+         self.ensure_one()
+-        if self.scrapped:
++        if not self.is_inventory and self.location_dest_usage == 'inventory':
+             return {
+                 'res_model': 'stock.scrap',
+                 'type': 'ir.actions.act_window',
+
+--- a/addons/stock/models/stock_move_line.py
++++ b/addons/stock/models/stock_move_line.py
+@@ -81,9 +81,9 @@ class StockMoveLine(models.Model):
+     picking_type_use_create_lots = fields.Boolean(related='picking_type_id.use_create_lots', readonly=True)
+     picking_type_use_existing_lots = fields.Boolean(related='picking_type_id.use_existing_lots', readonly=True)
+     state = fields.Selection(related='move_id.state', store=True)
++    scrap_id = fields.Many2one(related='move_id.scrap_id')
+     is_inventory = fields.Boolean(related='move_id.is_inventory')
+     is_locked = fields.Boolean(related='move_id.is_locked', readonly=True)
+-    is_scrap = fields.Boolean(related='move_id.scrapped')
+     consume_line_ids = fields.Many2many('stock.move.line', 'stock_move_line_consume_rel', 'consume_line_id', 'produce_line_id')
+     produce_line_ids = fields.Many2many('stock.move.line', 'stock_move_line_consume_rel', 'produce_line_id', 'consume_line_id')
+     reference = fields.Char(related='move_id.reference', readonly=False)
+
+--- a/addons/stock/models/stock_picking.py
++++ b/addons/stock/models/stock_picking.py
+@@ -822,8 +822,8 @@ class StockPicking(models.Model):
+                 'any_draft': picking_moves_state_map[picking_id.id].get('any_draft', False) or move_state == 'draft',
+                 'all_cancel': picking_moves_state_map[picking_id.id].get('all_cancel', True) and move_state == 'cancel',
+                 'all_cancel_done': picking_moves_state_map[picking_id.id].get('all_cancel_done', True) and move_state in ('cancel', 'done'),
+-                'all_done_are_scrapped': picking_moves_state_map[picking_id.id].get('all_done_are_scrapped', True) and (move.scrapped if move_state == 'done' else True),
+-                'any_cancel_and_not_scrapped': picking_moves_state_map[picking_id.id].get('any_cancel_and_not_scrapped', False) or (move_state == 'cancel' and not move.scrapped),
++                'all_done_are_scrapped': picking_moves_state_map[picking_id.id].get('all_done_are_scrapped', True) and (move.location_dest_usage == 'inventory' if move_state == 'done' else True),
++                'any_cancel_and_not_scrapped': picking_moves_state_map[picking_id.id].get('any_cancel_and_not_scrapped', False) or (move_state == 'cancel' and move.location_dest_usage != 'inventory'),
+             })
+             picking_move_lines[picking_id.id].add(move.id)
+         for picking in self:
+@@ -916,7 +916,7 @@ class StockPicking(models.Model):
+         result = {
+             picking
+             for [picking] in self.env['stock.move']._read_group(
+-                [('picking_id', 'in', self.ids), ('scrapped', '=', True)],
++                [('picking_id', 'in', self.ids), ('location_dest_usage', '=', 'inventory')],
+                 ['picking_id'],
+             )
+         }
+@@ -1142,7 +1142,7 @@ class StockPicking(models.Model):
+         if 'partner_id' in vals:
+             after_vals['partner_id'] = vals['partner_id']
+         if after_vals:
+-            self.move_ids.filtered(lambda move: not move.scrapped).write(after_vals)
++            self.move_ids.filtered(lambda move: move.location_dest_usage != 'inventory').write(after_vals)
+         if vals.get('move_ids'):
+             self._autoconfirm_picking()
+ 
+@@ -1455,7 +1455,7 @@ class StockPicking(models.Model):
+             for move in picking.move_ids:
+                 if move.quantity:
+                     has_quantity = True
+-                if move.scrapped:
++                if move.location_dest_usage == 'inventory':
+                     continue
+                 if move.picked:
+                     has_pick = True
+
+--- a/addons/stock/models/stock_scrap.py
++++ b/addons/stock/models/stock_scrap.py
+@@ -43,7 +43,7 @@ class StockScrap(models.Model):
+     scrap_location_id = fields.Many2one(
+         'stock.location', 'Scrap Location',
+         compute='_compute_scrap_location_id', store=True, required=True, precompute=True,
+-        domain="[('scrap_location', '=', True)]", check_company=True, readonly=False)
++        domain="[('usage', '=', 'inventory')]", check_company=True, readonly=False)
+     scrap_qty = fields.Float(
+         'Quantity', required=True, digits='Product Unit',
+         compute='_compute_scrap_qty', default=1.0, readonly=False, store=True)
+@@ -88,7 +88,7 @@ class StockScrap(models.Model):
+     @api.depends('company_id')
+     def _compute_scrap_location_id(self):
+         groups = self.env['stock.location']._read_group(
+-            [('company_id', 'in', self.company_id.ids), ('scrap_location', '=', True)], ['company_id'], ['id:min'])
++            [('company_id', 'in', self.company_id.ids), ('usage', '=', 'inventory')], ['company_id'], ['id:min'])
+         locations_per_company = {
+             company.id: stock_warehouse_id
+             for company, stock_warehouse_id in groups
+@@ -132,7 +132,6 @@ class StockScrap(models.Model):
+             'state': 'draft',
+             'product_uom_qty': self.scrap_qty,
+             'location_id': self.location_id.id,
+-            'scrapped': True,
+             'scrap_id': self.id,
+             'location_dest_id': self.scrap_location_id.id,
+             'move_line_ids': [(0, 0, {

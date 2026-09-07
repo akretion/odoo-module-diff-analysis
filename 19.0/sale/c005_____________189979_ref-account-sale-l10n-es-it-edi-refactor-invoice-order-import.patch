@@ -1,0 +1,176 @@
+PR: https://github.com/odoo/odoo/pull/189979
+
+From: e7c93e5a6ff1754a9c798ab6f775ea411cf98a8e
+From: Antoine Dupuis (andu)
+Date: 2025-06-13 06:44:28
+
+Breaking data model changes scores: del:1 + add:0, change matches:
+-    _inherit = ['portal.mixin', 'product.catalog.mixin', 'mail.thread', 'mail.activity.mixin', 'utm.mixin']
+
+Total Changes: 71
+
+[REF] account, sale, l10n_{es,it}_edi: Refactor invoice/order import.
+
+The main aim of this refactor is to clean up `_extend_with_attachments`
+which was previously doing two things: (1) extract embedded attachments,
+and (2) determine which one to decode and call the decoder on it.
+
+In addition, a secondary aim is to allow a single imported file to
+generate multiple records in Odoo, because in some countries invoices
+are batched in a single XML file.
+
+To do this, we separate the identification and unwrapping of embedded
+files from the decision of how many new records to create and which
+files to decode and attach on which records.
+
+After this refactor, the helper methods `_to_files_data` and
+`_unwrap_attachments` should be used to convert an `ir.attachment` into
+an intermediate `files_data` format, which can handle both real
+`ir.attachment` records and embedded files.
+
+The `files_data` representing real attachments and embedded files should
+then be grouped as desired before calling `_extend_with_attachments`,
+which now does nothing but call the decoder on the 'best' attachment
+and handle transaction commit/rollback.
+
+Some more points:
+* We remove the savepoint in a loop in `_extend_with_attachments`.
+  Instead, we use a new `rollbackable_transaction` context manager which
+  executes the decoder in a new transaction.
+
+* The `_get_edi_decoder` method added a unnecessary layer of
+  indirection. We replace it with a single method, `_decode_attachment`
+  which should be overridden anytime we want to implement a decoder.
+
+* We improve how we determine how to dispatch attachments to multiple
+  invoices in the mail alias case. Previously, we would create one new
+  invoice for each attachment. Now, we have a method that groups them
+  before creating invoices.
+
+* We remove the `no_new_invoice` context key. Now by default attachments
+  aren't decoded when the message's `message_type` is `notification`
+  or any other type except `email` or `comment`. To handle the case
+  where we need to disable decoding attachments of a message posted with
+  `message_type = comment` (e.g. in the Send & Print) we have a context
+  key `disable_attachment_import` which does the same thing as
+  `no_new_invoice`.
+
+* In `l10n_{es,it,uy}_edi`, we implement a file-splitting mechanism that
+  allows an incoming attachment to be transformed into several
+  `file_data` dicts, which should each generate a separate invoice.
+
+task-4290875
+
+closes odoo/odoo#189979
+
+Related: odoo/enterprise#75327
+Signed-off-by: Laurent Smet (las) <las@odoo.com>
+
+================================= pseudo patch: =================================
+
+--- a/addons/sale/models/sale_order.py
++++ b/addons/sale/models/sale_order.py
+@@ -8,7 +8,7 @@ from datetime import timedelta
+ from itertools import groupby
+ 
+ from odoo import SUPERUSER_ID, _, api, fields, models
+-from odoo.exceptions import AccessError, RedirectWarning, UserError, ValidationError
++from odoo.exceptions import AccessError, UserError, ValidationError
+ from odoo.fields import Command
+ from odoo.http import request
+ from odoo.osv import expression
+@@ -18,8 +18,6 @@ from odoo.tools.misc import str2bool
+ 
+ from odoo.addons.payment import utils as payment_utils
+ 
+-_logger = logging.getLogger(__name__)
+-
+ INVOICE_STATUS = [
+     ('upselling', 'Upselling Opportunity'),
+     ('invoiced', 'Fully Invoiced'),
+@@ -37,7 +35,7 @@ SALE_ORDER_STATE = [
+ 
+ class SaleOrder(models.Model):
+     _name = 'sale.order'
+-    _inherit = ['portal.mixin', 'product.catalog.mixin', 'mail.thread', 'mail.activity.mixin', 'utm.mixin']
++    _inherit = ['portal.mixin', 'product.catalog.mixin', 'mail.thread', 'mail.activity.mixin', 'utm.mixin', 'account.document.import.mixin']
+     _description = "Sales Order"
+     _order = 'date_order desc, id desc'
+     _check_company_auto = True
+@@ -1799,74 +1797,13 @@ class SaleOrder(models.Model):
+         :return: An action redirecting to related sale order view.
+         :rtype: dict
+         """
+-        orders = self._create_order_from_attachment(attachment_ids)
+-        return orders._get_records_action(name=_("Generated Orders"))
+-
+-    @api.model
+-    def _create_order_from_attachment(self, attachment_ids):
+-        """ Create the sale orders from given attachment_ids and fill data by extracting detail
+-        from attachments and return generated orders.
+-
+-        :param list attachment_ids: List of attachments process.
+-        :return: Recordset of order.
+-        """
+         attachments = self.env['ir.attachment'].browse(attachment_ids)
+         if not attachments:
+             raise UserError(_("No attachment was provided"))
+ 
+-        orders = self.browse()
+-        for attachment in attachments:
+-            order = self.create({
+-                'partner_id': self.env.user.partner_id.id,
+-            })
+-            order._extend_with_attachments(attachment)
+-            orders |= order
+-            order.message_post(attachment_ids=attachment.ids)
+-            attachment.write({'res_model': self._name, 'res_id': order.id})
+-
+-        return orders
++        orders = self.with_context(default_partner_id=self.env.user.partner_id.id)._create_records_from_attachments(attachments)
+ 
+-    def _extend_with_attachments(self, attachment):
+-        """ Main entry point to extend/enhance order with attachment.
+-
+-        :param attachment: A recordset of ir.attachment.
+-        :returns: None
+-        """
+-        self.ensure_one()
+-
+-        file_data = attachment._unwrap_edi_attachments()[0]
+-        decoder = self._get_order_edi_decoder(file_data)
+-        if decoder:
+-            try:
+-                with self.env.cr.savepoint():
+-                    decoder(self, file_data)
+-            except RedirectWarning:
+-                raise
+-            except Exception:
+-                message = _(
+-                    "Error importing attachment '%(file_name)s' as order (decoder=%(decoder)s)",
+-                    file_name=file_data['filename'],
+-                    decoder=decoder.__name__,
+-                )
+-                self.with_user(SUPERUSER_ID).message_post(body=message)
+-                _logger.exception(message)
+-
+-        if file_data.get('on_close'):
+-            file_data['on_close']()
+-        return True
+-
+-    def _get_order_edi_decoder(self, file_data):
+-        """ To be extended with decoding capabilities of order data from file data.
+-
+-        :returns:  Function to be later used to import the file.
+-                   Function' args:
+-                   - order: sale.order
+-                   - file_data: attachemnt information / value
+-                   returns True if was able to process the order
+-        """
+-        if file_data['type'] in ('pdf', 'binary'):
+-            return lambda *args: False
+-        return
++        return orders._get_records_action(name=_("Generated Orders"))
+ 
+     # PORTAL #
+ 

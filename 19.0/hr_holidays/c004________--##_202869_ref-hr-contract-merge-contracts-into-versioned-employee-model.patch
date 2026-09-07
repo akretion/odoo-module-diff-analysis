@@ -1,0 +1,976 @@
+PR: https://github.com/odoo/odoo/pull/202869
+
+From: 21f18b1a6fdbf1a01c3dda83acfa66addd01a759
+From: Arthur Pierrot (arpi)
+Date: 2025-06-11 23:02:42
+
+Breaking data model changes scores: del:5 + add:0, change matches:
+-    current_leave_state = fields.Selection(compute='_compute_leave_status', string="Current Time Off Status",
+-    leave_date_from = fields.Date('From Date', compute='_compute_leave_status')
+-    allocation_count = fields.Float('Total number of days allocated.', compute='_compute_allocation_count')
+-    allocations_count = fields.Integer('Total number of allocations', compute="_compute_allocation_count")
+-    allocation_remaining_display = fields.Char(compute='_compute_allocation_remaining_display')
+
+Total Changes: 775
+
+[REF] hr_contract: Merge contracts into versioned employee model
+
+This revamp simplifies the HR system by merging contracts into a versioned structure directly linked to the employee model. All payroll-impacting fields now reside in `hr.version`, which is inherited by `hr.employee`. This approach ensures each version reflects a time-specific contract state, enabling clear historical tracking and timeline visualization.
+
+Key Changes:
+
+* New Model `hr.version`:
+  - Replaces `hr.contract` and inherits via `_inherits` on `hr.employee`
+  - Fields from both `hr.employee` and `hr.contract` centralized
+  - No standalone form view for versions (except templates)
+
+* Versioning Logic:
+  - New versions created manually or automatically (past/future)
+  - Modifying a version with "Done"/"Paid" payslips triggers:
+    - A new version
+    - Payslip flagging
+    - Activity for HR responsible
+  - Versions can only be deleted if not linked to any payslip
+  - Contract states (`open`, `close`, etc.) and `kanban_state` removed
+
+* Date Fields:
+  - Replaces `date_start`/`date_end` with:
+    - `date_version` (mandatory)
+    - `contract_date_start`, `contract_date_end`
+  - `date_start`/`date_end` now computed, non-stored
+
+* ORM and SQL Adjustments:
+  - Access to version fields via ORM remains transparent
+  - SQL queries must join with `hr.version` for accurate data
+
+* Employee Creation / Demo Data:
+  - Creating an employee creates a first version
+  - For multiple versions, use `create_version`
+  - Demo/test data must define version fields in the employee or via `create_version`
+
+* Localization & Salary Rules:
+  - Fields like marital status moved to `hr.version`
+  - Salary rules uses `version` in `localdict` from now instead of `contract`
+  - Update all domains using `date_start`, `state`, etc. to use appropriate computed methods (`is_current`, `is_past`, etc.)
+
+* UI/UX:
+  - Timeline for version history shown in the employee form view
+  - Tabs organize versioned fields for clarity
+  - Debug-only "View" button in version list to ease template editing
+
+This redesign improves HR data management, payroll accuracy, and localization readiness.
+
+closes odoo/odoo#202869
+
+Task: 4564173
+Related: odoo/enterprise#83136
+Related: odoo/upgrade#7709
+Signed-off-by: Yannick Tivisse (yti) <yti@odoo.com>
+Co-authored-by: Jurgen Gjini <jugj@odoo.com>
+Co-authored-by: David Beguin <dbe@odoo.com>
+Co-authored-by: Xavier Bol (xbo) <xbo@odoo.com>
+Co-authored-by: romc-odoo <romc@odoo.com>
+Co-authored-by: Alvaro Fuentes <afu@odoo.com>
+Co-authored-by: Yannick Tivisse <yti@odoo.com>
+
+================================= pseudo patch: =================================
+
+--- a/addons/hr_holidays/models/__init__.py
++++ b/addons/hr_holidays/models/__init__.py
+@@ -1,9 +1,8 @@
+-# -*- coding: utf-8 -*-
+ # Part of Odoo. See LICENSE file for full copyright and licensing details.
+ 
+ from . import resource
+-from . import hr_employee_base
+ from . import hr_employee
++from . import hr_employee_public
+ from . import hr_department
+ from . import hr_leave
+ from . import hr_leave_allocation
+@@ -11,6 +10,7 @@ from . import hr_leave_type
+ from . import hr_leave_accrual_plan_level
+ from . import hr_leave_accrual_plan
+ from . import hr_leave_mandatory_day
++from . import hr_version
+ from . import mail_message_subtype
+ from . import res_partner
+ from . import res_users
+
+--- a/addons/hr_holidays/models/hr_employee.py
++++ b/addons/hr_holidays/models/hr_employee.py
+@@ -1,18 +1,50 @@
+ # Part of Odoo. See LICENSE file for full copyright and licensing details.
++
+ from ast import literal_eval
+-from datetime import datetime, time
++from datetime import date, datetime, time, timedelta, timezone
+ from collections import defaultdict
+ from dateutil.relativedelta import relativedelta
+ import pytz
+ 
+ from odoo import _, api, fields, models
++from odoo.exceptions import ValidationError
++from odoo.addons.resource.models.utils import HOURS_PER_DAY
++from odoo.tools.float_utils import float_round
+ 
+ 
+ class HrEmployee(models.Model):
+     _inherit = 'hr.employee'
+ 
++    leave_manager_id = fields.Many2one(
++        'res.users', string='Time Off Approver',
++        compute='_compute_leave_manager', store=True, readonly=False,
++        domain="[('share', '=', False), ('company_ids', 'in', company_id)]",
++        help='Select the user responsible for approving "Time Off" of this employee.\n'
++             'If empty, the approval is done by an Administrator or Approver (determined in settings/users).')
+     current_leave_id = fields.Many2one('hr.leave.type', compute='_compute_current_leave', string="Current Time Off Type",
+                                        groups="hr.group_hr_user")
++    current_leave_state = fields.Selection(compute='_compute_leave_status', string="Current Time Off Status",
++        selection=[
++            ('confirm', 'Waiting Approval'),
++            ('refuse', 'Refused'),
++            ('validate1', 'Waiting Second Approval'),
++            ('validate', 'Approved'),
++            ('cancel', 'Cancelled'),
++        ], groups="hr.group_hr_user")
++    leave_date_from = fields.Date('From Date', compute='_compute_leave_status', groups="hr.group_hr_user")
++    leave_date_to = fields.Date('To Date', compute='_compute_leave_status')
++    allocation_count = fields.Float('Total number of days allocated.', compute='_compute_allocation_count',
++                                    groups="hr.group_hr_user")
++    allocations_count = fields.Integer('Total number of allocations', compute="_compute_allocation_count",
++                                       groups="hr.group_hr_user")
++    show_leaves = fields.Boolean('Able to see Remaining Time Off', compute='_compute_show_leaves')
++    is_absent = fields.Boolean('Absent Today', compute='_compute_leave_status', search='_search_absent_employee')
++    allocation_display = fields.Char(compute='_compute_allocation_remaining_display')
++    allocation_remaining_display = fields.Char(compute='_compute_allocation_remaining_display',
++                                               groups="hr.group_hr_user")
++    hr_icon_display = fields.Selection(selection_add=[
++        ('presence_holiday_absent', 'On leave'),
++        ('presence_holiday_present', 'Present but on leave')])
+ 
+     def _compute_current_leave(self):
+         self.current_leave_id = False
+@@ -27,6 +59,212 @@ class HrEmployee(models.Model):
+             employee = self.filtered(lambda e: e.id == holiday.employee_id.id)
+             employee.current_leave_id = holiday.holiday_status_id.id
+ 
++    def _compute_presence_state(self):
++        super()._compute_presence_state()
++        employees = self.filtered(lambda employee: employee.hr_presence_state != 'present' and employee.is_absent)
++        employees.update({'hr_presence_state': 'absent'})
++
++    def _compute_allocation_count(self):
++        # Don't get allocations that are expired
++        current_date = date.today()
++        data = self.env['hr.leave.allocation']._read_group([
++            ('employee_id', 'in', self.ids),
++            ('holiday_status_id.active', '=', True),
++            ('holiday_status_id.requires_allocation', '=', 'yes'),
++            ('state', '=', 'validate'),
++            ('date_from', '<=', current_date),
++            '|',
++            ('date_to', '=', False),
++            ('date_to', '>=', current_date),
++        ], ['employee_id'], ['__count', 'number_of_days:sum'])
++        rg_results = {employee.id: (count, days) for employee, count, days in data}
++        for employee in self:
++            count, days = rg_results.get(employee.id, (0, 0))
++            employee.allocation_count = float_round(days, precision_digits=2)
++            employee.allocations_count = count
++
++    def _compute_allocation_remaining_display(self):
++        current_date = date.today()
++        allocations = self.env['hr.leave.allocation'].search([('employee_id', 'in', self.ids)])
++        leaves_taken = self._get_consumed_leaves(allocations.holiday_status_id)[0]
++        for employee in self:
++            employee_remaining_leaves = 0
++            employee_max_leaves = 0
++            for leave_type in leaves_taken[employee]:
++                if leave_type.requires_allocation == 'no' or leave_type.hide_on_dashboard:
++                    continue
++                for allocation in leaves_taken[employee][leave_type]:
++                    if allocation and allocation.date_from <= current_date\
++                            and (not allocation.date_to or allocation.date_to >= current_date):
++                        virtual_remaining_leaves = leaves_taken[employee][leave_type][allocation]['virtual_remaining_leaves']
++                        employee_remaining_leaves += virtual_remaining_leaves\
++                            if leave_type.request_unit in ['day', 'half_day']\
++                            else virtual_remaining_leaves / (employee.resource_calendar_id.hours_per_day or HOURS_PER_DAY)
++                        employee_max_leaves += allocation.number_of_days
++            employee.allocation_remaining_display = "%g" % float_round(employee_remaining_leaves, precision_digits=2)
++            employee.allocation_display = "%g" % float_round(employee_max_leaves, precision_digits=2)
++
++    def _compute_presence_icon(self):
++        super()._compute_presence_icon()
++        employees_absent = self.filtered(
++            lambda employee: employee.hr_presence_state != 'present' and employee.is_absent)
++        employees_absent.update({'hr_icon_display': 'presence_holiday_absent', 'show_hr_icon_display': True})
++        employees_present = self.filtered(
++            lambda employee: employee.hr_presence_state == 'present' and employee.is_absent)
++        employees_present.update({'hr_icon_display': 'presence_holiday_present', 'show_hr_icon_display': True})
++
++    def _get_first_working_interval(self, dt):
++        # find the first working interval after a given date
++        dt = dt.replace(tzinfo=timezone.utc)
++        lookahead_days = [7, 30, 90, 180, 365, 730]
++        work_intervals = None
++        for lookahead_day in lookahead_days:
++            periods = self._get_calendar_periods(dt, dt + timedelta(days=lookahead_day))
++            if not periods:
++                calendar = self.resource_calendar_id or self.company_id.resource_calendar_id
++                work_intervals = calendar._work_intervals_batch(
++                    dt, dt + timedelta(days=lookahead_day), resources=self.resource_id)
++            else:
++                for period in periods[self]:
++                    start, end, calendar = period
++                    calendar = calendar or self.company_id.resource_calendar_id
++                    work_intervals = calendar._work_intervals_batch(
++                        start, end, resources=self.resource_id)
++            if work_intervals.get(self.resource_id.id) and work_intervals[self.resource_id.id]._items:
++                # return start time of the earliest interval
++                return work_intervals[self.resource_id.id]._items[0][0]
++
++    def _compute_leave_status(self):
++        # Used SUPERUSER_ID to forcefully get status of other user's leave, to bypass record rule
++        holidays = self.env['hr.leave'].sudo().search([
++            ('employee_id', 'in', self.ids),
++            ('date_from', '<=', fields.Datetime.now()),
++            ('date_to', '>=', fields.Datetime.now()),
++            ('state', '=', 'validate'),
++        ])
++        leave_data = {}
++        for holiday in holidays:
++            leave_data[holiday.employee_id.id] = {}
++            leave_data[holiday.employee_id.id]['leave_date_from'] = holiday.date_from.date()
++            back_on = holiday.employee_id._get_first_working_interval(holiday.date_to)
++            leave_data[holiday.employee_id.id]['leave_date_to'] = back_on.date() if back_on else None
++            leave_data[holiday.employee_id.id]['current_leave_state'] = holiday.state
++
++        for employee in self:
++            employee.leave_date_from = leave_data.get(employee.id, {}).get('leave_date_from')
++            employee.leave_date_to = leave_data.get(employee.id, {}).get('leave_date_to')
++            employee.current_leave_state = leave_data.get(employee.id, {}).get('current_leave_state')
++            employee.is_absent = leave_data.get(employee.id) and leave_data.get(employee.id).get('current_leave_state') == 'validate'
++
++    @api.depends('parent_id')
++    def _compute_leave_manager(self):
++        for employee in self:
++            previous_manager = employee._origin.parent_id.user_id
++            manager = employee.parent_id.user_id
++            if manager and employee.leave_manager_id == previous_manager or not employee.leave_manager_id:
++                employee.leave_manager_id = manager
++            elif not employee.leave_manager_id:
++                employee.leave_manager_id = False
++
++    def _compute_show_leaves(self):
++        show_leaves = self.env.user.has_group('hr_holidays.group_hr_holidays_user')
++        for employee in self:
++            if show_leaves or employee.user_id == self.env.user:
++                employee.show_leaves = True
++            else:
++                employee.show_leaves = False
++
++    def _search_absent_employee(self, operator, value):
++        if operator != 'in':
++            return NotImplemented
++        # This search is only used for the 'Absent Today' filter however
++        # this only returns employees that are absent right now.
++        today_start = date.today()
++        today_end = today_start + timedelta(1)
++        holidays = self.env['hr.leave'].sudo().search([
++            ('employee_id', '!=', False),
++            ('state', '=', 'validate'),
++            ('date_from', '<', today_end),
++            ('date_to', '>=', today_start),
++        ])
++        return [('id', 'in', holidays.employee_id.ids)]
++
++    @api.model_create_multi
++    def create(self, vals_list):
++        if self.env.context.get('salary_simulation'):
++            return super().create(vals_list)
++        approver_group = self.env.ref('hr_holidays.group_hr_holidays_responsible', raise_if_not_found=False)
++        group_updates = []
++        for vals in vals_list:
++            if 'parent_id' in vals:
++                manager = self.env['hr.employee'].browse(vals['parent_id']).user_id
++                vals['leave_manager_id'] = vals.get('leave_manager_id', manager.id)
++            if approver_group and vals.get('leave_manager_id'):
++                group_updates.append((4, vals['leave_manager_id']))
++        if group_updates:
++            approver_group.sudo().write({'user_ids': group_updates})
++        return super().create(vals_list)
++
++    def write(self, values):
++        # Prevent the resource calendar of leaves to be updated by a write to
++        # employee. When this module is enabled the resource calendar of
++        # leaves are determined by those of the contracts.
++        self = self.with_context(no_leave_resource_calendar_update=True)  # noqa: PLW0642
++        if 'parent_id' in values:
++            manager = self.env['hr.employee'].browse(values['parent_id']).user_id
++            if manager:
++                to_change = self.filtered(lambda e: e.leave_manager_id == e.parent_id.user_id or not e.leave_manager_id)
++                to_change.write({'leave_manager_id': values.get('leave_manager_id', manager.id)})
++
++        old_managers = self.env['res.users']
++        if 'leave_manager_id' in values:
++            old_managers = self.mapped('leave_manager_id')
++            if values['leave_manager_id']:
++                leave_manager = self.env['res.users'].browse(values['leave_manager_id'])
++                old_managers -= leave_manager
++                approver_group = self.env.ref('hr_holidays.group_hr_holidays_responsible', raise_if_not_found=False)
++                if approver_group and not leave_manager.has_group('hr_holidays.group_hr_holidays_responsible'):
++                    leave_manager.sudo().write({'group_ids': [(4, approver_group.id)]})
++
++        res = super().write(values)
++        # remove users from the Responsible group if they are no longer leave managers
++        old_managers.sudo()._clean_leave_responsible_users()
++
++        # Change the resource calendar of the employee's leaves in the future
++        # Other modules can disable this behavior by setting the context key
++        # 'no_leave_resource_calendar_update'
++        if 'resource_calendar_id' in values and not self.env.context.get('no_leave_resource_calendar_update'):
++            try:
++                self.env['hr.leave'].search([
++                    ('employee_id', 'in', self.ids),
++                    ('resource_calendar_id', '!=', int(values['resource_calendar_id'])),
++                    ('date_from', '>', fields.Datetime.now())]).write({'resource_calendar_id': values['resource_calendar_id']})
++            except ValidationError:
++                raise ValidationError(_("Changing this working schedule results in the affected employee(s) not having enough "
++                                        "leaves allocated to accomodate for their leaves already taken in the future. Please "
++                                        "review this employee's leaves and adjust their allocation accordingly."))
++
++        if 'parent_id' in values or 'department_id' in values:
++            today_date = fields.Datetime.now()
++            hr_vals = {}
++            if values.get('parent_id') is not None:
++                hr_vals['manager_id'] = values['parent_id']
++            if values.get('department_id') is not None:
++                hr_vals['department_id'] = values['department_id']
++            holidays = self.env['hr.leave'].sudo().search([
++                '|',
++                ('state', '=', 'confirm'),
++                ('date_from', '>', today_date),
++                ('employee_id', 'in', self.ids),
++            ])
++            holidays.write(hr_vals)
++            allocations = self.env['hr.leave.allocation'].sudo().search([
++                ('state', '=', 'confirm'),
++                ('employee_id', 'in', self.ids),
++            ])
++            allocations.write(hr_vals)
++        return res
++
+     def _get_user_m2o_to_empty_on_archived_employees(self):
+         return super()._get_user_m2o_to_empty_on_archived_employees() + ['leave_manager_id']
+ 
+@@ -323,7 +561,6 @@ class HrEmployee(models.Model):
+                         leave_type_data[False]['remaining_leaves'] = 0
+                         if leave.state == 'validate':
+                             leave_type_data[False]['leaves_taken'] += allocated_time
+-
+         for employee in to_recheck_leaves_per_leave_type:
+             for leave_type in to_recheck_leaves_per_leave_type[employee]:
+                 content = to_recheck_leaves_per_leave_type[employee][leave_type]
+
+--- a/addons/hr_holidays/models/hr_employee_base.py
++++ b/None
+@@ -1,240 +0,0 @@
+-# Part of Odoo. See LICENSE file for full copyright and licensing details.
+-
+-from datetime import date, timezone, timedelta
+-
+-from odoo import api, fields, models, _
+-from odoo.exceptions import ValidationError
+-from odoo.tools.float_utils import float_round
+-
+-from odoo.addons.resource.models.utils import HOURS_PER_DAY
+-
+-
+-class HrEmployeeBase(models.AbstractModel):
+-    _inherit = "hr.employee.base"
+-
+-    leave_manager_id = fields.Many2one(
+-        'res.users', string='Time Off Approver',
+-        compute='_compute_leave_manager', store=True, readonly=False,
+-        domain="[('share', '=', False), ('company_ids', 'in', company_id)]",
+-        help='Select the user responsible for approving "Time Off" of this employee.\n'
+-             'If empty, the approval is done by an Administrator or Approver (determined in settings/users).')
+-    current_leave_state = fields.Selection(compute='_compute_leave_status', string="Current Time Off Status",
+-        selection=[
+-            ('confirm', 'Waiting Approval'),
+-            ('refuse', 'Refused'),
+-            ('validate1', 'Waiting Second Approval'),
+-            ('validate', 'Approved'),
+-            ('cancel', 'Cancelled')
+-        ])
+-    leave_date_from = fields.Date('From Date', compute='_compute_leave_status')
+-    leave_date_to = fields.Date('To Date', compute='_compute_leave_status')
+-    allocation_count = fields.Float('Total number of days allocated.', compute='_compute_allocation_count')
+-    allocations_count = fields.Integer('Total number of allocations', compute="_compute_allocation_count")
+-    show_leaves = fields.Boolean('Able to see Remaining Time Off', compute='_compute_show_leaves')
+-    is_absent = fields.Boolean('Absent Today', compute='_compute_leave_status', search='_search_absent_employee')
+-    allocation_display = fields.Char(compute='_compute_allocation_remaining_display')
+-    allocation_remaining_display = fields.Char(compute='_compute_allocation_remaining_display')
+-    hr_icon_display = fields.Selection(selection_add=[
+-        ('presence_holiday_absent', 'On leave'),
+-        ('presence_holiday_present', 'Present but on leave')])
+-
+-    def _compute_presence_state(self):
+-        super()._compute_presence_state()
+-        employees = self.filtered(lambda employee: employee.hr_presence_state != 'present' and employee.is_absent)
+-        employees.update({'hr_presence_state': 'absent'})
+-
+-    def _compute_allocation_count(self):
+-        # Don't get allocations that are expired
+-        current_date = date.today()
+-        data = self.env['hr.leave.allocation']._read_group([
+-            ('employee_id', 'in', self.ids),
+-            ('holiday_status_id.active', '=', True),
+-            ('holiday_status_id.requires_allocation', '=', True),
+-            ('state', '=', 'validate'),
+-            ('date_from', '<=', current_date),
+-            '|',
+-            ('date_to', '=', False),
+-            ('date_to', '>=', current_date),
+-        ], ['employee_id'], ['__count', 'number_of_days:sum'])
+-        rg_results = {employee.id: (count, days) for employee, count, days in data}
+-        for employee in self:
+-            count, days = rg_results.get(employee.id, (0, 0))
+-            employee.allocation_count = float_round(days, precision_digits=2)
+-            employee.allocations_count = count
+-
+-    def _compute_allocation_remaining_display(self):
+-        current_date = date.today()
+-        allocations = self.env['hr.leave.allocation'].search([('employee_id', 'in', self.ids)])
+-        leaves_taken = self._get_consumed_leaves(allocations.holiday_status_id)[0]
+-        for employee in self:
+-            employee_remaining_leaves = 0
+-            employee_max_leaves = 0
+-            for leave_type in leaves_taken[employee]:
+-                if not leave_type.requires_allocation or leave_type.hide_on_dashboard:
+-                    continue
+-                for allocation in leaves_taken[employee][leave_type]:
+-                    if allocation and allocation.date_from <= current_date\
+-                            and (not allocation.date_to or allocation.date_to >= current_date):
+-                        virtual_remaining_leaves = leaves_taken[employee][leave_type][allocation]['virtual_remaining_leaves']
+-                        employee_remaining_leaves += virtual_remaining_leaves\
+-                            if leave_type.request_unit in ['day', 'half_day']\
+-                            else virtual_remaining_leaves / (employee.resource_calendar_id.hours_per_day or HOURS_PER_DAY)
+-                        employee_max_leaves += allocation.number_of_days
+-            employee.allocation_remaining_display = "%g" % float_round(employee_remaining_leaves, precision_digits=2)
+-            employee.allocation_display = "%g" % float_round(employee_max_leaves, precision_digits=2)
+-
+-    def _compute_presence_icon(self):
+-        super()._compute_presence_icon()
+-        employees_absent = self.filtered(
+-            lambda employee: employee.hr_presence_state != 'present' and employee.is_absent)
+-        employees_absent.update({'hr_icon_display': 'presence_holiday_absent', 'show_hr_icon_display': True})
+-        employees_present = self.filtered(
+-            lambda employee: employee.hr_presence_state == 'present' and employee.is_absent)
+-        employees_present.update({'hr_icon_display': 'presence_holiday_present', 'show_hr_icon_display': True})
+-
+-    def _get_first_working_interval(self, dt):
+-        # find the first working interval after a given date
+-        dt = dt.replace(tzinfo=timezone.utc)
+-        lookahead_days = [7, 30, 90, 180, 365, 730]
+-        work_intervals = None
+-        for lookahead_day in lookahead_days:
+-            periods = self._get_calendar_periods(dt, dt + timedelta(days=lookahead_day))
+-            if not periods:
+-                calendar = self.resource_calendar_id or self.company_id.resource_calendar_id
+-                work_intervals = calendar._work_intervals_batch(
+-                    dt, dt + timedelta(days=lookahead_day), resources=self.resource_id)
+-            else:
+-                for period in periods[self]:
+-                    start, end, calendar = period
+-                    work_intervals = calendar._work_intervals_batch(
+-                        start, end, resources=self.resource_id)
+-            if work_intervals.get(self.resource_id.id) and work_intervals[self.resource_id.id]._items:
+-                # return start time of the earliest interval
+-                return work_intervals[self.resource_id.id]._items[0][0]
+-
+-    def _compute_leave_status(self):
+-        # Used SUPERUSER_ID to forcefully get status of other user's leave, to bypass record rule
+-        holidays = self.env['hr.leave'].sudo().search([
+-            ('employee_id', 'in', self.ids),
+-            ('date_from', '<=', fields.Datetime.now()),
+-            ('date_to', '>=', fields.Datetime.now()),
+-            ('state', '=', 'validate'),
+-        ])
+-        leave_data = {}
+-        for holiday in holidays:
+-            leave_data[holiday.employee_id.id] = {}
+-            leave_data[holiday.employee_id.id]['leave_date_from'] = holiday.date_from.date()
+-            back_on = holiday.employee_id._get_first_working_interval(holiday.date_to)
+-            leave_data[holiday.employee_id.id]['leave_date_to'] = back_on.date() if back_on else None
+-            leave_data[holiday.employee_id.id]['current_leave_state'] = holiday.state
+-
+-        for employee in self:
+-            employee.leave_date_from = leave_data.get(employee.id, {}).get('leave_date_from')
+-            employee.leave_date_to = leave_data.get(employee.id, {}).get('leave_date_to')
+-            employee.current_leave_state = leave_data.get(employee.id, {}).get('current_leave_state')
+-            employee.is_absent = leave_data.get(employee.id) and leave_data.get(employee.id).get('current_leave_state') == 'validate'
+-
+-    @api.depends('parent_id')
+-    def _compute_leave_manager(self):
+-        for employee in self:
+-            previous_manager = employee._origin.parent_id.user_id
+-            manager = employee.parent_id.user_id
+-            if manager and employee.leave_manager_id == previous_manager or not employee.leave_manager_id:
+-                employee.leave_manager_id = manager
+-            elif not employee.leave_manager_id:
+-                employee.leave_manager_id = False
+-
+-    def _compute_show_leaves(self):
+-        show_leaves = self.env.user.has_group('hr_holidays.group_hr_holidays_user')
+-        for employee in self:
+-            if show_leaves or employee.user_id == self.env.user:
+-                employee.show_leaves = True
+-            else:
+-                employee.show_leaves = False
+-
+-    def _search_absent_employee(self, operator, value):
+-        if operator != 'in':
+-            return NotImplemented
+-        # This search is only used for the 'Absent Today' filter however
+-        # this only returns employees that are absent right now.
+-        today_start = date.today()
+-        today_end = today_start + timedelta(1)
+-        holidays = self.env['hr.leave'].sudo().search([
+-            ('employee_id', '!=', False),
+-            ('state', '=', 'validate'),
+-            ('date_from', '<', today_end),
+-            ('date_to', '>=', today_start),
+-        ])
+-        return [('id', 'in', holidays.employee_id.ids)]
+-
+-    @api.model_create_multi
+-    def create(self, vals_list):
+-        if self.env.context.get('salary_simulation'):
+-            return super().create(vals_list)
+-        approver_group = self.env.ref('hr_holidays.group_hr_holidays_responsible', raise_if_not_found=False)
+-        group_updates = []
+-        for vals in vals_list:
+-            if 'parent_id' in vals:
+-                manager = self.env['hr.employee'].browse(vals['parent_id']).user_id
+-                vals['leave_manager_id'] = vals.get('leave_manager_id', manager.id)
+-            if approver_group and vals.get('leave_manager_id'):
+-                group_updates.append((4, vals['leave_manager_id']))
+-        if group_updates:
+-            approver_group.sudo().write({'user_ids': group_updates})
+-        return super().create(vals_list)
+-
+-    def write(self, values):
+-        if 'parent_id' in values:
+-            manager = self.env['hr.employee'].browse(values['parent_id']).user_id
+-            if manager:
+-                to_change = self.filtered(lambda e: e.leave_manager_id == e.parent_id.user_id or not e.leave_manager_id)
+-                to_change.write({'leave_manager_id': values.get('leave_manager_id', manager.id)})
+-
+-        old_managers = self.env['res.users']
+-        if 'leave_manager_id' in values:
+-            old_managers = self.mapped('leave_manager_id')
+-            if values['leave_manager_id']:
+-                leave_manager = self.env['res.users'].browse(values['leave_manager_id'])
+-                old_managers -= leave_manager
+-                approver_group = self.env.ref('hr_holidays.group_hr_holidays_responsible', raise_if_not_found=False)
+-                if approver_group and not leave_manager.has_group('hr_holidays.group_hr_holidays_responsible'):
+-                    leave_manager.sudo().write({'group_ids': [(4, approver_group.id)]})
+-
+-        res = super().write(values)
+-        # remove users from the Responsible group if they are no longer leave managers
+-        old_managers.sudo()._clean_leave_responsible_users()
+-
+-        # Change the resource calendar of the employee's leaves in the future
+-        # Other modules can disable this behavior by setting the context key
+-        # 'no_leave_resource_calendar_update'
+-        if 'resource_calendar_id' in values and not self.env.context.get('no_leave_resource_calendar_update'):
+-            try:
+-                self.env['hr.leave'].search([
+-                    ('employee_id', 'in', self.ids),
+-                    ('resource_calendar_id', '!=', int(values['resource_calendar_id'])),
+-                    ('date_from', '>', fields.Datetime.now())]).write({'resource_calendar_id': values['resource_calendar_id']})
+-            except ValidationError:
+-                raise ValidationError(_("Changing this working schedule results in the affected employee(s) not having enough "
+-                                        "leaves allocated to accomodate for their leaves already taken in the future. Please "
+-                                        "review this employee's leaves and adjust their allocation accordingly."))
+-
+-        if 'parent_id' in values or 'department_id' in values:
+-            today_date = fields.Datetime.now()
+-            hr_vals = {}
+-            if values.get('parent_id') is not None:
+-                hr_vals['manager_id'] = values['parent_id']
+-            if values.get('department_id') is not None:
+-                hr_vals['department_id'] = values['department_id']
+-            holidays = self.env['hr.leave'].sudo().search([
+-                '|',
+-                ('state', '=', 'confirm'),
+-                ('date_from', '>', today_date),
+-                ('employee_id', 'in', self.ids),
+-            ])
+-            holidays.write(hr_vals)
+-            allocations = self.env['hr.leave.allocation'].sudo().search([
+-                ('state', 'in', ['draft', 'confirm']),
+-                ('employee_id', 'in', self.ids),
+-            ])
+-            allocations.write(hr_vals)
+-        return res
+
+--- a/None
++++ b/addons/hr_holidays/models/hr_employee_public.py
+@@ -0,0 +1,50 @@
++# Part of Odoo. See LICENSE file for full copyright and licensing details.
++
++from datetime import date, timedelta
++
++from odoo import fields, models
++
++
++class HrEmployeePublic(models.Model):
++    _inherit = 'hr.employee.public'
++
++    leave_manager_id = fields.Many2one(
++        'res.users', string='Time Off Approver',
++        compute='_compute_leave_manager', store=True, readonly=False,
++        domain="[('share', '=', False), ('company_ids', 'in', company_id)]",
++        help='Select the user responsible for approving "Time Off" of this employee.\n'
++             'If empty, the approval is done by an Administrator or Approver (determined in settings/users).')
++    leave_date_to = fields.Date('To Date', compute='_compute_leave_status')
++    show_leaves = fields.Boolean('Able to see Remaining Time Off', compute='_compute_show_leaves')
++    is_absent = fields.Boolean('Absent Today', compute='_compute_leave_status', search='_search_absent_employee')
++    hr_icon_display = fields.Selection(selection_add=[
++        ('presence_holiday_absent', 'On leave'),
++        ('presence_holiday_present', 'Present but on leave')])
++    allocation_display = fields.Char(compute='_compute_allocation_display')
++
++    def _compute_show_leaves(self):
++        self._compute_from_employee('show_leaves')
++
++    def _compute_leave_manager(self):
++        self._compute_from_employee('leave_manager_id')
++
++    def _compute_leave_status(self):
++        self._compute_from_employee(['leave_date_to', 'is_absent'])
++
++    def _search_absent_employee(self, operator, value):
++        if operator != 'in':
++            return NotImplemented
++        # This search is only used for the 'Absent Today' filter however
++        # this only returns employees that are absent right now.
++        today_start = date.today()
++        today_end = today_start + timedelta(1)
++        holidays = self.env['hr.leave'].sudo().search([
++            ('employee_id', '!=', False),
++            ('state', '=', 'validate'),
++            ('date_from', '<', today_end),
++            ('date_to', '>=', today_start),
++        ])
++        return [('id', 'in', holidays.employee_id.ids)]
++
++    def _compute_allocation_display(self):
++        self._compute_from_employee('allocation_display')
+
+--- a/addons/hr_holidays/models/hr_leave.py
++++ b/addons/hr_holidays/models/hr_leave.py
+@@ -333,6 +333,7 @@ class HrLeave(models.Model):
+ 
+     @api.depends('employee_id')
+     def _compute_resource_calendar_id(self):
++        # YTI TODO: Clean that brol to improve performance
+         employees_by_dates = defaultdict(lambda: self.env['hr.employee'])
+         for leave in self:
+             if leave.employee_id and leave.request_date_from:
+@@ -343,6 +344,61 @@ class HrLeave(models.Model):
+             if leave.employee_id and leave.request_date_from:
+                 calendar = calendar_by_dates[leave.request_date_from][leave.employee_id.id]
+             leave.resource_calendar_id = calendar or self.env.company.resource_calendar_id
++        for leave in self:
++            # We use the request dates to find the contracts, because date_from
++            # and date_to are not set yet at this point. Since these dates are
++            # used to get the contracts for which these leaves apply and
++            # contract start- and end-dates are just dates (and not datetimes)
++            # these dates are comparable.
++            if not leave.employee_id:
++                continue
++            contracts = self.env['hr.version'].search([('employee_id', '=', leave.employee_id.id)]).filtered(
++                lambda c: c.date_start <= leave.request_date_to and
++                          (not c.date_end or c.date_end >= leave.request_date_from))
++            if contracts:
++                # If there are more than one contract they should all have the
++                # same calendar, otherwise a constraint is violated.
++                leave.resource_calendar_id = contracts[:1].resource_calendar_id
++
++    def _get_overlapping_contracts(self):
++        self.ensure_one()
++        domain = [
++            ('employee_id', '=', self.employee_id.id),
++            ('contract_date_start', '<=', self.date_to),
++            '|',
++                ('contract_date_end', '>=', self.date_from),
++                ('contract_date_end', '=', False),
++        ]
++        return self.env['hr.version'].sudo().search(domain)
++
++    @api.constrains('date_from', 'date_to')
++    def _check_contracts(self):
++        """
++            A leave cannot be set across multiple contracts.
++            Note: a leave can be across multiple contracts despite this constraint.
++            It happens if a leave is correctly created (not across multiple contracts) but
++            contracts are later modifed/created in the middle of the leave.
++        """
++        for holiday in self.filtered('employee_id'):
++            contracts = holiday._get_overlapping_contracts()
++            if len(contracts.resource_calendar_id) > 1:
++                raise ValidationError(
++                    _("""A leave cannot be set across multiple contracts with different working schedules.
++
++Please create one time off for each contract.
++
++Time off:
++%(time_off)s
++
++Contracts:
++%(contracts)s""",
++                      time_off=holiday.display_name,
++                      contracts='\n'.join(_(
++                          "Contract %(contract)s from %(start_date)s to %(end_date)s",
++                          contract=contract.name or contract.employee_id.name,
++                          start_date=format_date(self.env, contract.date_start),
++                          end_date=format_date(self.env, contract.date_end) if contract.date_end else _("undefined"),
++                      ) for contract in contracts)))
+ 
+     @api.depends('request_date_from_period', 'request_hour_from', 'request_hour_to', 'request_date_from', 'request_date_to',
+                  'request_unit_half', 'request_unit_hours', 'employee_id')
+@@ -421,7 +477,8 @@ class HrLeave(models.Model):
+     def _compute_has_mandatory_day(self):
+         date_from, date_to = min(self.mapped('date_from')), max(self.mapped('date_to'))
+         if date_from and date_to:
+-            mandatory_days = self.employee_id._get_mandatory_days(
++            # Sudo to get access to version fields on employee (job_id)
++            mandatory_days = self.employee_id.sudo()._get_mandatory_days(
+                 date_from.date(),
+                 date_to.date())
+ 
+@@ -507,7 +564,8 @@ class HrLeave(models.Model):
+                 continue
+             hours, days = (0, 0)
+             if leave.employee_id:
+-                if leave.employee_id.is_flexible and leave.leave_type_request_unit in ['day','half_day']:
++                # sudo as is_flexible is on version model and employee does not have access to it.
++                if leave.employee_id.sudo().is_flexible and leave.leave_type_request_unit in ['day', 'half_day']:
+                     duration = leave.date_to - leave.date_from
+                     days = ceil(duration.total_seconds() / (24 * 3600))
+                 elif leave.leave_type_request_unit == 'day' and check_leave_type:
+@@ -1344,13 +1402,13 @@ is approved, validated or refused.')
+             if self.holiday_status_id.responsible_ids:
+                 responsible = self.holiday_status_id.responsible_ids
+         return responsible
+-    
++
+     def _get_to_clean_activities(self):
+         return ['hr_holidays.mail_act_leave_approval', 'hr_holidays.mail_act_leave_second_approval']
+ 
+     def activity_update(self):
+         if self.env.context.get('mail_activity_automation_skip'):
+-            return False
++            return
+ 
+         to_clean, to_do, to_do_confirm_activity = self.env['hr.leave'], self.env['hr.leave'], self.env['hr.leave']
+         activity_vals = []
+
+--- a/addons/hr_holidays/models/hr_leave_allocation.py
++++ b/addons/hr_holidays/models/hr_leave_allocation.py
+@@ -733,7 +733,7 @@ class HrLeaveAllocation(models.Model):
+                 raise UserError(_('Incorrect state for new allocation'))
+             employee_id = values.get('employee_id', False)
+             if not values.get('department_id'):
+-                values.update({'department_id': self.env['hr.employee'].browse(employee_id).department_id.id})
++                values.update({'department_id': self.env['hr.employee'].sudo().browse(employee_id).department_id.id})
+         allocations = super(HrLeaveAllocation, self.with_context(mail_create_nosubscribe=True)).create(vals_list)
+         allocations._add_lastcalls()
+         for allocation in allocations:
+@@ -741,7 +741,7 @@ class HrLeaveAllocation(models.Model):
+             if allocation.employee_id.user_id:
+                 partners_to_subscribe.add(allocation.employee_id.user_id.partner_id.id)
+             if allocation.validation_type == 'hr':
+-                partners_to_subscribe.add(allocation.employee_id.parent_id.user_id.partner_id.id)
++                partners_to_subscribe.add(allocation.employee_id.sudo().parent_id.user_id.partner_id.id)
+                 partners_to_subscribe.add(allocation.employee_id.leave_manager_id.partner_id.id)
+             allocation.message_subscribe(partner_ids=tuple(partners_to_subscribe))
+             if not self._context.get('import_file'):
+
+--- a/None
++++ b/addons/hr_holidays/models/hr_version.py
+@@ -0,0 +1,170 @@
++# Part of Odoo. See LICENSE file for full copyright and licensing details.
++
++from datetime import date
++from odoo import api, fields, models
++from odoo.fields import Domain
++from odoo.exceptions import ValidationError
++
++
++class HrVersion(models.Model):
++    """ Write and Create:
++        Special case when setting a contract as running:
++        If there is already a validated time off over another contract
++        with a different schedule, split the time off, before the
++        _check_contracts raises an issue.
++        If there are existing leaves that are spanned by this new
++        contract, update their resource calendar to the current one.
++    """
++    # TODO BIOUTIFY ME (the whole file :)
++    _inherit = 'hr.version'
++    _description = 'Employee Contract'
++
++    @api.constrains('contract_date_start', 'contract_date_end')
++    def _check_contracts(self):
++        self._get_leaves()._check_contracts()
++
++    @api.model_create_multi
++    def create(self, vals_list):
++        all_new_leave_origin = []
++        all_new_leave_vals = []
++        leaves_state = {}
++        created_versions = self.env['hr.version']
++        try:
++            for vals in vals_list:
++                if not 'employee_id' in vals or not 'resource_calendar_id' in vals:
++                    created_versions |= super().create(vals)
++                    continue
++                leaves = self._get_leaves_from_vals(vals)
++                is_created = False
++                for leave in leaves:
++                    leaves_state = self._refuse_leave(leave, leaves_state)
++                    if not is_created:
++                        created_versions |= super().create([vals])
++                        is_created = True
++                    overlapping_contracts = self._check_overlapping_contract(leave)
++                    if not overlapping_contracts:
++                        continue
++                    all_new_leave_origin, all_new_leave_vals = self._populate_all_new_leave_vals_from_split_leave(
++                        all_new_leave_origin, all_new_leave_vals, overlapping_contracts, leave, leaves_state)
++                # TODO FIXME
++                # to keep creation order, not ideal but ok for now.
++                if not is_created:
++                    created_versions |= super().create([vals])
++            if all_new_leave_vals:
++                self._create_all_new_leave(all_new_leave_origin, all_new_leave_vals)
++        except ValidationError:
++            # In case a validation error is thrown due to holiday creation with the new resource calendar (which can
++            # increase their duration), we catch this error to display a more meaningful error message.
++            raise ValidationError(
++                self.env._("Changing the contract on this employee changes their working schedule in a period "
++                           "they already took leaves. Changing this working schedule changes the duration of "
++                           "these leaves in such a way the employee no longer has the required allocation for "
++                           "them. Please review these leaves and/or allocations before changing the contract."))
++        return created_versions
++
++    def write(self, vals):
++        specific_contracts = self.env['hr.version']
++        if any(field in vals for field in ['contract_date_start', 'contract_date_end', 'date_version', 'resource_calendar_id']):
++            all_new_leave_origin = []
++            all_new_leave_vals = []
++            leaves_state = {}
++            try:
++                for contract in self:
++                    resource_calendar_id = vals.get('resource_calendar_id', contract.resource_calendar_id.id)
++                    extra_domain = [('resource_calendar_id', '!=', resource_calendar_id)] if resource_calendar_id else None
++                    leaves = contract._get_leaves(
++                        extra_domain=extra_domain
++                    )
++                    for leave in leaves:
++                        overlapping_contracts = self._check_overlapping_contract(leave)
++                        if not overlapping_contracts:
++                            continue
++                        leaves_state = self._refuse_leave(leave, leaves_state)
++                        super(HrVersion, contract).write(vals)
++                        specific_contracts += contract
++                        all_new_leave_origin, all_new_leave_vals = self._populate_all_new_leave_vals_from_split_leave(
++                            all_new_leave_origin, all_new_leave_vals, overlapping_contracts, leave, leaves_state)
++                if all_new_leave_vals:
++                    self._create_all_new_leave(all_new_leave_origin, all_new_leave_vals)
++            except ValidationError:
++                # In case a validation error is thrown due to holiday creation with the new resource calendar (which can
++                # increase their duration), we catch this error to display a more meaningful error message.
++                raise ValidationError(self.env._("Changing the contract on this employee changes their working schedule in a period "
++                                        "they already took leaves. Changing this working schedule changes the duration of "
++                                        "these leaves in such a way the employee no longer has the required allocation for "
++                                        "them. Please review these leaves and/or allocations before changing the contract."))
++        return super(HrVersion, self - specific_contracts).write(vals)
++
++    def _get_leaves(self, extra_domain=None):
++        domain = [
++            ('state', '!=', 'refuse'),
++            ('employee_id', 'in', self.mapped('employee_id.id')),
++            ('date_from', '<=', max(end or date.max for end in self.mapped('date_end'))),
++            ('date_to', '>=', min(self.mapped('date_start'))),
++        ]
++        if extra_domain:
++            domain = Domain.AND([domain, extra_domain])
++        return self.env['hr.leave'].search(domain)
++
++    def _get_leaves_from_vals(self, vals):
++        domain = [
++            ('state', '!=', 'refuse'),
++            ('employee_id', 'in', vals['employee_id']),
++            ('date_to', '>=', fields.Date.from_string(vals.get('contract_date_start', vals['date_version']))),
++            ('resource_calendar_id', '!=', vals.get('resource_calendar_id')),
++        ]
++        if vals.get('contract_date_end'):
++            domain = Domain.AND([domain, [('date_from', '<=', fields.Date.from_string(vals['contract_date_end']))]])
++        return self.env['hr.leave'].search(domain)
++
++    def _check_overlapping_contract(self, leave):
++        # Get all overlapping contracts but exclude draft contracts that are not included in this transaction.
++        overlapping_contracts = leave._get_overlapping_contracts().sorted(
++            key=lambda c: c.contract_date_start)
++        if len(overlapping_contracts.resource_calendar_id) <= 1:
++            if overlapping_contracts and leave.resource_calendar_id != overlapping_contracts[
++                0].resource_calendar_id:
++                leave.resource_calendar_id = overlapping_contracts[0].resource_calendar_id
++            return False
++        return overlapping_contracts
++
++    def _refuse_leave(self, leave, leaves_state):
++        if leave.id not in leaves_state:
++            leaves_state[leave.id] = leave.state
++        if leave.state != 'refuse':
++            leave.action_refuse()
++        return leaves_state
++
++    def _populate_all_new_leave_vals_from_split_leave(self, all_new_leave_origin, all_new_leave_vals, overlapping_contracts, leave, leaves_state):
++        for overlapping_contract in overlapping_contracts:
++            new_request_date_from = max(leave.request_date_from, overlapping_contract.contract_date_start)
++            new_request_date_to = min(leave.request_date_to, overlapping_contract.contract_date_end or date.max)
++            new_leave_vals = leave.copy_data({
++                'request_date_from': new_request_date_from,
++                'request_date_to': new_request_date_to,
++                'state': leaves_state[leave.id],
++            })[0]
++            new_leave = self.env['hr.leave'].new(new_leave_vals)
++            new_leave._compute_date_from_to()
++            new_leave._compute_duration()
++            # Could happen for part-time contract, that time off is not necessary
++            # anymore.
++            if new_leave.date_from < new_leave.date_to:
++                all_new_leave_origin.append(leave)
++                all_new_leave_vals.append(new_leave._convert_to_write(new_leave._cache))
++        return all_new_leave_origin, all_new_leave_vals
++
++    def _create_all_new_leave(self, all_new_leave_origin, all_new_leave_vals):
++        new_leaves = self.env['hr.leave'].with_context(
++            tracking_disable=True,
++            mail_activity_automation_skip=True,
++            leave_fast_create=True,
++            leave_skip_state_check=True
++        ).create(all_new_leave_vals)
++        new_leaves.filtered(lambda l: l.state in 'validate')._validate_leave_request()
++        for index, new_leave in enumerate(new_leaves):
++            new_leave.message_post_with_source(
++                'mail.message_origin_link',
++                render_values={'self': new_leave, 'origin': all_new_leave_origin[index]},
++                subtype_xmlid='mail.mt_note',
++            )

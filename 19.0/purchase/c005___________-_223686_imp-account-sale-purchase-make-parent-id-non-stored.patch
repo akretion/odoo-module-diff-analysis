@@ -1,0 +1,137 @@
+PR: https://github.com/odoo/odoo/pull/223686
+
+From: 572680aa30d41900223f1bea36e410e5c0270b37
+From: Nisarg (nipl)
+Date: 2025-09-05 13:00:22
+
+Breaking data model changes scores: del:4 + add:0, change matches:
+-    collapse_composition = fields.Boolean(
+-    collapse_prices = fields.Boolean(
+-    child_ids = fields.One2many(comodel_name='purchase.order.line', inverse_name='parent_id')
+
+Total Changes: 48
+
+[IMP] account, sale, purchase: make `parent_id` non-stored
+
+Before this commit:
+* The computed field `parent_id` was stored, which caused frequent
+  recomputations whenever related records changed.
+* This led to unnecessary overhead and performance issues.
+
+After this commit:
+* Made `parent_id` non-stored to avoid redundant recomputations.
+* Changed `filter_domain` to `filtered` in catalog related controllers
+* Add a `compute_sudo` in Accounting to avoid having access error
+  in Sale.
+
+task-5009037,4966574
+
+closes odoo/odoo#223686
+
+Related: odoo/enterprise#92822
+Signed-off-by: Habib Ayob (ayh) <ayh@odoo.com>
+
+================================= pseudo patch: =================================
+
+--- a/addons/purchase/models/purchase_order.py
++++ b/addons/purchase/models/purchase_order.py
+@@ -453,11 +453,6 @@ class PurchaseOrder(models.Model):
+         """
+         self.order_line._compute_tax_id()
+ 
+-    @api.onchange('order_line')
+-    def _onchange_order_line(self):
+-        self.order_line.invalidate_recordset(['parent_id'])
+-        self.env.add_to_compute(self.order_line._fields['parent_id'], self.order_line)
+-
+     # ------------------------------------------------------------
+     # MAIL.THREAD
+     # ------------------------------------------------------------
+@@ -1152,6 +1147,7 @@ class PurchaseOrder(models.Model):
+ 
+     def _get_product_catalog_record_lines(self, product_ids, *, selected_section_id=False, **kwargs):
+         grouped_lines = defaultdict(lambda: self.env['purchase.order.line'])
++        selected_section_id = selected_section_id or False
+         for line in self.order_line:
+             if (
+                 line.display_type
+@@ -1276,10 +1272,11 @@ class PurchaseOrder(models.Model):
+         :rtype: float
+         """
+         self.ensure_one()
+-        pol = self.order_line.filtered_domain([
+-            ('product_id', '=', product_id),
+-            ('id', 'child_of', selected_section_id),
+-        ])
++        selected_section_id = selected_section_id or False
++        pol = self.order_line.filtered(
++            lambda l: l.product_id.id == product_id
++            and l.get_parent_section_line().id == selected_section_id,
++        )
+         if pol:
+             if quantity != 0:
+                 pol.product_qty = quantity
+
+--- a/addons/purchase/models/purchase_order_line.py
++++ b/addons/purchase/models/purchase_order_line.py
+@@ -86,24 +86,11 @@ class PurchaseOrderLine(models.Model):
+     product_template_attribute_value_ids = fields.Many2many(related='product_id.product_template_attribute_value_ids', readonly=True)
+     product_no_variant_attribute_value_ids = fields.Many2many('product.template.attribute.value', string='Product attribute values that do not create variants', ondelete='restrict')
+     purchase_line_warn_msg = fields.Text(related='product_id.purchase_line_warn_msg')
+-    collapse_composition = fields.Boolean(
+-        string="Hide Composition",
+-        help="If checked, the lines below this section will not be displayed in reports and portal.",
+-        compute="_compute_section_visibility_fields", store=True, copy=True,
+-    )
+-    collapse_prices = fields.Boolean(
+-        string="Hide Prices",
+-        help="If checked, the prices of the lines below this section will not be displayed in reports and portal.",
+-        compute="_compute_section_visibility_fields", store=True, copy=True,
+-    )
+     parent_id = fields.Many2one(
+         'purchase.order.line',
+         string="Parent Section Line",
+         compute='_compute_parent_id',
+-        index='btree_not_null',
+-        store=True
+     )
+-    child_ids = fields.One2many(comodel_name='purchase.order.line', inverse_name='parent_id')
+     technical_price_unit = fields.Float(help="Technical field for price computation")
+ 
+     @api.depends('product_qty', 'price_unit', 'tax_ids', 'discount')
+@@ -413,10 +400,12 @@ class PurchaseOrderLine(models.Model):
+             price_unit *= self.product_id.uom_id.factor / self.product_uom_id.factor
+         return price_unit
+ 
+-    @api.depends('order_id.order_line.order_id')
+     def _compute_parent_id(self):
+         purchase_order_lines = set(self)
+-        for order in self.grouped('order_id'):
++        for order, lines in self.grouped('order_id').items():
++            if not order:
++                lines.parent_id = False
++                continue
+             last_section = False
+             last_sub = False
+             for line in order.order_line.sorted('sequence'):
+@@ -432,20 +421,6 @@ class PurchaseOrderLine(models.Model):
+                 elif line in purchase_order_lines:
+                     line.parent_id = last_sub or last_section
+ 
+-    @api.depends('parent_id')
+-    def _compute_section_visibility_fields(self):
+-        for order in self.grouped('order_id'):
+-            for line in order.order_line.sorted('sequence'):
+-                if line.display_type == 'line_section':
+-                    continue
+-
+-                if line.display_type == 'line_subsection':
+-                    line.collapse_prices = line.collapse_prices or line.parent_id.collapse_prices
+-                    line.collapse_composition = line.collapse_composition or line.parent_id.collapse_composition
+-                else:
+-                    line.collapse_prices = line.parent_id.collapse_prices
+-                    line.collapse_composition = line.parent_id.collapse_composition
+-
+     def action_add_from_catalog(self):
+         order = self.env['purchase.order'].browse(self.env.context.get('order_id'))
+         return order.with_context(child_field='order_line').action_add_from_catalog()

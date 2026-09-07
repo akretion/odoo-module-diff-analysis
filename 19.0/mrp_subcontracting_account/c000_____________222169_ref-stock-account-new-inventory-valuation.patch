@@ -1,0 +1,182 @@
+PR: https://github.com/odoo/odoo/pull/222169
+
+From: 08b62a4bbcc6f9a391b2cc00a621ef4c76100229
+From: Arnold Moyaux
+Date: 2025-08-09 04:39:25
+
+Breaking data model changes scores: del:2 + add:0, change matches:
+-    _inherit = 'stock.move'
+-    _inherit = 'stock.picking'
+
+Total Changes: 85
+
+[REF] stock_account: New inventory valuation
+
+Functional:
+* Automated handling of periodic valuation
+* Closing report with managment of good delivered not invoiced and bill
+  to receive
+* Realtime valuation only at invoice/bill (no more at delivery/receipt)
+* Removal of input/output accounts
+* Automatic periodic/realtime closing
+* Error management at closing (back dating, rounding issue,...)
+* Back dating
+* Inventory value is justify from last documents rather than the full
+  history (fifo)
+
+Technical:
+* Removal of `stock.valuation.layer`
+* value is stored on the `stock.move`
+* value is compute base on accounting documents
+* value priority order is: manual val > bill/inv > po/so > std price
+* value could be use with a context at date to get the value at date
+* `product.value` to log manual update from the user without real
+  justification
+* It doesn't try to replay and correct the past. Instead it focus on the
+  current situation and match it
+
+The new valuation aims to reduce the complexity of realtime accounting
+and improve the simple periodic valuation.
+
+The value for move in is always computed base on account.move/so/po or
+standard price if none are available. In periodic, we compare the
+balance of valuation account and the computed value of product. We
+suggest the difference. In real time, the COGS are posted with the
+know value of the goods at the time, they are post. The possible error
+(back dating,...) are erased with the closing entries (same as periodic)
+
+There is no more account for input and output. Instead in the closing
+report, we show the po/so that are delivered but not invoiced. This way
+the user can create the accrual for it. If you have good receipt not
+billed. The inventory value will be greater than stock value. It result
+by an entry that debit stock account and credit the variation account.
+Then an accrual entry is posted to debit the variation account and
+credit a bill to receive account.
+
+There is a lot of skip test in this PR. We will try to remove them asap.
+We decided to merge it in this state since it's already functional and
+we can get feedbacks sooner.
+
+Remaining work:
+* Clean the test and remove all the skip (priority to module not in our
+  scope)
+* Analytic accounting
+* Adapt report for cost of good sold.
+* Accrual entries in report and closing account move
+
+closes odoo/odoo#222169
+
+Related: odoo/enterprise#91890
+Related: odoo/upgrade#8189
+Signed-off-by: Arnold Moyaux (arm) <arm@odoo.com>
+
+================================= pseudo patch: =================================
+
+--- a/addons/mrp_subcontracting_account/models/__init__.py
++++ b/addons/mrp_subcontracting_account/models/__init__.py
+@@ -2,6 +2,4 @@
+ # Part of Odoo. See LICENSE file for full copyright and licensing details.
+ 
+ from . import mrp_production
+-from . import stock_picking
+ from . import product_product
+-from . import stock_move
+
+--- a/addons/mrp_subcontracting_account/models/mrp_production.py
++++ b/addons/mrp_subcontracting_account/models/mrp_production.py
+@@ -12,5 +12,8 @@ class MrpProduction(models.Model):
+         # Take the price unit of the reception move
+         last_done_receipt = finished_move.move_dest_ids.filtered(lambda m: m.state == 'done')[-1:]
+         if last_done_receipt.is_subcontract:
+-            self.extra_cost = next(iter(last_done_receipt._get_price_unit().values()))
++            quantity = last_done_receipt.quantity
++            value_from_bill, bill_qty = last_done_receipt._get_value_from_account_move(quantity)
++            value_from_po = last_done_receipt._get_value_from_quotation(quantity - bill_qty)[0]
++            self.extra_cost = value_from_bill + value_from_po
+         return super()._cal_price(consumed_moves=consumed_moves)
+
+--- a/addons/mrp_subcontracting_account/models/stock_move.py
++++ b/None
+@@ -1,60 +0,0 @@
+-# -*- coding: utf-8 -*-
+-# Part of Odoo. See LICENSE file for full copyright and licensing details.
+-
+-from odoo import models
+-from odoo.tools import float_compare
+-
+-
+-class StockMove(models.Model):
+-    _inherit = 'stock.move'
+-
+-    def _should_force_price_unit(self):
+-        self.ensure_one()
+-        return self.is_subcontract or super()._should_force_price_unit()
+-
+-    def _generate_valuation_lines_data(self, partner_id, qty, debit_value, credit_value, debit_account_id, credit_account_id, svl_id, description):
+-        rslt = super()._generate_valuation_lines_data(partner_id, qty, debit_value, credit_value, debit_account_id, credit_account_id, svl_id, description)
+-
+-        subcontract_production = self.production_id.filtered(lambda p: p.subcontractor_id)
+-        rounding = self.product_id.uom_id.rounding
+-        if not subcontract_production or float_compare(qty, 0, precision_rounding=rounding) < 0:
+-            return rslt
+-        # split the credit line to two, one for component cost, one for subcontracting service cost
+-        currency = self.company_id.currency_id
+-        if self.product_id.cost_method == 'standard':
+-            # In case of standard price, the component cost is the cost of the product
+-            # the subcontracting service cost may not represent the real cost of the subcontracting service
+-            # the difference should be posted in price difference account in the end
+-            component_cost = abs(currency.round(sum(subcontract_production.move_raw_ids.stock_valuation_layer_ids.mapped('value'))))
+-            subcontract_service_cost = credit_value - component_cost
+-        else:
+-            subcontract_service_cost = currency.round(subcontract_production.extra_cost * qty)
+-            component_cost = credit_value - subcontract_service_cost
+-        if not currency.is_zero(subcontract_service_cost):
+-            del rslt['credit_line_vals']
+-            service_cost_account = self.product_id.product_tmpl_id.get_product_accounts()['stock_input']
+-            rslt['subcontract_credit_line_vals'] = {
+-                'name': description,
+-                'product_id': self.product_id.id,
+-                'quantity': qty,
+-                'product_uom_id': self.product_id.uom_id.id,
+-                'ref': description,
+-                'partner_id': partner_id,
+-                'balance': -subcontract_service_cost,
+-                'account_id': service_cost_account.id,
+-            }
+-            rslt['component_credit_line_vals'] = {
+-                'name': description,
+-                'product_id': self.product_id.id,
+-                'quantity': qty,
+-                'product_uom_id': self.product_id.uom_id.id,
+-                'ref': description,
+-                'partner_id': partner_id,
+-                'balance': -component_cost,
+-                'account_id': credit_account_id,
+-            }
+-        # if svl passed is not linked to the move in self, the valuation is a correction and should always credit the
+-        # `stock_input` account as it adds directly to the value of the subcontracted product
+-        elif svl_id and self.stock_valuation_layer_ids.ids and svl_id not in self.stock_valuation_layer_ids.ids:
+-            rslt['credit_line_vals']['account_id'] = self.product_id.product_tmpl_id.get_product_accounts()['stock_input'].id
+-        return rslt
+
+--- a/addons/mrp_subcontracting_account/models/stock_picking.py
++++ b/None
+@@ -1,18 +0,0 @@
+-# Part of Odoo. See LICENSE file for full copyright and licensing details.
+-
+-from odoo import models
+-from odoo.fields import Domain
+-
+-
+-class StockPicking(models.Model):
+-    _inherit = 'stock.picking'
+-
+-    def action_view_stock_valuation_layers(self):
+-        action = super(StockPicking, self).action_view_stock_valuation_layers()
+-        subcontracted_productions = self._get_subcontract_production()
+-        if not subcontracted_productions:
+-            return action
+-        domain = action['domain']
+-        domain_subcontracting = [('id', 'in', (subcontracted_productions.move_raw_ids | subcontracted_productions.move_finished_ids).stock_valuation_layer_ids.ids)]
+-        domain = Domain.OR([domain, domain_subcontracting])
+-        return dict(action, domain=domain)

@@ -1,0 +1,242 @@
+PR: https://github.com/odoo/odoo/pull/221225
+
+From: 1e0d929122b518f86cb01b61e0af42fde5554b84
+From: rajh-odoo
+Date: 2025-09-08 10:24:40
+
+Breaking data model changes scores: del:1 + add:0, change matches:
+-    show_task_button = fields.Boolean(compute='_compute_show_project_and_task_button', groups='project.group_project_user', export_string_translation=False)
+
+Total Changes: 125
+
+[IMP] sale_project,sale_timesheet: improve project creation flow from Sale Order
+
+Before this commit:
+* When a Sale Order (SO) had a service product that created both a project and
+  task, two stat buttons were shown on the SO project and another was task.
+* If you confirmed an SO with service product and then clicked "Create Project"
+  from the action menu, it would always create a normal project, no option to
+  create project based on project template.
+
+After this commit:
+* The task button has been removed from the SO. Now, only the project button is
+  shown to keep things simple.
+* When you confirm a Sale Order and then create a project from it, a wizard will
+  appear. And in this you can also choose a project template.
+* If you select a template, the project will be created based on that template.
+* If you don’t select any template, a regular project will be created instead.
+
+task-4946932
+
+closes odoo/odoo#221225
+
+Related: odoo/enterprise#91351
+Related: odoo/upgrade#8139
+Signed-off-by: Xavier Bol (xbo) <xbo@odoo.com>
+
+================================= pseudo patch: =================================
+
+--- a/addons/sale_project/models/project_project.py
++++ b/addons/sale_project/models/project_project.py
+@@ -866,6 +866,15 @@ class ProjectProject(models.Model):
+         action = super().action_view_tasks()
+         action['context']['hide_partner'] = self._get_hide_partner()
+         action['context']['allow_billable'] = self.allow_billable
++        if self.env.context.get("from_sale_order_action"):
++            context = dict(action.get("context", {}))
++            context.pop("search_default_open_tasks", None)
++            if self.sale_order_id:
++                context["search_default_sale_order_id"] = self.sale_order_id.id
++            if not self.sale_order_id:
++                sale_order = self.env["sale.order"].browse(self.env.context.get("active_id"))
++                context["default_sale_order_id"] = sale_order.id
++            action["context"] = context
+         return action
+ 
+     def action_open_project_vendor_bills(self):
+@@ -923,4 +932,5 @@ class ProjectProject(models.Model):
+         return [
+             *super()._get_template_default_context_whitelist(),
+             'allow_billable',
++            'from_sale_order_action',
+         ]
+
+--- a/addons/sale_project/models/project_task.py
++++ b/addons/sale_project/models/project_task.py
+@@ -44,6 +44,18 @@ class ProjectTask(models.Model):
+     def TASK_PORTAL_READABLE_FIELDS(self):
+         return super().TASK_PORTAL_READABLE_FIELDS | {'allow_billable', 'sale_order_id', 'sale_line_id', 'display_sale_order_button'}
+ 
++    @api.model
++    def default_get(self, fields):
++        default = super().default_get(fields)
++        if self.env.context.get("from_sale_order_action"):
++            sol = self.env['sale.order.line'].search([
++                ("order_id", "=", self.env.context.get("default_sale_order_id")),
++                ("project_id", "=", self.env.context.get("active_id")),
++            ], limit=1)
++            if sol:
++                default["sale_line_id"] = sol.id
++        return default
++
+     @api.model
+     def _group_expand_sales_order(self, sales_orders, domain):
+         start_date = self.env.context.get('gantt_start_date')
+@@ -239,3 +251,10 @@ class ProjectTask(models.Model):
+                 ('project_id', '!=', False),
+             ],
+         ])
++
++    def _get_template_default_context_whitelist(self):
++        return [
++            *super()._get_template_default_context_whitelist(),
++            'sale_line_id',
++            'from_sale_order_action',
++        ]
+
+--- a/addons/sale_project/models/sale_order.py
++++ b/addons/sale_project/models/sale_order.py
+@@ -30,7 +30,6 @@ class SaleOrder(models.Model):
+     is_product_milestone = fields.Boolean(compute='_compute_is_product_milestone', export_string_translation=False)
+     show_create_project_button = fields.Boolean(compute='_compute_show_project_and_task_button', groups='project.group_project_user', export_string_translation=False)
+     show_project_button = fields.Boolean(compute='_compute_show_project_and_task_button', groups='project.group_project_user', export_string_translation=False)
+-    show_task_button = fields.Boolean(compute='_compute_show_project_and_task_button', groups='project.group_project_user', export_string_translation=False)
+     closed_task_count = fields.Integer(compute='_compute_tasks_ids', groups="project.group_project_user", export_string_translation=False)
+     completed_task_percentage = fields.Float(compute="_compute_completed_task_percentage", groups="project.group_project_user", export_string_translation=False)
+     project_id = fields.Many2one('project.project', domain=[('allow_billable', '=', True), ('is_template', '=', False)], copy=False, help="A task will be created for the project upon sales order confirmation. The analytic distribution of this project will also serve as a reference for newly created sales order items.")
+@@ -58,11 +57,7 @@ class SaleOrder(models.Model):
+         ], aggregates=['order_id:array_agg'])[0][0]
+         for order in self:
+             state = order.state not in ['draft', 'sent']
+-            service_tracking = any(line.product_id.service_tracking == 'no' for line in order.order_line)
+             order.show_project_button = state and order.project_count
+-            order.show_task_button = state and (any(order.order_line.mapped('project_id'))
+-                or order.tasks_count
+-                or (service_tracking and order.project_id))
+             order.show_create_project_button = (
+                 is_project_manager
+                 and order.id in show_button_ids
+@@ -158,52 +153,6 @@ class SaleOrder(models.Model):
+                         break
+         return super()._action_confirm()
+ 
+-    def action_view_task(self):
+-        self.ensure_one()
+-        if not self.order_line:
+-            return {'type': 'ir.actions.act_window_close'}
+-
+-        list_view_id = self.env.ref('project.view_task_tree2').id
+-        form_view_id = self.env.ref('project.view_task_form2').id
+-        kanban_view_id = self.env.ref('project.view_task_kanban_inherit_view_default_project').id
+-
+-        project_ids = self.tasks_ids.project_id
+-        if len(project_ids) > 1:
+-            action = self.env['ir.actions.actions']._for_xml_id('project.action_view_task')
+-            action['domain'] = list(Domain.AND([ast.literal_eval(action['domain']), self._tasks_ids_domain()]))
+-            action['context'] = {}
+-        else:
+-            # Load top bar if all the tasks linked to the SO belong to the same project
+-            action = self.env['ir.actions.actions'].with_context({'active_id': project_ids.id})._for_xml_id('project.act_project_project_2_project_task_all')
+-            action['context'] = {
+-                'active_id': project_ids.id,
+-                'search_default_sale_order_id': self.id,
+-            }
+-
+-        if self.tasks_count > 1:  # cross project kanban task
+-            for idx, (_view_id, view_type) in enumerate(action['views']):
+-                if view_type == 'kanban':
+-                    action['views'][idx] = (kanban_view_id, 'kanban')
+-                elif view_type == 'list':
+-                    action['views'][idx] = (list_view_id, 'list')
+-                elif view_type == 'form':
+-                    action['views'][idx] = (form_view_id, 'form')
+-        else:  # 1 or 0 tasks -> form view
+-            action['views'] = [(form_view_id, 'form')]
+-            action['res_id'] = self.tasks_ids.id
+-        # set default project
+-        default_line = next((sol for sol in self.order_line if sol.product_id.type == 'service'), self.env['sale.order.line'])
+-        default_project_id = default_line.project_id.id or self.project_ids[:1].id or self.tasks_ids.project_id[:1].id
+-
+-        action['context'].update({
+-            'default_sale_order_id': self.id,
+-            'default_sale_line_id': default_line.id,
+-            'default_partner_id': self.partner_id.id,
+-            'default_project_id': default_project_id,
+-            'default_user_ids': [self.env.uid],
+-        })
+-        return action
+-
+     def _tasks_ids_domain(self):
+         return [('project_id', '!=', False), '|', ('sale_line_id', 'in', self.order_line.ids), ('sale_order_id', 'in', self.ids)]
+ 
+@@ -224,8 +173,11 @@ class SaleOrder(models.Model):
+             sol for sol in sorted_line
+             if sol.product_id.type == 'service' and not sol.is_downpayment
+         ), self.env['sale.order.line'])
++        view_id = self.env.ref('sale_project.sale_project_view_form_simplified_template', raise_if_not_found=False)
+         return {
+-            **self.env["ir.actions.actions"]._for_xml_id("project.open_create_project"),
++            **self.env['project.template.create.wizard'].action_open_template_view(),
++            'name': self.env._('Create a Project'),
++            'views': [(view_id.id, 'form')],
+             'context': {
+                 'default_sale_order_id': self.id,
+                 'default_reinvoiced_sale_order_id': self.id,
+@@ -236,6 +188,7 @@ class SaleOrder(models.Model):
+                 'hide_allow_billable': True,
+                 'default_company_id': self.company_id.id,
+                 'generate_milestone': default_sale_line.product_id.service_policy == 'delivered_milestones',
++                'default_name': self.name,
+             },
+         }
+ 
+@@ -248,23 +201,36 @@ class SaleOrder(models.Model):
+         default_sale_line = next((
+             sol for sol in sorted_line if sol.product_id.type == 'service'
+         ), self.env['sale.order.line'])
+-        action = {
+-            'type': 'ir.actions.act_window',
+-            'name': _('Projects'),
+-            'domain': ['|', ('sale_order_id', '=', self.id), ('id', 'in', self.with_context(active_test=False).project_ids.ids), ('active', 'in', [True, False])],
+-            'res_model': 'project.project',
+-            'views': [(False, 'kanban'), (False, 'list'), (False, 'form')],
+-            'view_mode': 'kanban,list,form',
+-            'context': {
++        project_ids = self.with_context(active_test=False).project_ids
++        partner = self.partner_shipping_id or self.partner_id
++        if len(project_ids) == 1:
++            action = (self.env['ir.actions.actions']._for_xml_id('project.action_view_task'))
++            action['context'] = {
++                'active_id': project_ids.id,
++                'default_partner_id': partner.id,
++                'default_project_id': self.project_ids.id,
++                'default_sale_line_id': default_sale_line.id,
++                'default_user_ids': [self.env.uid],
++                'search_default_sale_order_id': self.id,
++            }
++            return action
++        else:
++            action = self.env['ir.actions.actions']._for_xml_id('project.open_view_project_all')
++            action['domain'] = [
++                '|',
++                ('sale_order_id', '=', self.id),
++                ('id', 'in', project_ids.ids),
++                ('active', 'in', [True, False]),
++            ]
++            action['context'] = {
+                 **self.env.context,
+-                'default_partner_id': self.partner_id.id,
++                'default_partner_id': partner.id,
++                'default_reinvoiced_sale_order_id': self.id,
+                 'default_sale_line_id': default_sale_line.id,
+                 'default_allow_billable': 1,
++                'from_sale_order_action': True,
+             }
+-        }
+-        if len(self.with_context(active_test=False).project_ids) == 1:
+-            action.update({'views': [(False, 'form')], 'res_id': self.project_ids.id})
+-        return action
++            return action
+ 
+     def action_view_milestone(self):
+         self.ensure_one()

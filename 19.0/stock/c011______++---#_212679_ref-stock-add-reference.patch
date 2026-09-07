@@ -1,0 +1,635 @@
+PR: https://github.com/odoo/odoo/pull/212679
+
+From: 2713876dbc70d3984e584a9037a2206dcda4e84a
+From: Arnold Moyaux
+Date: 2025-09-07 15:50:27
+
+Breaking data model changes scores: del:11 + add:4, change matches:
+-    group_id = fields.Many2one('procurement.group', 'Procurement Group', default=_default_group_id, index=True)
++    reference_ids = fields.Many2many(
+-    group_id = fields.Many2one(
+-    group_id = fields.Many2one(
++    reference_ids = fields.Many2many(
++    move_ids = fields.Many2many(
++    picking_ids = fields.Many2many('stock.picking', compute='_compute_picking_ids', string="Transfers", readonly=True)
+-    group_propagation_option = fields.Selection([
+-    group_id = fields.Many2one('procurement.group', 'Fixed Procurement Group')
+-    propagate_warehouse_id = fields.Many2one(
+-    partner_id = fields.Many2one('res.partner', 'Partner')
+-    name = fields.Char(
+-    move_type = fields.Selection(
+-    stock_move_ids = fields.One2many('stock.move', 'group_id', string="Related Stock Moves")
+
+Total Changes: 209
+
+[REF] stock, *: add reference
+
+The model `procurement.group` is replaced by a more flexible one:
+`stock.reference`. The first one was somehow not well understood and a
+bit limited by its many2one links to other business model (Sales Order,
+Purchase Order, ...). The reference is made of a name and many2many to
+all the documents integrated with Inventory. It's purpose has been
+shrank to the minimal "make links between object". For instance
+opening the manufacturing order created for a MTO sale. The merge of
+stock move is delegated to existing parameters (`sale_id`,
+created_purchase_line_ids`, ...)
+
+The `mrp.production` needed an extra effort to group them according to
+inheritance relationships. This commit add a new object to group
+productions together either in a backorder relation or in a child-parent
+one. This allow for instance to have a Sale Order linked to the MTO
+product of the sold product and the production them selves to be linked
+to the SO *and* the potential child MOs.
+
+The procurement group propagation, before set on the Stock Rule, allowing
+the stock moves to be merged in an existing picking or not has been
+removed and replaced (for the creation of purchase order only) by a new
+parameter on `res.partner` allowing the group of Request for Quotation
+base on the scheduled date of the potential merge candidate (never, same
+week, same month, always). All other merge scenarios should use batches
+and waves transfers.
+
+closes odoo/odoo#212679
+
+Task: 4279803
+Related: odoo/enterprise#87170
+Related: odoo/upgrade#8326
+Signed-off-by: Arnold Moyaux (arm) <arm@odoo.com>
+
+================================= pseudo patch: =================================
+
+--- a/addons/stock/models/__init__.py
++++ b/addons/stock/models/__init__.py
+@@ -15,6 +15,7 @@ from . import stock_orderpoint
+ from . import stock_lot
+ from . import stock_picking
+ from . import stock_quant
++from . import stock_reference
+ from . import stock_replenish_mixin
+ from . import stock_rule
+ from . import stock_warehouse
+
+--- a/addons/stock/models/product.py
++++ b/addons/stock/models/product.py
+@@ -653,9 +653,7 @@ class ProductProduct(models.Model):
+         if not seen_rules:
+             seen_rules = self.env['stock.rule']
+         warehouse = location.warehouse_id
+-        if not warehouse and seen_rules:
+-            warehouse = seen_rules[-1].propagate_warehouse_id
+-        rule = self.env['procurement.group'].with_context(active_test=True)._get_rule(self, location, {
++        rule = self.env['stock.rule'].with_context(active_test=True)._get_rule(self, location, {
+             'route_ids': route_ids,
+             'warehouse_id': warehouse,
+         })
+
+--- a/addons/stock/models/stock_move.py
++++ b/addons/stock/models/stock_move.py
+@@ -21,11 +21,6 @@ class StockMove(models.Model):
+     _order = 'sequence, id'
+     _rec_name = 'reference'
+ 
+-    def _default_group_id(self):
+-        if self.env.context.get('default_picking_id'):
+-            return self.env['stock.picking'].browse(self.env.context['default_picking_id']).group_id.id
+-        return False
+-
+     sequence = fields.Integer('Sequence', default=10)
+     priority = fields.Selection(
+         PROCUREMENT_PRIORITIES, 'Priority', default='0',
+@@ -139,8 +134,9 @@ class StockMove(models.Model):
+              "its current stock) to gather products. If we want to chain moves and have this one to wait for the previous, "
+              "this second option should be chosen.")
+     scrap_id = fields.Many2one('stock.scrap', 'Scrap operation', readonly=True, check_company=True, index='btree_not_null')
+-    group_id = fields.Many2one('procurement.group', 'Procurement Group', default=_default_group_id, index=True)
+     procurement_values = fields.Json(store=False, help="Dummy field to store procurement values to propagate them to later steps")
++    reference_ids = fields.Many2many(
++        'stock.reference', 'stock_reference_move_rel', 'move_id', 'reference_id', string='References')
+     rule_id = fields.Many2one(
+         'stock.rule', 'Stock Rule', ondelete='restrict', help='The stock rule that created this stock move',
+         check_company=True)
+@@ -708,6 +704,11 @@ Please change the quantity done or the rounding precision in your settings.""",
+                 move.product_id.code and '%s: ' % move.product_id.code or '',
+                 move.location_id.name, move.location_dest_id.name)
+ 
++    def _set_references(self):
++        for move in self:
++            if not move.reference_ids and move.picking_id:
++                move.reference_ids = move.picking_id.reference_ids
++
+     @api.depends('product_id', 'picking_type_id', 'description_picking_manual')
+     def _compute_description_picking(self):
+         for move in self:
+@@ -733,14 +734,13 @@ Please change the quantity done or the rounding precision in your settings.""",
+             if (vals.get('quantity') or vals.get('move_line_ids')) and 'lot_ids' in vals:
+                 vals.pop('lot_ids')
+             picking_id = self.env['stock.picking'].browse(vals.get('picking_id'))
+-            if picking_id.group_id and 'group_id' not in vals:
+-                vals['group_id'] = picking_id.group_id.id
+             if picking_id.state == 'done' and vals.get('state') != 'done':
+                 vals['state'] = 'done'
+             if vals.get('state') == 'done':
+                 vals['picked'] = True
+         res = super().create(vals_list)
+         res._update_orderpoints()
++        res._set_references()
+         return res
+ 
+     def write(self, vals):
+@@ -778,10 +778,6 @@ Please change the quantity done or the rounding precision in your settings.""",
+             move_to_recompute_state |= self.filtered(lambda m: m.state not in ['draft', 'cancel', 'done'])
+         if 'location_id' in vals:
+             move_to_check_location = self.filtered(lambda m: m.location_id.id != vals.get('location_id'))
+-        if 'picking_id' in vals and 'group_id' not in vals:
+-            picking = self.env['stock.picking'].browse(vals['picking_id'])
+-            if picking.group_id:
+-                vals['group_id'] = picking.group_id.id
+         if 'product_id' in vals or 'location_id' in vals or 'location_dest_id' in vals:
+             self._update_orderpoints()
+         res = super().write(vals)
+@@ -809,6 +805,8 @@ Please change the quantity done or the rounding precision in your settings.""",
+         if ('product_id' in vals or 'state' in vals or 'date' in vals or 'product_uom_qty' in vals or
+                 'location_id' in vals or 'location_dest_id' in vals):
+             self._update_orderpoints()
++        if 'picking_id' in vals:
++            self._set_references()
+         return res
+ 
+     def _update_orderpoints(self):
+@@ -1101,20 +1099,20 @@ Please change the quantity done or the rounding precision in your settings.""",
+             # first priority goes to the preferred routes defined on the move itself (e.g. coming from a SO line)
+             warehouse_id = move.warehouse_id or move.picking_id.picking_type_id.warehouse_id
+ 
+-            ProcurementGroup = self.env['procurement.group']
++            StockRule = self.env['stock.rule']
+             if move.location_dest_id.company_id not in self.env.companies:
+-                ProcurementGroup = self.env['procurement.group'].sudo()
++                StockRule = self.env['stock.rule'].sudo()
+                 move = move.with_context(allowed_companies=self.env.user.company_ids.ids)
+                 warehouse_id = False
+ 
+-            rule = ProcurementGroup._get_push_rule(move.product_id, move.location_dest_id, {
++            rule = StockRule._get_push_rule(move.product_id, move.location_dest_id, {
+                 'route_ids': move.route_ids | move.move_line_ids.result_package_id.package_type_id.route_ids, 'warehouse_id': warehouse_id, 'packaging_uom_id': move.packaging_uom_id,
+             })
+ 
+             excluded_rule_ids = []
+             while (rule and rule.push_domain and not move.filtered_domain(literal_eval(rule.push_domain))):
+                 excluded_rule_ids.append(rule.id)
+-                rule = ProcurementGroup._get_push_rule(move.product_id, move.location_dest_id, {
++                rule = StockRule._get_push_rule(move.product_id, move.location_dest_id, {
+                     'route_ids': move.route_ids | move.move_line_ids.result_package_id.package_type_id.route_ids, 'warehouse_id': warehouse_id, 'packaging_uom_id': move.packaging_uom_id,
+                     'domain': [('id', 'not in', excluded_rule_ids)],
+                 })
+@@ -1353,20 +1351,20 @@ Please change the quantity done or the rounding precision in your settings.""",
+ 
+     def _key_assign_picking(self):
+         self.ensure_one()
+-        keys = (self.group_id, self.location_id, self.location_dest_id, self.picking_type_id)
+-        if self.partner_id and not self.group_id:
++        keys = (self.reference_ids, self.location_id, self.location_dest_id, self.picking_type_id)
++        if self.partner_id and not self.reference_ids:
+             keys += (self.partner_id, )
+         return keys
+ 
+     def _search_picking_for_assignation_domain(self):
+         domain = [
+-            ('group_id', '=', self.group_id.id),
++            ('reference_ids', '=', self.reference_ids.ids),
+             ('location_id', '=', self.location_id.id),
+             ('location_dest_id', '=', (self.location_dest_id.id or self.picking_type_id.default_location_dest_id.id)),
+             ('picking_type_id', '=', self.picking_type_id.id),
+             ('printed', '=', False),
+             ('state', 'in', ['draft', 'confirmed', 'waiting', 'partially_available', 'assigned'])]
+-        if self.partner_id and not self.group_id:
++        if self.partner_id and not self.reference_ids:
+             domain += [('partner_id', '=', self.partner_id.id)]
+         return domain
+ 
+@@ -1503,7 +1501,6 @@ Please change the quantity done or the rounding precision in your settings.""",
+             'origin': origin,
+             'company_id': self.mapped('company_id').id,
+             'user_id': False,
+-            'group_id': self.mapped('group_id').id,
+             'partner_id': partner,
+             'picking_type_id': self.mapped('picking_type_id').id,
+             'location_id': self.mapped('location_id').id,
+@@ -1541,7 +1538,7 @@ Please change the quantity done or the rounding precision in your settings.""",
+             else:
+                 move_to_confirm.add(move.id)
+             if move._should_be_assigned():
+-                key = (move.group_id.id, move.location_id.id, move.location_dest_id.id)
++                key = (frozenset(move.reference_ids.ids), move.location_id.id, move.location_dest_id.id)
+                 to_assign[key].add(move.id)
+ 
+         # create procurements for make to order moves
+@@ -1551,11 +1548,11 @@ Please change the quantity done or the rounding precision in your settings.""",
+         for move, quantity in zip(move_create_proc, quantities):
+             values = move._prepare_procurement_values()
+             origin = move._prepare_procurement_origin()
+-            procurement_requests.append(self.env['procurement.group'].Procurement(
++            procurement_requests.append(self.env['stock.rule'].Procurement(
+                 move.product_id, quantity, move.product_uom,
+                 move.location_id, move.rule_id and move.rule_id.name or "/",
+                 origin, move.company_id, values))
+-        self.env['procurement.group'].run(procurement_requests, raise_user_error=not self.env.context.get('from_orderpoint'))
++        self.env['stock.rule'].run(procurement_requests, raise_user_error=not self.env.context.get('from_orderpoint'))
+ 
+         move_to_confirm, move_waiting = self.browse(move_to_confirm).filtered(lambda m: m.state != 'cancel'), self.browse(move_waiting).filtered(lambda m: m.state != 'cancel')
+         move_to_confirm.write({'state': 'confirmed'})
+@@ -1614,7 +1611,7 @@ Please change the quantity done or the rounding precision in your settings.""",
+ 
+     def _prepare_procurement_origin(self):
+         self.ensure_one()
+-        return self.group_id and self.group_id.name or (self.origin or self.picking_id.name or "/")
++        return (self.reference_ids and self.reference_ids[0].name) or self.origin or self.picking_id.display_name
+ 
+     def _prepare_procurement_qty(self):
+         quantities = []
+@@ -1655,20 +1652,16 @@ Please change the quantity done or the rounding precision in your settings.""",
+         be used in move/po creation.
+         """
+         self.ensure_one()
+-        group_id = self.group_id or False
+-        if self.rule_id:
+-            if self.rule_id.group_propagation_option == 'fixed' and self.rule_id.group_id:
+-                group_id = self.rule_id.group_id
+-            elif self.rule_id.group_propagation_option == 'none':
+-                group_id = False
+ 
+         product_id = self.product_id.with_context(lang=self._get_lang())
+         dates_info = {'date_planned': self._get_mto_procurement_date()}
++        route = []
+         if self.location_id.warehouse_id and self.location_id.warehouse_id.lot_stock_id.parent_path in self.location_id.parent_path:
+             dates_info = self.product_id._get_dates_info(self.date, self.location_id, route_ids=self.route_ids)
+         warehouse = self.warehouse_id or self.picking_type_id.warehouse_id
+         if not self.location_id.warehouse_id:
+-            warehouse = self.rule_id.propagate_warehouse_id
++            warehouse = self.env['stock.warehouse']
++            route = self.route_ids or self.move_line_ids.result_package_id.package_type_id.route_ids
+         move_dest_ids = False
+         if self.procure_method == "make_to_order":
+             move_dest_ids = self
+@@ -1680,10 +1673,10 @@ Please change the quantity done or the rounding precision in your settings.""",
+             'date_order': dates_info.get('date_order'),
+             'date_deadline': self.date_deadline,
+             'move_dest_ids': move_dest_ids,
+-            'group_id': group_id,
+-            'route_ids': self.route_ids or self.move_line_ids.result_package_id.package_type_id.route_ids,
++            'route_ids': route,
+             'warehouse_id': warehouse,
+             'priority': self.priority,
++            'reference_ids': self.reference_ids,
+             'orderpoint_id': self.orderpoint_id,
+             'packaging_uom_id': self.packaging_uom_id,
+             'procurement_values': self.procurement_values,
+@@ -2342,7 +2335,7 @@ Please change the quantity done or the rounding precision in your settings.""",
+                 ]
+                 if picking_type_code:
+                     domain.append(('picking_type_id.code', '=', picking_type_code))
+-                rule = self.env['procurement.group']._search_rule(False, move.packaging_uom_id, product_id, move.warehouse_id, domain)
++                rule = self.env['stock.rule']._search_rule(False, move.packaging_uom_id, product_id, move.warehouse_id, domain)
+                 if rule:
+                     break
+                 location = location.location_id
+@@ -2373,9 +2366,9 @@ Please change the quantity done or the rounding precision in your settings.""",
+             ], limit=1)
+             if orderpoint:
+                 orderpoints_by_company[orderpoint.company_id] |= orderpoint
+-            if orderpoint and move.product_qty > orderpoint.product_min_qty and move.origin:
+-                orderpoints_context_by_company[orderpoint.company_id].setdefault(orderpoint.id, [])
+-                orderpoints_context_by_company[orderpoint.company_id][orderpoint.id].append(move.origin)
++            if orderpoint and move.product_qty > orderpoint.product_min_qty and move.reference_ids:
++                orderpoints_context_by_company[orderpoint.company_id].setdefault(orderpoint.id, set())
++                orderpoints_context_by_company[orderpoint.company_id][orderpoint.id] |= set(move.reference_ids.ids)
+         for company, orderpoints in orderpoints_by_company.items():
+             orderpoints.with_context(origins=orderpoints_context_by_company[company])._procure_orderpoint_confirm(
+                 company_id=company, raise_user_error=False)
+@@ -2400,7 +2393,7 @@ Please change the quantity done or the rounding precision in your settings.""",
+         moves_to_reserve = self.env['stock.move'].search(
+             Domain(static_domain) & product_domains,
+             order='priority desc, date asc, id asc')
+-        moves_to_reserve = moves_to_reserve.sorted(key=lambda m: m.group_id.id in self.group_id.ids, reverse=True)
++        moves_to_reserve = moves_to_reserve.sorted(key=lambda m: any(r in self.reference_ids.ids for r in m.reference_ids.ids), reverse=True)
+         moves_to_reserve._action_assign()
+ 
+     def _rollup_move_dests_fetch(self):
+
+--- a/addons/stock/models/stock_orderpoint.py
++++ b/addons/stock/models/stock_orderpoint.py
+@@ -65,9 +65,6 @@ class StockWarehouseOrderpoint(models.Model):
+         'uom.uom', 'Multiple',
+         domain="[('id', 'in', allowed_replenishment_uom_ids)]", help="The procurement quantity will be rounded up to a multiple of this unit/packaging. If it is not set, it is not rounded.")
+     replenishment_uom_id_placeholder = fields.Char(compute='_compute_replenishment_uom_id_placeholder')
+-    group_id = fields.Many2one(
+-        'procurement.group', 'Procurement Group', copy=False,
+-        help="Moves created through this orderpoint will be put in this procurement group. If none is given, the moves generated by stock rules will be grouped into one big picking.")
+     company_id = fields.Many2one(
+         'res.company', 'Company', required=True, index=True,
+         default=lambda self: self.env.company)
+@@ -428,7 +425,7 @@ class StockWarehouseOrderpoint(models.Model):
+ 
+     def _get_default_rule(self):
+         self.ensure_one()
+-        return self.env['procurement.group']._get_rule(self.product_id, self.location_id, {
++        return self.env['stock.rule']._get_rule(self.product_id, self.location_id, {
+             'route_ids': self.route_id,
+             'warehouse_id': self.warehouse_id,
+         })
+@@ -680,22 +677,25 @@ class StockWarehouseOrderpoint(models.Model):
+         orderpoints_to_remove.unlink()
+         return orderpoints_to_remove
+ 
+-    def _prepare_procurement_values(self, date=False, group=False):
++    def _prepare_procurement_values(self, date=False):
+         """ Prepare specific key for moves or other components that will be created from a stock rule
+         comming from an orderpoint. This method could be override in order to add other custom key that could
+         be used in move/po creation.
+         """
+         date_deadline = date or fields.Date.today()
+         dates_info = self.product_id._get_dates_info(date_deadline, self.location_id, route_ids=self.route_id)
+-        return {
++        values = {
+             'route_ids': self.route_id,
+             'date_planned': dates_info['date_planned'],
+             'date_order': dates_info['date_order'],
+             'date_deadline': date or False,
+             'warehouse_id': self.warehouse_id,
+             'orderpoint_id': self,
+-            'group_id': group or self.group_id,
+         }
++        reference = self.env.context.get('origins')
++        if reference:
++            values['reference_ids'] = self.env['stock.reference'].browse(reference.get(self.id))
++        return values
+ 
+     def _procure_orderpoint_confirm(self, use_new_cursor=False, company_id=None, raise_user_error=True):
+         """ Create procurements based on orderpoints.
+@@ -718,7 +718,8 @@ class StockWarehouseOrderpoint(models.Model):
+                     for orderpoint in orderpoints_batch:
+                         origins = orderpoint.env.context.get('origins', {}).get(orderpoint.id, False)
+                         if origins:
+-                            origin = '%s - %s' % (orderpoint.display_name, ','.join(origins))
++                            origins = self.env['stock.reference'].browse(origins)
++                            origin = '%s - %s' % (orderpoint.display_name, ','.join(origins.mapped('name')))
+                         else:
+                             origin = orderpoint.name
+                         if orderpoint.product_uom.compare(orderpoint.qty_to_order, 0.0) == 1:
+@@ -727,14 +728,14 @@ class StockWarehouseOrderpoint(models.Model):
+                             if global_horizon_days:
+                                 date -= relativedelta.relativedelta(days=int(global_horizon_days))
+                             values = orderpoint._prepare_procurement_values(date=date)
+-                            procurements.append(self.env['procurement.group'].Procurement(
++                            procurements.append(self.env['stock.rule'].Procurement(
+                                 orderpoint.product_id, orderpoint.qty_to_order, orderpoint.product_uom,
+                                 orderpoint.location_id, orderpoint.name, origin,
+                                 orderpoint.company_id, values))
+ 
+                     try:
+                         with self.env.cr.savepoint():
+-                            self.env['procurement.group'].with_context(from_orderpoint=True).run(procurements, raise_user_error=raise_user_error)
++                            self.env['stock.rule'].with_context(from_orderpoint=True).run(procurements, raise_user_error=raise_user_error)
+                     except ProcurementException as errors:
+                         orderpoints_exceptions = []
+                         for procurement, error_msg in errors.procurement_exceptions:
+
+--- a/addons/stock/models/stock_picking.py
++++ b/addons/stock/models/stock_picking.py
+@@ -586,9 +586,8 @@ class StockPicking(models.Model):
+              " * Ready: The transfer is ready to be processed.\n(a) The shipping policy is \"As soon as possible\": at least one product has been reserved.\n(b) The shipping policy is \"When all products are ready\": all product have been reserved.\n"
+              " * Done: The transfer has been processed.\n"
+              " * Cancelled: The transfer has been cancelled.")
+-    group_id = fields.Many2one(
+-        'procurement.group', 'Procurement Group',
+-        readonly=True, related='move_ids.group_id', store=True)
++    reference_ids = fields.Many2many(
++        'stock.reference', related="move_ids.reference_ids", string="References", readonly=True)
+     priority = fields.Selection(
+         PROCUREMENT_PRIORITIES, string='Priority', default='0',
+         help="Products will be reserved first for the transfers with the highest priorities.")
+@@ -717,8 +716,7 @@ class StockPicking(models.Model):
+     @api.depends('picking_type_id')
+     def _compute_move_type(self):
+         for record in self:
+-            if not record.group_id.move_type:
+-                record.move_type = record.picking_type_id.move_type
++            record.move_type = record.picking_type_id.move_type
+ 
+     @api.depends('date_deadline', 'scheduled_date')
+     def _compute_has_deadline_issue(self):
+@@ -1102,10 +1100,6 @@ class StockPicking(models.Model):
+                 if picking_type.sequence_id:
+                     vals['name'] = picking_type.sequence_id.next_by_id()
+ 
+-            if 'move_type' not in vals and vals.get('group_id'):
+-                procurement_group = self.env['procurement.group'].browse(vals.get('group_id'))
+-                if procurement_group.move_type:
+-                    vals['move_type'] = procurement_group.move_type
+             # make sure to write `schedule_date` *after* the `stock.move` creation in
+             # order to get a determinist execution of `_set_scheduled_date`
+             scheduled_dates.append(vals.pop('scheduled_date', False))
+
+--- a/None
++++ b/addons/stock/models/stock_reference.py
+@@ -0,0 +1,15 @@
++from odoo import fields, models
++
++
++class StockReference(models.Model):
++    _name = 'stock.reference'
++    _description = 'Reference between stock documents'
++
++    name = fields.Char('Reference', required=True, readonly=True)
++    move_ids = fields.Many2many(
++        'stock.move', 'stock_reference_move_rel', 'reference_id', 'move_id', string="Stock Moves")
++    picking_ids = fields.Many2many('stock.picking', compute='_compute_picking_ids', string="Transfers", readonly=True)
++
++    def _compute_picking_ids(self):
++        for reference in self:
++            reference.picking_ids = reference.move_ids.picking_id
+
+--- a/addons/stock/models/stock_rule.py
++++ b/addons/stock/models/stock_rule.py
+@@ -2,12 +2,13 @@
+ 
+ import datetime
+ import logging
+-from collections import defaultdict, namedtuple, OrderedDict
++from collections import defaultdict, OrderedDict
+ from dateutil.relativedelta import relativedelta
++from typing import NamedTuple
+ 
+ from odoo import _, api, fields, models
+ from odoo.exceptions import UserError, ValidationError
+-from odoo.fields import Domain
++from odoo.fields import Command, Domain
+ from odoo.tools import float_is_zero
+ from odoo.tools.misc import split_every
+ 
+@@ -15,7 +16,7 @@ _logger = logging.getLogger(__name__)
+ 
+ 
+ class ProcurementException(Exception):
+-    """An exception raised by ProcurementGroup `run` containing all the faulty
++    """An exception raised by StockRule `run` containing all the faulty
+     procurements.
+     """
+     def __init__(self, procurement_exceptions):
+@@ -26,6 +27,17 @@ class ProcurementException(Exception):
+         self.procurement_exceptions = procurement_exceptions
+ 
+ 
++class Procurement(NamedTuple):
++    product_id: fields.Many2one
++    product_qty: fields.Float
++    product_uom: fields.Many2one
++    location_id: fields.Many2one
++    name: fields.Char
++    origin: fields.Char
++    company_id: fields.Many2one
++    values: dict
++
++
+ class StockRule(models.Model):
+     """ A rule describe what a procurement should do; produce, buy, move, ... """
+     _name = 'stock.rule'
+@@ -40,17 +52,13 @@ class StockRule(models.Model):
+             res['company_id'] = self.env.company.id
+         return res
+ 
++    Procurement = Procurement
+     name = fields.Char(
+         'Name', required=True, translate=True,
+         help="This field will fill the packing origin and the name of its moves")
+     active = fields.Boolean(
+         'Active', default=True,
+         help="If unchecked, it will allow you to hide the rule without removing it.")
+-    group_propagation_option = fields.Selection([
+-        ('none', 'Leave Empty'),
+-        ('propagate', 'Propagate'),
+-        ('fixed', 'Fixed')], string="Propagation of Procurement Group", default='propagate')
+-    group_id = fields.Many2one('procurement.group', 'Fixed Procurement Group')
+     action = fields.Selection(
+         selection=[('pull', 'Pull From'), ('push', 'Push To'), ('pull_push', 'Pull & Push')], string='Action',
+         default='pull', required=True, index=True)
+@@ -92,9 +100,6 @@ class StockRule(models.Model):
+         'Propagation of carrier', default=False,
+         help="When ticked, carrier of shipment will be propagated.")
+     warehouse_id = fields.Many2one('stock.warehouse', 'Warehouse', check_company=True, index=True)
+-    propagate_warehouse_id = fields.Many2one(
+-        'stock.warehouse', 'Warehouse to Propagate',
+-        help="The warehouse to propagate on the created move/procurement, which can be different of the warehouse this rule is for (e.g for resupplying rules from another warehouse)")
+     auto = fields.Selection([
+         ('manual', 'Manual Operation'),
+         ('transparent', 'Automatic No Step Added')], string='Automatic Move',
+@@ -318,17 +323,12 @@ class StockRule(models.Model):
+ 
+         :rtype: dictionary
+         '''
+-        group_id = False
+-        if self.group_propagation_option == 'propagate':
+-            group_id = values.get('group_id', False) and values['group_id'].id
+-        elif self.group_propagation_option == 'fixed':
+-            group_id = self.group_id.id
+ 
+         date_scheduled = fields.Datetime.to_string(
+             fields.Datetime.from_string(values['date_planned']) - relativedelta(days=self.delay or 0)
+         )
+         date_deadline = values.get('date_deadline') and (fields.Datetime.to_datetime(values['date_deadline']) - relativedelta(days=self.delay or 0)) or False
+-        partner = self.partner_address_id or (values.get('group_id', False) and values['group_id'].partner_id)
++        partner = self.partner_address_id or values.get('partner', False)
+         # it is possible that we've already got some move done, so check for the done qty and create
+         # a new move with the correct qty
+         qty_left = product_qty
+@@ -358,16 +358,16 @@ class StockRule(models.Model):
+             'location_final_id': location_dest_id.id,
+             'move_dest_ids': move_dest_ids,
+             'rule_id': self.id,
++            'reference_ids': [Command.set(values.get('reference_ids', self.env['stock.reference']).ids)],
+             'procure_method': self.procure_method,
+             'origin': origin,
+             'picking_type_id': self.picking_type_id.id,
+-            'group_id': group_id,
+             'procurement_values': self._serialize_procurement_values(values),
+-            'route_ids': [(4, route.id) for route in values.get('route_ids', [])],
++            'route_ids': [Command.clear()] + [Command.link(route.id) for route in values.get('route_ids', [])] + [Command.link(self.route_id.id)],
+             'never_product_template_attribute_value_ids': values.get('never_product_template_attribute_value_ids'),
+             'warehouse_id': self.warehouse_id.id,
+             'date': date_scheduled,
+-            'date_deadline': False if self.group_propagation_option == 'fixed' else date_deadline,
++            'date_deadline': date_deadline,
+             'propagate_cancel': self.propagate_cancel,
+             'priority': values.get('priority', "0"),
+             'orderpoint_id': values.get('orderpoint_id') and values['orderpoint_id'].id,
+@@ -433,47 +433,6 @@ class StockRule(models.Model):
+                 delay_description.append((_('Time Horizon'), _('+ %d day(s)', global_horizon_days)))
+         return delays, delay_description
+ 
+-
+-class ProcurementGroup(models.Model):
+-    """
+-    The procurement group class is used to group products together
+-    when computing procurements. (tasks, physical products, ...)
+-
+-    The goal is that when you have one sales order of several products
+-    and the products are pulled from the same or several location(s), to keep
+-    having the moves grouped into pickings that represent the sales order.
+-
+-    Used in: sales order (to group delivery order lines like the so), pull/push
+-    rules (to pack like the delivery order), on orderpoints (e.g. for wave picking
+-    all the similar products together).
+-
+-    Grouping is made only if the source and the destination is the same.
+-    Suppose you have 4 lines on a picking from Output where 2 lines will need
+-    to come from Input (crossdock) and 2 lines coming from Stock -> Output As
+-    the four will have the same group ids from the SO, the move from input will
+-    have a stock.picking with 2 grouped lines and the move from stock will have
+-    2 grouped lines also.
+-
+-    The name is usually the name of the original document (sales order) or a
+-    sequence computed if created manually.
+-    """
+-    _name = 'procurement.group'
+-    _description = 'Procurement Group'
+-    _order = "id desc"
+-
+-    Procurement = namedtuple('Procurement', ['product_id', 'product_qty',
+-        'product_uom', 'location_id', 'name', 'origin', 'company_id', 'values'])
+-    partner_id = fields.Many2one('res.partner', 'Partner')
+-    name = fields.Char(
+-        'Reference',
+-        default=lambda self: self.env['ir.sequence'].next_by_code('procurement.group') or '',
+-        required=True)
+-    move_type = fields.Selection(
+-        [('direct', 'Partial'), ('one', 'All at once')],
+-        string='Delivery Type'
+-    )
+-    stock_move_ids = fields.One2many('stock.move', 'group_id', string="Related Stock Moves")
+-
+     @api.model
+     def _skip_procurement(self, procurement):
+         return procurement.product_id.type != "consu" or float_is_zero(
+
+--- a/addons/stock/models/stock_scrap.py
++++ b/addons/stock/models/stock_scrap.py
+@@ -165,7 +165,7 @@ class StockScrap(models.Model):
+     def do_replenish(self, values=False):
+         self.ensure_one()
+         values = values or {}
+-        self.with_context(clean_context(self.env.context)).env['procurement.group'].run([self.env['procurement.group'].Procurement(
++        self.with_context(clean_context(self.env.context)).env['stock.rule'].run([self.env['stock.rule'].Procurement(
+             self.product_id,
+             self.scrap_qty,
+             self.product_uom_id,
+
+--- a/addons/stock/models/stock_warehouse.py
++++ b/addons/stock/models/stock_warehouse.py
+@@ -730,7 +730,7 @@ class StockWarehouse(models.Model):
+                     values={'route_id': inter_wh_route.id})
+             pull_rules_list += self._get_supply_pull_rules_values(
+                 [self.Routing(transit_location, self.lot_stock_id, self.in_type_id, 'pull')],
+-                values={'route_id': inter_wh_route.id, 'propagate_warehouse_id': supplier_wh.id})
++                values={'route_id': inter_wh_route.id})
+             for pull_rule_vals in pull_rules_list:
+                 Rule.create(pull_rule_vals)
+ 

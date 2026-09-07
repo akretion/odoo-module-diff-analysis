@@ -1,0 +1,202 @@
+PR: https://github.com/odoo/odoo/pull/212679
+
+From: 2713876dbc70d3984e584a9037a2206dcda4e84a
+From: Arnold Moyaux
+Date: 2025-09-07 15:50:27
+
+Breaking data model changes scores: del:4 + add:2, change matches:
+-    procurement_group_id = fields.Many2one('procurement.group', 'Procurement Group', copy=False)
++    stock_reference_ids = fields.Many2many('stock.reference', 'stock_reference_pos_order_rel', 'pos_order_id', 'reference_id', string="Reference")
+-    _inherit = 'procurement.group'
+-    _inherit = 'procurement.group'
+-    pos_order_id = fields.Many2one('pos.order', 'POS Order')
++    pos_order_ids = fields.Many2many(
+
+Total Changes: 59
+
+[REF] stock, *: add reference
+
+The model `procurement.group` is replaced by a more flexible one:
+`stock.reference`. The first one was somehow not well understood and a
+bit limited by its many2one links to other business model (Sales Order,
+Purchase Order, ...). The reference is made of a name and many2many to
+all the documents integrated with Inventory. It's purpose has been
+shrank to the minimal "make links between object". For instance
+opening the manufacturing order created for a MTO sale. The merge of
+stock move is delegated to existing parameters (`sale_id`,
+created_purchase_line_ids`, ...)
+
+The `mrp.production` needed an extra effort to group them according to
+inheritance relationships. This commit add a new object to group
+productions together either in a backorder relation or in a child-parent
+one. This allow for instance to have a Sale Order linked to the MTO
+product of the sold product and the production them selves to be linked
+to the SO *and* the potential child MOs.
+
+The procurement group propagation, before set on the Stock Rule, allowing
+the stock moves to be merged in an existing picking or not has been
+removed and replaced (for the creation of purchase order only) by a new
+parameter on `res.partner` allowing the group of Request for Quotation
+base on the scheduled date of the potential merge candidate (never, same
+week, same month, always). All other merge scenarios should use batches
+and waves transfers.
+
+closes odoo/odoo#212679
+
+Task: 4279803
+Related: odoo/enterprise#87170
+Related: odoo/upgrade#8326
+Signed-off-by: Arnold Moyaux (arm) <arm@odoo.com>
+
+================================= pseudo patch: =================================
+
+--- a/addons/point_of_sale/models/__init__.py
++++ b/addons/point_of_sale/models/__init__.py
+@@ -30,6 +30,7 @@ from . import res_config_settings
+ from . import ir_http
+ from . import ir_module_module
+ from . import stock_picking
++from . import stock_reference
+ from . import stock_warehouse
+ from . import pos_payment
+ from . import pos_payment_method
+
+--- a/addons/point_of_sale/models/pos_order.py
++++ b/addons/point_of_sale/models/pos_order.py
+@@ -310,7 +310,7 @@ class PosOrder(models.Model):
+     picking_count = fields.Integer(compute='_compute_picking_count')
+     failed_pickings = fields.Boolean(compute='_compute_picking_count')
+     picking_type_id = fields.Many2one('stock.picking.type', related='session_id.config_id.picking_type_id', string="Operation Type", readonly=False)
+-    procurement_group_id = fields.Many2one('procurement.group', 'Procurement Group', copy=False)
++    stock_reference_ids = fields.Many2many('stock.reference', 'stock_reference_pos_order_rel', 'pos_order_id', 'reference_id', string="Reference")
+     preset_id = fields.Many2one('pos.preset', string='Preset')
+     floating_order_name = fields.Char(string='Order Name')
+     general_customer_note = fields.Text(string='General Customer Note')
+@@ -1629,18 +1629,13 @@ class PosOrderLine(models.Model):
+         for line in self:
+             line.tax_ids_after_fiscal_position = line.order_id.fiscal_position_id.map_tax(line.tax_ids)
+ 
+-    def _get_procurement_group(self):
+-        return self.order_id.procurement_group_id
+-
+-    def _prepare_procurement_group_vals(self):
++    def _prepare_reference_vals(self):
+         return {
+             'name': self.order_id.name,
+-            'move_type': self.order_id.config_id.picking_policy,
+-            'pos_order_id': self.order_id.id,
+-            'partner_id': self.order_id.partner_id.id,
++            'pos_order_ids': [Command.link(self.order_id.id)],
+         }
+ 
+-    def _prepare_procurement_values(self, group_id=False):
++    def _prepare_procurement_values(self):
+         """ Prepare specific key for moves or other components that will be created from a stock rule
+         coming from a sale order line. This method could be override in order to add other custom key that could
+         be used in move/po creation.
+@@ -1659,7 +1654,6 @@ class PosOrderLine(models.Model):
+             date_deadline = self.order_id.date_order
+ 
+         values = {
+-            'group_id': group_id,
+             'date_planned': date_deadline,
+             'date_deadline': date_deadline,
+             'route_ids': self.order_id.config_id.route_id,
+@@ -1667,6 +1661,7 @@ class PosOrderLine(models.Model):
+             'partner_id': self.order_id.partner_id.id,
+             'product_description_variants': self.full_product_name,
+             'company_id': self.order_id.company_id,
++            'reference_ids': self.order_id.stock_reference_ids,
+         }
+         return values
+ 
+@@ -1678,21 +1673,21 @@ class PosOrderLine(models.Model):
+             if line.product_id.type != 'consu':
+                 continue
+ 
+-            group_id = line._get_procurement_group()
+-            if not group_id:
+-                group_id = self.env['procurement.group'].create(line._prepare_procurement_group_vals())
+-                line.order_id.write({'procurement_group_id': group_id})
++            reference_ids = line.order_id.stock_reference_ids
++            if not reference_ids:
++                reference_ids = self.env['stock.reference'].create(line._prepare_reference_vals())
++                line.order_id.stock_reference_ids = [Command.set(reference_ids.ids)]
+ 
+-            values = line._prepare_procurement_values(group_id=group_id)
++            values = line._prepare_procurement_values()
+             product_qty = line.qty
+ 
+             procurement_uom = line.product_id.uom_id
+-            procurements.append(self.env['procurement.group'].Procurement(
++            procurements.append(self.env['stock.rule'].Procurement(
+                 line.product_id, product_qty, procurement_uom,
+                 line.order_id.partner_id.property_stock_customer,
+                 line.name, line.order_id.name, line.order_id.company_id, values))
+         if procurements:
+-            self.env['procurement.group'].run(procurements)
++            self.env['stock.rule'].run(procurements)
+ 
+         # This next block is currently needed only because the scheduler trigger is done by picking confirmation rather than stock.move confirmation
+         orders = self.mapped('order_id')
+
+--- a/addons/point_of_sale/models/pos_session.py
++++ b/addons/point_of_sale/models/pos_session.py
+@@ -1895,8 +1895,8 @@ class PosSession(models.Model):
+         return self.order_ids.filtered(lambda o: o.state not in ['draft', 'cancel'])
+ 
+ 
+-class ProcurementGroup(models.Model):
+-    _inherit = 'procurement.group'
++class StockRule(models.Model):
++    _inherit = 'stock.rule'
+ 
+     @api.model
+     def _run_scheduler_tasks(self, use_new_cursor=False, company_id=False):
+
+--- a/addons/point_of_sale/models/stock_picking.py
++++ b/addons/point_of_sale/models/stock_picking.py
+@@ -191,24 +191,20 @@ class StockPickingType(models.Model):
+         return ['id', 'use_create_lots', 'use_existing_lots']
+ 
+ 
+-class ProcurementGroup(models.Model):
+-    _inherit = 'procurement.group'
+-
+-    pos_order_id = fields.Many2one('pos.order', 'POS Order')
+-
+-
+ class StockMove(models.Model):
+     _inherit = 'stock.move'
+ 
+     def _get_new_picking_values(self):
+-        vals = super(StockMove, self)._get_new_picking_values()
+-        vals['pos_session_id'] = self.mapped('group_id.pos_order_id.session_id').id
+-        vals['pos_order_id'] = self.mapped('group_id.pos_order_id').id
++        vals = super()._get_new_picking_values()
++        order = self.reference_ids.pos_order_ids
++        if order:
++            vals['pos_session_id'] = order.session_id.id
++            vals['pos_order_id'] = order.id
+         return vals
+ 
+     def _key_assign_picking(self):
+         keys = super(StockMove, self)._key_assign_picking()
+-        return keys + (self.group_id.pos_order_id,)
++        return keys + (self.reference_ids.pos_order_ids,)
+ 
+     @api.model
+     def _prepare_lines_data_dict(self, order_lines):
+
+--- a/None
++++ b/addons/point_of_sale/models/stock_reference.py
+@@ -0,0 +1,9 @@
++from odoo import fields, models
++
++
++class StockReference(models.Model):
++    _inherit = 'stock.reference'
++
++    pos_order_ids = fields.Many2many(
++        'pos.order', 'stock_reference_pos_order_rel', 'reference_id',
++        'pos_order_id', string="PoS Orders")

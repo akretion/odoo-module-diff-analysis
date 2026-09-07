@@ -1,0 +1,328 @@
+PR: https://github.com/odoo/odoo/pull/222169
+
+From: 08b62a4bbcc6f9a391b2cc00a621ef4c76100229
+From: Arnold Moyaux
+Date: 2025-08-09 04:39:25
+
+Breaking data model changes scores: del:1 + add:0, change matches:
+-    _inherit = 'stock.valuation.layer'
+
+Total Changes: 173
+
+[REF] stock_account: New inventory valuation
+
+Functional:
+* Automated handling of periodic valuation
+* Closing report with managment of good delivered not invoiced and bill
+  to receive
+* Realtime valuation only at invoice/bill (no more at delivery/receipt)
+* Removal of input/output accounts
+* Automatic periodic/realtime closing
+* Error management at closing (back dating, rounding issue,...)
+* Back dating
+* Inventory value is justify from last documents rather than the full
+  history (fifo)
+
+Technical:
+* Removal of `stock.valuation.layer`
+* value is stored on the `stock.move`
+* value is compute base on accounting documents
+* value priority order is: manual val > bill/inv > po/so > std price
+* value could be use with a context at date to get the value at date
+* `product.value` to log manual update from the user without real
+  justification
+* It doesn't try to replay and correct the past. Instead it focus on the
+  current situation and match it
+
+The new valuation aims to reduce the complexity of realtime accounting
+and improve the simple periodic valuation.
+
+The value for move in is always computed base on account.move/so/po or
+standard price if none are available. In periodic, we compare the
+balance of valuation account and the computed value of product. We
+suggest the difference. In real time, the COGS are posted with the
+know value of the goods at the time, they are post. The possible error
+(back dating,...) are erased with the closing entries (same as periodic)
+
+There is no more account for input and output. Instead in the closing
+report, we show the po/so that are delivered but not invoiced. This way
+the user can create the accrual for it. If you have good receipt not
+billed. The inventory value will be greater than stock value. It result
+by an entry that debit stock account and credit the variation account.
+Then an accrual entry is posted to debit the variation account and
+credit a bill to receive account.
+
+There is a lot of skip test in this PR. We will try to remove them asap.
+We decided to merge it in this state since it's already functional and
+we can get feedbacks sooner.
+
+Remaining work:
+* Clean the test and remove all the skip (priority to module not in our
+  scope)
+* Analytic accounting
+* Adapt report for cost of good sold.
+* Accrual entries in report and closing account move
+
+closes odoo/odoo#222169
+
+Related: odoo/enterprise#91890
+Related: odoo/upgrade#8189
+Signed-off-by: Arnold Moyaux (arm) <arm@odoo.com>
+
+================================= pseudo patch: =================================
+
+--- a/addons/mrp_account/models/__init__.py
++++ b/addons/mrp_account/models/__init__.py
+@@ -6,4 +6,3 @@ from . import mrp_production
+ from . import product
+ from . import stock_move
+ from . import account_move
+-from . import stock_valuation_layer
+
+--- a/addons/mrp_account/models/mrp_production.py
++++ b/addons/mrp_account/models/mrp_production.py
+@@ -34,16 +34,6 @@ class MrpProduction(models.Model):
+                     workorder.mo_analytic_account_line_ids.name = _("[WC] %s", workorder.display_name)
+         return res
+ 
+-    def action_view_stock_valuation_layers(self):
+-        self.ensure_one()
+-        domain = [('id', 'in', (self.move_raw_ids + self.move_finished_ids + self.scrap_ids.move_ids).stock_valuation_layer_ids.ids)]
+-        action = self.env["ir.actions.actions"]._for_xml_id("stock_account.stock_valuation_layer_action")
+-        context = literal_eval(action['context'])
+-        context.update(self.env.context)
+-        context['no_at_date'] = True
+-        context['search_default_group_by_product_id'] = False
+-        return dict(action, domain=domain, context=context)
+-
+     def action_view_move_wip(self):
+         self.ensure_one()
+         action = {
+@@ -67,7 +57,8 @@ class MrpProduction(models.Model):
+     def _cal_price(self, consumed_moves):
+         """Set a price unit on the finished move according to `consumed_moves`.
+         """
+-        super(MrpProduction, self)._cal_price(consumed_moves)
++        super()._cal_price(consumed_moves)
++        consumed_moves._set_value()
+         work_center_cost = 0
+         finished_move = self.move_finished_ids.filtered(
+             lambda x: x.product_id == self.product_id and x.state not in ('done', 'cancel') and x.quantity > 0)
+@@ -78,7 +69,8 @@ class MrpProduction(models.Model):
+             quantity = finished_move.product_uom._compute_quantity(
+                 finished_move.quantity, finished_move.product_id.uom_id)
+             extra_cost = self.extra_cost * quantity
+-            total_cost = - sum(consumed_moves.sudo().stock_valuation_layer_ids.mapped('value')) + work_center_cost + extra_cost
++
++            total_cost = sum(move.value for move in consumed_moves) + work_center_cost + extra_cost
+             byproduct_moves = self.move_byproduct_ids.filtered(lambda m: m.state not in ('done', 'cancel') and m.quantity > 0)
+             byproduct_cost_share = 0
+             for byproduct in byproduct_moves:
+@@ -89,50 +81,10 @@ class MrpProduction(models.Model):
+                     byproduct.price_unit = total_cost * byproduct.cost_share / 100 / byproduct.product_uom._compute_quantity(byproduct.quantity, byproduct.product_id.uom_id)
+             if finished_move.product_id.cost_method in ('fifo', 'average'):
+                 finished_move.price_unit = total_cost * float_round(1 - byproduct_cost_share / 100, precision_rounding=0.0001) / quantity
++        self.move_finished_ids._set_value()
+         return True
+ 
+     def _get_backorder_mo_vals(self):
+         res = super()._get_backorder_mo_vals()
+         res['extra_cost'] = self.extra_cost
+         return res
+-
+-    def _post_labour(self):
+-        for mo in self:
+-            if mo.with_company(mo.company_id).product_id.valuation != 'real_time':
+-                continue
+-
+-            product_accounts = mo.product_id.product_tmpl_id.get_product_accounts()
+-            labour_amounts = defaultdict(float)
+-            workorders = defaultdict(self.env['mrp.workorder'].browse)
+-            for wo in mo.workorder_ids:
+-                account = wo.workcenter_id.expense_account_id or product_accounts['expense']
+-                labour_amounts[account] += wo.company_id.currency_id.round(wo._cal_cost())
+-                workorders[account] |= wo
+-            workcenter_cost = sum(labour_amounts.values())
+-
+-            if mo.company_id.currency_id.is_zero(workcenter_cost):
+-                continue
+-
+-            desc = _('%s - Labour', mo.name)
+-            account = self.env['account.account'].browse(mo.move_finished_ids[0]._get_src_account(product_accounts))
+-            labour_amounts[account] -= workcenter_cost
+-            account_move = self.env['account.move'].sudo().create({
+-                'journal_id': product_accounts['stock_journal'].id,
+-                'date': fields.Date.context_today(self),
+-                'ref': desc,
+-                'move_type': 'entry',
+-                'line_ids': [(0, 0, {
+-                    'name': desc,
+-                    'ref': desc,
+-                    'balance': -amt,
+-                    'account_id': acc.id,
+-                }) for acc, amt in labour_amounts.items()]
+-            })
+-            account_move._post()
+-            for line in account_move.line_ids[:-1]:
+-                workorders[line.account_id].time_ids.write({'account_move_line_id': line.id})
+-
+-    def _post_inventory(self, cancel_backorder=False):
+-        res = super()._post_inventory(cancel_backorder=cancel_backorder)
+-        self.filtered(lambda mo: mo.state == 'done')._post_labour()
+-        return res
+
+--- a/addons/mrp_account/models/product.py
++++ b/addons/mrp_account/models/product.py
+@@ -60,30 +60,6 @@ class ProductProduct(models.Model):
+                 if price:
+                     self.standard_price = price
+ 
+-    def _compute_average_price(self, qty_invoiced, qty_to_invoice, stock_moves, is_returned=False):
+-        self.ensure_one()
+-        if stock_moves.product_id == self:
+-            return super()._compute_average_price(qty_invoiced, qty_to_invoice, stock_moves, is_returned=is_returned)
+-        bom = self.env['mrp.bom']._bom_find(self, company_id=stock_moves.company_id.id, bom_type='phantom')[self]
+-        if not bom:
+-            return super()._compute_average_price(qty_invoiced, qty_to_invoice, stock_moves, is_returned=is_returned)
+-        value = 0
+-        dummy, bom_lines = bom.explode(self, 1)
+-        bom_lines = {line: data for line, data in bom_lines}
+-        for bom_line, moves_list in groupby(stock_moves.filtered(lambda sm: sm.state != 'cancel'), lambda sm: sm.bom_line_id):
+-            if bom_line not in bom_lines:
+-                for move in moves_list:
+-                    component_quantity = next(
+-                        (bml.product_qty for bml in move.product_id.bom_line_ids if bml in bom_lines),
+-                        1
+-                    )
+-                    value += component_quantity * move.product_id._compute_average_price(qty_invoiced * move.product_qty, qty_to_invoice * move.product_qty, move, is_returned=is_returned)
+-                continue
+-            line_qty = bom_line.product_uom_id._compute_quantity(bom_lines[bom_line]['qty'], bom_line.product_id.uom_id)
+-            moves = self.env['stock.move'].concat(*moves_list)
+-            value += line_qty * bom_line.product_id._compute_average_price(qty_invoiced * line_qty, qty_to_invoice * line_qty, moves, is_returned=is_returned)
+-        return value
+-
+     def _compute_bom_price(self, bom, boms_to_recompute=False, byproduct_bom=False):
+         self.ensure_one()
+         if not bom:
+@@ -120,6 +96,7 @@ class ProductProduct(models.Model):
+             if byproduct_cost_share:
+                 total *= float_round(1 - byproduct_cost_share / 100, precision_rounding=0.0001)
+             return bom.product_uom_id._compute_price(total / bom.product_qty, self.uom_id)
++        return 0.0
+ 
+ 
+ class ProductCategory(models.Model):
+@@ -130,6 +107,3 @@ class ProductCategory(models.Model):
+         check_company=True,
+         help="""This account will be used as a valuation counterpart for both components and final products for manufacturing orders.
+                 If there are any workcenter/employee costs, this value will remain on the account once the production is completed.""")
+-
+-    def _get_stock_account_property_field_names(self):
+-        return super()._get_stock_account_property_field_names() + ['property_stock_account_production_cost_id']
+
+--- a/addons/mrp_account/models/stock_move.py
++++ b/addons/mrp_account/models/stock_move.py
+@@ -1,4 +1,3 @@
+-# -*- coding: utf-8 -*-
+ # Part of Odoo. See LICENSE file for full copyright and licensing details.
+ 
+ from collections import defaultdict
+@@ -9,70 +8,17 @@ from odoo import models
+ class StockMove(models.Model):
+     _inherit = "stock.move"
+ 
+-    def _filter_anglo_saxon_moves(self, product):
+-        res = super(StockMove, self)._filter_anglo_saxon_moves(product)
+-        res += self.filtered(lambda m: m.bom_line_id.bom_id.product_tmpl_id.id == product.product_tmpl_id.id)
+-        return res
+-
+-    def _should_force_price_unit(self):
++    def _get_value(self, forced_std_price=False, at_date=False):
+         self.ensure_one()
+-        return ((self.picking_type_id.code == 'mrp_operation' and self.production_id) or
+-                super()._should_force_price_unit()
+-        )
+-
+-    def _ignore_automatic_valuation(self):
+-        return super()._ignore_automatic_valuation() or bool(self.raw_material_production_id)
+-
+-    def _get_src_account(self, accounts_data):
+-        if self._is_production():
+-            return self.location_id.valuation_out_account_id.id or accounts_data['production'].id or accounts_data['stock_input'].id
+-        return super()._get_src_account(accounts_data)
+-
+-    def _get_dest_account(self, accounts_data):
+-        if self._is_production_consumed():
+-            return self.location_dest_id.valuation_in_account_id.id or accounts_data['production'].id or accounts_data['stock_output'].id
+-        return super()._get_dest_account(accounts_data)
++        if self.production_id:
++            valued_qty = self._get_valued_qty()
++            return self._get_value_from_production(valued_qty), valued_qty
++        return super()._get_value(forced_std_price)
+ 
+-    def _is_production(self):
++    def _get_value_from_production(self, quantity):
++        # TODO: Maybe move _cal_price here
+         self.ensure_one()
+-        return self.location_id.usage == 'production' and self.location_dest_id._should_be_valued()
+-
+-    def _is_production_consumed(self):
+-        self.ensure_one()
+-        return self.location_dest_id.usage == 'production' and self.location_id._should_be_valued()
+-
+-    def _get_out_svl_vals(self, forced_quantity):
+-        unbuild_moves = self.filtered('unbuild_id')
+-        # 'real cost' of finished product moves @ build time
+-        price_unit_map = {
+-            move.id: (
+-                (move.unbuild_id.mo_id.move_finished_ids |
+-                move.unbuild_id.mo_id.move_raw_ids).stock_valuation_layer_ids.filtered(
+-                    lambda svl: svl.product_id == move.product_id
+-                )[0].unit_cost,
+-                move.company_id.currency_id.round,
+-            )
+-            for move in unbuild_moves.sudo()
+-            if move.product_id.cost_method != 'standard' and
+-            move.unbuild_id.mo_id.move_finished_ids.stock_valuation_layer_ids
+-        }
+-        svl_vals_list = super()._get_out_svl_vals(forced_quantity)
+-        if price_unit_map:
+-            for svl_vals in svl_vals_list:
+-                if (move_id := svl_vals['stock_move_id']) in price_unit_map:
+-                    unit_cost = price_unit_map[move_id][0]
+-                    svl_vals.update({
+-                        'unit_cost': unit_cost,
+-                        'value': price_unit_map[move_id][1](unit_cost * svl_vals['quantity']),
+-                    })
+-        return svl_vals_list
+-
+-    def _create_out_svl(self, forced_quantity=None):
+-        product_unbuild_map = defaultdict(self.env['mrp.unbuild'].browse)
+-        for move in self:
+-            if move.unbuild_id:
+-                product_unbuild_map[move.product_id] |= move.unbuild_id
+-        return super(StockMove, self.with_context(product_unbuild_map=product_unbuild_map))._create_out_svl(forced_quantity)
++        return quantity * self.price_unit
+ 
+     def _get_all_related_sm(self, product):
+         moves = super()._get_all_related_sm(product)
+
+--- a/addons/mrp_account/models/stock_valuation_layer.py
++++ b/None
+@@ -1,16 +0,0 @@
+-# Part of Odoo. See LICENSE file for full copyright and licensing details.
+-
+-from odoo import models
+-
+-
+-class StockValuationLayer(models.Model):
+-    _inherit = 'stock.valuation.layer'
+-
+-    def _candidate_sort_key(self):
+-        self.ensure_one()
+-        res = super()._candidate_sort_key()
+-        if self.product_id in self.env.context.get('product_unbuild_map', ()):
+-            unbuild = self.env.context['product_unbuild_map'][self.product_id]
+-            # Give priority to the SVL that produced `self.product_id`
+-            res += (self.stock_move_id.id not in unbuild.mo_id.move_finished_ids.ids,)
+-        return res
