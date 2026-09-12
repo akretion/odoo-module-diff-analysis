@@ -1,53 +1,46 @@
 # Dude, what did they do to my Odoo at version 15.0?
 
-You can see below the Odoo addons that got the largest data model changes between versions 14.0 and 15.0:
-(this is just summing the size of the data model impacting commits addon per addon)
+You can see below the Odoo addons that got the largest data model
+changes between versions 14.0 and 15.0:
+(this is just summing the size of the data model impacting commits
+addon per addon; method signature deltas are in each addon's
+method_signatures.patch)
 You can browse each directory to dig into the detail of these changes.
 
-1. mail - 192K
-2. account - 188K
-3. payment - 176K
-4. sale - 124K
-5. hr_holidays - 116K
-6. stock - 112K
-7. point_of_sale - 96K
-8. project - 92K
-9. mail_group - 80K
-10. crm - 76K
-11. mass_mailing - 68K
-12. payment_authorize - 64K
-13. event - 56K
-14. payment_stripe - 52K
-15. sale_timesheet - 48K
-16. sales_team - 44K
-17. base - 44K
-18. fleet - 40K
-19. website - 36K
-20. hr - 36K
-21. payment_adyen - 32K
-22. payment_sips - 28K
-23. payment_paypal - 28K
-24. payment_alipay - 28K
-25. payment_payulatam - 24K
-26. payment_buckaroo - 24K
-27. lunch - 24K
-28. hr_fleet - 24K
-29. google_calendar - 24K
-30. calendar - 24K
-31. pos_adyen - 20K
-32. payment_transfer - 20K
-33. payment_payumoney - 20K
-34. product - 16K
-35. gift_card - 16K
-36. auth_totp - 16K
-37. stock_account - 12K
-38. sale_project - 12K
-39. project_timesheet_holidays - 12K
-40. pad - 12K
-41. mrp - 12K
-42. hr_expense - 12K
-43. event_sms - 12K
-44. delivery - 12K
-45. phone_validation - 7.5K
-46. im_livechat - 7.5K
-47. calendar_sms - 7.5K
+1. [account](https://github.com/akretion/odoo-module-diff-analysis/blob/main/15.0/account) - 172K (5 commits)
+2. [payment](https://github.com/akretion/odoo-module-diff-analysis/blob/main/15.0/payment) - 169K (2 commits)
+3. [mail](https://github.com/akretion/odoo-module-diff-analysis/blob/main/15.0/mail) - 137K (7 commits)
+4. [sale](https://github.com/akretion/odoo-module-diff-analysis/blob/main/15.0/sale) - 117K (2 commits)
+5. [hr_holidays](https://github.com/akretion/odoo-module-diff-analysis/blob/main/15.0/hr_holidays) - 110K (1 commit)
+6. [stock](https://github.com/akretion/odoo-module-diff-analysis/blob/main/15.0/stock) - 100K (3 commits)
+7. [point_of_sale](https://github.com/akretion/odoo-module-diff-analysis/blob/main/15.0/point_of_sale) - 87K (2 commits)
+8. [project](https://github.com/akretion/odoo-module-diff-analysis/blob/main/15.0/project) - 77K (5 commits)
+9. [mail_group](https://github.com/akretion/odoo-module-diff-analysis/blob/main/15.0/mail_group) - 72K (2 commits)
+10. [crm](https://github.com/akretion/odoo-module-diff-analysis/blob/main/15.0/crm) - 62K (4 commits)
+11. [mass_mailing](https://github.com/akretion/odoo-module-diff-analysis/blob/main/15.0/mass_mailing) - 61K (3 commits)
+12. [payment_authorize](https://github.com/akretion/odoo-module-diff-analysis/blob/main/15.0/payment_authorize) - 57K (1 commit)
+13. [payment_stripe](https://github.com/akretion/odoo-module-diff-analysis/blob/main/15.0/payment_stripe) - 45K (1 commit)
+14. [event](https://github.com/akretion/odoo-module-diff-analysis/blob/main/15.0/event) - 44K (5 commits)
+15. [sale_timesheet](https://github.com/akretion/odoo-module-diff-analysis/blob/main/15.0/sale_timesheet) - 38K (3 commits)
+16. [base](https://github.com/akretion/odoo-module-diff-analysis/blob/main/15.0/base) - 36K (3 commits)
+17. [sales_team](https://github.com/akretion/odoo-module-diff-analysis/blob/main/15.0/sales_team) - 34K (3 commits)
+18. [fleet](https://github.com/akretion/odoo-module-diff-analysis/blob/main/15.0/fleet) - 31K (2 commits)
+19. [payment_adyen](https://github.com/akretion/odoo-module-diff-analysis/blob/main/15.0/payment_adyen) - 27K (1 commit)
+20. [website](https://github.com/akretion/odoo-module-diff-analysis/blob/main/15.0/website) - 26K (2 commits)
+21. [hr](https://github.com/akretion/odoo-module-diff-analysis/blob/main/15.0/hr) - 24K (3 commits)
+22. [payment_sips](https://github.com/akretion/odoo-module-diff-analysis/blob/main/15.0/payment_sips) - 23K (1 commit)
+23. [payment_alipay](https://github.com/akretion/odoo-module-diff-analysis/blob/main/15.0/payment_alipay) - 21K (1 commit)
+24. [payment_paypal](https://github.com/akretion/odoo-module-diff-analysis/blob/main/15.0/payment_paypal) - 21K (1 commit)
+25. [payment_buckaroo](https://github.com/akretion/odoo-module-diff-analysis/blob/main/15.0/payment_buckaroo) - 18K (1 commit)
+26. [payment_payulatam](https://github.com/akretion/odoo-module-diff-analysis/blob/main/15.0/payment_payulatam) - 17K (1 commit)
+27. [lunch](https://github.com/akretion/odoo-module-diff-analysis/blob/main/15.0/lunch) - 17K (2 commits)
+28. [google_calendar](https://github.com/akretion/odoo-module-diff-analysis/blob/main/15.0/google_calendar) - 16K (1 commit)
+29. [hr_fleet](https://github.com/akretion/odoo-module-diff-analysis/blob/main/15.0/hr_fleet) - 14K (1 commit)
+30. [payment_payumoney](https://github.com/akretion/odoo-module-diff-analysis/blob/main/15.0/payment_payumoney) - 14K (1 commit)
+
+In total: 45 addons, 85 data model
+impacting commits, 1.8M of pseudo patches.
+
+Generated by [odoo-module-diff](https://github.com/akretion/odoo-module-diff): these numbers are
+heuristic (see the repo README); the full pseudo patches are in each
+addon directory.
