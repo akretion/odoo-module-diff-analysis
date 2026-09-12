@@ -1,0 +1,398 @@
+PR: https://github.com/odoo/odoo/pull/169868
+
+From: 238a41e35280256382f6509182b9e900fb4f7aba
+From: Maxime de Neuville
+Date: 2024-08-29 11:54:49
+
+Breaking data model changes scores: del:1.4 + add:0, change matches:
+-    analytic_account_id = fields.Many2one(
+-    analytic_account_active = fields.Boolean("Active Analytic Account", compute='_compute_analytic_account_active', compute_sudo=True, recursive=True, export_string_translation=False)
++    analytic_account_active = fields.Boolean("Active Analytic Account", related='project_id.analytic_account_active', export_string_translation=False)
+
+Total Changes: 189
+
+[IMP] project,sale,purchase,stock,mrp: analytic plans on projects
+
+PURPOSE
+
+Currently, users can track the profitability of their projects, but they cannot allocate their timesheet-related costs to different entries. This approach is one-dimensional.
+For instance, it can be relevant to track costs for the project as a whole, but also for the team or department in charge, the staff, a particular service, or a specific customer simultaneously.
+By doing so, users can track the profitability of their company at a more granular level. They gain a better understanding of what is impacting their costs and can budget their projects accordingly.
+Furthermore, we would like to handle the use-case of construction companies. Indeed, when stock is allocated to a construction site (or moved back to the warehouse if it wasn't used), it is not reflected in the profitability of the project because it doesn't generate analytic entries. This leads to an incorrect overview of the project's finances.
+In addition, it is not easy to identify the stock moves impacting the project as there is no direct link between the two. It would be convenient for construction companies to have an overview and be able to create new pickings from the top bar of the project in their operations.
+At last, these extra materials used sometimes need to be re-invoiced to the customer. Currently, this has to be done manually by adding a product to the SO. This is error-prone and time-consuming. We are thus relying on the 're-invoice expenses' feature that already exists for expenses and vendor bills to make it automatic.
+Finally, another use-case that would benefit from these changes is companies that are engineering custom machines for their customers. They use projects to track the progress made on their prototypes but also need an overview of the POs, MOs, and stock pickings involved in the process.
+
+FEATURE DETAILS
+
+* Project
+* Remove the 'analytic_account_id' field from projects
+* Replace it with an analytic notebook allowing to define multiple analytic accounts (one per plan)
+* Remove the analytic accounting for tasks
+* Timesheets inherit the analytic accounts configured on their project or on the distribution of their associated SOL (priority to their SOL)
+
+* Sale
+* Remove the 'analytic_account_id' field from the SO
+* Replace it with a project field. The analytic accounts of the project set on the SO are used to set a default SOL analytic distribution
+
+* Stock
+* Add an analytic costs field of operation types that indicates whether the stock picking of this type should generates AALs and do reinvoicing on validation
+* Add a project field on stock pickings, used to generate AALs using the project's accounts and also for the reinvoicing of reinvoicable products
+* Add a sales order field on projects to indicate on which SO to do the reinvoicing when validating stock pickings
+* About the AAL generation, the amount is negative for operation of type 'delivery' and positive for type 'receipt'. If automatic accounting (anglo-saxon accounting) is enabled, do not generate AALs on stock picking validtion, to avoid generating in duplicate
+* Landed costs's generated journal entries distribution receives the accounts of the stock picking's project or the MO's project that was selected
+
+* MRP
+* Remove the analytic distribution from MOs
+* Replace it with a project field
+* When generating AALs with the MO, again, the accounts are taken from the project linked to the MO
+* Remove the analytic distribution from BOMs
+* Replace it with a project field, used as a default value for setting the project of MOs
+
+* Purchase
+* Similarly to SOs, add a project field to POs
+* Again, the accounts of the project linked to the PO are used as a default value for the distribution of the POLs
+
+* Others
+* Rename 'Project Updates' into 'Dashboard'
+* Update the project profitability (report should reflect the analytic items linked to the analytic account of the 'Project' plan (in other words, we keep the current behavior))
+* Update stat buttons and add top bars actions accordingly to the changes described above (SO, PO, From WH, To WH, MO, BOMs, Analytic Items)
+* Adapt the reinvoicing of vendor bills to work with the project of the SO (and not the analytic account of the SO anymore)
+
+task-3985258
+
+closes odoo/odoo#169868
+
+Related: odoo/enterprise#65054
+Related: odoo/upgrade#6296
+Signed-off-by: Xavier Bol (xbo) <xbo@odoo.com>
+
+================================= pseudo patch: =================================
+
+--- a/addons/hr_timesheet/models/__init__.py
++++ b/addons/hr_timesheet/models/__init__.py
+@@ -1,6 +1,7 @@
+ # -*- coding: utf-8 -*-
+ # Part of Odoo. See LICENSE file for full copyright and licensing details.
+ 
++from . import analytic_applicability
+ from . import hr_employee
+ from . import hr_timesheet
+ from . import ir_http
+
+--- a/None
++++ b/addons/hr_timesheet/models/analytic_applicability.py
+@@ -0,0 +1,15 @@
++# Part of Odoo. See LICENSE file for full copyright and licensing details.
++
++from odoo import fields, models
++
++
++class AccountAnalyticApplicability(models.Model):
++    _inherit = 'account.analytic.applicability'
++    _description = "Analytic Plan's Applicabilities"
++
++    business_domain = fields.Selection(
++        selection_add=[
++            ('timesheet', 'Timesheet'),
++        ],
++        ondelete={'timesheet': 'cascade'},
++    )
+
+--- a/addons/hr_timesheet/models/hr_timesheet.py
++++ b/addons/hr_timesheet/models/hr_timesheet.py
+@@ -7,6 +7,8 @@ import re
+ from odoo import api, fields, models, _, _lt
+ from odoo.exceptions import UserError, AccessError, ValidationError
+ from odoo.osv import expression
++from odoo.tools import format_list
++
+ 
+ class AccountAnalyticLine(models.Model):
+     _inherit = 'account.analytic.line'
+@@ -177,10 +179,25 @@ class AccountAnalyticLine(models.Model):
+         user_ids = []
+         employee_ids = []
+         # 1/ Collect the user_ids and employee_ids from each timesheet vals
+-        vals_list = self._timesheet_preprocess(vals_list)
+         for vals in vals_list:
+-            if not vals.get('project_id'):
++            task = self.env['project.task'].sudo().browse(vals.get('task_id'))
++            project = self.env['project.project'].sudo().browse(vals.get('project_id'))
++            if not (task or project):
++                # It is not a timesheet
+                 continue
++            elif task:
++                if not task.project_id:
++                    raise ValidationError(_('Timesheets cannot be created on a private task.'))
++                if not project:
++                    vals['project_id'] = task.project_id.id
++
++            company = task.company_id or project.company_id or self.env['res.company'].browse(vals.get('company_id'))
++            vals['company_id'] = company.id
++            vals.update(self._timesheet_preprocess_get_accounts(vals))
++
++            if not vals.get('product_uom_id'):
++                vals['product_uom_id'] = company.project_time_mode_id.id
++
+             if not vals.get('name'):
+                 vals['name'] = '/'
+             employee_id = vals.get('employee_id', self._context.get('default_employee_id', False))
+@@ -228,7 +245,7 @@ class AccountAnalyticLine(models.Model):
+                     vals['user_id'] = valid_employee_per_id[employee_in_id].sudo().user_id.id   # (A) OK
+                     continue
+                 else:
+-                    raise ValidationError(error_msg)                                      # (C) KO
++                    raise ValidationError(error_msg)                                            # (C) KO
+             else:
+                 user_id = vals.get('user_id', default_user_id)                                  # (B)...
+ 
+@@ -263,7 +280,14 @@ class AccountAnalyticLine(models.Model):
+     def write(self, values):
+         self._check_can_write(values)
+ 
+-        values = self._timesheet_preprocess([values])[0]
++        task = self.env['project.task'].sudo().browse(values.get('task_id'))
++        project = self.env['project.project'].sudo().browse(values.get('project_id'))
++        if task and not task.project_id:
++            raise ValidationError(_('Timesheets cannot be created on a private task.'))
++        if project or task:
++            values['company_id'] = task.company_id.id or project.company_id.id
++        values.update(self._timesheet_preprocess_get_accounts(values))
++
+         if values.get('employee_id'):
+             employee = self.env['hr.employee'].browse(values['employee_id'])
+             if not employee.active:
+@@ -304,67 +328,24 @@ class AccountAnalyticLine(models.Model):
+             ('project_id.privacy_visibility', '=', 'portal'),
+         ]
+ 
+-    def _timesheet_preprocess(self, vals_list):
+-        """ Deduce other field values from the one given.
+-            Overrride this to compute on the fly some field that can not be computed fields.
+-            :param vals_list: list of dict from `create`or `write`.
+-        """
+-        timesheet_indices = set()
+-        task_ids, project_ids, account_ids = set(), set(), set()
+-        for index, vals in enumerate(vals_list):
+-            if not vals.get('project_id') and not vals.get('task_id'):
+-                continue
+-            timesheet_indices.add(index)
+-            if vals.get('task_id'):
+-                task_ids.add(vals['task_id'])
+-            elif vals.get('project_id'):
+-                project_ids.add(vals['project_id'])
+-            if vals.get('account_id'):
+-                account_ids.add(vals['account_id'])
+-
+-        task_per_id = {}
+-        if task_ids:
+-            tasks = self.env['project.task'].sudo().browse(task_ids)
+-            for task in tasks:
+-                task_per_id[task.id] = task
+-                if not task.project_id:
+-                    raise ValidationError(_('Timesheets cannot be created on a private task.'))
+-            account_ids = account_ids.union(tasks.analytic_account_id.ids, tasks.project_id.analytic_account_id.ids)
+-
+-        project_per_id = {}
+-        if project_ids:
+-            projects = self.env['project.project'].sudo().browse(project_ids)
+-            account_ids = account_ids.union(projects.analytic_account_id.ids)
+-            project_per_id = {p.id: p for p in projects}
+-
+-        accounts = self.env['account.analytic.account'].sudo().browse(account_ids)
+-        account_per_id = {account.id: account for account in accounts}
+-
+-        uom_id_per_company = {
+-            company: company.project_time_mode_id.id
+-            for company in accounts.company_id
++    def _timesheet_preprocess_get_accounts(self, vals):
++        project = self.env['project.project'].sudo().browse(vals.get('project_id'))
++        if not project:
++            return {}
++        company = self.env['res.company'].browse(vals.get('company_id'))
++        mandatory_plans = self._get_mandatory_plans(company, business_domain='timesheet')
++        missing_plan_names = [plan['name'] for plan in mandatory_plans if not project[plan['column_name']]]
++        if missing_plan_names:
++            raise ValidationError(_(
++                "'%(missing_plan_names)s' analytic plan(s) required on the project '%(project_name)s' linked to the timesheet.",
++                missing_plan_names=format_list(self.env, missing_plan_names),
++                project_name=project.name,
++            ))
++        return {
++            fname: project[fname].id
++            for fname in self._get_plan_fnames()
+         }
+ 
+-        for index in timesheet_indices:
+-            vals = vals_list[index]
+-            data = task_per_id[vals['task_id']] if vals.get('task_id') else project_per_id[vals['project_id']]
+-            if not vals.get('project_id'):
+-                vals['project_id'] = data.project_id.id
+-            if not vals.get('account_id'):
+-                account = data._get_task_analytic_account_id() if vals.get('task_id') else data.analytic_account_id
+-                if not account or not account.active:
+-                    raise ValidationError(_('Timesheets must be created on a project or a task with an active analytic account.'))
+-                vals['account_id'] = account.id
+-                vals['company_id'] = account.company_id.id or data.company_id.id or vals.get('company_id')
+-            if not vals.get('product_uom_id'):
+-                company = account_per_id[vals['account_id']].company_id or data.company_id
+-                vals['product_uom_id'] = uom_id_per_company.get(company.id, company.project_time_mode_id.id) or self.env.company.project_time_mode_id.id
+-            # Set the top-level analytic plan according to the given analytic account
+-            plan = self.env['account.analytic.account'].browse(vals.get('account_id')).root_plan_id
+-            if plan:
+-                vals[plan._column_name()] = vals.get('account_id')
+-        return vals_list
+-
+     def _timesheet_postprocess(self, values):
+         """ Hook to update record one by one according to the values of a `write` or a `create`. """
+         sudo_self = self.sudo()  # this creates only one env for all operation that required sudo() in `_timesheet_postprocess_values`override
+@@ -386,6 +367,17 @@ class AccountAnalyticLine(models.Model):
+         # (re)compute the amount (depending on unit_amount, employee_id for the cost, and account_id for currency)
+         if any(field_name in values for field_name in ['unit_amount', 'employee_id', 'account_id']):
+             for timesheet in sudo_self:
++                if not timesheet.account_id.active:
++                    project_plan, _other_plans = self.env['account.analytic.plan']._get_all_plans()
++                    raise ValidationError(_(
++                        "Timesheets must be created with at least an active analytic account defined in the plan '%(plan_name)s'.",
++                        plan_name=project_plan.name
++                    ))
++                accounts = timesheet._get_analytic_accounts()
++                companies = timesheet.company_id | accounts.company_id | timesheet.task_id.company_id | timesheet.project_id.company_id
++                if len(companies) > 1:
++                    raise ValidationError(_('The project, the task and the analytic accounts of the timesheet must belong to the same company.'))
++
+                 cost = timesheet._hourly_cost()
+                 amount = -timesheet.unit_amount * cost
+                 amount_converted = timesheet.employee_id.currency_id._convert(
+
+--- a/addons/hr_timesheet/models/project_project.py
++++ b/addons/hr_timesheet/models/project_project.py
+@@ -13,14 +13,14 @@ class Project(models.Model):
+     allow_timesheets = fields.Boolean(
+         "Timesheets", compute='_compute_allow_timesheets', store=True, readonly=False,
+         default=True)
+-    analytic_account_id = fields.Many2one(
++    account_id = fields.Many2one(
+         # note: replaces ['|', ('company_id', '=', False), ('company_id', '=', company_id)]
+         domain="""[
+             '|', ('company_id', '=', False), ('company_id', '=?', company_id),
+             ('partner_id', '=?', partner_id),
+         ]"""
+     )
+-    analytic_account_active = fields.Boolean("Active Account", related="analytic_account_id.active", export_string_translation=False)
++    analytic_account_active = fields.Boolean("Active Account", related="account_id.active", export_string_translation=False)
+ 
+     timesheet_ids = fields.One2many('account.analytic.line', 'project_id', 'Associated Timesheets', export_string_translation=False)
+     timesheet_encode_uom_id = fields.Many2one('uom.uom', compute='_compute_timesheet_encode_uom_id', export_string_translation=False)
+@@ -44,9 +44,9 @@ class Project(models.Model):
+         for project in self:
+             project.timesheet_encode_uom_id = project.company_id.timesheet_encode_uom_id or self.env.company.timesheet_encode_uom_id
+ 
+-    @api.depends('analytic_account_id')
++    @api.depends('account_id')
+     def _compute_allow_timesheets(self):
+-        without_account = self.filtered(lambda t: not t.analytic_account_id and t._origin)
++        without_account = self.filtered(lambda t: t._origin and not t.account_id)
+         without_account.update({'allow_timesheets': False})
+ 
+     @api.depends('company_id')
+@@ -109,11 +109,15 @@ class Project(models.Model):
+             operator_new = 'not in'
+         return [('id', operator_new, sql)]
+ 
+-    @api.constrains('allow_timesheets', 'analytic_account_id')
++    @api.constrains('allow_timesheets', 'account_id')
+     def _check_allow_timesheet(self):
+         for project in self:
+-            if project.allow_timesheets and not project.analytic_account_id:
+-                raise ValidationError(_('You cannot use timesheets without an analytic account.'))
++            if project.allow_timesheets and not project.account_id:
++                project_plan, _other_plans = self.env['account.analytic.plan']._get_all_plans()
++                raise ValidationError(_(
++                    "To use the timesheets feature, you need an analytic account for your project. Please set one up in the plan '%(plan_name)s' or turn off the timesheets feature.",
++                    plan_name=project_plan.name
++                ))
+ 
+     @api.depends('timesheet_ids', 'timesheet_encode_uom_id')
+     def _compute_total_timesheet_time(self):
+@@ -143,21 +147,27 @@ class Project(models.Model):
+         """ Create an analytic account if project allow timesheet and don't provide one
+             Note: create it before calling super() to avoid raising the ValidationError from _check_allow_timesheet
+         """
+-        defaults = self.default_get(['allow_timesheets', 'analytic_account_id'])
+-        analytic_accounts_vals = [vals for vals in vals_list if
+-            vals.get('allow_timesheets', defaults.get('allow_timesheets'))
+-            and not vals.get('analytic_account_id', defaults.get('analytic_account_id'))
++        defaults = self.default_get(['allow_timesheets', 'account_id'])
++        analytic_accounts_vals = [
++            vals for vals in vals_list
++            if (
++                vals.get('allow_timesheets', defaults.get('allow_timesheets')) and
++                not vals.get('account_id', defaults.get('account_id'))
++            )
+         ]
+-        analytic_accounts = self.env['account.analytic.account'].create(self._get_values_analytic_account_batch(analytic_accounts_vals))
+-        for vals, analytic_account in zip(analytic_accounts_vals, analytic_accounts):
+-            vals['analytic_account_id'] = analytic_account.id
++
++        if analytic_accounts_vals:
++            analytic_accounts = self.env['account.analytic.account'].create(self._get_values_analytic_account_batch(analytic_accounts_vals))
++            for vals, analytic_account in zip(analytic_accounts_vals, analytic_accounts):
++                vals['account_id'] = analytic_account.id
+         return super().create(vals_list)
+ 
+     def write(self, values):
+         # create the AA for project still allowing timesheet
+-        if values.get('allow_timesheets') and not values.get('analytic_account_id'):
+-            project_new_account = self.filtered(lambda project: not project.analytic_account_id)
+-            project_new_account._create_analytic_account()
++        if values.get('allow_timesheets') and not values.get('account_id'):
++            project_wo_account = self.filtered(lambda project: not project.account_id)
++            if project_wo_account:
++                project_wo_account._create_analytic_account()
+         return super(Project, self).write(values)
+ 
+     @api.depends('is_internal_project', 'company_id')
+@@ -173,7 +183,7 @@ class Project(models.Model):
+ 
+     @api.model
+     def _init_data_analytic_account(self):
+-        self.search([('analytic_account_id', '=', False), ('allow_timesheets', '=', True)])._create_analytic_account()
++        self.search([('account_id', '=', False), ('allow_timesheets', '=', True)])._create_analytic_account()
+ 
+     @api.ondelete(at_uninstall=False)
+     def _unlink_except_contains_entries(self):
+
+--- a/addons/hr_timesheet/models/project_task.py
++++ b/addons/hr_timesheet/models/project_task.py
+@@ -13,7 +13,6 @@ from odoo.addons.rating.models.rating_data import OPERATOR_MAPPING
+ PROJECT_TASK_READABLE_FIELDS = {
+     'allow_timesheets',
+     'analytic_account_active',
+-    'analytic_account_id',  # To compute `analytic_account_active`
+     'effective_hours',
+     'encode_uom_in_days',
+     'allocated_hours',
+@@ -31,7 +30,7 @@ class Task(models.Model):
+     _inherit = "project.task"
+ 
+     project_id = fields.Many2one(domain="['|', ('company_id', '=', False), ('company_id', '=?',  company_id), ('is_internal_project', '=', False)]")
+-    analytic_account_active = fields.Boolean("Active Analytic Account", compute='_compute_analytic_account_active', compute_sudo=True, recursive=True, export_string_translation=False)
++    analytic_account_active = fields.Boolean("Active Analytic Account", related='project_id.analytic_account_active', export_string_translation=False)
+     allow_timesheets = fields.Boolean(
+         "Allow timesheets",
+         compute='_compute_allow_timesheets', search='_search_allow_timesheets',
+@@ -79,12 +78,6 @@ class Task(models.Model):
+         ])
+         return [('project_id', 'in', query)]
+ 
+-    @api.depends('analytic_account_id.active', 'project_id.analytic_account_id.active')
+-    def _compute_analytic_account_active(self):
+-        """ Overridden in sale_timesheet """
+-        for task in self:
+-            task.analytic_account_active = task._get_task_analytic_account_id().active
+-
+     @api.depends('timesheet_ids.unit_amount')
+     def _compute_effective_hours(self):
+         if not any(self._ids):

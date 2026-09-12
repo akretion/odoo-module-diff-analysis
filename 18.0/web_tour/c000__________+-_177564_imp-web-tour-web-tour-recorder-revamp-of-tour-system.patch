@@ -1,0 +1,217 @@
+PR: https://github.com/odoo/odoo/pull/177564
+
+From: 37b35f18bd9138a9a8717d17268f375607b9482e
+From: Bastien PIERRE
+Date: 2024-09-11 11:57:27
+
+Breaking data model changes scores: del:2 + add:2, change matches:
++    step_ids = fields.One2many("web_tour.tour.step", "tour_id")
++    user_consumed_ids = fields.Many2many("res.users")
+-    name = fields.Char(string="Tour name", required=True)
+-    user_id = fields.Many2one('res.users', string='Consumed by')
+
+Total Changes: 137
+
+[IMP] web_tour,web_tour_recorder: revamp of tour system
+
+To run a tour in the UI, now you have to register your tour
+in the database. The field are:
+* name (same as the tour in the registry)
+* url
+* rainbowManMessage (this one won't be in the tour registry anymore)
+* sequence (same as above)
+* fadeout
+
+Only this details about the tour are register in the DB, not
+the steps.
+The new view for tours is in Settings > Technical > Tours.
+This change was to improve the UX of the tour system
+compared to the old dialog not easily accessible
+(debug, dialog not easy to navigate into if too many tours,
+access to test tour that required python pre-configuration and not
+working on the frontend).
+
+With this changes comes also the fusion of web_tour and web_tour_recorder.
+The custom tour are now stored in the DB, with their steps. Now the tour
+service handle tour and custom tour.
+
+Task-id: 4070659
+Part-of: odoo/odoo#177564
+Related: odoo/enterprise#69183
+Related: odoo/upgrade#6445
+Signed-off-by: Lucas Perais (lpe) <lpe@odoo.com>
+
+================================= pseudo patch: =================================
+
+--- a/addons/web_tour/models/__init__.py
++++ b/addons/web_tour/models/__init__.py
+@@ -1,5 +1,3 @@
+-# -*- coding: utf-8 -*-
+-# Part of Odoo. See LICENSE file for full copyright and licensing details.
+-
++from . import res_users
+ from . import ir_http
+ from . import tour
+
+--- a/addons/web_tour/models/ir_http.py
++++ b/addons/web_tour/models/ir_http.py
+@@ -1,6 +1,3 @@
+-# -*- coding: utf-8 -*-
+-# Part of Odoo. See LICENSE file for full copyright and licensing details.
+-
+ from odoo import models
+ 
+ 
+@@ -9,8 +6,6 @@ class Http(models.AbstractModel):
+ 
+     def session_info(self):
+         result = super().session_info()
+-        if result['is_admin']:
+-            demo_modules_count = self.env['ir.module.module'].sudo().search_count([('demo', '=', True)])
+-            result['web_tours'] = self.env['web_tour.tour'].get_consumed_tours()
+-            result['tour_disable'] = demo_modules_count > 0
++        result["tour_enabled"] = self.env.user.tour_enabled
++        result['current_tour'] = self.env["web_tour.tour"].get_current_tour()
+         return result
+
+--- a/None
++++ b/addons/web_tour/models/res_users.py
+@@ -0,0 +1,12 @@
++from odoo import models, fields, api
++
++
++class ResUsers(models.Model):
++    _inherit = "res.users"
++
++    tour_enabled = fields.Boolean()
++
++    @api.model
++    def switch_tour_enabled(self, val):
++        self.env.user.sudo().tour_enabled = val
++        return self.env.user.tour_enabled
+
+--- a/addons/web_tour/models/tour.py
++++ b/addons/web_tour/models/tour.py
+@@ -1,30 +1,102 @@
+-# -*- coding: utf-8 -*-
+-# Part of Odoo. See LICENSE file for full copyright and licensing details.
+-
+-from odoo import api, fields, models
++from odoo import api, fields, models, Command
++import json
++import base64
+ 
+ 
+ class Tour(models.Model):
+-
+     _name = "web_tour.tour"
+     _description = "Tours"
+-    _log_access = False
++    _order = "sequence, name, id"
++
++    name = fields.Char(required=True)
++    step_ids = fields.One2many("web_tour.tour.step", "tour_id")
++    url = fields.Char(string="Starting URL", default="/odoo")
++    sharing_url = fields.Char(compute="_compute_sharing_url", string="Sharing URL")
++    rainbow_man_message = fields.Html(default="<b>Good job!</b> You went through all steps of this tour.", translate=True)
++    sequence = fields.Integer(default=1000)
++    custom = fields.Boolean(string="Custom")
++    user_consumed_ids = fields.Many2many("res.users")
+ 
+-    name = fields.Char(string="Tour name", required=True)
+-    user_id = fields.Many2one('res.users', string='Consumed by')
++    _sql_constraints = [
++        ('uniq_name', 'unique(name)', "A tour already exists with this name . Tour's name must be unique!"),
++    ]
++
++    @api.depends("url")
++    def _compute_sharing_url(self):
++        for tour in self:
++            tour.sharing_url = tour.url and f"{tour.get_base_url()}/odoo?tour={tour.name}"
+ 
+     @api.model
+-    def consume(self, tour_names):
+-        """ Sets given tours as consumed, meaning that
+-            these tours won't be active anymore for that user """
+-        if not self.env.user._is_internal():
+-            # Only internal users can use this method.
+-            # TODO master: update ir.model.access records instead of using sudo()
+-            return
+-        for name in tour_names:
+-            self.sudo().create({'name': name, 'user_id': self.env.uid})
++    def consume(self, tourName):
++        if self.env.user and self.env.user._is_internal():
++            tour_id = self.search([("name", "=", tourName)])
++            if tour_id:
++                tour_id.sudo().user_consumed_ids = [Command.link(self.env.user.id)]
++        return self.get_current_tour()
+ 
+     @api.model
+-    def get_consumed_tours(self):
+-        """ Returns the list of consumed tours for the current user """
+-        return [t.name for t in self.search([('user_id', '=', self.env.uid)])]
++    def get_current_tour(self):
++        if self.env.user and self.env.user.tour_enabled and self.env.user._is_internal():
++            tours_to_run = self.search([("custom", "=", False), ("user_consumed_ids", "not in", self.env.user.id)])
++            return bool(tours_to_run[:1]) and tours_to_run[:1]._get_tour_json()
++
++    @api.model
++    def get_tour_json_by_name(self, tour_name):
++        tour_id = self.search([("name", "=", tour_name)])
++        return tour_id._get_tour_json()
++
++    def _get_tour_json(self):
++        tour_json = self.read(fields={
++            "name",
++            "url",
++            "custom"
++        })[0]
++
++        del tour_json["id"]
++        tour_json["steps"] = self.step_ids.get_steps_json()
++        tour_json["rainbowManMessage"] = self.rainbow_man_message
++        return tour_json
++
++    def export_js_file(self):
++        js_content = f"""import {{ registry }} from '@web/core/registry';
++
++registry.category("web_tour.tours").add("{self.name}", {{
++    url: "{self.url}",
++    steps: () => {json.dumps(self.step_ids.get_steps_json(), indent=4)}
++}})"""
++
++        attachment_id = self.env["ir.attachment"].create({
++            "datas": base64.b64encode(bytes(js_content, 'utf-8')),
++            "name": f"{self.name}.js",
++            "mimetype": "application/javascript",
++            "res_model": "web_tour.tour",
++            "res_id": self.id,
++        })
++
++        return {
++            "type": "ir.actions.act_url",
++            "url": f"/web/content/{attachment_id.id}?download=true",
++        }
++
++
++class TourStep(models.Model):
++    _name = "web_tour.tour.step"
++    _description = "Tour's step"
++    _order = "sequence, id"
++
++    trigger = fields.Char(required=True)
++    content = fields.Char()
++    tour_id = fields.Many2one("web_tour.tour", required=True, ondelete="cascade")
++    run = fields.Char()
++    sequence = fields.Integer()
++
++    def get_steps_json(self):
++        steps = []
++
++        for step in self.read(fields=["trigger", "content", "run"]):
++            del step["id"]
++            if not step["content"]:
++                del step["content"]
++            steps.append(step)
++
++        return steps

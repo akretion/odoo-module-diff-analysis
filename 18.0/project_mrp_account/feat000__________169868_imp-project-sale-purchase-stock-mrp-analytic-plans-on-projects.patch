@@ -1,0 +1,239 @@
+PR: https://github.com/odoo/odoo/pull/169868
+
+From: 238a41e35280256382f6509182b9e900fb4f7aba
+From: Maxime de Neuville
+Date: 2024-08-29 11:54:49
+
+Total Changes: 150
+
+[IMP] project,sale,purchase,stock,mrp: analytic plans on projects
+
+PURPOSE
+
+Currently, users can track the profitability of their projects, but they cannot allocate their timesheet-related costs to different entries. This approach is one-dimensional.
+For instance, it can be relevant to track costs for the project as a whole, but also for the team or department in charge, the staff, a particular service, or a specific customer simultaneously.
+By doing so, users can track the profitability of their company at a more granular level. They gain a better understanding of what is impacting their costs and can budget their projects accordingly.
+Furthermore, we would like to handle the use-case of construction companies. Indeed, when stock is allocated to a construction site (or moved back to the warehouse if it wasn't used), it is not reflected in the profitability of the project because it doesn't generate analytic entries. This leads to an incorrect overview of the project's finances.
+In addition, it is not easy to identify the stock moves impacting the project as there is no direct link between the two. It would be convenient for construction companies to have an overview and be able to create new pickings from the top bar of the project in their operations.
+At last, these extra materials used sometimes need to be re-invoiced to the customer. Currently, this has to be done manually by adding a product to the SO. This is error-prone and time-consuming. We are thus relying on the 're-invoice expenses' feature that already exists for expenses and vendor bills to make it automatic.
+Finally, another use-case that would benefit from these changes is companies that are engineering custom machines for their customers. They use projects to track the progress made on their prototypes but also need an overview of the POs, MOs, and stock pickings involved in the process.
+
+FEATURE DETAILS
+
+* Project
+* Remove the 'analytic_account_id' field from projects
+* Replace it with an analytic notebook allowing to define multiple analytic accounts (one per plan)
+* Remove the analytic accounting for tasks
+* Timesheets inherit the analytic accounts configured on their project or on the distribution of their associated SOL (priority to their SOL)
+
+* Sale
+* Remove the 'analytic_account_id' field from the SO
+* Replace it with a project field. The analytic accounts of the project set on the SO are used to set a default SOL analytic distribution
+
+* Stock
+* Add an analytic costs field of operation types that indicates whether the stock picking of this type should generates AALs and do reinvoicing on validation
+* Add a project field on stock pickings, used to generate AALs using the project's accounts and also for the reinvoicing of reinvoicable products
+* Add a sales order field on projects to indicate on which SO to do the reinvoicing when validating stock pickings
+* About the AAL generation, the amount is negative for operation of type 'delivery' and positive for type 'receipt'. If automatic accounting (anglo-saxon accounting) is enabled, do not generate AALs on stock picking validtion, to avoid generating in duplicate
+* Landed costs's generated journal entries distribution receives the accounts of the stock picking's project or the MO's project that was selected
+
+* MRP
+* Remove the analytic distribution from MOs
+* Replace it with a project field
+* When generating AALs with the MO, again, the accounts are taken from the project linked to the MO
+* Remove the analytic distribution from BOMs
+* Replace it with a project field, used as a default value for setting the project of MOs
+
+* Purchase
+* Similarly to SOs, add a project field to POs
+* Again, the accounts of the project linked to the PO are used as a default value for the distribution of the POLs
+
+* Others
+* Rename 'Project Updates' into 'Dashboard'
+* Update the project profitability (report should reflect the analytic items linked to the analytic account of the 'Project' plan (in other words, we keep the current behavior))
+* Update stat buttons and add top bars actions accordingly to the changes described above (SO, PO, From WH, To WH, MO, BOMs, Analytic Items)
+* Adapt the reinvoicing of vendor bills to work with the project of the SO (and not the analytic account of the SO anymore)
+
+task-3985258
+
+closes odoo/odoo#169868
+
+Related: odoo/enterprise#65054
+Related: odoo/upgrade#6296
+Signed-off-by: Xavier Bol (xbo) <xbo@odoo.com>
+
+================================= pseudo patch: =================================
+
+--- a/None
++++ b/addons/project_mrp_account/models/__init__.py
+@@ -0,0 +1,7 @@
++# Part of Odoo. See LICENSE file for full copyright and licensing details.
++
++from . import mrp_production
++from . import mrp_workorder
++from . import project_project
++from . import stock_move
++from . import stock_rule
+
+--- a/None
++++ b/addons/project_mrp_account/models/mrp_production.py
+@@ -0,0 +1,33 @@
++# Part of Odoo. See LICENSE file for full copyright and licensing details.
++
++from odoo import api, fields, models, _
++
++
++class MrpProduction(models.Model):
++    _inherit = 'mrp.production'
++
++    has_analytic_account = fields.Boolean(compute='_compute_has_analytic_account')
++
++    @api.depends('project_id')
++    def _compute_has_analytic_account(self):
++        has_analytic_account_per_project_id = {p.id: bool(p._get_analytic_accounts()) for p in self.project_id}
++        for production in self:
++            production.has_analytic_account = has_analytic_account_per_project_id.get(production.project_id.id, False)
++
++    def action_view_analytic_accounts(self):
++        self.ensure_one()
++        return {
++            'type': 'ir.actions.act_window',
++            'res_model': 'account.analytic.account',
++            'domain': [('id', 'in', self.project_id._get_analytic_accounts().ids)],
++            'name': _('Analytic Accounts'),
++            'view_mode': 'tree,form',
++        }
++
++    def write(self, vals):
++        res = super().write(vals)
++        for production in self:
++            if 'project_id' in vals and production.state != 'draft':
++                production.move_raw_ids._account_analytic_entry_move()
++                production.workorder_ids._create_or_update_analytic_entry()
++        return res
+
+--- a/None
++++ b/addons/project_mrp_account/models/mrp_workorder.py
+@@ -0,0 +1,14 @@
++# Part of Odoo. See LICENSE file for full copyright and licensing details.
++
++from odoo import models
++
++
++class MrpWorkorder(models.Model):
++    _inherit = 'mrp.workorder'
++
++    def _create_or_update_analytic_entry_for_record(self, value, hours):
++        super()._create_or_update_analytic_entry_for_record(value, hours)
++        project = self.production_id.project_id
++        mo_analytic_line_vals = self.env['account.analytic.account']._perform_analytic_distribution(project._get_analytic_distribution(), value, hours, self.mo_analytic_account_line_ids, self)
++        if mo_analytic_line_vals:
++            self.mo_analytic_account_line_ids += self.env['account.analytic.line'].sudo().create(mo_analytic_line_vals)
+
+--- a/None
++++ b/addons/project_mrp_account/models/project_project.py
+@@ -0,0 +1,55 @@
++# Part of Odoo. See LICENSE file for full copyright and licensing details.
++
++from odoo import models, _
++from odoo.osv import expression
++
++
++class Project(models.Model):
++    _inherit = "project.project"
++
++    # ----------------------------
++    #  Project Updates
++    # ----------------------------
++
++    def _get_profitability_labels(self):
++        labels = super()._get_profitability_labels()
++        labels['manufacturing_order'] = _('Manufacturing Orders')
++        return labels
++
++    def _get_profitability_sequence_per_invoice_type(self):
++        sequence_per_invoice_type = super()._get_profitability_sequence_per_invoice_type()
++        sequence_per_invoice_type['manufacturing_order'] = 12
++        return sequence_per_invoice_type
++
++    def _get_profitability_aal_domain(self):
++        return expression.AND([
++            super()._get_profitability_aal_domain(),
++            [('category', '!=', 'manufacturing_order')],
++        ])
++
++    def _get_profitability_items(self, with_action=True):
++        profitability_items = super()._get_profitability_items(with_action)
++        mrp_category = 'manufacturing_order'
++        mrp_aal_read_group = self.env['account.analytic.line'].sudo()._read_group(
++            [('auto_account_id', 'in', self.account_id.ids), ('category', '=', mrp_category)],
++            ['currency_id'],
++            ['amount:sum'],
++        )
++        if mrp_aal_read_group:
++            can_see_manufactoring_order = with_action and len(self) == 1 and self.env.user.has_group('mrp.group_mrp_user')
++            total_amount = 0
++            for currency, amount_summed in mrp_aal_read_group:
++                total_amount += currency._convert(amount_summed, self.currency_id, self.company_id)
++
++            mrp_costs = {
++                'id': mrp_category,
++                'sequence': self._get_profitability_sequence_per_invoice_type()[mrp_category],
++                'billed': total_amount,
++                'to_bill': 0.0,
++            }
++            if can_see_manufactoring_order:
++                mrp_costs['action'] = {'name': 'action_view_mrp_production', 'type': 'object'}
++            costs = profitability_items['costs']
++            costs['data'].append(mrp_costs)
++            costs['total']['billed'] += mrp_costs['billed']
++        return profitability_items
+
+--- a/None
++++ b/addons/project_mrp_account/models/stock_move.py
+@@ -0,0 +1,28 @@
++# Part of Odoo. See LICENSE file for full copyright and licensing details.
++
++from odoo import _, models
++from odoo.exceptions import ValidationError
++from odoo.tools import format_list
++
++
++class StockMove(models.Model):
++    _inherit = 'stock.move'
++
++    def _get_analytic_distribution(self):
++        distribution = self.raw_material_production_id.project_id._get_analytic_distribution()
++        return distribution or super()._get_analytic_distribution()
++
++    def _prepare_analytic_lines(self):
++        res = super()._prepare_analytic_lines()
++        if res and self.raw_material_production_id:
++            # Check that all mandatory plans are set on the project linked to the MO of the stock move before generating the AALs
++            project = self.raw_material_production_id.project_id
++            mandatory_plans = project._get_mandatory_plans(self.company_id, business_domain='manufacturing_order')
++            missing_plan_names = [plan['name'] for plan in mandatory_plans if not project[plan['column_name']]]
++            if missing_plan_names:
++                raise ValidationError(_(
++                    "'%(missing_plan_names)s' analytic plan(s) required on the project '%(project_name)s' linked to the manufacturing order.",
++                    missing_plan_names=format_list(self.env, missing_plan_names),
++                    project_name=project.name,
++                ))
++        return res
+
+--- a/None
++++ b/addons/project_mrp_account/models/stock_rule.py
+@@ -0,0 +1,13 @@
++# Part of Odoo. See LICENSE file for full copyright and licensing details.
++
++from odoo import models
++
++
++class StockRule(models.Model):
++    _inherit = 'stock.rule'
++
++    def _prepare_mo_vals(self, product_id, product_qty, product_uom, location_id, name, origin, company_id, values, bom):
++        res = super()._prepare_mo_vals(product_id, product_qty, product_uom, location_id, name, origin, company_id, values, bom)
++        if values.get('project_id'):
++            res['project_id'] = values['project_id']
++        return res

@@ -1,0 +1,571 @@
+PR: https://github.com/odoo/odoo/pull/175627
+
+From: de302c2d36305c0d7562572a30587641eabfe914
+From: Chong Wang (cwg)
+Date: 2024-09-23 09:09:35
+
+Total Changes: 241
+
+[IMP] core: jsonb company dependent fields
+
+use jsonb for company dependent fields
+1. field type
+	before: company dependent fields were non-stored and computed
+	now:    company dependent fields are stored fields whose column type is
+	        jsonb with the format like '{"1": val1}'::jsonb
+
+2. fallback
+	before: fallbacks of company dependent fields were stored in
+	        ir_property.value_xxx `WHERE res_id IS NULL`
+	now:    fallbacks are stored in ir_default.json_value in the format of
+	        jsonfied write format
+
+3. many2one
+	field.ondelete
+		before: only field.ondelete='set null'
+		now:    support field.ondelete='set null' and field.ondelete='restrict'
+	field.index
+		before: no index
+		now:    default 'btree_not_null' which index (col IS NOT NULL) for all
+		        NOT NULL rows
+	reference exists
+		before: checked when get data from ir_property
+		now:    cleaned when orm `unlink`. As a side effect, if a model is
+		        referenced by a many2one company dependent field, this model
+		        cannot have any field.ondelete='cascade' field. The developer
+		        must override the `unlink` method to do the logical on delete
+		        cascade in the ORM
+
+4. _field_to_sql
+	before: not supported for company dependent fields
+	now:    can be used by company dependent fields like normal fields to
+	        generate reports
+
+closes odoo/odoo#175627
+
+Task: 3954610
+Related: odoo/enterprise#67925
+Related: odoo/upgrade#6366
+Related: odoo/upgrade-util#124
+Signed-off-by: Chong Wang (cwg) <cwg@odoo.com>
+
+================================= pseudo patch: =================================
+
+--- a/addons/account/models/account_account.py
++++ b/addons/account/models/account_account.py
+@@ -9,7 +9,6 @@ from odoo import api, fields, models, _, Command
+ from odoo.osv import expression
+ from odoo.exceptions import UserError, ValidationError, RedirectWarning
+ from odoo.tools import SQL, Query
+-from odoo.addons.base.models.ir_property import TYPE2FIELD
+ 
+ 
+ ACCOUNT_REGEX = re.compile(r'(?:(\S*\d+\S*))?(.*)')
+@@ -48,6 +47,7 @@ class AccountAccount(models.Model):
+     company_currency_id = fields.Many2one('res.currency', compute='_compute_company_currency_id')
+     company_fiscal_country_code = fields.Char(compute='_compute_company_fiscal_country_code')
+     code = fields.Char(string="Code", size=64, tracking=True, compute='_compute_code', search='_search_code', inverse='_inverse_code')
++    code_store = fields.Char(company_dependent=True)
+     placeholder_code = fields.Char(string="Display code", compute='_compute_placeholder_code')
+     deprecated = fields.Boolean(default=False, tracking=True)
+     used = fields.Boolean(compute='_compute_used', search='_search_used')
+@@ -139,29 +139,7 @@ class AccountAccount(models.Model):
+         if fname == 'internal_group':
+             return SQL("split_part(account_account.account_type, '_', 1)", to_flush=self._fields['account_type'])
+         if fname == 'code':
+-            field = self._fields.get(fname)
+-
+-            company_dependent_field_alias = query.make_alias(alias, f'{field.name}_company_dependent')
+-            query.add_join('LEFT JOIN', alias=company_dependent_field_alias, table='ir_property', condition=SQL(
+-                    """
+-                        %(ir_property_fields_id)s = %(field_id)s
+-                        AND %(ir_property_company_id)s = %(root_company_id)s
+-                        AND %(ir_property_res_id)s = 'account.account,' || %(account_id)s::text
+-                    """,
+-                    ir_property_fields_id=self.env['ir.property']._field_to_sql(company_dependent_field_alias, 'fields_id'),
+-                    field_id=self.env['ir.model.fields']._get(self._name, field.name).id,
+-                    ir_property_company_id=self.env['ir.property']._field_to_sql(company_dependent_field_alias, 'company_id'),
+-                    root_company_id=self.env.company.root_id.id,
+-                    ir_property_res_id=self.env['ir.property']._field_to_sql(company_dependent_field_alias, 'res_id'),
+-                    account_id=SQL.identifier(alias, 'id'),
+-                )
+-            )
+-
+-            # This is the field on ir.property that will contain the value of 'code'.
+-            value_field = self.env['ir.property']._fields[TYPE2FIELD[field.type]]
+-
+-            return self.env['ir.property']._field_to_sql(company_dependent_field_alias, value_field.name)
+-
++            return self.with_company(self.env.company.root_id).sudo()._field_to_sql(alias, 'code_store', query, flush)
+         return super()._field_to_sql(alias, fname, query, flush)
+ 
+     @api.constrains('reconcile', 'account_type', 'tax_ids')
+@@ -352,21 +330,17 @@ class AccountAccount(models.Model):
+ 
+     @api.depends_context('company')
+     def _compute_code(self):
+-        values = self.env['ir.property'].with_company(self.env.company.root_id).sudo()._get_multi('code', 'account.account', self.ids)
+-        for record in self:
++        for record, record_root in zip(self, self.with_company(self.env.company.root_id).sudo()):
+             # Need to set record.code with `company = self.env.company`, not `self.env.company.root_id`
+-            record.code = values.get(record.id)
++            record.code = record_root.code_store
+ 
+     def _search_code(self, operator, value):
+-        return self._fields['code']._search_company_dependent(self.with_company(self.env.company.root_id), operator, value)
++        return [('id', 'in', self.with_company(self.env.company.root_id).sudo()._search([('code_store', operator, value)]))]
+ 
+     def _inverse_code(self):
+-        values = {
+-            # Need to access record.code with `company = self.env.company`
+-            record.id: self._fields['code'].convert_to_write(record.code, record)
+-            for record in self
+-        }
+-        self.env['ir.property'].with_company(self.env.company.root_id).sudo()._set_multi('code', 'account.account', values)
++        for record, record_root in zip(self, self.with_company(self.env.company.root_id).sudo()):
++            # Need to set record.code with `company = self.env.company`, not `self.env.company.root_id`
++            record_root.code_store = record.code
+ 
+     @api.depends_context('company')
+     @api.depends('code')
+@@ -1003,19 +977,6 @@ class AccountAccount(models.Model):
+         if self.env['account.move.line'].search_count([('account_id', 'in', self.ids)], limit=1):
+             raise UserError(_('You cannot perform this action on an account that contains journal items.'))
+ 
+-    @api.ondelete(at_uninstall=False)
+-    def _unlink_except_account_set_on_customer(self):
+-        #Checking whether the account is set as a property to any Partner or not
+-        values = ['account.account,%s' % (account_id,) for account_id in self.ids]
+-        partner_prop_acc = self.env['ir.property'].sudo().search([('value_reference', 'in', values)], limit=1)
+-        if partner_prop_acc:
+-            account_name = partner_prop_acc.get_by_record().display_name
+-            raise UserError(
+-                _("You can't delete the account %s, as it is used on a contact.\n\n"
+-                    "Think of it as safeguarding your customer's receivables; your CFO would appreciate it :)"
+-                    , account_name)
+-            )
+-
+     @api.ondelete(at_uninstall=False)
+     def _unlink_except_linked_to_fiscal_position(self):
+         if self.env['account.fiscal.position.account'].search_count(['|', ('account_src_id', 'in', self.ids), ('account_dest_id', 'in', self.ids)], limit=1):
+@@ -1151,7 +1112,6 @@ class AccountAccount(models.Model):
+         self.env.invalidate_all()
+ 
+         new_account_id_by_company_id = {str(company.id): new_account.id for company, new_account in new_account_by_company.items()}
+-        new_account_id_by_company_id[base_company.id] = self.id  # Needed for update of xmlids
+         new_account_id_by_company_id_json = json.dumps(new_account_id_by_company_id)
+         (self | new_accounts).invalidate_recordset()
+ 
+@@ -1159,7 +1119,8 @@ class AccountAccount(models.Model):
+         many2x_fields = self.env['ir.model.fields'].search([
+             ('ttype', 'in', ('many2one', 'many2many')),
+             ('relation', '=', 'account.account'),
+-            ('store', '=', True)
++            ('store', '=', True),
++            ('company_dependent', '=', False),
+         ])
+         for field_to_update in many2x_fields:
+             model = field_to_update.model
+@@ -1195,14 +1156,30 @@ class AccountAccount(models.Model):
+                 account_id=self.id,
+                 company_ids_to_update=tuple(new_account_id_by_company_id),
+             ))
++        for field in self.env.registry.many2one_company_dependents[self._name]:
++            self.env.cr.execute(SQL(
++                """
++                UPDATE %(table)s
++                SET %(column)s = (
++                    SELECT jsonb_object_agg(key,
++                        CASE
++                            WHEN value::int = %(account_id)s AND %(new_account_id_by_company_id_json)s ? key
++                            THEN (%(new_account_id_by_company_id_json)s::jsonb->>key)::int
++                            ELSE value::int
++                        END
++                    )
++                    FROM jsonb_each_text(%(column)s)
++                )
++                WHERE %(column)s IS NOT NULL
++                """,
++                table=SQL.identifier(self.env[field.model_name]._table),
++                column=SQL.identifier(field.name),
++                new_account_id_by_company_id_json=new_account_id_by_company_id_json,
++                account_id=self.id,
++            ))
+ 
+         # 3.2: Update Reference fields that reference account.account
+-        # Include the 'value_reference' field on ir.property that is nominally a char (used e.g. for default receivable accounts)
+-        reference_fields = self.env['ir.model.fields'].search([
+-            '|',
+-            '&', ('ttype', '=', 'reference'), ('store', '=', True),
+-            '&', ('model', '=', 'ir.property'), ('name', '=', 'value_reference'),
+-        ])
++        reference_fields = self.env['ir.model.fields'].search([('ttype', '=', 'reference'), ('store', '=', True)])
+         for field_to_update in reference_fields:
+             model = field_to_update.model
+             if not self.env[model]._auto:
+@@ -1259,36 +1236,62 @@ class AccountAccount(models.Model):
+                 company_ids_to_update=tuple(new_account_id_by_company_id),
+             ))
+ 
+-        # 3.4: Update ir_property.
+-        # First, remove values already existing for the new accounts (e.g. their codes)
+-        self.env['ir.property'].invalidate_model()
++        # 3.4: Update company_dependent fields
++        # Dispatch the values of the existing account to the new accounts.
+         self.env.cr.execute(SQL(
+             """
+-             DELETE FROM ir_property
+-              WHERE res_id = %(new_account_res_ids)s
++            WITH new_account_company AS (
++                SELECT key AS company_id, value::int AS account_id
++                FROM json_each_text(%(new_account_id_by_company_id_json)s)
++            )
++            UPDATE %(table)s new
++            SET %(migrate_fields)s
++            FROM %(table)s old, new_account_company a2c
++            WHERE old.id = %(old_id)s
++            AND a2c.account_id = new.id
++            AND new.id IN %(new_ids)s
+             """,
+-            new_account_res_ids=tuple(f'account.account,{new_account.id}' for new_account in new_accounts),
++            new_account_id_by_company_id_json=new_account_id_by_company_id_json,
++            table=SQL.identifier(self._table),
++            migrate_fields=SQL(', ').join(
++                SQL(
++                    """
++                    %(field)s = CASE WHEN old.%(field)s ? a2c.company_id
++                                THEN jsonb_build_object(a2c.company_id, old.%(field)s->a2c.company_id)
++                                ELSE NULL END
++                    """,
++                    field=SQL.identifier(field_name),
++                )
++                for field_name, field in self._fields.items()
++                if field.company_dependent
++            ),
++            old_id=self.id,
++            new_ids=tuple(new_accounts.ids)
+         ))
+-        # Then, dispatch the values of the existing account to the new accounts.
++        # On the original account, remove values for other companies
+         self.env.cr.execute(SQL(
+-            """
+-             UPDATE ir_property
+-                SET res_id = 'account.account,' || (%(new_account_id_by_company_id_json)s::jsonb->>company_id::text)
+-              WHERE res_id = %(account_res_id)s
+-                AND company_id IN %(company_ids_to_update)s
+-            """,
+-            new_account_id_by_company_id_json=new_account_id_by_company_id_json,
+-            account_res_id=f'account.account,{self.id}',
+-            company_ids_to_update=tuple(new_account_id_by_company_id),
++            "UPDATE %(table)s SET %(fields_drop_company_ids)s WHERE id = %(id)s",
++            table=SQL.identifier(self._table),
++            fields_drop_company_ids=SQL(', ').join(
++                SQL(
++                    "%(field)s = NULLIF(%(field)s - %(company_ids)s, '{}'::jsonb)",
++                    field=SQL.identifier(field_name),
++                    company_ids=list(new_account_id_by_company_id)
++                )
++                for field_name, field in self._fields.items()
++                if field.company_dependent
++            ),
++            id=self.id
+         ))
+ 
+         # 3.5. Split account xmlids based on the company_id that is present within the xmlid
+         self.env['ir.model.data'].invalidate_model()
++        account_id_by_company_id_json = json.dumps({**new_account_id_by_company_id, str(base_company.id): self.id})
+         self.env.cr.execute(SQL(
+             """
+              UPDATE ir_model_data
+                 SET res_id = (
+-                        %(new_account_id_by_company_id_json)s::jsonb->>
++                        %(account_id_by_company_id_json)s::jsonb->>
+                         substring(name, %(xmlid_regex)s)
+                     )::int
+               WHERE module = 'account'
+@@ -1296,7 +1299,7 @@ class AccountAccount(models.Model):
+                 AND res_id = %(account_id)s
+                 AND name ~ %(xmlid_regex)s
+             """,
+-            new_account_id_by_company_id_json=new_account_id_by_company_id_json,
++            account_id_by_company_id_json=account_id_by_company_id_json,
+             xmlid_regex=r'([\d]+)_.*',
+             account_id=self.id,
+         ))
+
+--- a/addons/account/models/account_cash_rounding.py
++++ b/addons/account/models/account_cash_rounding.py
+@@ -28,6 +28,7 @@ class AccountCashRounding(models.Model):
+         company_dependent=True,
+         check_company=True,
+         domain="[('deprecated', '=', False)]",
++        ondelete='restrict',
+     )
+     loss_account_id = fields.Many2one(
+         'account.account',
+@@ -35,6 +36,7 @@ class AccountCashRounding(models.Model):
+         company_dependent=True,
+         check_company=True,
+         domain="[('deprecated', '=', False)]",
++        ondelete='restrict',
+     )
+     rounding_method = fields.Selection(string='Rounding Method', required=True,
+         selection=[('UP', 'UP'), ('DOWN', 'DOWN'), ('HALF-UP', 'HALF-UP')],
+
+--- a/addons/account/models/account_journal.py
++++ b/addons/account/models/account_journal.py
+@@ -585,6 +585,7 @@ class AccountJournal(models.Model):
+             accounts = self.search([('bank_account_id', '=', bank_account.id)])
+             if accounts <= self:
+                 bank_accounts += bank_account
++        self.env['account.payment.method.line'].search([('journal_id', 'in', self.ids)]).unlink()
+         ret = super(AccountJournal, self).unlink()
+         bank_accounts.unlink()
+         return ret
+
+--- a/addons/account/models/account_journal_dashboard.py
++++ b/addons/account/models/account_journal_dashboard.py
+@@ -903,7 +903,8 @@ class account_journal(models.Model):
+                 'name': 'Deco Addict',
+                 'is_company': True,
+             })
+-        default_expense_account = self.env['ir.property'].with_company(company)._get('property_account_expense_categ_id', 'product.category')
++        ProductCategory = self.env['product.category'].with_company(company)
++        default_expense_account = ProductCategory._fields['property_account_expense_categ_id'].get_company_dependent_fallback(ProductCategory)
+         ref = 'DE%s' % invoice_date.strftime('%Y%m')
+         bill = self.env['account.move'].with_context(default_extract_state='done').create({
+             'move_type': 'in_invoice',
+
+--- a/addons/account/models/account_move_line.py
++++ b/addons/account/models/account_move_line.py
+@@ -543,38 +543,6 @@ class AccountMoveLine(models.Model):
+                        AND line.display_type = 'payment_term'
+                        AND line.id != ANY(%(current_ids)s)
+                 ),
+-                properties AS(
+-                    SELECT DISTINCT ON (property.company_id, property.name, property.res_id)
+-                           'res.partner' AS model,
+-                           SPLIT_PART(property.res_id, ',', 2)::integer AS id,
+-                           CASE
+-                               WHEN property.name = 'property_account_receivable_id' THEN 'asset_receivable'
+-                               ELSE 'liability_payable'
+-                           END AS account_type,
+-                           SPLIT_PART(property.value_reference, ',', 2)::integer AS account_id
+-                      FROM ir_property property
+-                      JOIN res_company company ON property.company_id = company.id
+-                     WHERE property.name IN ('property_account_receivable_id', 'property_account_payable_id')
+-                       AND property.company_id = ANY(%(company_ids)s)
+-                       AND property.res_id = ANY(%(partners)s)
+-                  ORDER BY property.company_id, property.name, property.res_id, account_id
+-                ),
+-                default_properties AS(
+-                    SELECT DISTINCT ON (property.company_id, property.name)
+-                           'res.partner' AS model,
+-                           company.partner_id AS id,
+-                           CASE
+-                               WHEN property.name = 'property_account_receivable_id' THEN 'asset_receivable'
+-                               ELSE 'liability_payable'
+-                           END AS account_type,
+-                           SPLIT_PART(property.value_reference, ',', 2)::integer AS account_id
+-                      FROM ir_property property
+-                      JOIN res_company company ON property.company_id = company.id
+-                     WHERE property.name IN ('property_account_receivable_id', 'property_account_payable_id')
+-                       AND property.company_id = ANY(%(company_ids)s)
+-                       AND property.res_id IS NULL
+-                  ORDER BY property.company_id, property.name, account_id
+-                ),
+                 fallback AS (
+                     SELECT DISTINCT ON (account_companies.res_company_id, account.account_type)
+                            'res.company' AS model,
+@@ -590,10 +558,6 @@ class AccountMoveLine(models.Model):
+                 )
+                 SELECT * FROM previous
+                 UNION ALL
+-                SELECT * FROM default_properties
+-                UNION ALL
+-                SELECT * FROM properties
+-                UNION ALL
+                 SELECT * FROM fallback
+             """, {
+                 'company_ids': moves.company_id.ids,
+@@ -610,8 +574,8 @@ class AccountMoveLine(models.Model):
+                 move = line.move_id
+                 account_id = (
+                     accounts.get(('account.move', move.id, None))
+-                    or accounts.get(('res.partner', move.commercial_partner_id.id, account_type))
+-                    or accounts.get(('res.partner', move.company_id.partner_id.id, account_type))
++                    or move.with_company(move.company_id).commercial_partner_id['property_account_receivable_id' if account_type == 'asset_receivable' else 'property_account_payable_id'].id
++                    or move.with_company(move.company_id).company_id.partner_id['property_account_receivable_id' if account_type == 'asset_receivable' else 'property_account_payable_id'].id
+                     or accounts.get(('res.company', move.company_id.id, account_type))
+                 )
+                 if line.move_id.fiscal_position_id:
+
+--- a/addons/account/models/account_payment_method.py
++++ b/addons/account/models/account_payment_method.py
+@@ -88,6 +88,10 @@ class AccountPaymentMethod(models.Model):
+         """
+         return []
+ 
++    def unlink(self):
++        self.env['account.payment.method.line'].search([('payment_method_id', 'in', self.ids)]).unlink()
++        return super().unlink()
++
+ 
+ class AccountPaymentMethodLine(models.Model):
+     _name = "account.payment.method.line"
+@@ -102,7 +106,6 @@ class AccountPaymentMethodLine(models.Model):
+         comodel_name='account.payment.method',
+         domain="[('payment_type', '=?', payment_type), ('id', 'in', available_payment_method_ids)]",
+         required=True,
+-        ondelete='cascade'
+     )
+     payment_account_id = fields.Many2one(
+         comodel_name='account.account',
+@@ -114,7 +117,6 @@ class AccountPaymentMethodLine(models.Model):
+     )
+     journal_id = fields.Many2one(
+         comodel_name='account.journal',
+-        ondelete="cascade",
+         check_company=True,
+     )
+ 
+
+--- a/addons/account/models/account_payment_term.py
++++ b/addons/account/models/account_payment_term.py
+@@ -253,13 +253,6 @@ class AccountPaymentTerm(models.Model):
+         if self.env['account.move'].search_count([('invoice_payment_term_id', 'in', self.ids)], limit=1):
+             raise UserError(_('You can not delete payment terms as other records still reference it. However, you can archive it.'))
+ 
+-    def unlink(self):
+-        for terms in self:
+-            self.env['ir.property'].sudo().search(
+-                [('value_reference', 'in', ['account.payment.term,%s'%payment_term.id for payment_term in terms])]
+-            ).unlink()
+-        return super(AccountPaymentTerm, self).unlink()
+-
+     def _get_last_discount_date(self, date_ref):
+         self.ensure_one()
+         return date_ref + relativedelta(days=self.discount_days or 0) if self.early_discount else False
+
+--- a/addons/account/models/chart_template.py
++++ b/addons/account/models/chart_template.py
+@@ -667,7 +667,7 @@ class AccountChartTemplate(models.AbstractModel):
+         for field, model in self._get_property_accounts(additional_properties).items():
+             value = template_data.get(field)
+             if value and field in self.env[model]._fields:
+-                self.env['ir.property']._set_default(field, model, self.ref(value).id, company=company)
++                self.env['ir.default'].set(model, field, self.ref(value).id, company_id=company.id)
+ 
+         # Set default transfer account on the internal transfer reconciliation model
+         reco = self.ref('internal_transfer_reco', raise_if_not_found=False)
+
+--- a/addons/account/models/partner.py
++++ b/addons/account/models/partner.py
+@@ -532,18 +532,19 @@ class ResPartner(models.Model):
+         string="Account Payable",
+         domain="[('account_type', '=', 'liability_payable'), ('deprecated', '=', False)]",
+         help="This account will be used instead of the default one as the payable account for the current partner",
+-        required=True)
++        ondelete='restrict')
+     property_account_receivable_id = fields.Many2one('account.account', company_dependent=True,
+         string="Account Receivable",
+         domain="[('account_type', '=', 'asset_receivable'), ('deprecated', '=', False)]",
+         help="This account will be used instead of the default one as the receivable account for the current partner",
+-        required=True)
++        ondelete='restrict')
+     property_account_position_id = fields.Many2one('account.fiscal.position', company_dependent=True,
+         string="Fiscal Position",
+         help="The fiscal position determines the taxes/accounts used for this contact.")
+     property_payment_term_id = fields.Many2one('account.payment.term', company_dependent=True,
+         string='Customer Payment Terms',
+-        help="This payment term will be used instead of the default one for sales orders and customer invoices")
++        help="This payment term will be used instead of the default one for sales orders and customer invoices",
++        ondelete='restrict')
+     property_supplier_payment_term_id = fields.Many2one('account.payment.term', company_dependent=True,
+         string='Vendor Payment Terms',
+         help="This payment term will be used instead of the default one for purchase orders and vendor bills")
+@@ -552,7 +553,7 @@ class ResPartner(models.Model):
+     invoice_ids = fields.One2many('account.move', 'partner_id', string='Invoices', readonly=True, copy=False)
+     contract_ids = fields.One2many('account.analytic.account', 'partner_id', string='Partner Contracts', readonly=True)
+     bank_account_count = fields.Integer(compute='_compute_bank_count', string="Bank")
+-    trust = fields.Selection([('good', 'Good Debtor'), ('normal', 'Normal Debtor'), ('bad', 'Bad Debtor')], string='Degree of trust you have in this debtor', default='normal', company_dependent=True)
++    trust = fields.Selection([('good', 'Good Debtor'), ('normal', 'Normal Debtor'), ('bad', 'Bad Debtor')], string='Degree of trust you have in this debtor', company_dependent=True)
+     ignore_abnormal_invoice_date = fields.Boolean(company_dependent=True)
+     ignore_abnormal_invoice_amount = fields.Boolean(company_dependent=True)
+     invoice_warn = fields.Selection(WARNING_MESSAGE, 'Invoice', help=WARNING_HELP, default="no-message")
+@@ -616,14 +617,15 @@ class ResPartner(models.Model):
+ 
+     @api.depends_context('company')
+     def _compute_use_partner_credit_limit(self):
++        company_limit = self._fields['credit_limit'].get_company_dependent_fallback(self)
+         for partner in self:
+-            company_limit = self.env['ir.property']._get('credit_limit', 'res.partner')
+             partner.use_partner_credit_limit = partner.credit_limit != company_limit
+ 
+     def _inverse_use_partner_credit_limit(self):
++        company_limit = self._fields['credit_limit'].get_company_dependent_fallback(self)
+         for partner in self:
+             if not partner.use_partner_credit_limit:
+-                partner.credit_limit = self.env['ir.property']._get('credit_limit', 'res.partner')
++                partner.credit_limit = company_limit
+ 
+     @api.depends_context('company')
+     def _compute_show_credit_limit(self):
+
+--- a/addons/account/models/product.py
++++ b/addons/account/models/product.py
+@@ -15,12 +15,14 @@ class ProductCategory(models.Model):
+         domain=ACCOUNT_DOMAIN,
+         help="This account will be used when validating a customer invoice.",
+         tracking=True,
++        ondelete='restrict',
+     )
+     property_account_expense_categ_id = fields.Many2one('account.account', company_dependent=True,
+         string="Expense Account",
+         domain=ACCOUNT_DOMAIN,
+         help="The expense is accounted for when a vendor bill is validated, except in anglo-saxon accounting with perpetual inventory valuation in which case the expense (Cost of Goods Sold account) is recognized at the customer invoice validation.",
+         tracking=True,
++        ondelete='restrict',
+     )
+ 
+ #----------------------------------------------------------
+@@ -42,11 +44,11 @@ class ProductTemplate(models.Model):
+         domain=[('type_tax_use', '=', 'purchase')],
+         default=lambda self: self.env.companies.account_purchase_tax_id or self.env.companies.root_id.sudo().account_purchase_tax_id,
+     )
+-    property_account_income_id = fields.Many2one('account.account', company_dependent=True,
++    property_account_income_id = fields.Many2one('account.account', company_dependent=True, ondelete='restrict',
+         string="Income Account",
+         domain=ACCOUNT_DOMAIN,
+         help="Keep this field empty to use the default value from the product category.")
+-    property_account_expense_id = fields.Many2one('account.account', company_dependent=True,
++    property_account_expense_id = fields.Many2one('account.account', company_dependent=True, ondelete='restrict',
+         string="Expense Account",
+         domain=ACCOUNT_DOMAIN,
+         help="Keep this field empty to use the default value from the product category. If anglo-saxon accounting with automated valuation method is configured, the expense account on the product category will be used.")
+
+--- a/addons/account/models/res_config_settings.py
++++ b/addons/account/models/res_config_settings.py
+@@ -233,16 +233,17 @@ class ResConfigSettings(models.TransientModel):
+ 
+     @api.depends('company_id')
+     def _compute_account_default_credit_limit(self):
+-        for setting in self:
+-            setting.account_default_credit_limit = self.env['ir.property']._get('credit_limit', 'res.partner')
++        ResPartner = self.env['res.partner']
++        company_limit = ResPartner._fields['credit_limit'].get_company_dependent_fallback(ResPartner)
++        self.account_default_credit_limit = company_limit
+ 
+     def _inverse_account_default_credit_limit(self):
+         for setting in self:
+-            self.env['ir.property']._set_default(
+-                'credit_limit',
++            self.env['ir.default'].set(
+                 'res.partner',
++                'credit_limit',
+                 setting.account_default_credit_limit,
+-                setting.company_id.id
++                company_id=setting.company_id.id
+             )
+ 
+     @api.depends('company_id')

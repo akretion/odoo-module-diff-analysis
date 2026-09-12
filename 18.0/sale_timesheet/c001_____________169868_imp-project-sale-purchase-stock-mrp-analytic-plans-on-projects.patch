@@ -1,0 +1,205 @@
+PR: https://github.com/odoo/odoo/pull/169868
+
+From: 238a41e35280256382f6509182b9e900fb4f7aba
+From: Maxime de Neuville
+Date: 2024-08-29 11:54:49
+
+Breaking data model changes scores: del:2 + add:0, change matches:
+-    so_analytic_account_id = fields.Many2one(related='sale_order_id.analytic_account_id', string='Sale Order Analytic Account')
+-    _inherit = 'project.task.recurrence'
+
+Total Changes: 55
+
+[IMP] project,sale,purchase,stock,mrp: analytic plans on projects
+
+PURPOSE
+
+Currently, users can track the profitability of their projects, but they cannot allocate their timesheet-related costs to different entries. This approach is one-dimensional.
+For instance, it can be relevant to track costs for the project as a whole, but also for the team or department in charge, the staff, a particular service, or a specific customer simultaneously.
+By doing so, users can track the profitability of their company at a more granular level. They gain a better understanding of what is impacting their costs and can budget their projects accordingly.
+Furthermore, we would like to handle the use-case of construction companies. Indeed, when stock is allocated to a construction site (or moved back to the warehouse if it wasn't used), it is not reflected in the profitability of the project because it doesn't generate analytic entries. This leads to an incorrect overview of the project's finances.
+In addition, it is not easy to identify the stock moves impacting the project as there is no direct link between the two. It would be convenient for construction companies to have an overview and be able to create new pickings from the top bar of the project in their operations.
+At last, these extra materials used sometimes need to be re-invoiced to the customer. Currently, this has to be done manually by adding a product to the SO. This is error-prone and time-consuming. We are thus relying on the 're-invoice expenses' feature that already exists for expenses and vendor bills to make it automatic.
+Finally, another use-case that would benefit from these changes is companies that are engineering custom machines for their customers. They use projects to track the progress made on their prototypes but also need an overview of the POs, MOs, and stock pickings involved in the process.
+
+FEATURE DETAILS
+
+* Project
+* Remove the 'analytic_account_id' field from projects
+* Replace it with an analytic notebook allowing to define multiple analytic accounts (one per plan)
+* Remove the analytic accounting for tasks
+* Timesheets inherit the analytic accounts configured on their project or on the distribution of their associated SOL (priority to their SOL)
+
+* Sale
+* Remove the 'analytic_account_id' field from the SO
+* Replace it with a project field. The analytic accounts of the project set on the SO are used to set a default SOL analytic distribution
+
+* Stock
+* Add an analytic costs field of operation types that indicates whether the stock picking of this type should generates AALs and do reinvoicing on validation
+* Add a project field on stock pickings, used to generate AALs using the project's accounts and also for the reinvoicing of reinvoicable products
+* Add a sales order field on projects to indicate on which SO to do the reinvoicing when validating stock pickings
+* About the AAL generation, the amount is negative for operation of type 'delivery' and positive for type 'receipt'. If automatic accounting (anglo-saxon accounting) is enabled, do not generate AALs on stock picking validtion, to avoid generating in duplicate
+* Landed costs's generated journal entries distribution receives the accounts of the stock picking's project or the MO's project that was selected
+
+* MRP
+* Remove the analytic distribution from MOs
+* Replace it with a project field
+* When generating AALs with the MO, again, the accounts are taken from the project linked to the MO
+* Remove the analytic distribution from BOMs
+* Replace it with a project field, used as a default value for setting the project of MOs
+
+* Purchase
+* Similarly to SOs, add a project field to POs
+* Again, the accounts of the project linked to the PO are used as a default value for the distribution of the POLs
+
+* Others
+* Rename 'Project Updates' into 'Dashboard'
+* Update the project profitability (report should reflect the analytic items linked to the analytic account of the 'Project' plan (in other words, we keep the current behavior))
+* Update stat buttons and add top bars actions accordingly to the changes described above (SO, PO, From WH, To WH, MO, BOMs, Analytic Items)
+* Adapt the reinvoicing of vendor bills to work with the project of the SO (and not the analytic account of the SO anymore)
+
+task-3985258
+
+closes odoo/odoo#169868
+
+Related: odoo/enterprise#65054
+Related: odoo/upgrade#6296
+Signed-off-by: Xavier Bol (xbo) <xbo@odoo.com>
+
+================================= pseudo patch: =================================
+
+--- a/addons/sale_timesheet/models/__init__.py
++++ b/addons/sale_timesheet/models/__init__.py
+@@ -9,7 +9,6 @@ from . import product_product
+ from . import product_template
+ from . import project_project
+ from . import project_sale_line_employee_map
+-from . import project_task_recurrency
+ from . import project_task
+ from . import project_update
+ from . import res_config_settings
+
+--- a/addons/sale_timesheet/models/hr_timesheet.py
++++ b/addons/sale_timesheet/models/hr_timesheet.py
+@@ -1,9 +1,10 @@
+ # Part of Odoo. See LICENSE file for full copyright and licensing details.
+ 
+-from odoo.exceptions import UserError
++from odoo.exceptions import UserError, ValidationError
+ 
+ from odoo import api, fields, models, _
+ from odoo.osv import expression
++from odoo.tools import format_list
+ 
+ TIMESHEET_INVOICE_TYPES = [
+     ('billable_time', 'Billed on Timesheets'),
+@@ -200,3 +201,28 @@ class AccountAnalyticLine(models.Model):
+ 
+     def _is_updatable_timesheet(self):
+         return super()._is_updatable_timesheet and self._is_not_billed()
++
++    def _timesheet_preprocess_get_accounts(self, vals):
++        so_line = self.env['sale.order.line'].browse(vals.get('so_line'))
++        if not (so_line and (distribution := so_line.analytic_distribution)):
++            return super()._timesheet_preprocess_get_accounts(vals)
++
++        company = self.env['res.company'].browse(vals.get('company_id'))
++        accounts = self.env['account.analytic.account'].browse([
++            int(account_id) for account_id in next(iter(distribution)).split(',')
++        ])
++
++        plan_column_names = {account.root_plan_id._column_name() for account in accounts}
++        mandatory_plans = self._get_mandatory_plans(company, business_domain='timesheet')
++        missing_plan_names = [plan['name'] for plan in mandatory_plans if plan['column_name'] not in plan_column_names]
++        if missing_plan_names:
++            raise ValidationError(_(
++                "'%(missing_plan_names)s' analytic plan(s) required on the analytic distribution of the sale order item '%(so_line_name)s' linked to the timesheet.",
++                missing_plan_names=format_list(self.env, missing_plan_names),
++                so_line_name=so_line.name,
++            ))
++
++        account_id_per_fname = dict.fromkeys(self._get_plan_fnames(), False)
++        for account in accounts:
++            account_id_per_fname[account.root_plan_id._column_name()] = account.id
++        return account_id_per_fname
+
+--- a/addons/sale_timesheet/models/project_project.py
++++ b/addons/sale_timesheet/models/project_project.py
+@@ -283,7 +283,7 @@ class ProjectProject(models.Model):
+         panel_data = super().get_panel_data()
+         return {
+             **panel_data,
+-            'analytic_account_id': self.analytic_account_id.id,
++            'account_id': self.account_id.id,
+         }
+ 
+     def _get_sale_order_items_query(self, domain_per_model=None):
+
+--- a/addons/sale_timesheet/models/project_task.py
++++ b/addons/sale_timesheet/models/project_task.py
+@@ -19,7 +19,6 @@ class ProjectTask(models.Model):
+         return res
+ 
+     sale_order_id = fields.Many2one(domain="['|', '|', ('partner_id', '=', partner_id), ('partner_id', 'child_of', commercial_partner_id), ('partner_id', 'parent_of', partner_id)]")
+-    so_analytic_account_id = fields.Many2one(related='sale_order_id.analytic_account_id', string='Sale Order Analytic Account')
+     pricing_type = fields.Selection(related="project_id.pricing_type")
+     is_project_map_empty = fields.Boolean("Is Project map empty", compute='_compute_is_project_map_empty')
+     has_multi_sol = fields.Boolean(compute='_compute_has_multi_sol', compute_sudo=True)
+@@ -58,12 +57,6 @@ class ProjectTask(models.Model):
+     def _search_remaining_hours_so(self, operator, value):
+         return [('sale_line_id.remaining_hours', operator, value)]
+ 
+-    @api.depends('so_analytic_account_id.active')
+-    def _compute_analytic_account_active(self):
+-        super()._compute_analytic_account_active()
+-        for task in self:
+-            task.analytic_account_active = task.analytic_account_active or task.so_analytic_account_id.active
+-
+     def _inverse_partner_id(self):
+         super()._inverse_partner_id()
+         for task in self:
+
+--- a/addons/sale_timesheet/models/project_task_recurrency.py
++++ b/None
+@@ -1,11 +0,0 @@
+-# Part of Odoo. See LICENSE file for full copyright and licensing details.
+-
+-from odoo import api, models
+-
+-
+-class ProjectTaskRecurrence(models.Model):
+-    _inherit = 'project.task.recurrence'
+-
+-    @api.model
+-    def _get_recurring_fields_to_copy(self):
+-        return super()._get_recurring_fields_to_copy() + ['so_analytic_account_id']
+
+--- a/addons/sale_timesheet/models/project_update.py
++++ b/addons/sale_timesheet/models/project_update.py
+@@ -14,7 +14,7 @@ class ProjectUpdate(models.Model):
+         template_values = super(ProjectUpdate, self)._get_template_values(project)
+         services = self._get_services_values(project)
+         profitability_values = self._get_profitability_values(project)
+-        show_profitability = bool(profitability_values and profitability_values.get('analytic_account_id') and (profitability_values.get('costs') or profitability_values.get('revenues')))
++        show_profitability = bool(profitability_values and profitability_values.get('account_id') and (profitability_values.get('costs') or profitability_values.get('revenues')))
+         show_sold = template_values['project'].allow_billable and len(services.get('data', [])) > 0
+         return {
+             **template_values,
+@@ -68,7 +68,7 @@ class ProjectUpdate(models.Model):
+ 
+     @api.model
+     def _get_profitability_values(self, project):
+-        costs_revenues = project.analytic_account_id and project.allow_billable
++        costs_revenues = project.account_id and project.allow_billable
+         if not (self.env.user.has_group('project.group_project_manager') and costs_revenues):
+             return {}
+         profitability_items = project._get_profitability_items(False)
+@@ -76,7 +76,7 @@ class ProjectUpdate(models.Model):
+         revenues = sum(profitability_items['revenues']['total'].values())
+         margin = revenues + costs
+         return {
+-            'analytic_account_id': project.analytic_account_id,
++            'account_id': project.account_id,
+             'costs': profitability_items['costs'],
+             'revenues': profitability_items['revenues'],
+             'total': {

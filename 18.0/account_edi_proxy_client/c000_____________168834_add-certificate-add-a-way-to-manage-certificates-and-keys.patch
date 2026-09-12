@@ -1,0 +1,185 @@
+PR: https://github.com/odoo/odoo/pull/168834
+
+From: 78e43c0b3f0c9441eb8e2813e1eefbdbed040f99
+From: Antoine Boonen
+Date: 2024-09-19 13:34:24
+
+Breaking data model changes scores: del:2 + add:0, change matches:
+-    private_key = fields.Binary(required=True, attachment=False, groups="base.group_system", help="The key to encrypt all the user's data")
+-    private_key_filename = fields.Char(compute='_compute_private_key_filename')
+
+Total Changes: 80
+
+[ADD] certificate: Add a way to manage certificates and keys
+
+Problem
+*--------
+All localizations dealing with certificates do it their own way.
+However, these have a lot of common usages and there is lot of redundant
+work done there. Furthermore, it makes maintenance harder in case of
+failure.
+
+Objective
+*--------
+Create common models to manage keys and certificates.
+
+Solution
+*--------
+We create 2 models:
+ 1 - For certificates, `certificate.certificate`
+ 2 - For keys, `certificate.key`
+
+Each model makes use of the cryptography library to extract data from
+the certificate file.
+
+task-3806683
+
+closes odoo/odoo#168834
+
+Related: odoo/enterprise#64323
+Related: odoo/upgrade#6142
+Signed-off-by: Laurent Smet (las) <las@odoo.com>
+
+================================= pseudo patch: =================================
+
+--- a/addons/account_edi_proxy_client/models/__init__.py
++++ b/addons/account_edi_proxy_client/models/__init__.py
+@@ -1,2 +1,3 @@
+ from . import account_edi_proxy_user
++from . import key
+ from . import res_company
+
+--- a/addons/account_edi_proxy_client/models/account_edi_proxy_user.py
++++ b/addons/account_edi_proxy_client/models/account_edi_proxy_user.py
+@@ -1,17 +1,11 @@
+ import base64
+ import logging
++import uuid
+ 
+ import psycopg2.errors
+ import requests
+-import uuid
+-from cryptography.hazmat.backends import default_backend
+-from cryptography.hazmat.primitives.asymmetric import rsa
+-from cryptography.hazmat.primitives import serialization
+-from cryptography.hazmat.primitives import hashes
+-from cryptography.hazmat.primitives.asymmetric import padding
+-from cryptography.fernet import Fernet
+-
+-from odoo import models, fields, _
++
++from odoo import _, fields, models
+ from odoo.exceptions import UserError
+ from odoo.tools import index_exists
+ from .account_edi_proxy_auth import OdooEdiProxyAuth
+@@ -44,8 +38,13 @@ class AccountEdiProxyClientUser(models.Model):
+     company_id = fields.Many2one('res.company', string='Company', required=True,
+         default=lambda self: self.env.company)
+     edi_identification = fields.Char(required=True, help="The unique id that identifies this user, typically the vat")
+-    private_key = fields.Binary(required=True, attachment=False, groups="base.group_system", help="The key to encrypt all the user's data")
+-    private_key_filename = fields.Char(compute='_compute_private_key_filename')
++    private_key_id = fields.Many2one(
++        string='Private Key',
++        comodel_name='certificate.key',
++        required=True,
++        domain=[('public', '=', False)],
++        help="The key to encrypt all the user's data",
++    )
+     refresh_token = fields.Char(groups="base.group_system")
+     proxy_type = fields.Selection(selection=[], required=True)
+     edi_mode = fields.Selection(
+@@ -78,10 +77,6 @@ class AccountEdiProxyClientUser(models.Model):
+                               WHERE (active = True)
+             """)
+ 
+-    def _compute_private_key_filename(self):
+-        for record in self:
+-            record.private_key_filename = f'{record.id_client}_{record.edi_identification}.key'
+-
+     def _get_proxy_urls(self):
+         # To extend
+         return {}
+@@ -157,24 +152,7 @@ class AccountEdiProxyClientUser(models.Model):
+ 
+         :param company: the company of the user.
+         '''
+-        # public_exponent=65537 is a default value that should be used most of the time, as per the documentation of cryptography.
+-        # key_size=2048 is considered a reasonable default key size, as per the documentation of cryptography.
+-        # see https://cryptography.io/en/latest/hazmat/primitives/asymmetric/rsa/
+-        private_key = rsa.generate_private_key(
+-            public_exponent=65537,
+-            key_size=2048,
+-            backend=default_backend()
+-        )
+-        private_pem = private_key.private_bytes(
+-            encoding=serialization.Encoding.PEM,
+-            format=serialization.PrivateFormat.PKCS8,
+-            encryption_algorithm=serialization.NoEncryption()
+-        )
+-        public_key = private_key.public_key()
+-        public_pem = public_key.public_bytes(
+-            encoding=serialization.Encoding.PEM,
+-            format=serialization.PublicFormat.SubjectPublicKeyInfo
+-        )
++        private_key_sudo = self.env['certificate.key'].sudo()._generate_rsa_private_key(company, name=f"{self.id_client}_{self.edi_identification}.key")
+         edi_identification = self._get_proxy_identification(company, proxy_type)
+         if edi_mode == 'demo':
+             # simulate registration
+@@ -186,7 +164,7 @@ class AccountEdiProxyClientUser(models.Model):
+                     'dbuuid': company.env['ir.config_parameter'].get_param('database.uuid'),
+                     'company_id': company.id,
+                     'edi_identification': edi_identification,
+-                    'public_key': base64.b64encode(public_pem).decode(),
++                    'public_key': private_key_sudo._get_public_key_bytes(encoding='pem').decode(),
+                     'proxy_type': proxy_type,
+                 })
+             except AccountEdiProxyError as e:
+@@ -200,7 +178,7 @@ class AccountEdiProxyClientUser(models.Model):
+             'proxy_type': proxy_type,
+             'edi_mode': edi_mode,
+             'edi_identification': edi_identification,
+-            'private_key': base64.b64encode(private_pem),
++            'private_key_id': private_key_sudo.id,
+             'refresh_token': response['refresh_token'],
+         })
+ 
+@@ -229,20 +207,7 @@ class AccountEdiProxyClientUser(models.Model):
+         We must therefore decrypt the symmetric key.
+ 
+         :param data:            The data to decrypt.
+-        :param symmetric_key:   The symmetric_key encrypted with self.private_key.public_key()
++        :param symmetric_key:   The symmetric_key encrypted with self.private_key_id.public_key()
+         '''
+-        private_key = serialization.load_pem_private_key(
+-            base64.b64decode(self.sudo().private_key),
+-            password=None,
+-            backend=default_backend()
+-        )
+-        key = private_key.decrypt(
+-            base64.b64decode(symmetric_key),
+-            padding.OAEP(
+-                mgf=padding.MGF1(algorithm=hashes.SHA256()),
+-                algorithm=hashes.SHA256(),
+-                label=None
+-            )
+-        )
+-        f = Fernet(key)
+-        return f.decrypt(base64.b64decode(data))
++        decrypted_key = self.sudo().private_key_id._decrypt(base64.b64decode(symmetric_key))
++        return self.env['certificate.key']._account_edi_fernet_decrypt(decrypted_key, base64.b64decode(data))
+
+--- a/None
++++ b/addons/account_edi_proxy_client/models/key.py
+@@ -0,0 +1,12 @@
++from cryptography.fernet import Fernet
++
++from odoo import api, models
++
++
++class Key(models.Model):
++    _inherit = 'certificate.key'
++
++    @api.model
++    def _account_edi_fernet_decrypt(self, key, message):
++        key = Fernet(key)
++        return key.decrypt(message)

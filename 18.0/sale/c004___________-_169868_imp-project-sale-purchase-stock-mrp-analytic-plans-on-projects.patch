@@ -1,0 +1,273 @@
+PR: https://github.com/odoo/odoo/pull/169868
+
+From: 238a41e35280256382f6509182b9e900fb4f7aba
+From: Maxime de Neuville
+Date: 2024-08-29 11:54:49
+
+Breaking data model changes scores: del:1 + add:0, change matches:
+-    analytic_account_id = fields.Many2one(
+
+Total Changes: 103
+
+[IMP] project,sale,purchase,stock,mrp: analytic plans on projects
+
+PURPOSE
+
+Currently, users can track the profitability of their projects, but they cannot allocate their timesheet-related costs to different entries. This approach is one-dimensional.
+For instance, it can be relevant to track costs for the project as a whole, but also for the team or department in charge, the staff, a particular service, or a specific customer simultaneously.
+By doing so, users can track the profitability of their company at a more granular level. They gain a better understanding of what is impacting their costs and can budget their projects accordingly.
+Furthermore, we would like to handle the use-case of construction companies. Indeed, when stock is allocated to a construction site (or moved back to the warehouse if it wasn't used), it is not reflected in the profitability of the project because it doesn't generate analytic entries. This leads to an incorrect overview of the project's finances.
+In addition, it is not easy to identify the stock moves impacting the project as there is no direct link between the two. It would be convenient for construction companies to have an overview and be able to create new pickings from the top bar of the project in their operations.
+At last, these extra materials used sometimes need to be re-invoiced to the customer. Currently, this has to be done manually by adding a product to the SO. This is error-prone and time-consuming. We are thus relying on the 're-invoice expenses' feature that already exists for expenses and vendor bills to make it automatic.
+Finally, another use-case that would benefit from these changes is companies that are engineering custom machines for their customers. They use projects to track the progress made on their prototypes but also need an overview of the POs, MOs, and stock pickings involved in the process.
+
+FEATURE DETAILS
+
+* Project
+* Remove the 'analytic_account_id' field from projects
+* Replace it with an analytic notebook allowing to define multiple analytic accounts (one per plan)
+* Remove the analytic accounting for tasks
+* Timesheets inherit the analytic accounts configured on their project or on the distribution of their associated SOL (priority to their SOL)
+
+* Sale
+* Remove the 'analytic_account_id' field from the SO
+* Replace it with a project field. The analytic accounts of the project set on the SO are used to set a default SOL analytic distribution
+
+* Stock
+* Add an analytic costs field of operation types that indicates whether the stock picking of this type should generates AALs and do reinvoicing on validation
+* Add a project field on stock pickings, used to generate AALs using the project's accounts and also for the reinvoicing of reinvoicable products
+* Add a sales order field on projects to indicate on which SO to do the reinvoicing when validating stock pickings
+* About the AAL generation, the amount is negative for operation of type 'delivery' and positive for type 'receipt'. If automatic accounting (anglo-saxon accounting) is enabled, do not generate AALs on stock picking validtion, to avoid generating in duplicate
+* Landed costs's generated journal entries distribution receives the accounts of the stock picking's project or the MO's project that was selected
+
+* MRP
+* Remove the analytic distribution from MOs
+* Replace it with a project field
+* When generating AALs with the MO, again, the accounts are taken from the project linked to the MO
+* Remove the analytic distribution from BOMs
+* Replace it with a project field, used as a default value for setting the project of MOs
+
+* Purchase
+* Similarly to SOs, add a project field to POs
+* Again, the accounts of the project linked to the PO are used as a default value for the distribution of the POLs
+
+* Others
+* Rename 'Project Updates' into 'Dashboard'
+* Update the project profitability (report should reflect the analytic items linked to the analytic account of the 'Project' plan (in other words, we keep the current behavior))
+* Update stat buttons and add top bars actions accordingly to the changes described above (SO, PO, From WH, To WH, MO, BOMs, Analytic Items)
+* Adapt the reinvoicing of vendor bills to work with the project of the SO (and not the analytic account of the SO anymore)
+
+task-3985258
+
+closes odoo/odoo#169868
+
+Related: odoo/enterprise#65054
+Related: odoo/upgrade#6296
+Signed-off-by: Xavier Bol (xbo) <xbo@odoo.com>
+
+================================= pseudo patch: =================================
+
+--- a/addons/sale/models/account_move_line.py
++++ b/addons/sale/models/account_move_line.py
+@@ -1,4 +1,3 @@
+-# -*- coding: utf-8 -*-
+ # Part of Odoo. See LICENSE file for full copyright and licensing details.
+ 
+ from odoo import fields, models, _
+@@ -78,25 +77,20 @@ class AccountMoveLine(models.Model):
+             # raise if the sale order is not currently open
+             if sale_order.state in ('draft', 'sent'):
+                 raise UserError(_(
+-                    "The Sales Order %(order)s linked to the Analytic Account %(account)s must be"
+-                    " validated before registering expenses.",
++                    "The Sales Order %(order)s to be reinvoiced must be validated before registering expenses.",
+                     order=sale_order.name,
+-                    account=sale_order.analytic_account_id.name,
+                 ))
+             elif sale_order.state == 'cancel':
+                 raise UserError(_(
+-                    "The Sales Order %(order)s linked to the Analytic Account %(account)s is cancelled."
++                    "The Sales Order %(order)s to be reinvoiced is cancelled."
+                     " You cannot register an expense on a cancelled Sales Order.",
+                     order=sale_order.name,
+-                    account=sale_order.analytic_account_id.name,
+                 ))
+             elif sale_order.locked:
+                 raise UserError(_(
+-                    "The Sales Order %(order)s linked to the Analytic Account %(account)s is currently locked."
+-                    " You cannot register an expense on a locked Sales Order."
+-                    " Please create a new SO linked to this Analytic Account.",
++                    "The Sales Order %(order)s to be reinvoiced is currently locked."
++                    " You cannot register an expense on a locked Sales Order.",
+                     order=sale_order.name,
+-                    account=sale_order.analytic_account_id.name,
+                 ))
+ 
+             price = move_line._sale_get_invoice_price(sale_order)
+@@ -151,23 +145,7 @@ class AccountMoveLine(models.Model):
+         """ Get the mapping of move.line with the sale.order record on which its analytic entries should be reinvoiced
+             :return a dict where key is the move line id, and value is sale.order record (or None).
+         """
+-        mapping = {}
+-        for move_line in self:
+-            if move_line.analytic_distribution:
+-                distribution_json = move_line.analytic_distribution
+-                account_ids = [int(account_id) for key in distribution_json.keys() for account_id in key.split(',')]
+-
+-                sale_order = self.env['sale.order'].search([('analytic_account_id', 'in', account_ids),
+-                                                            ('state', '=', 'sale')], order='create_date ASC', limit=1)
+-                if sale_order:
+-                    mapping[move_line.id] = sale_order
+-                else:
+-                    sale_order = self.env['sale.order'].search([('analytic_account_id', 'in', account_ids)],
+-                                                               order='create_date ASC', limit=1)
+-                    mapping[move_line.id] = sale_order
+-
+-        # map of AAL index with the SO on which it needs to be reinvoiced. Maybe be None if no SO found
+-        return mapping
++        return {}
+ 
+     def _sale_prepare_sale_line_values(self, order, price):
+         """ Generate the sale.line creation value from the current move line """
+@@ -188,7 +166,7 @@ class AccountMoveLine(models.Model):
+             'discount': 0.0,
+             'product_id': self.product_id.id,
+             'product_uom': self.product_uom_id.id,
+-            'product_uom_qty': 0.0,
++            'product_uom_qty': self.quantity,
+             'is_expense': True,
+         }
+ 
+
+--- a/addons/sale/models/product_template.py
++++ b/addons/sale/models/product_template.py
+@@ -30,9 +30,9 @@ class ProductTemplate(models.Model):
+             ('cost', "At cost"),
+             ('sales_price', "Sales price"),
+         ],
+-        string="Re-Invoice Expenses", default='no',
++        string="Re-Invoice Costs", default='no',
+         compute='_compute_expense_policy', store=True, readonly=False,
+-        help="Validated expenses can be re-invoiced to a customer at its cost or sales price.")
++        help="Validated expenses, vendor bills, or stock pickings (set up to track costs) can be invoiced to the customer at either cost or sales price.")
+     visible_expense_policy = fields.Boolean(
+         string="Re-Invoice Policy visible", compute='_compute_visible_expense_policy')
+     sales_count = fields.Float(
+@@ -98,11 +98,11 @@ class ProductTemplate(models.Model):
+         super()._compute_service_tracking()
+         self.filtered(lambda pt: not pt.sale_ok).service_tracking = 'no'
+ 
+-    @api.depends('name')
++    @api.depends('purchase_ok')
+     def _compute_visible_expense_policy(self):
+         visibility = self.env.user.has_group('analytic.group_analytic_accounting')
+         for product_template in self:
+-            product_template.visible_expense_policy = visibility
++            product_template.visible_expense_policy = visibility and product_template.purchase_ok
+ 
+     @api.depends('sale_ok')
+     def _compute_expense_policy(self):
+
+--- a/addons/sale/models/sale_order.py
++++ b/addons/sale/models/sale_order.py
+@@ -258,11 +258,6 @@ class SaleOrder(models.Model):
+     source_id = fields.Many2one(ondelete='set null')
+ 
+     # Followup ?
+-    analytic_account_id = fields.Many2one(
+-        comodel_name='account.analytic.account',
+-        string="Analytic Account",
+-        copy=False, check_company=True,  # Unrequired company
+-        domain="['|', ('company_id', '=', False), ('company_id', '=', company_id)]")
+     tag_ids = fields.Many2many(
+         comodel_name='crm.tag',
+         relation='sale_order_tag_rel', column1='order_id', column2='tag_id',
+@@ -1036,16 +1031,7 @@ class SaleOrder(models.Model):
+             This method should be extended when the confirmation should generated
+             other documents. In this method, the SO are in 'sale' state (not yet 'done').
+         """
+-        self._generate_analytic_account()
+-
+-    def _generate_analytic_account(self):
+-        """ Generate an analytic account for the SO confirmed if at least an expense product """
+-        for order in self:
+-            if (
+-                not order.analytic_account_id
+-                and any(expense_policy not in [False, 'no'] for expense_policy in order.order_line.product_id.mapped('expense_policy'))
+-            ):
+-                order._create_analytic_account()
++        pass
+ 
+     def _send_order_confirmation_mail(self):
+         """ Send a mail to the SO customer to inform them that their order has been confirmed.
+@@ -1809,41 +1795,6 @@ class SaleOrder(models.Model):
+                 user_id=order.user_id.id or order.partner_id.user_id.id,
+                 note=_("Upsell %(order)s for customer %(customer)s", order=order_ref, customer=customer_ref))
+ 
+-    def _prepare_analytic_account_data(self, prefix=None):
+-        """ Prepare SO analytic account creation values.
+-
+-        :param str prefix: The prefix of the to-be-created analytic account name
+-        :return: `account.analytic.account` creation values
+-        :rtype: dict
+-        """
+-        self.ensure_one()
+-        name = self.name
+-        if prefix:
+-            name = prefix + ": " + self.name
+-        plan = self.env['account.analytic.plan'].sudo().search([], limit=1)
+-        if not plan:
+-            plan = self.env['account.analytic.plan'].sudo().create({
+-                'name': 'Default',
+-            })
+-        return {
+-            'name': name,
+-            'code': self.client_order_ref,
+-            'company_id': self.company_id.id,
+-            'plan_id': plan.id,
+-            'partner_id': self.partner_id.id,
+-        }
+-
+-    def _create_analytic_account(self, prefix=None):
+-        """ Create a new analytic account for the given orders.
+-
+-        :param str prefix: if specified, the account name will be '<prefix>: <so_reference>'.
+-            If not, the account name will be the Sales Order reference.
+-        :return: None
+-        """
+-        for order in self:
+-            analytic = self.env['account.analytic.account'].create(order._prepare_analytic_account_data(prefix))
+-            order.analytic_account_id = analytic
+-
+     def _prepare_down_payment_section_line(self, **optional_values):
+         """ Prepare the values to create a new down payment section.
+ 
+
+--- a/addons/sale/models/sale_order_line.py
++++ b/addons/sale/models/sale_order_line.py
+@@ -1132,9 +1132,6 @@ class SaleOrderLine(models.Model):
+             if line.product_id and line.state == 'sale':
+                 msg = _("Extra line with %s", line.product_id.display_name)
+                 line.order_id.message_post(body=msg)
+-                # create an analytic account if at least an expense product
+-                if line.product_id.expense_policy not in [False, 'no'] and not line.order_id.analytic_account_id:
+-                    line.order_id._create_analytic_account()
+ 
+         return lines
+ 
+@@ -1290,15 +1287,8 @@ class SaleOrderLine(models.Model):
+         return res
+ 
+     def _set_analytic_distribution(self, inv_line_vals, **optional_values):
+-        analytic_account_id = self.order_id.analytic_account_id.id
+         if self.analytic_distribution and not self.display_type:
+             inv_line_vals['analytic_distribution'] = self.analytic_distribution
+-        if analytic_account_id and not self.display_type:
+-            analytic_account_id = str(analytic_account_id)
+-            if 'analytic_distribution' in inv_line_vals:
+-                inv_line_vals['analytic_distribution'][analytic_account_id] = inv_line_vals['analytic_distribution'].get(analytic_account_id, 0) + 100
+-            else:
+-                inv_line_vals['analytic_distribution'] = {analytic_account_id: 100}
+ 
+     def _prepare_procurement_values(self, group_id=False):
+         """ Prepare specific key for moves or other components that will be created from a stock rule

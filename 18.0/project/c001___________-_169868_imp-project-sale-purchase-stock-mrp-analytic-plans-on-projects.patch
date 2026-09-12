@@ -1,0 +1,324 @@
+PR: https://github.com/odoo/odoo/pull/169868
+
+From: 238a41e35280256382f6509182b9e900fb4f7aba
+From: Maxime de Neuville
+Date: 2024-08-29 11:54:49
+
+Breaking data model changes scores: del:3 + add:0, change matches:
+-    analytic_account_id = fields.Many2one('account.analytic.account', string="Analytic Account", copy=False, ondelete='set null',
+-    analytic_account_id = fields.Many2one('account.analytic.account', ondelete='set null', compute='_compute_analytic_account_id', store=True, readonly=False,
+-    analytic_plan_id = fields.Many2one(
+
+Total Changes: 99
+
+[IMP] project,sale,purchase,stock,mrp: analytic plans on projects
+
+PURPOSE
+
+Currently, users can track the profitability of their projects, but they cannot allocate their timesheet-related costs to different entries. This approach is one-dimensional.
+For instance, it can be relevant to track costs for the project as a whole, but also for the team or department in charge, the staff, a particular service, or a specific customer simultaneously.
+By doing so, users can track the profitability of their company at a more granular level. They gain a better understanding of what is impacting their costs and can budget their projects accordingly.
+Furthermore, we would like to handle the use-case of construction companies. Indeed, when stock is allocated to a construction site (or moved back to the warehouse if it wasn't used), it is not reflected in the profitability of the project because it doesn't generate analytic entries. This leads to an incorrect overview of the project's finances.
+In addition, it is not easy to identify the stock moves impacting the project as there is no direct link between the two. It would be convenient for construction companies to have an overview and be able to create new pickings from the top bar of the project in their operations.
+At last, these extra materials used sometimes need to be re-invoiced to the customer. Currently, this has to be done manually by adding a product to the SO. This is error-prone and time-consuming. We are thus relying on the 're-invoice expenses' feature that already exists for expenses and vendor bills to make it automatic.
+Finally, another use-case that would benefit from these changes is companies that are engineering custom machines for their customers. They use projects to track the progress made on their prototypes but also need an overview of the POs, MOs, and stock pickings involved in the process.
+
+FEATURE DETAILS
+
+* Project
+* Remove the 'analytic_account_id' field from projects
+* Replace it with an analytic notebook allowing to define multiple analytic accounts (one per plan)
+* Remove the analytic accounting for tasks
+* Timesheets inherit the analytic accounts configured on their project or on the distribution of their associated SOL (priority to their SOL)
+
+* Sale
+* Remove the 'analytic_account_id' field from the SO
+* Replace it with a project field. The analytic accounts of the project set on the SO are used to set a default SOL analytic distribution
+
+* Stock
+* Add an analytic costs field of operation types that indicates whether the stock picking of this type should generates AALs and do reinvoicing on validation
+* Add a project field on stock pickings, used to generate AALs using the project's accounts and also for the reinvoicing of reinvoicable products
+* Add a sales order field on projects to indicate on which SO to do the reinvoicing when validating stock pickings
+* About the AAL generation, the amount is negative for operation of type 'delivery' and positive for type 'receipt'. If automatic accounting (anglo-saxon accounting) is enabled, do not generate AALs on stock picking validtion, to avoid generating in duplicate
+* Landed costs's generated journal entries distribution receives the accounts of the stock picking's project or the MO's project that was selected
+
+* MRP
+* Remove the analytic distribution from MOs
+* Replace it with a project field
+* When generating AALs with the MO, again, the accounts are taken from the project linked to the MO
+* Remove the analytic distribution from BOMs
+* Replace it with a project field, used as a default value for setting the project of MOs
+
+* Purchase
+* Similarly to SOs, add a project field to POs
+* Again, the accounts of the project linked to the PO are used as a default value for the distribution of the POLs
+
+* Others
+* Rename 'Project Updates' into 'Dashboard'
+* Update the project profitability (report should reflect the analytic items linked to the analytic account of the 'Project' plan (in other words, we keep the current behavior))
+* Update stat buttons and add top bars actions accordingly to the changes described above (SO, PO, From WH, To WH, MO, BOMs, Analytic Items)
+* Adapt the reinvoicing of vendor bills to work with the project of the SO (and not the analytic account of the SO anymore)
+
+task-3985258
+
+closes odoo/odoo#169868
+
+Related: odoo/enterprise#65054
+Related: odoo/upgrade#6296
+Signed-off-by: Xavier Bol (xbo) <xbo@odoo.com>
+
+================================= pseudo patch: =================================
+
+--- a/addons/project/models/account_analytic_account.py
++++ b/addons/project/models/account_analytic_account.py
+@@ -9,19 +9,19 @@ class AccountAnalyticAccount(models.Model):
+     _inherit = 'account.analytic.account'
+     _description = 'Analytic Account'
+ 
+-    project_ids = fields.One2many('project.project', 'analytic_account_id', string='Projects', export_string_translation=False)
++    project_ids = fields.One2many('project.project', 'account_id', string='Projects', export_string_translation=False)
+     project_count = fields.Integer("Project Count", compute='_compute_project_count', export_string_translation=False)
+ 
+     @api.depends('project_ids')
+     def _compute_project_count(self):
+-        project_data = self.env['project.project']._read_group([('analytic_account_id', 'in', self.ids)], ['analytic_account_id'], ['__count'])
++        project_data = self.env['project.project']._read_group([('account_id', 'in', self.ids)], ['account_id'], ['__count'])
+         mapping = {analytic_account.id: count for analytic_account, count in project_data}
+         for account in self:
+             account.project_count = mapping.get(account.id, 0)
+ 
+     @api.ondelete(at_uninstall=False)
+     def _unlink_except_existing_tasks(self):
+-        projects = self.env['project.project'].search([('analytic_account_id', 'in', self.ids)])
++        projects = self.env['project.project'].search([('account_id', 'in', self.ids)])
+         has_tasks = self.env['project.task'].search_count([('project_id', 'in', projects.ids)])
+         if has_tasks:
+             raise UserError(_('Please remove existing tasks in the project linked to the accounts you want to delete.'))
+@@ -32,7 +32,7 @@ class AccountAnalyticAccount(models.Model):
+             "type": "ir.actions.act_window",
+             "res_model": "project.project",
+             "views": [[kanban_view_id, "kanban"], [False, "form"]],
+-            "domain": [['analytic_account_id', '=', self.id]],
++            "domain": [['account_id', '=', self.id]],
+             "context": {"create": False},
+             "name": _("Projects"),
+         }
+
+--- a/addons/project/models/project_project.py
++++ b/addons/project/models/project_project.py
+@@ -10,6 +10,7 @@ from odoo.addons.rating.models import rating_data
+ from odoo.exceptions import UserError
+ from odoo.osv.expression import AND
+ from odoo.tools import get_lang, SQL
++from odoo.tools.misc import unquote
+ from .project_update import STATUS_COLOR
+ from .project_task import CLOSED_STATES
+ 
+@@ -24,6 +25,7 @@ class Project(models.Model):
+         'mail.thread',
+         'mail.activity.mixin',
+         'mail.tracking.duration.mixin',
++        'analytic.plan.fields.mixin',
+     ]
+     _order = "sequence, name, id"
+     _rating_satisfaction_days = 30  # takes 30 days by default
+@@ -86,13 +88,8 @@ class Project(models.Model):
+     partner_id = fields.Many2one('res.partner', string='Customer', auto_join=True, tracking=True, domain="['|', ('company_id', '=?', company_id), ('company_id', '=', False)]")
+     company_id = fields.Many2one('res.company', string='Company', compute="_compute_company_id", inverse="_inverse_company_id", store=True, readonly=False)
+     currency_id = fields.Many2one('res.currency', compute="_compute_currency_id", string="Currency", readonly=True, export_string_translation=False)
+-    analytic_account_id = fields.Many2one('account.analytic.account', string="Analytic Account", copy=False, ondelete='set null',
+-        domain="['|', ('company_id', '=', False), ('company_id', '=?', company_id)]", check_company=True,
+-        help="Analytic account to which this project, its tasks and its timesheets are linked. \n"
+-            "Track the costs and revenues of your project by setting this analytic account on your related documents (e.g. sales orders, invoices, purchase orders, vendor bills, expenses etc.).\n"
+-            "This analytic account can be changed on each task individually if necessary.\n"
+-            "An analytic account is required in order to use timesheets.")
+-    analytic_account_balance = fields.Monetary(related="analytic_account_id.balance")
++    analytic_account_balance = fields.Monetary(related="account_id.balance")
++    account_id = fields.Many2one('account.analytic.account', copy=False, domain="['|', ('company_id', '=', False), ('company_id', '=?', company_id)]", ondelete='set null')
+ 
+     favorite_user_ids = fields.Many2many(
+         'res.users', 'project_favorite_user_rel', 'project_id', 'user_id',
+@@ -231,12 +228,12 @@ class Project(models.Model):
+             project.access_warning = _(
+                 "This project is currently restricted to \"Invited internal users\". The project's visibility will be changed to \"invited portal users and all internal users (public)\" in order to make it accessible to the recipients.")
+ 
+-    @api.depends('analytic_account_id.company_id', 'partner_id.company_id')
++    @api.depends('account_id.company_id', 'partner_id.company_id')
+     def _compute_company_id(self):
+         for project in self:
+             # if a new restriction is put on the account or the customer, the restriction on the project is updated.
+-            if project.analytic_account_id.company_id:
+-                project.company_id = project.analytic_account_id.company_id
++            if project.account_id.company_id:
++                project.company_id = project.account_id.company_id
+             if not project.company_id and project.partner_id.company_id:
+                 project.company_id = project.partner_id.company_id
+ 
+@@ -252,7 +249,7 @@ class Project(models.Model):
+         Ensures that the new company of the project is valid for the partner
+         """
+         for project in self:
+-            account = project.analytic_account_id
++            account = project.account_id
+             if project.partner_id and project.partner_id.company_id and project.company_id != project.partner_id.company_id:
+                 raise UserError(_('The project and the associated partner must be linked to the same company.'))
+             if not account or not account.company_id:
+@@ -532,10 +529,10 @@ class Project(models.Model):
+         if 'active' in vals:
+             # archiving/unarchiving a project does it on its tasks, too
+             self.with_context(active_test=False).mapped('tasks').write({'active': vals['active']})
+-        if 'name' in vals and self.analytic_account_id:
++        if 'name' in vals and self.account_id:
+             projects_read_group = self.env['project.project']._read_group(
+-                [('analytic_account_id', 'in', self.analytic_account_id.ids)],
+-                ['analytic_account_id'],
++                [('account_id', 'in', self.account_id.ids)],
++                ['account_id'],
+                 having=[('__count', '=', 1)],
+             )
+             analytic_account_to_update = self.env['account.analytic.account'].browse([
+@@ -548,8 +545,8 @@ class Project(models.Model):
+         # Delete the empty related analytic account
+         analytic_accounts_to_delete = self.env['account.analytic.account']
+         for project in self:
+-            if project.analytic_account_id and not project.analytic_account_id.line_ids:
+-                analytic_accounts_to_delete |= project.analytic_account_id
++            if project.account_id and not project.account_id.line_ids:
++                analytic_accounts_to_delete |= project.account_id
+         self.with_context(active_test=False).tasks.unlink()
+         result = super(Project, self).unlink()
+         analytic_accounts_to_delete.unlink()
+@@ -664,7 +661,7 @@ class Project(models.Model):
+ 
+     def project_update_all_action(self):
+         action = self.env['ir.actions.act_window']._for_xml_id('project.project_update_all_action')
+-        action['display_name'] = _("%(name)s's Updates", name=self.name)
++        action['display_name'] = _("%(name)s Dashboard", name=self.name)
+         return action
+ 
+     def action_open_share_project_wizard(self):
+@@ -820,7 +817,7 @@ class Project(models.Model):
+         return self.env.user.has_group('analytic.group_analytic_accounting')
+ 
+     def _get_profitability_aal_domain(self):
+-        return [('account_id', 'in', self.analytic_account_id.ids)]
++        return [('account_id', 'in', self.account_id.ids)]
+ 
+     def _get_profitability_items(self, with_action=True):
+         return self._get_items_from_aal(with_action)
+@@ -906,30 +903,32 @@ class Project(models.Model):
+         return False
+ 
+     @api.model
+-    def _get_values_analytic_account_batch(self, project_vals):
+-        project_plan_id = int(self.env['ir.config_parameter'].sudo().get_param('analytic.analytic_plan_projects'))
+-
+-        if not project_plan_id:
+-            project_plan, _other_plans = self.env['account.analytic.plan']._get_all_plans()
+-            project_plan_id = project_plan.id
+-        companies = self.env['res.company'].browse([val.get('company_id', False) for val in project_vals])
+-
++    def _get_values_analytic_account_batch(self, project_vals_list):
++        project_plan, _other_plans = self.env['account.analytic.plan']._get_all_plans()
+         return [{
+-            'name': val.get('name', _('Unknown Analytic Account')),
+-            'company_id': company.id,
+-            'partner_id': val.get('partner_id'),
+-            'plan_id': project_plan_id,
+-        } for val, company in zip(project_vals, companies)]
++            'name': project_vals.get('name', _('Unknown Analytic Account')),
++            'company_id': project_vals.get('company_id', False),
++            'partner_id': project_vals.get('partner_id', False),
++            'plan_id': project_plan.id,
++        } for project_vals in project_vals_list]
+ 
+     def _create_analytic_account(self):
+         analytic_accounts_values = self._get_values_analytic_account_batch(self._read_format(['name', 'company_id', 'partner_id'], None))
+         analytic_accounts = self.env['account.analytic.account'].create(analytic_accounts_values)
+         for project, analytic_account in zip(self, analytic_accounts):
+-            project.analytic_account_id = analytic_account
++            project.account_id = analytic_account
+ 
+     def _get_projects_to_make_billable_domain(self):
+         return [('partner_id', '!=', False)]
+ 
++    @api.constrains(lambda self: self._get_plan_fnames())
++    def _check_account_id(self):
++        # Overriden from 'analytic.plan.fields.mixin'
++        pass
++
++    def _get_plan_domain(self, plan):
++        return AND([super()._get_plan_domain(plan), ['|', ('company_id', '=', False), ('company_id', '=?', unquote('company_id'))]])
++
+     # ---------------------------------------------------
+     # Rating business
+     # ---------------------------------------------------
+
+--- a/addons/project/models/project_task.py
++++ b/addons/project/models/project_task.py
+@@ -284,13 +284,6 @@ class Task(models.Model):
+     ], default="forever", string="Until", compute='_compute_repeat', compute_sudo=True, readonly=False)
+     repeat_until = fields.Date(string="End Date", compute='_compute_repeat', compute_sudo=True, readonly=False)
+ 
+-    # Account analytic
+-    analytic_account_id = fields.Many2one('account.analytic.account', ondelete='set null', compute='_compute_analytic_account_id', store=True, readonly=False,
+-        domain="[('company_id', '=?', company_id)]",
+-        help="Analytic account to which this task and its timesheets are linked.\n"
+-            "Track the costs and revenues of your task by setting its analytic account on your related documents (e.g. sales orders, invoices, purchase orders, vendor bills, expenses etc.).\n"
+-            "By default, the analytic account of the project is set. However, it can be changed on each task individually if necessary.")
+-
+     # Quick creation shortcuts
+     display_name = fields.Char(compute='_compute_display_name', inverse='_inverse_display_name',
+         help="""Use these keywords in the title to set new tasks:\n
+@@ -357,11 +350,6 @@ class Task(models.Model):
+         for task in self:
+             task.show_display_in_project = bool(task.parent_id) and task.project_id == task.parent_id.project_id
+ 
+-    @api.depends('project_id.analytic_account_id')
+-    def _compute_analytic_account_id(self):
+-        for task in self:
+-            task.analytic_account_id = task.project_id.analytic_account_id
+-
+     @api.depends('stage_id', 'depend_on_ids.state', 'project_id.allow_task_dependencies')
+     def _compute_state(self):
+         for task in self:
+@@ -956,8 +944,6 @@ class Task(models.Model):
+         project_id = vals.get('project_id', self.env.context.get('default_project_id'))
+         if project_id:
+             project = self.env['project.project'].browse(project_id)
+-            if project.analytic_account_id:
+-                vals['analytic_account_id'] = project.analytic_account_id.id
+             if 'company_id' in default_fields and 'default_project_id' not in self.env.context:
+                 vals['company_id'] = project.sudo().company_id
+         elif 'default_user_ids' not in self.env.context and 'user_ids' in default_fields:
+@@ -1944,13 +1930,6 @@ class Task(models.Model):
+     def _unsubscribe_portal_users(self):
+         self.message_unsubscribe(partner_ids=self.message_partner_ids.filtered('user_ids.share').ids)
+ 
+-    # ---------------------------------------------------
+-    # Analytic accounting
+-    # ---------------------------------------------------
+-    def _get_task_analytic_account_id(self):
+-        self.ensure_one()
+-        return self.analytic_account_id or self.project_id.analytic_account_id
+-
+     @api.model
+     def get_unusual_days(self, date_from, date_to=None):
+         calendar = self.env.company.resource_calendar_id
+
+--- a/addons/project/models/res_config_settings.py
++++ b/addons/project/models/res_config_settings.py
+@@ -14,13 +14,6 @@ class ResConfigSettings(models.TransientModel):
+     group_project_task_dependencies = fields.Boolean("Task Dependencies", implied_group="project.group_project_task_dependencies")
+     group_project_milestone = fields.Boolean('Milestones', implied_group='project.group_project_milestone', group='base.group_portal,base.group_user')
+ 
+-    # Analytic Accounting
+-    analytic_plan_id = fields.Many2one(
+-        comodel_name='account.analytic.plan',
+-        string="Analytic Plan",
+-        config_parameter="analytic.analytic_plan_projects",
+-    )
+-
+     @api.model
+     def _get_basic_project_domain(self):
+         return []

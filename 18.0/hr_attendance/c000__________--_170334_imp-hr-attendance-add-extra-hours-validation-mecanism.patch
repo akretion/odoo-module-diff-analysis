@@ -1,0 +1,308 @@
+PR: https://github.com/odoo/odoo/pull/170334
+
+From: cac96f5d3c391ea0d52da2e3433e7eabe07e8fb0
+From: jugj-odoo
+Date: 2024-09-04 11:57:41
+
+Breaking data model changes scores: del:4 + add:0, change matches:
+-    hr_attendance_overtime = fields.Boolean(string="Count Extra Hours")
+-    overtime_start_date = fields.Date(string="Extra Hours Starting Date")
+-    hr_attendance_overtime = fields.Boolean(
+-    overtime_start_date = fields.Date(string="Extra Hours Starting Date", readonly=False)
+
+Total Changes: 156
+
+[IMP] hr_attendance: Add extra hours validation mecanism
+
+task-3999208
+
+closes odoo/odoo#170334
+
+Related: odoo/enterprise#65342
+Related: odoo/upgrade#6426
+Signed-off-by: Yannick Tivisse (yti) <yti@odoo.com>
+
+================================= pseudo patch: =================================
+
+--- a/addons/hr_attendance/models/hr_attendance.py
++++ b/addons/hr_attendance/models/hr_attendance.py
+@@ -42,6 +42,10 @@ class HrAttendance(models.Model):
+     worked_hours = fields.Float(string='Worked Hours', compute='_compute_worked_hours', store=True, readonly=True)
+     color = fields.Integer(compute='_compute_color')
+     overtime_hours = fields.Float(string="Over Time", compute='_compute_overtime_hours', store=True)
++    overtime_status = fields.Selection(selection=[('to_approve', "To Approve"),
++                                                  ('approved', "Approved"),
++                                                  ('refused', "Refused")], compute="_compute_overtime_status", store=True, tracking=True)
++    validated_overtime_hours = fields.Float(string="Extra Hours", compute='_compute_validated_overtime_hours', store=True, readonly=False, tracking=True)
+     in_latitude = fields.Float(string="Latitude", digits=(10, 7), readonly=True, aggregator=None)
+     in_longitude = fields.Float(string="Longitude", digits=(10, 7), readonly=True, aggregator=None)
+     in_country_name = fields.Char(string="Country", help="Based on IP Address", readonly=True)
+@@ -76,6 +80,7 @@ class HrAttendance(models.Model):
+     @api.depends('worked_hours')
+     def _compute_overtime_hours(self):
+         att_progress_values = dict()
++        negative_overtime_attendances = defaultdict(lambda: False)
+         if self.employee_id:
+             self.env['hr.attendance'].flush_model(['worked_hours'])
+             self.env['hr.attendance.overtime'].flush_model(['duration'])
+@@ -115,21 +120,47 @@ class HrAttendance(models.Model):
+                     else:
+                         grouped_dict[row['ot_id']]['attendances'].append((row['att_id'], row['att_wh']))
+ 
+-            for ot in grouped_dict:
+-                ot_bucket = grouped_dict[ot]['overtime_duration']
+-                for att in grouped_dict[ot]['attendances']:
+-                    if ot_bucket > 0:
+-                        sub_time = att[1] - ot_bucket
+-                        if sub_time < 0:
+-                            att_progress_values[att[0]] = 0
+-                            ot_bucket -= att[1]
++            for overtime in grouped_dict:
++                overtime_reservoir = grouped_dict[overtime]['overtime_duration']
++                if overtime_reservoir > 0:
++                    for attendance in grouped_dict[overtime]['attendances']:
++                        if overtime_reservoir > 0:
++                            sub_time = attendance[1] - overtime_reservoir
++                            if sub_time < 0:
++                                att_progress_values[attendance[0]] = 0
++                                overtime_reservoir -= attendance[1]
++                            else:
++                                att_progress_values[attendance[0]] = float(((attendance[1] - overtime_reservoir) / attendance[1]) * 100)
++                                overtime_reservoir = 0
+                         else:
+-                            att_progress_values[att[0]] = float(((att[1] - ot_bucket) / att[1])*100)
+-                            ot_bucket = 0
+-                    else:
+-                        att_progress_values[att[0]] = 100
++                            att_progress_values[attendance[0]] = 100
++                elif overtime_reservoir < 0 and grouped_dict[overtime]['attendances']:
++                    att_id = grouped_dict[overtime]['attendances'][0][0]
++                    att_progress_values[att_id] = overtime_reservoir
++                    negative_overtime_attendances[att_id] = True
++        for attendance in self:
++            if negative_overtime_attendances[attendance.id]:
++                attendance.overtime_hours = att_progress_values.get(attendance.id, 0)
++            else:
++                attendance.overtime_hours = attendance.worked_hours * ((100 - att_progress_values.get(attendance.id, 100)) / 100)
++
++    @api.depends('employee_id', 'overtime_status', 'overtime_hours')
++    def _compute_validated_overtime_hours(self):
++        no_validation = self.filtered(lambda a: a.employee_id.company_id.attendance_overtime_validation == 'no_validation')
++        with_validation = self - no_validation
++
++        for attendance in with_validation:
++            if attendance.overtime_status not in ['approved', 'refused']:
++                attendance.validated_overtime_hours = attendance.overtime_hours
++
++        for attendance in no_validation:
++            attendance.validated_overtime_hours = attendance.overtime_hours
++
++    @api.depends('employee_id')
++    def _compute_overtime_status(self):
+         for attendance in self:
+-            attendance.overtime_hours = attendance.worked_hours * ((100 - att_progress_values.get(attendance.id, 100))/100)
++            if not attendance.overtime_status:
++                attendance.overtime_status = "to_approve" if attendance.employee_id.company_id.attendance_overtime_validation == 'by_manager' else "approved"
+ 
+     @api.depends('employee_id', 'check_in', 'check_out')
+     def _compute_display_name(self):
+@@ -232,10 +263,8 @@ class HrAttendance(models.Model):
+     def _get_attendances_dates(self):
+         # Returns a dictionnary {employee_id: set((datetimes, dates))}
+         attendances_emp = defaultdict(set)
+-        for attendance in self.filtered(lambda a: a.employee_id.company_id.hr_attendance_overtime and a.check_in):
++        for attendance in self.filtered(lambda a: a.check_in):
+             check_in_day_start = attendance._get_day_start_and_day(attendance.employee_id, attendance.check_in)
+-            if check_in_day_start[0] < datetime.combine(attendance.employee_id.company_id.overtime_start_date, datetime.min.time()):
+-                continue
+             attendances_emp[attendance.employee_id].add(check_in_day_start)
+             if attendance.check_out:
+                 check_out_day_start = attendance._get_day_start_and_day(attendance.employee_id, attendance.check_out)
+@@ -391,8 +420,11 @@ class HrAttendance(models.Model):
+                                              created_overtimes.employee_id.ids +
+                                              overtime_to_unlink.employee_id.ids)
+         overtime_to_unlink.sudo().unlink()
++        to_recompute = self.search([('employee_id', 'in', employees_worked_hours_to_compute)])
+         self.env.add_to_compute(self._fields['overtime_hours'],
+-                                self.search([('employee_id', 'in', employees_worked_hours_to_compute)]))
++                                to_recompute)
++        self.env.add_to_compute(self._fields['validated_overtime_hours'],
++                                to_recompute)
+ 
+     @api.model_create_multi
+     def create(self, vals_list):
+@@ -610,3 +642,13 @@ class HrAttendance(models.Model):
+                 if len(leaf) == 3 and leaf[0] == 'employee_id':
+                     employee_name_domain.append([('name', leaf[1], leaf[2])])
+             return resources | self.env['hr.employee'].search(OR(employee_name_domain))
++
++    def action_approve_overtime(self):
++        self.write({
++            'overtime_status': 'approved'
++        })
++
++    def action_refuse_overtime(self):
++        self.write({
++            'overtime_status': 'refused'
++        })
+
+--- a/addons/hr_attendance/models/hr_employee.py
++++ b/addons/hr_attendance/models/hr_employee.py
+@@ -76,13 +76,22 @@ class HrEmployee(models.Model):
+ 
+         return res
+ 
+-    @api.depends('overtime_ids.duration', 'attendance_ids')
++    @api.depends('overtime_ids.duration', 'attendance_ids', 'attendance_ids.overtime_status')
+     def _compute_total_overtime(self):
++        mapped_validated_overtimes = dict(self.env['hr.attendance']._read_group(
++            domain=[('overtime_status', '=', 'approved')],
++            groupby=['employee_id'],
++            aggregates=['validated_overtime_hours:sum']
++        ))
++
++        mapped_overtime_adjustments = dict(self.env['hr.attendance.overtime']._read_group(
++            domain=[('adjustment', '=', True)],
++            groupby=['employee_id'],
++            aggregates=['duration:sum']
++        ))
++
+         for employee in self:
+-            if employee.company_id.hr_attendance_overtime:
+-                employee.total_overtime = float_round(sum(employee.overtime_ids.mapped('duration')), 2)
+-            else:
+-                employee.total_overtime = 0
++            employee.total_overtime = mapped_validated_overtimes.get(employee, 0) + mapped_overtime_adjustments.get(employee, 0)
+ 
+     def _compute_hours_last_month(self):
+         """
+@@ -206,11 +215,11 @@ class HrEmployee(models.Model):
+         self.ensure_one()
+         return {
+             "type": "ir.actions.act_window",
+-            "name": _("Overtime"),
+-            "res_model": "hr.attendance.overtime",
+-            "views": [[False, "tree"]],
++            "name": _("Attendances This Month"),
++            "res_model": "hr.attendance",
++            "views": [[self.env.ref('hr_attendance.hr_attendance_validated_hours_employee_simple_tree_view').id, "tree"]],
+             "context": {
+                 "create": 0
+             },
+-            "domain": [('employee_id', '=', self.id)]
++            "domain": [('employee_id', '=', self.id), ('overtime_status', '=', 'approved')]
+         }
+
+--- a/addons/hr_attendance/models/res_company.py
++++ b/addons/hr_attendance/models/res_company.py
+@@ -13,8 +13,6 @@ class ResCompany(models.Model):
+     def _default_company_token(self):
+         return str(uuid.uuid4())
+ 
+-    hr_attendance_overtime = fields.Boolean(string="Count Extra Hours")
+-    overtime_start_date = fields.Date(string="Extra Hours Starting Date")
+     overtime_company_threshold = fields.Integer(string="Tolerance Time In Favor Of Company", default=0)
+     overtime_employee_threshold = fields.Integer(string="Tolerance Time In Favor Of Employee", default=0)
+     hr_attendance_display_overtime = fields.Boolean(string="Display Extra Hours")
+@@ -33,6 +31,10 @@ class ResCompany(models.Model):
+     attendance_kiosk_url = fields.Char(compute="_compute_attendance_kiosk_url")
+     attendance_kiosk_use_pin = fields.Boolean(string='Employee PIN Identification')
+     attendance_from_systray = fields.Boolean(string='Attendance From Systray', default=True)
++    attendance_overtime_validation = fields.Selection([
++        ('no_validation', 'No Validation'),
++        ('by_manager', 'By Manager'),
++    ], string='Extra Hours Validation', default='no_validation')
+ 
+     @api.depends("attendance_kiosk_key")
+     def _compute_attendance_kiosk_url(self):
+@@ -64,50 +66,15 @@ class ResCompany(models.Model):
+ 
+     def write(self, vals):
+         search_domains = []  # Overtime to generate
+-        delete_domains = []  # Overtime to delete
+-
+-        overtime_enabled_companies = self.filtered('hr_attendance_overtime')
+-        # Prevent any further logic if we are disabling the feature
+-        is_disabling_overtime = False
+-        # If we disable overtime
+-        if 'hr_attendance_overtime' in vals and not vals['hr_attendance_overtime'] and overtime_enabled_companies:
+-            delete_domains.append([('company_id', 'in', overtime_enabled_companies.ids)])
+-            vals['overtime_start_date'] = False
+-            is_disabling_overtime = True
+-
+-        start_date = vals.get('hr_attendance_overtime') and vals.get('overtime_start_date')
+         # Also recompute if the threshold have changed
+-        if not is_disabling_overtime and (
+-            start_date or 'overtime_company_threshold' in vals or 'overtime_employee_threshold' in vals):
++        if 'overtime_company_threshold' in vals or 'overtime_employee_threshold' in vals:
+             for company in self:
+                 # If we modify the thresholds only
+-                if start_date == company.overtime_start_date and \
+-                    (vals.get('overtime_company_threshold') != company.overtime_company_threshold) or\
++                if (vals.get('overtime_company_threshold') != company.overtime_company_threshold) or\
+                     (vals.get('overtime_employee_threshold') != company.overtime_employee_threshold):
+                     search_domains.append([('employee_id.company_id', '=', company.id)])
+-                # If we enabled the overtime with a start date
+-                elif not company.overtime_start_date and start_date:
+-                    search_domains.append([
+-                        ('employee_id.company_id', '=', company.id),
+-                        ('check_in', '>=', start_date),
+-                    ])
+-                # If we move the start date into the past
+-                elif start_date and company.overtime_start_date > start_date:
+-                    search_domains.append([
+-                        ('employee_id.company_id', '=', company.id),
+-                        ('check_in', '>=', start_date),
+-                        ('check_in', '<=', company.overtime_start_date),
+-                    ])
+-                # If we move the start date into the future
+-                elif start_date and company.overtime_start_date < start_date:
+-                    delete_domains.append([
+-                        ('company_id', '=', company.id),
+-                        ('date', '<', start_date),
+-                    ])
+ 
+         res = super().write(vals)
+-        if delete_domains:
+-            self.env['hr.attendance.overtime'].search(OR(delete_domains)).unlink()
+         if search_domains:
+             self.env['hr.attendance'].search(OR(search_domains))._update_overtime()
+ 
+
+--- a/addons/hr_attendance/models/res_config_settings.py
++++ b/addons/hr_attendance/models/res_config_settings.py
+@@ -7,9 +7,6 @@ from odoo import api, fields, models
+ class ResConfigSettings(models.TransientModel):
+     _inherit = 'res.config.settings'
+ 
+-    hr_attendance_overtime = fields.Boolean(
+-        string="Count Extra Hours", readonly=False)
+-    overtime_start_date = fields.Date(string="Extra Hours Starting Date", readonly=False)
+     overtime_company_threshold = fields.Integer(
+         string="Tolerance Time In Favor Of Company", readonly=False)
+     overtime_employee_threshold = fields.Integer(
+@@ -21,14 +18,13 @@ class ResConfigSettings(models.TransientModel):
+     attendance_kiosk_url = fields.Char(related='company_id.attendance_kiosk_url')
+     attendance_kiosk_use_pin = fields.Boolean(related='company_id.attendance_kiosk_use_pin', readonly=False)
+     attendance_from_systray = fields.Boolean(related="company_id.attendance_from_systray", readonly=False)
++    attendance_overtime_validation = fields.Selection(related="company_id.attendance_overtime_validation", readonly=False)
+ 
+     @api.model
+     def get_values(self):
+         res = super(ResConfigSettings, self).get_values()
+         company = self.env.company
+         res.update({
+-            'hr_attendance_overtime': company.hr_attendance_overtime,
+-            'overtime_start_date': company.overtime_start_date,
+             'overtime_company_threshold': company.overtime_company_threshold,
+             'overtime_employee_threshold': company.overtime_employee_threshold,
+         })
+@@ -41,8 +37,6 @@ class ResConfigSettings(models.TransientModel):
+         # to avoid recomputing the overtimes several times with
+         # invalid company configurations
+         fields_to_check = [
+-            'hr_attendance_overtime',
+-            'overtime_start_date',
+             'overtime_company_threshold',
+             'overtime_employee_threshold',
+         ]

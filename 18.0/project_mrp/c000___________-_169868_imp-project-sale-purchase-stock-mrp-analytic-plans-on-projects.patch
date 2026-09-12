@@ -1,0 +1,283 @@
+PR: https://github.com/odoo/odoo/pull/169868
+
+From: 238a41e35280256382f6509182b9e900fb4f7aba
+From: Maxime de Neuville
+Date: 2024-08-29 11:54:49
+
+Breaking data model changes scores: del:2.8 + add:0, change matches:
+-    _inherit = "project.project"
+-    production_count = fields.Integer(related="analytic_account_id.production_count", groups='mrp.group_mrp_user', export_string_translation=False)
+-    workorder_count = fields.Integer(related="analytic_account_id.workorder_count", groups='mrp.group_mrp_user', export_string_translation=False)
+-    bom_count = fields.Integer(related="analytic_account_id.bom_count", groups='mrp.group_mrp_user', export_string_translation=False)
++    bom_count = fields.Integer(compute='_compute_bom_count', groups='mrp.group_mrp_user', export_string_translation=False)
++    production_count = fields.Integer(compute='_compute_production_count', groups='mrp.group_mrp_user', export_string_translation=False)
+
+Total Changes: 156
+
+[IMP] project,sale,purchase,stock,mrp: analytic plans on projects
+
+PURPOSE
+
+Currently, users can track the profitability of their projects, but they cannot allocate their timesheet-related costs to different entries. This approach is one-dimensional.
+For instance, it can be relevant to track costs for the project as a whole, but also for the team or department in charge, the staff, a particular service, or a specific customer simultaneously.
+By doing so, users can track the profitability of their company at a more granular level. They gain a better understanding of what is impacting their costs and can budget their projects accordingly.
+Furthermore, we would like to handle the use-case of construction companies. Indeed, when stock is allocated to a construction site (or moved back to the warehouse if it wasn't used), it is not reflected in the profitability of the project because it doesn't generate analytic entries. This leads to an incorrect overview of the project's finances.
+In addition, it is not easy to identify the stock moves impacting the project as there is no direct link between the two. It would be convenient for construction companies to have an overview and be able to create new pickings from the top bar of the project in their operations.
+At last, these extra materials used sometimes need to be re-invoiced to the customer. Currently, this has to be done manually by adding a product to the SO. This is error-prone and time-consuming. We are thus relying on the 're-invoice expenses' feature that already exists for expenses and vendor bills to make it automatic.
+Finally, another use-case that would benefit from these changes is companies that are engineering custom machines for their customers. They use projects to track the progress made on their prototypes but also need an overview of the POs, MOs, and stock pickings involved in the process.
+
+FEATURE DETAILS
+
+* Project
+* Remove the 'analytic_account_id' field from projects
+* Replace it with an analytic notebook allowing to define multiple analytic accounts (one per plan)
+* Remove the analytic accounting for tasks
+* Timesheets inherit the analytic accounts configured on their project or on the distribution of their associated SOL (priority to their SOL)
+
+* Sale
+* Remove the 'analytic_account_id' field from the SO
+* Replace it with a project field. The analytic accounts of the project set on the SO are used to set a default SOL analytic distribution
+
+* Stock
+* Add an analytic costs field of operation types that indicates whether the stock picking of this type should generates AALs and do reinvoicing on validation
+* Add a project field on stock pickings, used to generate AALs using the project's accounts and also for the reinvoicing of reinvoicable products
+* Add a sales order field on projects to indicate on which SO to do the reinvoicing when validating stock pickings
+* About the AAL generation, the amount is negative for operation of type 'delivery' and positive for type 'receipt'. If automatic accounting (anglo-saxon accounting) is enabled, do not generate AALs on stock picking validtion, to avoid generating in duplicate
+* Landed costs's generated journal entries distribution receives the accounts of the stock picking's project or the MO's project that was selected
+
+* MRP
+* Remove the analytic distribution from MOs
+* Replace it with a project field
+* When generating AALs with the MO, again, the accounts are taken from the project linked to the MO
+* Remove the analytic distribution from BOMs
+* Replace it with a project field, used as a default value for setting the project of MOs
+
+* Purchase
+* Similarly to SOs, add a project field to POs
+* Again, the accounts of the project linked to the PO are used as a default value for the distribution of the POLs
+
+* Others
+* Rename 'Project Updates' into 'Dashboard'
+* Update the project profitability (report should reflect the analytic items linked to the analytic account of the 'Project' plan (in other words, we keep the current behavior))
+* Update stat buttons and add top bars actions accordingly to the changes described above (SO, PO, From WH, To WH, MO, BOMs, Analytic Items)
+* Adapt the reinvoicing of vendor bills to work with the project of the SO (and not the analytic account of the SO anymore)
+
+task-3985258
+
+closes odoo/odoo#169868
+
+Related: odoo/enterprise#65054
+Related: odoo/upgrade#6296
+Signed-off-by: Xavier Bol (xbo) <xbo@odoo.com>
+
+================================= pseudo patch: =================================
+
+--- a/addons/project_mrp/models/__init__.py
++++ b/addons/project_mrp/models/__init__.py
+@@ -1,4 +1,5 @@
+-# -*- coding: utf-8 -*-
+ # Part of Odoo. See LICENSE file for full copyright and licensing details.
++
++from . import mrp_bom
+ from . import mrp_production
+ from . import project_project
+
+--- a/None
++++ b/addons/project_mrp/models/mrp_bom.py
+@@ -0,0 +1,9 @@
++# Part of Odoo. See LICENSE file for full copyright and licensing details.
++
++from odoo import fields, models
++
++
++class MrpBom(models.Model):
++    _inherit = 'mrp.bom'
++
++    project_id = fields.Many2one('project.project')
+
+--- a/addons/project_mrp/models/mrp_production.py
++++ b/addons/project_mrp/models/mrp_production.py
+@@ -1,14 +1,15 @@
+-from odoo import models
++# Part of Odoo. See LICENSE file for full copyright and licensing details.
++
++from odoo import api, fields, models
+ 
+ 
+ class MrpProduction(models.Model):
+     _inherit = 'mrp.production'
+ 
+-    def _compute_analytic_distribution(self):
+-        project_id = self.env.context.get('project_id')
+-        if not project_id:
+-            super()._compute_analytic_distribution()
+-        else:
+-            analytic_account = self.env['project.project'].browse(project_id).analytic_account_id
++    project_id = fields.Many2one('project.project', compute='_compute_project_id', readonly=False, store=True)
++
++    @api.depends('bom_id')
++    def _compute_project_id(self):
++        if not self.env.context.get('from_project_action'):
+             for production in self:
+-                production.analytic_distribution = production.analytic_distribution or {analytic_account.id: 100}
++                production.project_id = production.bom_id.project_id
+
+--- a/addons/project_mrp/models/project_project.py
++++ b/addons/project_mrp/models/project_project.py
+@@ -1,101 +1,68 @@
+-# -*- coding: utf-8 -*-
+ # Part of Odoo. See LICENSE file for full copyright and licensing details.
+ 
+-from odoo import fields, models, _lt
+-from odoo.osv import expression
++from odoo import _, fields, models
+ 
+ 
+-class Project(models.Model):
+-    _inherit = "project.project"
++class ProjectProject(models.Model):
++    _inherit = 'project.project'
+ 
+-    production_count = fields.Integer(related="analytic_account_id.production_count", groups='mrp.group_mrp_user', export_string_translation=False)
+-    workorder_count = fields.Integer(related="analytic_account_id.workorder_count", groups='mrp.group_mrp_user', export_string_translation=False)
+-    bom_count = fields.Integer(related="analytic_account_id.bom_count", groups='mrp.group_mrp_user', export_string_translation=False)
++    bom_count = fields.Integer(compute='_compute_bom_count', groups='mrp.group_mrp_user', export_string_translation=False)
++    production_count = fields.Integer(compute='_compute_production_count', groups='mrp.group_mrp_user', export_string_translation=False)
+ 
+-    def action_view_mrp_production(self):
+-        self.ensure_one()
+-        action = self.env['ir.actions.actions']._for_xml_id('mrp.mrp_production_action')
+-        action['domain'] = [('id', 'in', self.analytic_account_id.production_ids.ids)]
+-        action['context'] = {'project_id': self.id}
+-        if self.production_count == 1:
+-            action['view_mode'] = 'form'
+-            action['res_id'] = self.analytic_account_id.production_ids.id
+-            if 'views' in action:
+-                action['views'] = [
+-                    (view_id, view_type)
+-                    for view_id, view_type in action['views']
+-                    if view_type == 'form'
+-                ] or [False, 'form']
+-        return action
++    def _compute_bom_count(self):
++        bom_count_per_project = dict(
++            self.env['mrp.bom']._read_group(
++                [('project_id', 'in', self.ids)],
++                ['project_id'], ['__count']
++            )
++        )
++        for project in self:
++            project.bom_count = bom_count_per_project.get(project)
++
++    def _compute_production_count(self):
++        production_count_per_project = dict(
++            self.env['mrp.production']._read_group(
++                [('project_id', 'in', self.ids)],
++                ['project_id'], ['__count']
++            )
++        )
++        for project in self:
++            project.production_count = production_count_per_project.get(project)
+ 
+     def action_view_mrp_bom(self):
+         self.ensure_one()
+-        action = self.analytic_account_id.action_view_mrp_bom()
+-        if self.bom_count > 1:
+-            action['view_mode'] = 'tree,form,kanban'
++        action = {
++            'type': 'ir.actions.act_window',
++            'res_model': 'mrp.bom',
++            'domain': [('project_id', '=', self.id)],
++            'name': _('Bills of Materials'),
++            'view_mode': 'tree,form',
++            'context': {'default_project_id': self.id},
++        }
++        boms = self.env['mrp.bom'].search([('project_id', '=', self.id)])
++        if not self.env.context.get('from_embedded_action', False) and len(boms) == 1:
++            action['views'] = [[False, 'form']]
++            action['res_id'] = boms.id
+         return action
+ 
+-    def action_view_workorder(self):
++    def action_view_mrp_production(self):
+         self.ensure_one()
+-        action = self.analytic_account_id.action_view_workorder()
+-        if self.workorder_count > 1:
+-            action['view_mode'] = 'tree,form,kanban,calendar,pivot,graph'
++        action = self.env['ir.actions.actions']._for_xml_id('mrp.mrp_production_action')
++        action['domain'] = [('project_id', '=', self.id)]
++        action['context'] = {'default_project_id': self.id, 'from_project_action': True}
++        productions = self.env['mrp.production'].search([('project_id', '=', self.id)])
++        if not self.env.context.get('from_embedded_action', False) and len(productions) == 1:
++            action['views'] = [[False, 'form']]
++            action['res_id'] = productions.id
+         return action
+ 
+-    # ----------------------------
+-    #  Project Updates
+-    # ----------------------------
+-
+-    def _get_profitability_labels(self):
+-        labels = super()._get_profitability_labels()
+-        labels['manufacturing_order'] = _lt('Manufacturing Orders')
+-        return labels
+-
+-    def _get_profitability_sequence_per_invoice_type(self):
+-        sequence_per_invoice_type = super()._get_profitability_sequence_per_invoice_type()
+-        sequence_per_invoice_type['manufacturing_order'] = 12
+-        return sequence_per_invoice_type
+-
+-    def _get_profitability_aal_domain(self):
+-        return expression.AND([
+-            super()._get_profitability_aal_domain(),
+-            [('category', '!=', 'manufacturing_order')],
+-        ])
+-
+-    def _get_profitability_items(self, with_action=True):
+-        profitability_items = super()._get_profitability_items(with_action)
+-        mrp_category = 'manufacturing_order'
+-        mrp_aal_read_group = self.env['account.analytic.line'].sudo()._read_group(
+-            [('auto_account_id', 'in', self.analytic_account_id.ids), ('category', '=', mrp_category)],
+-            ['currency_id'],
+-            ['amount:sum'],
+-        )
+-        if mrp_aal_read_group:
+-            can_see_manufactoring_order = with_action and len(self) == 1 and self.env.user.has_group('mrp.group_mrp_user')
+-            total_amount = 0
+-            for currency, amount_summed in mrp_aal_read_group:
+-                total_amount += currency._convert(amount_summed, self.currency_id, self.company_id)
+-
+-            mrp_costs = {
+-                'id': mrp_category,
+-                'sequence': self._get_profitability_sequence_per_invoice_type()[mrp_category],
+-                'billed': total_amount,
+-                'to_bill': 0.0,
+-            }
+-            if can_see_manufactoring_order:
+-                mrp_costs['action'] = {'name': 'action_view_mrp_production', 'type': 'object'}
+-            costs = profitability_items['costs']
+-            costs['data'].append(mrp_costs)
+-            costs['total']['billed'] += mrp_costs['billed']
+-        return profitability_items
+-
+     def _get_stat_buttons(self):
+-        buttons = super(Project, self)._get_stat_buttons()
++        buttons = super()._get_stat_buttons()
+         if self.env.user.has_group('mrp.group_mrp_user'):
+             self_sudo = self.sudo()
+             buttons.extend([{
+                 'icon': 'flask',
+-                'text': _lt('Bills of Materials'),
++                'text': _('Bills of Materials'),
+                 'number': self_sudo.bom_count,
+                 'action_type': 'object',
+                 'action': 'action_view_mrp_bom',
+@@ -104,7 +71,7 @@ class Project(models.Model):
+             },
+             {
+                 'icon': 'wrench',
+-                'text': _lt('Manufacturing Orders'),
++                'text': _('Manufacturing Orders'),
+                 'number': self_sudo.production_count,
+                 'action_type': 'object',
+                 'action': 'action_view_mrp_production',

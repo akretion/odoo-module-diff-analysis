@@ -1,0 +1,209 @@
+PR: https://github.com/odoo/odoo/pull/180212
+
+From: 9e769e1b11f22890e5245859053bc8dd31e42634
+From: Claire Bretton (clbr)
+Date: 2024-09-23 17:45:47
+
+Breaking data model changes scores: del:5 + add:0, change matches:
+-    _inherit = "account.move"
+-    _inherit = "res.company"
+-    invoice_is_snailmail = fields.Boolean(string='Send by Post', default=False)
+-    _inherit = 'res.config.settings'
+-    invoice_is_snailmail = fields.Boolean(string='Send by Post', related='company_id.invoice_is_snailmail', readonly=False)
+
+Total Changes: 118
+
+[REF] account,*: Print & Send - partner default sending settings
+
+Refactoring of the Print & Send:
+
+Why ?
+Invoicing communication channels have multiplied with the advent of electronic invoicing.
+Clients want to receive PDF and electronic formats (UBL, Factur-X, Factura-e,...) in different ways
+(email, peppol, post, ...), depending on the localization and their needs.
+Mandatory B2G declarations of invoices are also multiplying.
+
+The current Print & Send allows for that flexibility, but at the cost of becoming:
+
+* quite messy: you have many checboxes that you can chose at the same time with different
+meaning (B2B, B2G, sending method,...)
+* hard to use in batch: as you can't setup invoice channel by partner, you need to chose
+each time you click on Print & Send. Then some magical things happen to apply the right checkbox
+to the right invoices.
+* technically complicated: because some options are about format, some about how to send, about
+one or more invoices.
+* the current solution invites the user to "multiply the channels", by clicking everything
+and send his invoices to his customers via all the channels possible. This creates a situation
+where E-Invoicing creates a mess for accountants that receive the same invoice via multiple sources,
+further causing potential duplicates, double payments, etc.
+
+How ?
+
+* Choose ONE channel of communication per partner to send his invoice (by Post, manual (download),
+by Email, by Peppol)
+* In the single-mode wizard it is still possible to send through multiple
+channels but it is no longuer encouraged since we only pre-check the
+preferred method on the partner (or email by default).
+* Synchronize mandatory B2G declaration with invoice sending
+* Choose if a B2B E-invoice format needs to be generated (UBL, Factur-X, Factura-e,...)
+* Make invoice batching sending easy by applying selected defaults, this also mean B2G declarations
+will be applied by default if relevant.
+* We also added at partner level the possibility the select an invoice report template, as well as
+mail templates.
+
+Query count increase in test_mail.test_performance:
+The composer creates missing partners, with the addition of the
+company_dependent fields (invoice_edi_format, invoice_sending_method), it
+results in more queries.
+
+task-4070132
+
+closes odoo/odoo#180212
+
+Related: odoo/enterprise#70031
+Related: odoo/upgrade#6505
+Signed-off-by: Claire Bretton (clbr) <clbr@odoo.com>
+
+================================= pseudo patch: =================================
+
+--- a/addons/snailmail_account/models/__init__.py
++++ b/addons/snailmail_account/models/__init__.py
+@@ -1,5 +1,2 @@
+-# -*- coding: utf-8 -*-
+-
+-from . import account_move
+-from . import res_company
+-from . import res_config_settings
++from . import account_move_send
++from . import res_partner
+
+--- a/addons/snailmail_account/models/account_move.py
++++ b/None
+@@ -1,14 +0,0 @@
+-# -*- coding: utf-8 -*-
+-# Part of Odoo. See LICENSE file for full copyright and licensing details.
+-
+-from odoo import models
+-
+-
+-class AccountMove(models.Model):
+-    _inherit = "account.move"
+-
+-    def _get_pdf_and_send_invoice_vals(self, template, **kwargs):
+-        # EXTENDS account
+-        vals = super()._get_pdf_and_send_invoice_vals(template, **kwargs)
+-        vals['checkbox_send_by_post'] = False
+-        return vals
+
+--- a/None
++++ b/addons/snailmail_account/models/account_move_send.py
+@@ -0,0 +1,68 @@
++from odoo import api, models, _
++
++
++class AccountMoveSend(models.AbstractModel):
++    _inherit = 'account.move.send'
++
++    # -------------------------------------------------------------------------
++    # ALERTS
++    # -------------------------------------------------------------------------
++    def _get_alerts(self, moves, moves_data):
++        # EXTENDS 'account'
++        alerts = super()._get_alerts(moves, moves_data)
++        if snailmail_moves_without_valid_address := moves.filtered(
++            lambda m: 'snailmail' in moves_data[m]['sending_methods'] and not self.env['snailmail.letter']._is_valid_address(m.partner_id)
++        ):
++            alerts['snailmail_account_partner_invalid_address'] = {
++                'level': 'danger' if len(snailmail_moves_without_valid_address) == 1 else 'warning',
++                'message': _(
++                    "The partners on the following invoices have no valid address, "
++                    "so those invoices will not be sent: %s",
++                    ", ".join(snailmail_moves_without_valid_address.mapped('name'))
++                ),
++                'action_text': _("View Invoice(s)"),
++                'action': snailmail_moves_without_valid_address._get_records_action(name=_("Check Invoice(s)")),
++            }
++        return alerts
++
++    # -------------------------------------------------------------------------
++    # HELPERS
++    # -------------------------------------------------------------------------
++    @api.model
++    def _prepare_snailmail_letter_values(self, move):
++        return {
++            'partner_id': move.partner_id.id,
++            'model': 'account.move',
++            'res_id': move.id,
++            'company_id': move.company_id.id,
++            'report_template': self.env['ir.actions.report']._get_report('account.account_invoices').id
++        }
++
++    # -------------------------------------------------------------------------
++    # SENDING METHODS
++    # -------------------------------------------------------------------------
++    def _is_applicable_to_move(self, method, move):
++        # EXTENDS 'account'
++        if method == 'snailmail':
++            return self.env['snailmail.letter']._is_valid_address(move.partner_id)
++        else:
++            return super()._is_applicable_to_move(method, move)
++
++    def _hook_if_success(self, moves_data):
++        # EXTENDS 'account'
++        super()._hook_if_success(moves_data)
++
++        to_send = {
++            move: move_data
++            for move, move_data in moves_data.items()
++            if 'snailmail' in move_data['sending_methods'] and self._is_applicable_to_move('snailmail', move)
++        }
++        if to_send:
++            self.env['snailmail.letter'].create([
++                {
++                    'user_id': move_data.get('author_user_id') or self.env.user.id,
++                    **self._prepare_snailmail_letter_values(move),
++                }
++                for move, move_data in to_send.items()
++            ])\
++            ._snailmail_print(immediate=False)
+
+--- a/addons/snailmail_account/models/res_company.py
++++ b/None
+@@ -1,10 +0,0 @@
+-# -*- coding: utf-8 -*-
+-# Part of Odoo. See LICENSE file for full copyright and licensing details.
+-
+-from odoo import fields, models
+-
+-
+-class Company(models.Model):
+-    _inherit = "res.company"
+-
+-    invoice_is_snailmail = fields.Boolean(string='Send by Post', default=False)
+
+--- a/addons/snailmail_account/models/res_config_settings.py
++++ b/None
+@@ -1,10 +0,0 @@
+-# -*- coding: utf-8 -*-	
+-# Part of Odoo. See LICENSE file for full copyright and licensing details.	
+-
+-from odoo import fields, models	
+-
+-
+-class ResConfigSettings(models.TransientModel):	
+-    _inherit = 'res.config.settings'	
+-
+-    invoice_is_snailmail = fields.Boolean(string='Send by Post', related='company_id.invoice_is_snailmail', readonly=False)
+
+--- a/None
++++ b/addons/snailmail_account/models/res_partner.py
+@@ -0,0 +1,9 @@
++from odoo import fields, models
++
++
++class ResPartner(models.Model):
++    _inherit = 'res.partner'
++
++    invoice_sending_method = fields.Selection(
++        selection_add=[('snailmail', 'by Post')],
++    )

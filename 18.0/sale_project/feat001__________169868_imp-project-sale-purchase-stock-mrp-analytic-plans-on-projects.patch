@@ -1,0 +1,601 @@
+PR: https://github.com/odoo/odoo/pull/169868
+
+From: 238a41e35280256382f6509182b9e900fb4f7aba
+From: Maxime de Neuville
+Date: 2024-08-29 11:54:49
+
+Total Changes: 279
+
+[IMP] project,sale,purchase,stock,mrp: analytic plans on projects
+
+PURPOSE
+
+Currently, users can track the profitability of their projects, but they cannot allocate their timesheet-related costs to different entries. This approach is one-dimensional.
+For instance, it can be relevant to track costs for the project as a whole, but also for the team or department in charge, the staff, a particular service, or a specific customer simultaneously.
+By doing so, users can track the profitability of their company at a more granular level. They gain a better understanding of what is impacting their costs and can budget their projects accordingly.
+Furthermore, we would like to handle the use-case of construction companies. Indeed, when stock is allocated to a construction site (or moved back to the warehouse if it wasn't used), it is not reflected in the profitability of the project because it doesn't generate analytic entries. This leads to an incorrect overview of the project's finances.
+In addition, it is not easy to identify the stock moves impacting the project as there is no direct link between the two. It would be convenient for construction companies to have an overview and be able to create new pickings from the top bar of the project in their operations.
+At last, these extra materials used sometimes need to be re-invoiced to the customer. Currently, this has to be done manually by adding a product to the SO. This is error-prone and time-consuming. We are thus relying on the 're-invoice expenses' feature that already exists for expenses and vendor bills to make it automatic.
+Finally, another use-case that would benefit from these changes is companies that are engineering custom machines for their customers. They use projects to track the progress made on their prototypes but also need an overview of the POs, MOs, and stock pickings involved in the process.
+
+FEATURE DETAILS
+
+* Project
+* Remove the 'analytic_account_id' field from projects
+* Replace it with an analytic notebook allowing to define multiple analytic accounts (one per plan)
+* Remove the analytic accounting for tasks
+* Timesheets inherit the analytic accounts configured on their project or on the distribution of their associated SOL (priority to their SOL)
+
+* Sale
+* Remove the 'analytic_account_id' field from the SO
+* Replace it with a project field. The analytic accounts of the project set on the SO are used to set a default SOL analytic distribution
+
+* Stock
+* Add an analytic costs field of operation types that indicates whether the stock picking of this type should generates AALs and do reinvoicing on validation
+* Add a project field on stock pickings, used to generate AALs using the project's accounts and also for the reinvoicing of reinvoicable products
+* Add a sales order field on projects to indicate on which SO to do the reinvoicing when validating stock pickings
+* About the AAL generation, the amount is negative for operation of type 'delivery' and positive for type 'receipt'. If automatic accounting (anglo-saxon accounting) is enabled, do not generate AALs on stock picking validtion, to avoid generating in duplicate
+* Landed costs's generated journal entries distribution receives the accounts of the stock picking's project or the MO's project that was selected
+
+* MRP
+* Remove the analytic distribution from MOs
+* Replace it with a project field
+* When generating AALs with the MO, again, the accounts are taken from the project linked to the MO
+* Remove the analytic distribution from BOMs
+* Replace it with a project field, used as a default value for setting the project of MOs
+
+* Purchase
+* Similarly to SOs, add a project field to POs
+* Again, the accounts of the project linked to the PO are used as a default value for the distribution of the POLs
+
+* Others
+* Rename 'Project Updates' into 'Dashboard'
+* Update the project profitability (report should reflect the analytic items linked to the analytic account of the 'Project' plan (in other words, we keep the current behavior))
+* Update stat buttons and add top bars actions accordingly to the changes described above (SO, PO, From WH, To WH, MO, BOMs, Analytic Items)
+* Adapt the reinvoicing of vendor bills to work with the project of the SO (and not the analytic account of the SO anymore)
+
+task-3985258
+
+closes odoo/odoo#169868
+
+Related: odoo/enterprise#65054
+Related: odoo/upgrade#6296
+Signed-off-by: Xavier Bol (xbo) <xbo@odoo.com>
+
+================================= pseudo patch: =================================
+
+--- a/addons/sale_project/models/account_move_line.py
++++ b/addons/sale_project/models/account_move_line.py
+@@ -1,6 +1,7 @@
+-# -*- coding: utf-8 -*-
++# Part of Odoo. See LICENSE file for full copyright and licensing details.
+ 
+ from odoo import models
++from odoo.osv.expression import AND, OR
+ 
+ 
+ class AccountMoveLine(models.Model):
+@@ -13,6 +14,61 @@ class AccountMoveLine(models.Model):
+         super(AccountMoveLine, self - project_amls)._compute_analytic_distribution()
+         project_id = self._context.get('project_id', False)
+         if project_id:
+-            analytic_account = self.env['project.project'].browse(project_id).analytic_account_id
+-            for line in self:
+-                line.analytic_distribution = line.analytic_distribution or {analytic_account.id: 100}
++            project = self.env['project.project'].browse(project_id)
++            self.analytic_distribution = project._get_analytic_distribution()
++
++    def _get_so_mapping_domain(self):
++        return OR([
++            OR([
++                AND([
++                    [(self.env['account.analytic.account'].browse(int(account_id)).root_plan_id._column_name(), "=", int(account_id))]
++                    for account_id in key.split(",")
++                ])
++                for key in line.analytic_distribution
++            ])
++            for line in self
++        ])
++
++    def _get_so_mapping_from_project(self):
++        """ Get the mapping of move.line with the sale.order record on which its analytic entries should be reinvoiced.
++            A sale.order matches a move.line if the sale.order's project contains all the same analytic accounts
++            as the ones in the distribution of the move.line.
++            :return a dict where key is the move line id, and value is sale.order record (or None).
++        """
++        mapping = {}
++        projects = self.env['project.project'].search(domain=self._get_so_mapping_domain())
++        orders_per_project = dict(self.env['sale.order']._read_group(
++            domain=[('project_id', 'in', projects.ids)],
++            groupby=['project_id'],
++            aggregates=['id:recordset']
++        ))
++        project_per_accounts = {
++            next(iter(project._get_analytic_distribution())): project
++            for project in projects
++        }
++
++        for move_line in self:
++            analytic_distribution = move_line.analytic_distribution
++            if not analytic_distribution:
++                continue
++
++            for accounts in analytic_distribution:
++                project = project_per_accounts.get(accounts)
++            if not project:
++                continue
++
++            orders = orders_per_project.get(project)
++            if not orders:
++                continue
++            orders = orders.sorted('create_date')
++            in_sale_state_orders = orders.filtered(lambda s: s.state == 'sale')
++
++            mapping[move_line.id] = in_sale_state_orders[0] if in_sale_state_orders else orders[0]
++
++        # map the move line index with the SO on which it needs to be reinvoiced. May be empty if no SO found
++        return mapping
++
++    def _sale_determine_order(self):
++        mapping_from_invoice = super()._sale_determine_order()
++        mapping_from_invoice.update(self._get_so_mapping_from_project())
++        return mapping_from_invoice
+
+--- a/addons/sale_project/models/project_project.py
++++ b/addons/sale_project/models/project_project.py
+@@ -20,16 +20,19 @@ class ProjectProject(models.Model):
+         help="Sales order item that will be selected by default on the tasks and timesheets of this project,"
+             " except if the employee set on the timesheets is explicitely linked to another sales order item on the project.\n"
+             "It can be modified on each task and timesheet entry individually if necessary.")
+-    sale_order_id = fields.Many2one(string='Sales Order', related='sale_line_id.order_id', export_string_translation=False)
++    sale_order_id = fields.Many2one(related='sale_line_id.order_id', export_string_translation=False)
+     has_any_so_to_invoice = fields.Boolean('Has SO to Invoice', compute='_compute_has_any_so_to_invoice', export_string_translation=False)
+     sale_order_line_count = fields.Integer(compute='_compute_sale_order_count', groups='sales_team.group_sale_salesman', export_string_translation=False)
+     sale_order_count = fields.Integer(compute='_compute_sale_order_count', groups='sales_team.group_sale_salesman', export_string_translation=False)
+     has_any_so_with_nothing_to_invoice = fields.Boolean('Has a SO with an invoice status of No', compute='_compute_has_any_so_with_nothing_to_invoice', export_string_translation=False)
+     invoice_count = fields.Integer(compute='_compute_invoice_count', groups='account.group_account_readonly', export_string_translation=False)
+-    vendor_bill_count = fields.Integer(related='analytic_account_id.vendor_bill_count', groups='account.group_account_readonly', export_string_translation=False)
++    vendor_bill_count = fields.Integer(related='account_id.vendor_bill_count', groups='account.group_account_readonly', export_string_translation=False)
+     partner_id = fields.Many2one(compute="_compute_partner_id", store=True, readonly=False)
+     display_sales_stat_buttons = fields.Boolean(compute='_compute_display_sales_stat_buttons', export_string_translation=False)
+     sale_order_state = fields.Selection(related='sale_order_id.state', export_string_translation=False)
++    reinvoiced_sale_order_id = fields.Many2one('sale.order', string='Sales Order', groups='sales_team.group_sale_salesman', domain="[('partner_id', '=', partner_id)]",
++        help="Products added to stock pickings, whose operation type is configured to generate analytic costs, will be re-invoiced in this sales order if they are set up for it.",
++    )
+ 
+     @api.model
+     def _map_tasks_default_values(self, project):
+@@ -100,13 +103,13 @@ class ProjectProject(models.Model):
+ 
+     def _compute_invoice_count(self):
+         data = self.env['account.move.line']._read_group(
+-            [('move_id.move_type', 'in', ['out_invoice', 'out_refund']), ('analytic_distribution', 'in', self.analytic_account_id.ids)],
++            [('move_id.move_type', 'in', ['out_invoice', 'out_refund']), ('analytic_distribution', 'in', self.account_id.ids)],
+             groupby=['analytic_distribution'],
+             aggregates=['__count'],
+         )
+         data = {int(account_id): move_count for account_id, move_count in data}
+         for project in self:
+-            project.invoice_count = data.get(project.analytic_account_id.id, 0)
++            project.invoice_count = data.get(project.account_id.id, 0)
+ 
+     @api.depends('allow_billable', 'partner_id')
+     def _compute_display_sales_stat_buttons(self):
+@@ -121,6 +124,16 @@ class ProjectProject(models.Model):
+             'url': self.get_portal_url(),
+         }
+ 
++    @api.onchange('reinvoiced_sale_order_id')
++    def _onchange_reinvoiced_sale_order_id(self):
++        if not self.sale_line_id and self.reinvoiced_sale_order_id.order_line:
++            self.sale_line_id = self.reinvoiced_sale_order_id.order_line[0]
++
++    @api.onchange('sale_line_id')
++    def _onchange_sale_line_id(self):
++        if not self.reinvoiced_sale_order_id and self.sale_line_id:
++            self.reinvoiced_sale_order_id = self.sale_line_id.order_id
++
+     def action_view_sols(self):
+         self.ensure_one()
+         all_sale_order_lines = self._fetch_sale_order_items({'project.task': [('is_closed', '=', False)]})
+@@ -163,7 +176,7 @@ class ProjectProject(models.Model):
+                 "create": self.env.context.get('create_for_project_id', embedded_action_context),
+                 "show_sale": True,
+                 'default_partner_id': self.partner_id.id,
+-                'default_analytic_account_id': self.analytic_account_id.id,
++                'default_project_id': self.id,
+                 "create_for_project_id": self.id if embedded_action_context else False,
+                 "from_embedded_action": embedded_action_context
+             },
+@@ -250,7 +263,7 @@ class ProjectProject(models.Model):
+         move_lines = self.env['account.move.line'].search_fetch(
+             [
+                 ('move_id.move_type', 'in', ['out_invoice', 'out_refund']),
+-                ('analytic_distribution', 'in', self.analytic_account_id.ids),
++                ('analytic_distribution', 'in', self.account_id.ids),
+             ],
+             ['move_id'],
+         )
+@@ -262,7 +275,6 @@ class ProjectProject(models.Model):
+             'views': [[False, 'tree'], [False, 'form'], [False, 'kanban']],
+             'domain': [('id', 'in', invoice_ids)],
+             'context': {
+-                'create': self.env.context.get('from_embedded_action', False),
+                 'default_move_type': 'out_invoice',
+                 'default_partner_id': self.partner_id.id,
+                 'project_id': self.id
+@@ -353,8 +365,11 @@ class ProjectProject(models.Model):
+         SaleOrderLine = self.env['sale.order.line']
+         sale_order_line_domain = [
+             '&',
+-            ('order_id', 'any', [('analytic_account_id', 'in', self.analytic_account_id.ids)]),
+-            ('display_type', '=', False),
++                ('display_type', '=', False),
++                ('order_id', 'any', ['|',
++                    ('id', 'in', self.reinvoiced_sale_order_id.ids),
++                    ('project_id', 'in', self.ids),
++                ]),
+         ]
+         sale_order_line_query = SaleOrderLine._where_calc(sale_order_line_domain)
+         sale_order_line_sql = sale_order_line_query.select(
+@@ -403,9 +418,7 @@ class ProjectProject(models.Model):
+             ('state', '=', 'sale'),
+             ('display_type', '=', False),
+             '|',
+-                '|',
+-                    ('project_id', 'in', self.ids),
+-                    ('project_id', '=', False),
++                ('project_id', 'in', [*self.ids, False]),
+                 ('id', 'in', sale_items.ids),
+         ]
+         if additional_domain:
+@@ -594,7 +607,7 @@ class ProjectProject(models.Model):
+         invoices_move_lines = self.env['account.move.line'].sudo().search_fetch(
+             expression.AND([
+                 self._get_revenues_items_from_invoices_domain([('id', 'not in', excluded_move_line_ids)]),
+-                [('analytic_distribution', 'in', self.analytic_account_id.ids)]
++                [('analytic_distribution', 'in', self.account_id.ids)]
+             ]),
+             ['price_subtotal', 'parent_state', 'currency_id', 'analytic_distribution', 'move_type', 'move_id']
+         )
+@@ -607,7 +620,7 @@ class ProjectProject(models.Model):
+                 # an analytic account can appear several time in an analytic distribution with different repartition percentage
+                 analytic_contribution = sum(
+                     percentage for ids, percentage in move_line.analytic_distribution.items()
+-                    if str(self.analytic_account_id.id) in ids.split(',')
++                    if str(self.account_id.id) in ids.split(',')
+                 ) / 100.
+                 if move_line.parent_state == 'draft':
+                     if move_line.move_type == 'out_invoice':
+@@ -713,7 +726,7 @@ class ProjectProject(models.Model):
+                 'number': self_sudo.invoice_count,
+                 'action_type': 'object',
+                 'action': 'action_open_project_invoices',
+-                'show': bool(self.analytic_account_id) and self_sudo.invoice_count > 0,
++                'show': bool(self.account_id) and self_sudo.invoice_count > 0,
+                 'sequence': 30,
+             })
+         if self.env.user.has_group('account.group_account_readonly'):
+@@ -763,7 +776,7 @@ class ProjectProject(models.Model):
+         move_lines = self.env['account.move.line'].search_fetch(
+             [
+                 ('move_id.move_type', 'in', ['in_invoice', 'in_refund']),
+-                ('analytic_distribution', 'in', self.analytic_account_id.ids),
++                ('analytic_distribution', 'in', self.account_id.ids),
+             ],
+             ['move_id'],
+         )
+
+--- a/addons/sale_project/models/sale_order.py
++++ b/addons/sale_project/models/sale_order.py
+@@ -1,4 +1,3 @@
+-# -*- coding: utf-8 -*-
+ # Part of Odoo. See LICENSE file for full copyright and licensing details.
+ 
+ import ast
+@@ -27,6 +26,8 @@ class SaleOrder(models.Model):
+     show_task_button = fields.Boolean(compute='_compute_show_project_and_task_button', groups='project.group_project_user', export_string_translation=False)
+     closed_task_count = fields.Integer(compute='_compute_tasks_ids', export_string_translation=False)
+     completed_task_percentage = fields.Float(compute="_compute_completed_task_percentage", export_string_translation=False)
++    project_id = fields.Many2one('project.project', domain=[('allow_billable', '=', True)], help="A task will be created for the project upon sales order confirmation. The analytic distribution of this project will also serve as a reference for newly created sales order items.")
++    project_account_id = fields.Many2one('account.analytic.account', related='project_id.account_id')
+ 
+     def _compute_milestone_count(self):
+         read_group = self.env['project.milestone']._read_group(
+@@ -130,7 +131,6 @@ class SaleOrder(models.Model):
+ 
+     def _action_confirm(self):
+         """ On SO confirmation, some lines should generate a task or a project. """
+-        result = super()._action_confirm()
+         if len(self.company_id) == 1:
+             # All orders are in the same company
+             self.order_line.sudo().with_company(self.company_id)._timesheet_service_generation()
+@@ -138,44 +138,7 @@ class SaleOrder(models.Model):
+             # Orders from different companies are confirmed together
+             for order in self:
+                 order.order_line.sudo().with_company(order.company_id)._timesheet_service_generation()
+-        return result
+-
+-    def _generate_analytic_account(self):
+-        """ Generate Analytic Account for SO confirmed
+-
+-            This override generates analytic account for the SO if the AA has not been
+-            generated in the parent method and the product contained in the SOLs will
+-            generate a project and/or task(s)
+-        """
+-        super()._generate_analytic_account()
+-        for order in self:
+-            if (
+-                not order.analytic_account_id
+-                and any(
+-                    sol.is_service
+-                    and not sol.project_id
+-                    and sol.product_id.service_tracking in ['project_only', 'task_in_project']
+-                    for sol in order.order_line
+-                )
+-            ):
+-                service_sols = order.order_line.filtered(
+-                    lambda sol:
+-                        sol.is_service
+-                        and not sol.project_id
+-                        and sol.product_id.service_tracking in ['project_only', 'task_in_project']
+-                )
+-                # if one service_product is found then we will generate a project and so we need to create an analytic account
+-                service_products = service_sols.product_id.filtered(
+-                    lambda p:
+-                        p.project_template_id
+-                        and (
+-                            p.service_tracking == 'task_in_project'
+-                            or p.service_tracking != 'no'
+-                        )
+-                        and p.default_code
+-                )
+-                default_code = service_products.default_code if len(service_products) == 1 else None
+-                order._create_analytic_account(default_code)
++        return super()._action_confirm()
+ 
+     def action_view_task(self):
+         self.ensure_one()
+@@ -319,10 +282,23 @@ class SaleOrder(models.Model):
+         return res
+ 
+     def _prepare_analytic_account_data(self, prefix=None):
+-        result = super(SaleOrder, self)._prepare_analytic_account_data(prefix=prefix)
++        """ Prepare SO analytic account creation values.
++
++        :return: `account.analytic.account` creation values
++        :rtype: dict
++        """
++        self.ensure_one()
++        name = self.name
++        if prefix:
++            name = prefix + ": " + self.name
+         project_plan, _other_plans = self.env['account.analytic.plan']._get_all_plans()
+-        result['plan_id'] = project_plan.id or result['plan_id']
+-        return result
++        return {
++            'name': name,
++            'code': self.client_order_ref,
++            'company_id': self.company_id.id,
++            'plan_id': project_plan.id,
++            'partner_id': self.partner_id.id,
++        }
+ 
+     def _compute_completed_task_percentage(self):
+         for so in self:
+
+--- a/addons/sale_project/models/sale_order_line.py
++++ b/addons/sale_project/models/sale_order_line.py
+@@ -1,11 +1,10 @@
+-# -*- coding: utf-8 -*-
+ # Part of Odoo. See LICENSE file for full copyright and licensing details.
+ 
+ from collections import defaultdict
+ 
+ from odoo import api, Command, fields, models, _
+-from odoo.exceptions import AccessError
+-from odoo.tools import format_amount
++from odoo.exceptions import AccessError, UserError
++from odoo.tools import format_list
+ from odoo.tools.sql import column_exists, create_column
+ 
+ 
+@@ -126,6 +125,17 @@ class SaleOrderLine(models.Model):
+             sol_id = line.id or line._origin.id
+             line.qty_delivered = reached_milestones_per_sol.get(sol_id, 0.0) * line.product_uom_qty
+ 
++    @api.depends('order_id.partner_id', 'product_id', 'order_id.project_id')
++    def _compute_analytic_distribution(self):
++        super()._compute_analytic_distribution()
++        for line in self:
++            if line.display_type or line.analytic_distribution or not line.product_id:
++                continue
++            project = line.product_id.project_id or line.product_id.project_template_id or line.order_id.project_id
++            distribution = project._get_analytic_distribution()
++            if distribution:
++                line.analytic_distribution = distribution
++
+     @api.model_create_multi
+     def create(self, vals_list):
+         lines = super().create(vals_list)
+@@ -139,6 +149,8 @@ class SaleOrderLine(models.Model):
+                 if line.task_id and not has_task:
+                     msg_body = _("Task Created (%(name)s): %(link)s", name=line.product_id.name, link=line.task_id._get_html_link())
+                     line.order_id.message_post(body=msg_body)
++                if line.product_id.expense_policy not in [False, 'no'] and line.order_id.project_id and not line.order_id.project_account_id:
++                    line.order_id.project_id._create_analytic_account()
+ 
+         # Set a service SOL on the project, if any is given
+         if project_id := self.env.context.get('link_to_project'):
+@@ -169,17 +181,9 @@ class SaleOrderLine(models.Model):
+ 
+     def _timesheet_create_project_prepare_values(self):
+         """Generate project values"""
+-        account = self.order_id.analytic_account_id
+-        if not account:
+-            service_products = self.order_id.order_line.product_id.filtered(
+-                lambda p: p.type == 'service' and p.default_code)
+-            default_code = service_products.default_code if len(service_products) == 1 else None
+-            self.order_id._create_analytic_account(prefix=default_code)
+-            account = self.order_id.analytic_account_id
+         # create the project or duplicate one
+         return {
+             'name': '%s - %s' % (self.order_id.client_order_ref, self.order_id.name) if self.order_id.client_order_ref else self.order_id.name,
+-            'analytic_account_id': account.id,
+             'partner_id': self.order_id.partner_id.id,
+             'sale_line_id': self.id,
+             'active': True,
+@@ -195,15 +199,17 @@ class SaleOrderLine(models.Model):
+         """
+         self.ensure_one()
+         values = self._timesheet_create_project_prepare_values()
+-        if self.product_id.project_template_id:
+-            values['name'] = "%s - %s" % (values['name'], self.product_id.project_template_id.name)
+-            project = self.product_id.project_template_id.copy(values)
+-            project.tasks.write({
++        project_template = self.product_id.project_template_id
++        if project_template:
++            values['name'] = "%s - %s" % (values['name'], project_template.name)
++            values.update(self._timesheet_create_project_account_vals(project_template))
++            order_project = project_template.copy(values)
++            order_project.tasks.write({
+                 'sale_line_id': self.id,
+                 'partner_id': self.order_id.partner_id.id,
+             })
+             # duplicating a project doesn't set the SO on sub-tasks
+-            project.tasks.filtered('parent_id').write({
++            order_project.tasks.filtered('parent_id').write({
+                 'sale_line_id': self.id,
+                 'sale_order_id': self.order_id.id,
+             })
+@@ -214,11 +220,12 @@ class SaleOrderLine(models.Model):
+             ])
+             if project_only_sol_count == 1:
+                 values['name'] = "%s - [%s] %s" % (values['name'], self.product_id.default_code, self.product_id.name) if self.product_id.default_code else "%s - %s" % (values['name'], self.product_id.name)
+-            project = self.env['project.project'].create(values)
++            values.update(self._timesheet_create_project_account_vals(self.order_id.project_id))
++            order_project = self.env['project.project'].create(values)
+ 
+         # Avoid new tasks to go to 'Undefined Stage'
+-        if not project.type_ids:
+-            project.type_ids = self.env['project.task.type'].create([{
++        if not order_project.type_ids:
++            order_project.type_ids = self.env['project.task.type'].create([{
+                 'name': name,
+                 'fold': fold,
+                 'sequence': sequence,
+@@ -230,8 +237,15 @@ class SaleOrderLine(models.Model):
+             ]])
+ 
+         # link project as generated by current so line
+-        self.write({'project_id': project.id})
+-        return project
++        self.write({'project_id': order_project.id})
++        order_project.reinvoiced_sale_order_id = self.order_id
++        return order_project
++
++    def _timesheet_create_project_account_vals(self, project):
++        return {
++            **{fname: project[fname].id for fname in project._get_plan_fnames() if project[fname]},
++            'account_id': self.env['account.analytic.account'].create(self.order_id._prepare_analytic_account_data()).id,
++        }
+ 
+     def _timesheet_create_task_prepare_values(self, project):
+         self.ensure_one()
+@@ -243,7 +257,6 @@ class SaleOrderLine(models.Model):
+         description = '<br/>'.join(sale_line_name_parts[1:])
+         return {
+             'name': title if project.sale_line_id else '%s - %s' % (self.order_id.name or '', title),
+-            'analytic_account_id': project.analytic_account_id.id,
+             'allocated_hours': allocated_hours,
+             'partner_id': self.order_id.partner_id.id,
+             'description': description,
+@@ -261,7 +274,7 @@ class SaleOrderLine(models.Model):
+         """
+         values = self._timesheet_create_task_prepare_values(project)
+         task = self.env['project.task'].sudo().create(values)
+-        self.write({'task_id': task.id})
++        self.task_id = task
+         # post message on task
+         task_msg = _("This task has been created from: %(order_link)s (%(product_name)s)",
+             order_link=self.order_id._get_html_link(),
+@@ -278,6 +291,15 @@ class SaleOrderLine(models.Model):
+             implied if so line of generated task has been modified, we may regenerate it.
+         """
+         so_line_task_global_project = self.filtered(lambda sol: sol.is_service and sol.product_id.service_tracking == 'task_global_project')
++        products_no_project = so_line_task_global_project.filtered(
++            lambda sol: not (sol.product_id.project_id or sol.order_id.project_id)
++        ).product_id
++        if products_no_project:
++            raise UserError(_(
++                "A project must be defined on the quotation or on the form of products creating a task on order.\n"
++                "The following products need a project in which to put their task: %(product_names)s",
++                product_names=format_list(self.env, products_no_project.mapped('name')),
++            ))
+         so_line_new_project = self.filtered(lambda sol: sol.is_service and sol.product_id.service_tracking in ['project_only', 'task_in_project'])
+ 
+         # search so lines from SO of current so lines having their project generated, in order to check if the current one can
+@@ -306,8 +328,9 @@ class SaleOrderLine(models.Model):
+         # task_global_project: create task in global project
+         for so_line in so_line_task_global_project:
+             if not so_line.task_id:
+-                if map_sol_project.get(so_line.id) and so_line.product_uom_qty > 0:
+-                    so_line._timesheet_create_task(project=map_sol_project[so_line.id])
++                project = map_sol_project.get(so_line.id) or so_line.order_id.project_id
++                if project and so_line.product_uom_qty > 0:
++                    so_line._timesheet_create_task(project)
+ 
+         # project_only, task_in_project: create a new project, based or not on a template (1 per SO). May be create a task too.
+         # if 'task_in_project' and project_id configured on SO, use that one instead
+@@ -337,6 +360,13 @@ class SaleOrderLine(models.Model):
+                     so_line._timesheet_create_task(project=project)
+             so_line._handle_milestones(project)
+ 
++        # If the SO generates projects or create task in project on confirmation and the project of the SO is not set, set it to the project with the lowest sequence
++        so_lines = so_line_task_global_project + so_line_new_project
++        so = so_lines.order_id
++        sol_projects = so_lines.project_id | so_lines.task_id.project_id
++        if not so.project_id and sol_projects:
++            so.project_id = sol_projects.sorted('sequence')[0]
++
+     def _handle_milestones(self, project):
+         self.ensure_one()
+         if self.product_id.service_policy != 'delivered_milestones':
+@@ -364,27 +394,19 @@ class SaleOrderLine(models.Model):
+         """
+         values = super(SaleOrderLine, self)._prepare_invoice_line(**optional_values)
+         if not values.get('analytic_distribution'):
+-            task_analytic_account = self.task_id._get_task_analytic_account_id() if self.task_id else False
+-            if task_analytic_account:
+-                values['analytic_distribution'] = {task_analytic_account.id: 100}
+-            elif self.project_id.analytic_account_id:
+-                values['analytic_distribution'] = {self.project_id.analytic_account_id.id: 100}
++            if self.task_id.project_id.account_id:
++                values['analytic_distribution'] = {self.task_id.project_id.account_id.id: 100}
++            elif self.project_id.account_id:
++                values['analytic_distribution'] = {self.project_id.account_id.id: 100}
+             elif self.is_service and not self.is_expense:
+-                [task_analytic_accounts] = self.env['project.task']._read_group([
+-                    ('sale_line_id', '=', self.id),
+-                    ('analytic_account_id', '!=', False),
+-                ], aggregates=['analytic_account_id:recordset'])[0]
+-                [project_analytic_accounts] = self.env['project.project']._read_group([
+-                    ('analytic_account_id', '!=', False),
++                [accounts] = self.env['project.project']._read_group([
++                    ('account_id', '!=', False),
+                     '|',
+                         ('sale_line_id', '=', self.id),
+-                        '&',
+-                            ('tasks.sale_line_id', '=', self.id),
+-                            ('tasks.analytic_account_id', '=', False)
+-                ], aggregates=['analytic_account_id:recordset'])[0]
+-                analytic_accounts = task_analytic_accounts | project_analytic_accounts
+-                if len(analytic_accounts) == 1:
+-                    values['analytic_distribution'] = {analytic_accounts.id: 100}
++                        ('tasks.sale_line_id', '=', self.id),
++                ], aggregates=['account_id:recordset'])[0]
++                if len(accounts) == 1:
++                    values['analytic_distribution'] = {accounts.id: 100}
+         return values
+ 
+     def _get_action_per_item(self):
