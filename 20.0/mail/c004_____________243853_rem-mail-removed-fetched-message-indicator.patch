@@ -1,0 +1,112 @@
+PR: https://github.com/odoo/odoo/pull/243853
+
+From: 5b7346456162da5a6f035de8f9cb9c10f6a136ac
+From: Giorgio Tocco (gito)
+Date: 2026-01-23 03:43:00
+
+Breaking data model changes scores: del:1 + add:0, change matches:
+-    fetched_message_id = fields.Many2one('mail.message', string='Last Fetched', index="btree_not_null")
+
+Total Changes: 37
+
+[REM] mail, *: removed fetched message indicator
+
+* = im_livechat, test_discuss_full
+
+This commit removes the fetched feature of Discuss messages, for the
+following reasons:
+1. Redundancy: The original purpose of confirming server receipt is
+now better handled by the "pending" message state (spinner/opacity).
+Once a message is no longer pending, it is effectively "sent".
+2. Reliability & Privacy: The previous implementation relied on a
+single bus notification, which when lost would lead to an
+inconsistent state. Fixing this reliability (by broadcasting status
+on connection) would negatively impact performance and, more
+critically, leak the presence of users who wish to appear "Offline".
+3. Data Modeling: The model only tracks the last fetched ID, which is
+an inaccurate representation of message history if gaps exist.
+
+This commit also simplifies the "Seen" indicator to reflect this change:
+* single gray check: Some people have seen.
+* double purple checks: Seen by all channel members.
+
+task-5177299
+
+closes odoo/odoo#243853
+
+Related: odoo/enterprise#104332
+Related: odoo/upgrade#9269
+Signed-off-by: Alexandre Kühn (aku) <aku@odoo.com>
+
+================================= pseudo patch: =================================
+
+--- a/addons/mail/models/discuss/discuss_channel.py
++++ b/addons/mail/models/discuss/discuss_channel.py
+@@ -1365,39 +1365,6 @@ class DiscussChannel(models.Model):
+         """ Return the channel types that load members lazily. """
+         return ["channel", "group"]
+ 
+-    def channel_fetched(self):
+-        """ Broadcast the channel_fetched notification to channel members
+-        """
+-        # Avoid serialization error when multiple tabs are opened.
+-        # In order to completely avoid any issues with concurrency, the very first thing we do on
+-        # the cursor needs to be a SELECT FOR UPDATE
+-        fetchable = self.filtered(lambda c: c.channel_type in ('chat', 'whatsapp'))
+-        member_query = self.env['discuss.channel.member']._search([('channel_id', 'in', fetchable.ids), ('is_self', '=', True)]).subselect()
+-        with self.env.registry.cursor() as cr:
+-            cursor_self = self.with_env(self.env(cr=cr))
+-            to_update = cursor_self.env.execute_query(SQL("""
+-                SELECT id
+-                  FROM discuss_channel_member
+-                 WHERE id IN (%s)
+-                   FOR NO KEY UPDATE SKIP LOCKED
+-            """, member_query))
+-            members = cursor_self.env['discuss.channel.member'].browse([r[0] for r in to_update])
+-            channel2message = members.channel_id._get_last_messages().grouped('channel_id')
+-            updated_members_by_channel = defaultdict(cursor_self.env["discuss.channel.member"].browse)
+-            for member in members:
+-                last_message = channel2message[member.channel_id]
+-                if member.fetched_message_id != last_message:
+-                    member.fetched_message_id = last_message
+-                    updated_members_by_channel[member.channel_id] |= member
+-            for channel in updated_members_by_channel:
+-                Store(bus_channel=channel).add(
+-                    updated_members_by_channel[channel],
+-                    lambda res: (
+-                        res.attr("fetched_message_id"),
+-                        res.from_method("_store_identifying_fields"),
+-                    ),
+-                ).bus_send()
+-
+     def channel_set_custom_name(self, name):
+         self.ensure_one()
+         self.self_member_id.custom_channel_name = name
+
+--- a/addons/mail/models/discuss/discuss_channel_member.py
++++ b/addons/mail/models/discuss/discuss_channel_member.py
+@@ -42,7 +42,6 @@ class DiscussChannelMember(models.Model):
+     )
+     # state
+     custom_channel_name = fields.Char('Custom channel name')
+-    fetched_message_id = fields.Many2one('mail.message', string='Last Fetched', index="btree_not_null")
+     is_favorite = fields.Boolean("Favorite")
+     seen_message_id = fields.Many2one('mail.message', string='Last Seen', index="btree_not_null")
+     new_message_separator = fields.Integer(help="Message id before which the separator should be displayed", default=0, required=True)
+@@ -422,7 +421,7 @@ class DiscussChannelMember(models.Model):
+     def _store_member_fields(self, res: Store.FieldList):
+         # sudo: discuss.channel.member - reading channel ownership related to a member is considered acceptable
+         res.attr("channel_role", sudo=True)
+-        res.extend(["create_date", "fetched_message_id", "last_seen_dt", "seen_message_id"])
++        res.extend(["create_date", "last_seen_dt", "seen_message_id"])
+         self._store_persona_default_fields(res)
+ 
+     # --------------------------------------------------------------------------
+@@ -657,7 +656,6 @@ class DiscussChannelMember(models.Model):
+         bus_channel = self._bus_channel()
+         if self.seen_message_id.id < message.id:
+             self.write({
+-                "fetched_message_id": max(self.fetched_message_id.id, message.id),
+                 "seen_message_id": message.id,
+                 "last_seen_dt": fields.Datetime.now(),
+             })

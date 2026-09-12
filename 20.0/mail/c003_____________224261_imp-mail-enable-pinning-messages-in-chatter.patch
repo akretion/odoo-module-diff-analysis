@@ -1,0 +1,146 @@
+PR: https://github.com/odoo/odoo/pull/224261
+
+From: e762a41d5af40c3352839789c827b8ae10c82877
+From: akus-odoo
+Date: 2025-12-10 12:51:34
+
+Breaking data model changes scores: del:2 + add:0, change matches:
+-    pinned_message_ids = fields.One2many('mail.message', 'res_id', domain=[('model', '=', 'discuss.channel'), ('pinned_at', '!=', False)], string='Pinned Messages')
+
+Total Changes: 77
+
+[IMP] mail: enable pinning messages in Chatter
+
+Until now, the pin/unpin feature was limited to Discuss channels, making it
+harder for users to quickly find key information in the Chatter. With this
+improvement, the same functionality is now available in Chatter as well.
+
+Users can pin any important message in a record's Chatter and easily revisit it
+later without having to scroll through the entire conversation history.
+
+Task-4686372
+
+closes odoo/odoo#224261
+
+Related: odoo/upgrade#8393
+Signed-off-by: Sébastien Theys (seb) <seb@odoo.com>
+
+================================= pseudo patch: =================================
+
+--- a/addons/mail/models/discuss/discuss_channel.py
++++ b/addons/mail/models/discuss/discuss_channel.py
+@@ -89,7 +89,6 @@ class DiscussChannel(models.Model):
+     parent_channel_id = fields.Many2one("discuss.channel", help="Parent channel", ondelete="cascade", index=True, bypass_search_access=True, readonly=True)
+     sub_channel_ids = fields.One2many("discuss.channel", "parent_channel_id", string="Sub Channels", readonly=True)
+     from_message_id = fields.Many2one("mail.message", help="The message the channel was created from.", readonly=True)
+-    pinned_message_ids = fields.One2many('mail.message', 'res_id', domain=[('model', '=', 'discuss.channel'), ('pinned_at', '!=', False)], string='Pinned Messages')
+     sfu_channel_uuid = fields.Char(groups="base.group_system")
+     sfu_server_url = fields.Char(groups="base.group_system")
+     rtc_session_ids = fields.One2many('discuss.channel.rtc.session', 'channel_id', groups="base.group_system")
+@@ -1080,29 +1079,8 @@ class DiscussChannel(models.Model):
+     # ------------------------------------------------------------
+ 
+     def set_message_pin(self, message_id, pinned):
+-        """ (Un)pin a message on the channel and send a notification to the
+-        members.
+-        :param message_id: id of the message to be pinned.
+-        :param pinned: whether the message should be pinned or unpinned.
+-        """
+-        self.ensure_one()
+-        message_to_update = self.env['mail.message'].search([
+-            ['id', '=', message_id],
+-            ['model', '=', 'discuss.channel'],
+-            ['res_id', '=', self.id],
+-            ['pinned_at', '=' if pinned else '!=', False]
+-        ])
+-        if not message_to_update:
+-            return
+-        message_to_update.flush_recordset(['pinned_at'])
+-        # Use SQL because by calling write method, write_date is going to be updated, but we don't want pin/unpin
+-        # a message changes the write_date
+-        self.env.cr.execute("UPDATE mail_message SET pinned_at=%s WHERE id=%s",
+-                            (fields.Datetime.now() if pinned else None, message_to_update.id))
+-        message_to_update.invalidate_recordset(['pinned_at'])
+-
+-        Store(bus_channel=self).add(message_to_update, ["pinned_at"]).bus_send()
+-        if pinned:
++        result = super().set_message_pin(message_id, pinned)
++        if pinned and result:
+             notification_text = '''
+                 <div data-oe-type="pin" class="o_mail_notification">
+                     %(user_pinned_a_message_to_this_channel)s
+@@ -1117,6 +1095,7 @@ class DiscussChannel(models.Model):
+                 'see_all_pins': _('See all pinned messages.'),
+             }
+             self.message_post(body=notification, message_type="notification", subtype_xmlid="mail.mt_comment")
++        return result
+ 
+     def _find_or_create_member_for_self(self):
+         self.ensure_one()
+
+--- a/addons/mail/models/mail_thread.py
++++ b/addons/mail/models/mail_thread.py
+@@ -2951,6 +2951,34 @@ class MailThread(models.AbstractModel):
+                        for record in self]
+         return self.sudo()._message_create(values_list)
+ 
++    def set_message_pin(self, message_id, pinned):
++        """(Un)pin a message on the thread.
++        The message must belong to the thread on which it is called.
++
++        :param message_id: id of the message to be pinned.
++        :param pinned: whether the message should be pinned or unpinned.
++        """
++        self.ensure_one()
++        message = self.env["mail.message"].search_fetch(
++            [
++                ["id", "=", message_id],
++                ["model", "=", self._name],
++                ["pinned_at", "=" if pinned else "!=", False],
++                ["res_id", "=", self.id],
++            ],
++        )
++        if not message:
++            return False
++        message.invalidate_recordset(["pinned_at"])
++        # Use SQL because by calling write method, write_date is going to be updated, but we don't
++        # want pin/unpin a message to change the write_date.
++        self.env.cr.execute(
++            "UPDATE mail_message SET pinned_at=%(pinned_at)s WHERE id=%(id)s",
++            {"pinned_at": fields.Datetime.now() if pinned else None, "id": message.id},
++        )
++        Store(bus_channel=message._bus_channel()).add(message, ["pinned_at"]).bus_send()
++        return True
++
+     # ------------------------------------------------------------
+     # MAIL.MESSAGE HELPERS
+     # ------------------------------------------------------------
+@@ -5065,6 +5093,28 @@ class MailThread(models.AbstractModel):
+             self._store_message_followers_fields(res, filter_recipients=True, reset=True)
+         if "display_name" in request_list:
+             res.attr("display_name")
++        pinned_domain = (
++            Domain("res_id", "in", self.ids)
++            & Domain("model", "=", self._name)
++            & Domain("pinned_at", "!=", False)
++        )
++        if res.is_for_internal_users() and "has_pinned_messages" in request_list:
++            pinned_count_by_tid = defaultdict(
++                int,
++                self.env["mail.message"]._read_group(pinned_domain, ["res_id"], ["__count"]),
++            )
++            res.attr("has_pinned_messages", lambda t: pinned_count_by_tid[t.id] > 0)
++        if res.is_for_internal_users() and "pinned_messages" in request_list:
++            messages_by_tid = defaultdict(
++                self.env["mail.message"].browse,
++                self.env["mail.message"].search_fetch(pinned_domain).grouped("res_id"),
++            )
++            res.many(
++                "pinned_messages",
++                "_store_message_fields",
++                only_data=True,
++                value=lambda t: messages_by_tid[t.id],
++            )
+         if "scheduledMessages" in request_list:
+             domain = Domain("model", "=", self._name) & Domain("res_id", "in", self.ids)
+             scheduled_messages = self.env["mail.scheduled.message"].search_fetch(domain)

@@ -1,0 +1,277 @@
+PR: https://github.com/odoo/odoo/pull/261817
+
+From: 4cb42c86d8cb88522f7659def579912f75a626f5
+From: Ziri
+Date: 2026-06-10 08:45:06
+
+Breaking data model changes scores: del:5.4 + add:1, change matches:
+-    linked_overtime_ids = fields.Many2many('hr.attendance.overtime.line', compute='_compute_linked_overtime_ids', readonly=False)
++    linked_overtime_ids = fields.One2many('hr.attendance.overtime.line', 'attendance_id', readonly=False)
+-    employee_id = fields.Many2one(
+-    company_id = fields.Many2one(related='employee_id.company_id')
++    employee_id = fields.Many2one(related='attendance_id.employee_id', string='Employee', store=True, readonly=True, index='btree_not_null')
+-    time_start = fields.Datetime(string='Start')
+-    time_stop = fields.Datetime(string='Stop')
+
+Total Changes: 125
+
+[REF] hr_attendance: overtimes have a m2o with attendance
+
+In odoo/odoo#241457 we made the relationship between overtime and attendance a m2o
+using time_start and employee_id as keys to attribute an overtime to its attendance.
+
+This wasn't ideal but was what was possible with the stable policy. In this commit we
+complete that fix by changing the relationship to a proper Many2One.
+
+task-6172452
+
+closes odoo/odoo#261817
+
+Related: odoo/enterprise#115510
+Related: odoo/upgrade#10074
+Signed-off-by: Bertrand Dossogne (bedo) <bedo@odoo.com>
+
+================================= pseudo patch: =================================
+
+--- a/addons/hr_attendance/models/hr_attendance.py
++++ b/addons/hr_attendance/models/hr_attendance.py
+@@ -80,7 +80,7 @@ class HrAttendance(models.Model):
+                                 default='manual')
+     expected_hours = fields.Float(string="Theoretical Hours", compute="_compute_expected_hours", store=True, aggregator="sum")
+     device_tracking_enabled = fields.Boolean(related="employee_id.company_id.attendance_device_tracking")
+-    linked_overtime_ids = fields.Many2many('hr.attendance.overtime.line', compute='_compute_linked_overtime_ids', readonly=False)
++    linked_overtime_ids = fields.One2many('hr.attendance.overtime.line', 'attendance_id', readonly=False)
+     day_of_date = fields.Selection(
+         compute='_compute_day_of_date',
+         store=True,
+@@ -119,7 +119,7 @@ class HrAttendance(models.Model):
+             else:
+                 attendance.color = 1 if attendance.check_in < (datetime.today() - timedelta(days=1)) else 10
+ 
+-    @api.depends('check_in', 'check_out', 'employee_id')
++    @api.depends('linked_overtime_ids.status')
+     def _compute_overtime_status(self):
+         for attendance in self:
+             if not attendance.linked_overtime_ids:
+@@ -131,22 +131,16 @@ class HrAttendance(models.Model):
+             else:
+                 attendance.overtime_status = 'to_approve'
+ 
+-    @api.depends('check_in', 'check_out', 'employee_id')
++    @api.depends('linked_overtime_ids.duration')
+     def _compute_overtime_hours(self):
+         for attendance in self:
+             attendance.overtime_hours = sum(attendance.linked_overtime_ids.mapped('duration'))
+ 
+-    @api.depends('check_in', 'check_out', 'employee_id')
++    @api.depends('linked_overtime_ids.status', 'linked_overtime_ids.manual_duration')
+     def _compute_validated_overtime_hours(self):
+         for attendance in self:
+             attendance.validated_overtime_hours = sum(attendance.linked_overtime_ids.filtered_domain([('status', '=', 'approved')]).mapped('manual_duration'))
+ 
+-    @api.depends('check_in', 'check_out', 'employee_id')
+-    def _compute_linked_overtime_ids(self):
+-        overtimes_by_attendance = self._linked_overtimes().grouped(lambda ot: (ot.employee_id, ot.time_start))
+-        for attendance in self:
+-            attendance.linked_overtime_ids = overtimes_by_attendance.get((attendance.employee_id, attendance.check_in), False)
+-
+     @api.depends('employee_id', 'check_in', 'check_out')
+     def _compute_display_name(self):
+         tz = request.httprequest.cookies.get('tz') if request else None
+@@ -320,14 +314,14 @@ class HrAttendance(models.Model):
+     def _update_overtime(self, attendance_domain=None):
+         if not attendance_domain:
+             attendance_domain = self._get_overtimes_to_update_domain()
+-        all_overtime_lines = self.env['hr.attendance.overtime.line'].search(attendance_domain)
+-        manual_overtimes = set(all_overtime_lines.filtered(
+-            lambda l: l.manual_duration != l.duration or l.status == 'to_approve'
+-        ).mapped(lambda l: (l.employee_id.id, l.date)))
+-        all_overtime_lines.unlink()
+         all_attendances = (self | self.env['hr.attendance'].search(attendance_domain)).filtered_domain([('check_out', '!=', False)])
+         if not all_attendances:
+             return
++        all_overtime_lines = all_attendances.linked_overtime_ids
++        manual_overtimes = set(all_overtime_lines.filtered(
++            lambda l: l.manual_duration != l.duration or l.status == 'to_approve'
++        ).mapped(lambda l: (l.attendance_id.id, l.date)))
++        all_overtime_lines.unlink()
+ 
+         start_check_in = min(all_attendances.mapped('check_in')).date() - relativedelta(days=1)  # for timezone
+         min_check_in = datetime.combine(start_check_in, time.min).replace(tzinfo=UTC)
+@@ -372,14 +366,10 @@ class HrAttendance(models.Model):
+                 {
+                     **val,
+                     'status': 'to_approve'
+-                } if (val['employee_id'], val['date']) in manual_overtimes else val
++                } if (val['attendance_id'], val['date']) in manual_overtimes else val
+                 for val in ruleset.rule_ids._generate_overtime_vals(min(attendances_dates), max(attendances_dates), ruleset_attendances, schedules_intervals_by_employee)
+             ])
+         self.env['hr.attendance.overtime.line'].create(overtime_vals_list)
+-        self.env.add_to_compute(self._fields['overtime_hours'], all_attendances)
+-        self.env.add_to_compute(self._fields['expected_hours'], all_attendances)
+-        self.env.add_to_compute(self._fields['validated_overtime_hours'], all_attendances)
+-        self.env.add_to_compute(self._fields['overtime_status'], all_attendances)
+ 
+     @api.model_create_multi
+     def create(self, vals_list):
+@@ -582,12 +572,6 @@ class HrAttendance(models.Model):
+             'url': self.env.company.attendance_kiosk_url + '?from_trial_mode=True'
+         }
+ 
+-    def _linked_overtimes(self):
+-        return self.env['hr.attendance.overtime.line'].search([
+-            ('time_start', 'in', self.mapped('check_in')),
+-            ('employee_id', 'in', self.employee_id.ids),
+-        ])
+-
+     def action_approve_overtime(self):
+         self.linked_overtime_ids.action_approve()
+ 
+
+--- a/addons/hr_attendance/models/hr_attendance_overtime.py
++++ b/addons/hr_attendance/models/hr_attendance_overtime.py
+@@ -6,22 +6,18 @@ from odoo import api, models, fields
+ class HrAttendanceOvertimeLine(models.Model):
+     _name = 'hr.attendance.overtime.line'
+     _description = "Attendance Overtime Line"
+-    _rec_name = 'employee_id'
+-    _order = 'time_start'
++    _order = 'date'
+ 
+-    employee_id = fields.Many2one(
+-        'hr.employee', string="Employee",
+-        required=True, ondelete='cascade', index=True)
+-    company_id = fields.Many2one(related='employee_id.company_id')
++    attendance_id = fields.Many2one('hr.attendance', string='Attendance', index=True, ondelete='cascade', required=True)
++    employee_id = fields.Many2one(related='attendance_id.employee_id', string='Employee', store=True, readonly=True, index='btree_not_null')
+ 
+     date = fields.Date(string='Day', index=True, required=True)
+     status = fields.Selection([
+             ('to_approve', "To Approve"),
+             ('approved', "Approved"),
+-            ('refused', "Refused")
++            ('refused', "Refused"),
+         ],
+-        compute='_compute_status',
+-        required=True, store=True, readonly=False, precompute=True,
++        required=True, default='to_approve',
+     )
+     duration = fields.Float(string='Extra Hours', default=0.0, required=True)
+     manual_duration = fields.Float(  # TODO -> real_duration for easier upgrade
+@@ -30,8 +26,6 @@ class HrAttendanceOvertimeLine(models.Model):
+         store=True, readonly=False,
+     )
+ 
+-    time_start = fields.Datetime(string='Start')  # time_start will be equal to attendance.check_in
+-    time_stop = fields.Datetime(string='Stop')  # time_stop will be equal to attendance.check_out
+     amount_rate = fields.Float("Overtime pay rate", required=True, default=1.0)
+ 
+     is_manager = fields.Boolean(compute="_compute_is_manager")
+@@ -39,38 +33,12 @@ class HrAttendanceOvertimeLine(models.Model):
+     rule_ids = fields.Many2many("hr.attendance.overtime.rule", string="Applied Rules")
+     ruleset_id = fields.Many2one(related='rule_ids.ruleset_id', string="Applied Rulesets", store=True)
+ 
+-    # in payroll: rate, work_entry_type
+-    # in time_off: convertible_to_time_off
+-
+-    # Check no overlapping overtimes for the same employee.
+-    # Technical explanation: Exclude constraints compares the given expression on rows 2 by 2 using the given operator; && on tsrange is the intersection.
+-    # cf: https://www.postgresql.org/docs/current/ddl-constraints.html#DDL-CONSTRAINTS-EXCLUSION
+-    # for employee_id we compare [employee_id -> employee_id] ranges bc raw integer is not supported (?)
+-    # _overtime_no_overlap_same_employee = models.Constraint("""
+-    #     EXCLUDE USING GIST (
+-    #         tsrange(time_start, time_stop, '()') WITH &&,
+-    #         int4range(employee_id, employee_id, '[]') WITH =
+-    #     )
+-    #     """,
+-    #     "Employee cannot have overlapping overtimes",
+-    # )
+-    _overtime_start_before_end = models.Constraint(
+-        'CHECK (time_stop > time_start)',
+-        'Starting time should be before end time.',
+-    )
+-
+-    @api.depends('employee_id')
+-    def _compute_status(self):
+-        for overtime in self:
+-            if not overtime.status:
+-                overtime.status = 'to_approve' if overtime.employee_id.company_id.attendance_overtime_validation == 'by_manager' else 'approved'
+-
+     @api.depends('duration')
+     def _compute_manual_duration(self):
+         for overtime in self:
+             overtime.manual_duration = overtime.duration
+ 
+-    @api.depends('employee_id')
++    @api.depends('attendance_id.employee_id')
+     def _compute_is_manager(self):
+         has_manager_right = self.env.user.has_group('hr_attendance.group_hr_attendance_manager')
+         has_officer_right = self.env.user.has_group('hr_attendance.group_hr_attendance_officer')
+@@ -83,6 +51,16 @@ class HrAttendanceOvertimeLine(models.Model):
+                 )
+             )
+ 
++    @api.model_create_multi
++    def create(self, vals_list):
++        attendances = self.env['hr.attendance'].browse([vals['attendance_id'] for vals in vals_list if 'status' not in vals])
++        for vals in vals_list:
++            if 'status' not in vals:
++                attendance = attendances.browse(vals['attendance_id'])
++                if attendance.employee_id.company_id.attendance_overtime_validation == 'no_validation':
++                    vals['status'] = 'approved'
++        return super().create(vals_list)
++
+     def action_approve(self):
+         self.write({'status': 'approved'})
+ 
+@@ -96,34 +74,5 @@ class HrAttendanceOvertimeLine(models.Model):
+             'view_mode': 'form',
+             'res_model': 'hr.attendance',
+             'type': 'ir.actions.act_window',
+-            'res_id': self._linked_attendances().id,
++            'res_id': self.attendance_id.id,
+         }
+-
+-    def _linked_attendances(self):
+-        return self.env['hr.attendance'].search([
+-            ('check_in', 'in', self.mapped('time_start')),
+-            ('employee_id', 'in', self.employee_id.ids),
+-        ])
+-
+-    def write(self, vals):
+-        if any(key in vals for key in ['status', 'manual_duration', 'duration']):
+-            attendances = self._linked_attendances()
+-            if any(key in vals for key in ['status', 'manual_duration']):
+-                self.env.add_to_compute(
+-                    attendances._fields['overtime_status'],
+-                    attendances
+-                )
+-                self.env.add_to_compute(
+-                    attendances._fields['validated_overtime_hours'],
+-                    attendances
+-                )
+-            if 'duration' in vals:
+-                self.env.add_to_compute(
+-                    attendances._fields['overtime_hours'],
+-                    attendances
+-                )
+-                self.env.add_to_compute(
+-                    attendances._fields['expected_hours'],
+-                    attendances
+-                )
+-        return super().write(vals)
+
+--- a/addons/hr_attendance/models/hr_attendance_overtime_rule.py
++++ b/addons/hr_attendance/models/hr_attendance_overtime_rule.py
+@@ -419,10 +419,8 @@ class HrAttendanceOvertimeRule(models.Model):
+             for day, duration_by_rules in duration_by_day_by_rules.items():
+                 for rules, duration in duration_by_rules.items():
+                     vals.append({
+-                        'time_start': attendance.check_in,
+-                        'time_stop': attendance.check_out,
++                        'attendance_id': attendance.id,
+                         'duration': round(duration, 3),
+-                        'employee_id': employee.id,
+                         'date': day,
+                         'rule_ids': rules.ids,
+                         **rules._extra_overtime_vals(),

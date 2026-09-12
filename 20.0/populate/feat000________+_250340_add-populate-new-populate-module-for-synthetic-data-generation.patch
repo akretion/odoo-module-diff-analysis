@@ -1,0 +1,1149 @@
+PR: https://github.com/odoo/odoo/pull/250340
+
+From: 9065debececbae60912d2ef02e5af55de5635e11
+From: Victor Piryns (pivi)
+Date: 2026-06-10 17:34:38
++    child_ids = fields.One2many('populate.job', inverse_name='parent_id')
++    job_ids = fields.One2many('populate.job', inverse_name='session_id', domain=[('parent_id', '=', False)])
+
+Total Changes: 1074
+
+[ADD] populate: New `populate` module for synthetic data generation
+
+Proper evaluation of performance patches requires databases with realistic,
+high-volume data. Demo data lacks the volume, and the existing populate
+tool (merged in v18) copies from the initial dataset, producing skewed
+distributions that lead to incorrect conclusions.
+
+The old populate framework also had structural problems: it populated entire
+model dependency graphs whether needed or not, ran single-core, required
+hooks on BaseModel, and gave developers too much unconstrained freedom,
+resulting in poorly optimized scripts that were hard to maintain.
+
+This new framework takes a declarative, data-driven approach (Blueprints)
+to address those shortcomings:
+* Blueprints target only the models relevant to what's being benchmarked,
+  avoiding unnecessary population of unrelated models.
+* A declarative structure prevents poorly written generation scripts and
+  allows the framework to parallelize work transparently via `-j <N>` or
+  `-j auto`, without developers needing an explicit parallel API.
+* A rich generator suite (scalar, textual, temporal, choice, relational,
+  reference, faker, misc, and properties) with statistical distributions
+  (normal, uniform, exponential, beta, poisson, triangular) produces
+  plausible, realistic data rather than uniformly distributed noise.
+* Virtual fields for intermediate computations, write jobs to update
+  previously created records, and blueprint inheritance allows expressive
+  scenarios without writing elaborate Python code.
+* Generated records carry external references (like xmlids), making them
+  traceable and referenceable across blueprints.
+* Session tracking with resume support after interruption (`--resume`).
+* Low maintenance overhead: adding or removing a field is typically a
+  one-line XML change, and new blueprints can be bootstrapped quickly.
+
+The end goal is to make [PERF] PR benchmarking accessible to all
+developers: a reviewer should be able to reproduce a realistic test
+database with a single command.
+
+More info the module's README.md
+
+task-4618828
+
+Part-of: odoo/odoo#250340
+Related: odoo/documentation#17432
+Signed-off-by: Krzysztof Magusiak (krma) <krma@odoo.com>
+
+================================= pseudo patch: =================================
+
+--- a/None
++++ b/addons/populate/models/__init__.py
+@@ -0,0 +1,6 @@
++from . import (
++    blueprint,
++    job,
++    model_data,
++    session,
++)
+
+--- a/None
++++ b/addons/populate/models/blueprint.py
+@@ -0,0 +1,164 @@
++from __future__ import annotations
++
++import json
++
++from odoo import api, fields, models
++from odoo.exceptions import ValidationError
++
++from ..utils import loading, xml
++
++DEFINITION_PREFETCH_GROUP = 'Definitions'
++
++
++class Blueprint(models.Model):
++    """
++    Declarative definition of what synthetic data to create.
++
++    A blueprint holds an XML or JSON definition describing which models to
++    populate, how many records to create, and which generators to use for
++    each field.  It supports simple inheritance via ``inherit_id``
++    (XPath specs applied to the parent's XML).
++
++    Blueprints are instantiated into ``populate.job`` records
++    within a ``populate.session`` at execution time.
++    """
++    _name = 'populate.blueprint'
++    _description = 'Data Population Blueprint'
++    _parent_name = 'inherit_id'
++
++    name = fields.Char("Blueprint Name", required=True)
++    inherit_id = fields.Many2one(
++        comodel_name='populate.blueprint',
++        string='Inherited Blueprint',
++        ondelete='set null',
++        index=True,
++        help="Blueprint to inherit from. Use XPath expressions in definition_xml to modify the parent.",
++    )
++    definition_xml = fields.Char("Raw XML Definition", prefetch=DEFINITION_PREFETCH_GROUP)
++    definition_json = fields.Json("Raw JSON Definition", prefetch=DEFINITION_PREFETCH_GROUP)
++    definition = fields.Json(
++        string="JSON Definition",
++        compute='_compute_definition',
++        prefetch=DEFINITION_PREFETCH_GROUP,
++        readonly=True,
++    )
++
++    _has_definition = models.Constraint(
++        'CHECK(definition_xml IS NOT NULL OR definition_json IS NOT NULL)',
++        "Either XML or JSON definition must be provided",
++    )
++
++    @api.constrains('definition_xml', 'definition_json', 'inherit_id')
++    def _check_definition(self):
++        """Validate resolved blueprint definitions against the loaded models.
++
++        Checks inheritance cycles, model names, and non-virtual field names before
++        a session can instantiate jobs from the blueprint.
++        """
++        if self._has_cycle():
++            raise ValidationError(self.env._("You cannot create recursive inherited blueprints."))
++
++        exceptions = []
++        for blueprint in self:
++            for model in blueprint.definition:
++                model_name = model['name']
++                if model_name not in self.env:
++                    pretty_definition = json.dumps(model, indent=2)
++                    exceptions.append(
++                        ValidationError(self.env._(
++                            "Blueprint '%(blueprint)s': Model '%(model)s' doesn't exist.\n"
++                            "Definition that failed:\n%(definition)s",
++                            blueprint=blueprint.name,
++                            model=model_name,
++                            definition=pretty_definition,
++                        )),
++                    )
++                    continue
++
++                model_field_names = self.env[model_name]._fields.keys()
++                inexistent_fields = [
++                    field_name
++                    for field_name, attrs in model['fields'].items()
++                    if field_name not in model_field_names
++                       and not attrs.get('virtual', False)
++                ]
++                if inexistent_fields:
++                    pretty_definition = json.dumps(model, indent=2)
++                    exceptions.append(
++                        ValidationError(self.env._(
++                            "Blueprint '%(blueprint)s': Model '%(model)s' "
++                            "doesn't have field(s): %(fields)s.\n"
++                            "Definition that failed:\n%(definition)s",
++                            blueprint=blueprint.name,
++                            model=model_name,
++                            fields=', '.join(repr(f) for f in inexistent_fields),
++                            definition=pretty_definition,
++                        )),
++                    )
++        if exceptions:
++            # The module doesn't have a webclient interface, so it's ok to not raise an explicit ValidationError
++            raise ExceptionGroup(self.env._("Some blueprint's definition(s) have inexistent models/fields used."), exceptions)
++
++    @api.depends('definition_xml', 'definition_json')
++    def _compute_definition(self):
++        """Compute the blueprint's definition in JSON.
++
++        If both raw definitions are specified, the XML one takes precedence.
++        If inherit_id is set, apply inheritance specs first.
++        """
++        for blueprint in self:
++            resolved_definition = blueprint._get_resolved_definition()
++            if resolved_definition:
++                blueprint.definition = xml.parse(resolved_definition)
++            else:
++                blueprint.definition = blueprint.definition_json
++
++    @api.model_create_multi
++    def create(self, vals_list):
++        for vals in vals_list:
++            if definition_xml := vals.get('definition_xml'):
++                vals['definition_xml'] = xml.ensure_root(definition_xml)
++        return super().create(vals_list)
++
++    def write(self, vals):
++        if definition_xml := vals.get('definition_xml'):
++            vals['definition_xml'] = xml.ensure_root(definition_xml)
++        return super().write(vals)
++
++    def _get_resolved_definition(self):
++        """Get the resolved XML definition, applying inheritance specs if needed.
++
++        :return: XML definition string, or ``None`` for JSON-only blueprints.
++        :raise ValueError: If inheritance targets a JSON-only parent or invalid XPath specs.
++        """
++        self.ensure_one()
++
++        if not self.definition_xml:
++            return None
++
++        if not self.inherit_id:
++            return self.definition_xml
++
++        parent_definition_xml = self.inherit_id._get_resolved_definition()
++        if not parent_definition_xml:
++            raise ValueError(self.env._(
++                "The blueprint '%(parent)s' does not have an XML definition, but '%(child)s' inherit from it.",
++                parent=self.inherit_id.name,
++                child=self.name,
++            ))
++
++        try:
++            return xml.apply_inheritance(parent_definition_xml, self.definition_xml)
++        except ValueError as e:
++            raise ValueError(self.env._(
++                "Error applying blueprint inheritance from %(parent)s' to %(child)s: %(error)s",
++                parent=self.inherit_id.name,
++                child=self.name,
++                error=e,
++            ))
++
++    def _register_hook(self):
++        """Load populate data if the `populate` module was installed or upgraded."""
++        super()._register_hook()
++        if 'populate' in self.env.registry.updated_modules:
++            loading.load_populate(self.env)
+
+--- a/None
++++ b/addons/populate/models/job.py
+@@ -0,0 +1,394 @@
++from __future__ import annotations
++
++import logging
++import math
++import time
++from contextlib import contextmanager
++from random import Random
++from typing import TYPE_CHECKING, Self
++
++from odoo import api, fields, models
++from odoo.exceptions import ValidationError
++from odoo.tools import str2bool
++
++from ..generators import DEFAULT_GENERATORS, Generator, get_fields_vals
++from ..utils.orm import VirtualField, drop_pending_update, get_ref_domain
++from ..utils.seed import derive_seed_from
++
++if TYPE_CHECKING:
++    from collections.abc import Mapping
++
++    from odoo.fields import Domain
++
++MAX_RECORD_COMMIT_SIZE = 1000
++
++_logger = logging.getLogger(__name__)
++
++
++class Job(models.Model):
++    """
++    Single unit of work that creates or updates records for one model.
++
++    A job is produced by instantiating a ``populate.blueprint``
++    associated with a ``populate.session``. Large jobs are automatically
++    split into smaller sub-jobs to allow for more frequent commits,
++    preventing excessive memory usage, and enable parallel execution across multiple workers.
++    """
++    _name = 'populate.job'
++    _description = 'Data Population Job'
++    _order = 'session_id.id, id ASC'
++    _parent_store = True
++
++    seed = fields.Integer()
++    parent_id = fields.Many2one('populate.job', index=True)
++    child_ids = fields.One2many('populate.job', inverse_name='parent_id')
++    parent_path = fields.Char(index=True)
++    blueprint_id = fields.Many2one(
++        'populate.blueprint',
++        related='session_id.blueprint_id',
++        store=True,  # avoid joining `populate.session` when searching on `populate.model.data`
++        required=True,
++        index=True,
++        precompute=True,
++    )
++    session_id = fields.Many2one('populate.session', required=True, index=True)
++    is_done = fields.Boolean()
++
++    ref = fields.Char(help="""Reference the batch of records used by the job.
++    If the job type is 'create' -> Annotates the records for referencing.
++    If the job type is 'write' -> Refers to records with said reference.
++    """)
++    model_name = fields.Char(required=True)
++    record_count = fields.Integer(default=1)  # Semantics: 0 <-> None
++    type = fields.Selection([
++        ('create', "Create"),
++        ('write', "Write"),
++    ], default='create', required=True)
++    parallel = fields.Boolean(help="Can the job be executed in parallel?", default=True)
++    context = fields.Json()
++    instructions = fields.Json()
++
++    _record_count_invariant = models.Constraint(
++        "CHECK (record_count > 0 OR (type = 'write' AND record_count = 0))",
++        "A job's record_count needs to be a non-zero positive integer. "
++        "Only write jobs are allowed to have no record_count, whose cardinality is unknown at creation time.",
++    )
++    # partial unique constraint, subjobs copy the info from parents,
++    # and you can have multiple write jobs refer the same created records' ref.
++    _unique_ref_per_session = models.UniqueIndex(
++        "(ref, session_id) WHERE parent_id IS NULL AND type = 'create'",
++        "A job with this reference already exists in this session. "
++        "References must be unique for create-type jobs within a session.",
++    )
++    _records_idx = models.Index('(model_name, ref, session_id, blueprint_id)')
++
++    @api.constrains('session_id', 'child_ids', 'parent_id')
++    def _check_same_session(self):
++        for session, jobs in self.grouped('session_id').items():
++            if jobs.parent_id and jobs.parent_id.session_id != session:
++                raise ValidationError(self.env._("Jobs in the same hierarchy should share the same session."))
++
++    @api.constrains('child_ids', 'parent_id')
++    def _check_parent_hierarchy(self):
++        if self._has_cycle():
++            raise ValidationError(self.env._("Job hierarchy cannot be recursive."))
++
++    @api.constrains('child_ids', 'parent_id')
++    def _check_single_level_hierarchy(self):
++        for subjobs in self.filtered('parent_id'):
++            if subjobs.parent_id.parent_id:
++                raise ValidationError(self.env._(
++                    "Subjobs cannot have subjobs themselves. Only one level of hierarchy is allowed.",
++                ))
++
++    @property
++    def is_executable(self) -> bool:
++        """Whether this job performs actual work."""
++        return self.parent_id or not self.child_ids
++
++    @property
++    def pending_subjobs(self) -> Self:
++        return self.child_ids.filtered(lambda job: not job.is_done)
++
++    @property
++    def progress(self) -> float:
++        """Get the progress of the job as value between [0, 1]"""
++        if not self.record_count:
++            # For unknown counts -> binary progress.
++            return float(self.is_done)
++
++        if self.parent_id:
++            done = sum(sibling_job.record_count for sibling_job in self.parent_id.child_ids if sibling_job.is_done)
++            total = self.parent_id.record_count
++        else:
++            if self.is_executable:
++                done = self.record_count if self.is_done else 0
++            else:
++                done = sum(subjob.record_count for subjob in self.child_ids if subjob.is_done)
++            total = self.record_count
++
++        return done / total
++
++    def _create_subjobs(self) -> Self:
++        """
++        Given a job, create the subjobs based on the session, if necessary.
++        A subjob, by design, is the same as its parent, it just has a smaller `record_count`,
++        based on the sessions `worker_count` and the cap of records that can be committed in one go.
++        Their main goal is to allow horizontal scaling and prevent memory issues.
++        """
++        jobs = self.filtered(lambda j: (
++            not j.child_ids      # Already has subjobs, do not recreate them
++            and not j.parent_id  # Subjobs cannot have subjobs of their own
++            and j.record_count   # Only with a defined record_count can be split.
++        ))
++
++        subjob_vals = []
++        for job in jobs:
++            worker_count = job.session_id.worker_count
++            records_to_create = job.record_count
++
++            if records_to_create <= MAX_RECORD_COMMIT_SIZE:
++                continue
++
++            max_records_per_worker = min(math.ceil(records_to_create / worker_count), MAX_RECORD_COMMIT_SIZE)
++            seed_idx = 0
++            while records_to_create > 0:
++                batch_size = min(records_to_create, max_records_per_worker)
++                vals = job.copy_data(default={
++                    'parent_id': job.id,
++                    'record_count': batch_size,
++                    # Assign a unique seed to each subjob to prevent identical random sequences
++                    # when subjobs run in parallel.
++                    # Without unique seeds, parallel subjobs would generate identical values,
++                    # defeating the purpose of probability distributions and weighted selections,
++                    # or violate unique constraints.
++                    'seed': derive_seed_from(job.seed, seed_idx),
++                })[0]
++                subjob_vals.append(vals)
++                seed_idx += 1
++                records_to_create -= batch_size
++
++        if subjob_vals:
++            subjobs = self.env['populate.job'].create(subjob_vals)
++            if all_jobs := jobs + subjobs:
++                seeds = all_jobs.mapped('seed')
++                assert len(seeds) == len(set(seeds)), "All job seeds must be unique"
++
++            return subjobs
++
++        return self.env['populate.job']
++
++    def _execute(self, generators: Mapping[str, Generator] | None = None, *, seed: int | None = None):
++        """
++        Execute a job.
++        If the job has children, execute those, and considers itself done when all children are done
++        If the job is a singleton (no parent and no children) or it's a subjob, execute the job itself.
++
++        Side effect: commits transaction when successfully executed.
++        """
++        self.ensure_one()
++        assert not self.is_done, "Cannot execute a job that is already done"
++        assert seed is not None or self.seed is not False
++
++        with execution_scope(self):
++            # A generator's scope is applicable per whole job, subjob included.
++            if generators is None:
++                generators = self.__create_generators(seed or self.seed)
++
++            if self.is_executable:
++                match self.type:
++                    case 'create':
++                        self._execute_create(generators)
++                    case 'write':
++                        self._execute_write(generators)
++            else:
++                for subjob in self.pending_subjobs:
++                    subjob._execute(generators, seed=seed)
++
++    def _execute_create(self, generators: Mapping[str, Generator]):
++        """Create records for this job and register their populate references.
++
++        :param generators: Field generators keyed by field name.
++        """
++        self.ensure_one()
++        assert self.type == 'create'
++
++        model = self.env[self.model_name]
++        records_vals = []
++
++        for _ in range(self.record_count):
++            vals = get_fields_vals(generators)
++            records_vals.append(vals)
++
++        if context := self.context:
++            model = model.with_context(**context)
++
++        new_records = model.create(records_vals)
++
++        self.env['populate.model.data'].create([{
++            'res_id': record_id,
++            'job_id': self.id,
++        } for record_id in new_records.ids])
++
++    def _execute_write(self, generators: Mapping[str, Generator]):
++        """Write generated values on the records targeted by this job.
++
++        :param generators: Field generators keyed by field name.
++        """
++        self.ensure_one()
++        assert self.type == 'write'
++
++        domain = self._get_ref_domain() if self.ref else []
++
++        slice_kwargs = {}
++        if self.parent_id:
++            preceding_siblings = self.parent_id.child_ids.filtered(lambda job: job.id < self.id)
++            slice_kwargs['offset'] = sum(job.record_count for job in preceding_siblings)
++            slice_kwargs['limit'] = self.record_count
++
++        records = self.env[self.model_name].with_context(active_test=False).search(domain, **slice_kwargs)
++
++        for record in records:
++            vals = get_fields_vals(generators)
++            record.write(vals)
++
++    def _get_ref_domain(self) -> Domain:
++        """Build the ORM domain matching records selected by this job's ``ref``.
++
++        :return: Domain restricted to this job's session and blueprint.
++        """
++        return get_ref_domain(self.env, self.model_name, self.ref, self.session_id, self.blueprint_id)
++
++    def __create_generators(self, seed: int) -> Mapping[str, Generator]:
++        """Instantiate field generators from the job instructions.
++
++        :param seed: Seed shared by all generators in this job, so generated
++            fields remain deterministic relative to each other.
++        :return: Generator instances keyed by field name.
++        """
++        self.ensure_one()
++        generators = {}
++        model = self.env[self.model_name]
++        valid_fields = self.instructions.keys()
++        random = Random(seed)
++        for field_name, attrs in self.instructions.items():
++            if str2bool(attrs.get('virtual', False)):
++                field = VirtualField(self.model_name, field_name)
++            else:
++                field = model._fields[field_name]
++
++            if 'generator' in attrs:
++                generator_name = attrs['generator']
++            elif 'eval' in attrs:
++                generator_name = 'misc.eval'
++            elif field.type in DEFAULT_GENERATORS:
++                generator_name = DEFAULT_GENERATORS[field.type]
++            else:
++                raise ValueError(self.env._(
++                    "No generator specified for field '%(field)s' of type '%(type)s', "
++                    "and no default generator is registered for that field type.",
++                    field=field_name,
++                    type=field.type,
++                ))
++
++            generator = Generator.by_name(generator_name)
++            kwargs = {
++                'field': field,
++                'env': self.env,
++                'random': random,
++                'job': self,
++                'valid_fields': valid_fields,
++                **generator.convert_to_kwargs(attrs),
++            }
++            try:
++                generators[field_name] = generator(**kwargs)
++            except Exception as exc:
++                exc.add_note(self.env._("Generator: '%s'", generator_name))
++                exc.add_note(self.env._("Field: '%s'", field))
++                if self.ref:
++                    exc.add_note(self.env._("Ref: '%s'", self.ref))
++                raise
++
++        return generators
++
++    def _log_start(self):
++        self.ensure_one()
++        progress_info = f'- Session: {self.session_id.progress * 100:.0f}%'
++        ref_info = f' [{self.ref}]' if self.ref else ''
++
++        if self.is_executable:
++            action = 'Creating' if self.type == 'create' else 'Writing on'
++            count = f' {self.record_count}' if self.record_count else ''
++
++            if self.parent_id:
++                progress_info = f'- Job: {self.progress * 100:.0f}% ' + progress_info
++
++            _logger.info(
++                "Job %(id)s: %(action)s%(count)s %(model)s%(ref)s %(progress)s",
++                {
++                    'id': self.parent_path[:-1],
++                    'action': action,
++                    'count': count,
++                    'model': self.model_name,
++                    'ref': ref_info,
++                    'progress': progress_info,
++                },
++            )
++        else:
++            assert self.record_count, f"Job {self.parent_path[:-1]} without a known `record_count` couldn't have been split."
++            is_parallel = self.parallel and self.session_id.is_parallel
++            parallel_info = ' (parallel)' if is_parallel else ''
++            _logger.info(
++                "Job %(id)s: Planning %(job_count)d subjobs for %(model)s%(ref)s (%(record_count)d records) %(progress)s%(parallel)s",
++                {
++                    'id': self.id,
++                    'job_count': len(self.child_ids),
++                    'model': self.model_name,
++                    'ref': ref_info,
++                    'record_count': self.record_count,
++                    'progress': progress_info,
++                    'parallel': parallel_info,
++                },
++            )
++
++    def _log_end(self, elapsed_time):
++        self.ensure_one()
++        progress_info = f'- Session: {self.session_id.progress * 100:.0f}%'
++
++        if self.parent_id:
++            progress_info = f'- Job: {self.progress * 100:.0f}% ' + progress_info
++
++        _logger.info(
++            "Job %(id)s: Completed in %(time).2fs %(progress)s",
++            {
++                'id': self.parent_path[:-1],
++                'time': elapsed_time,
++                'progress': progress_info,
++            },
++        )
++
++
++@contextmanager
++def execution_scope(job: Job):
++    """Lock, log, mark done, and commit one job execution.
++
++    :param job: Singleton job being executed.
++    :return: Context manager yielding the locked job.
++    """
++    job.ensure_one()
++    job.lock_for_update()  # Shouldn't raise, a locked job -> in progress
++
++    start_time = time.time()
++    job._log_start()
++
++    yield job
++
++    if job.is_executable and job.parallel and job.session_id.is_parallel:
++        # Discard pending updates to audit log fields (write_uid, write_date) to prevent some
++        # serialization errors during data population, where such metadata is not essential.
++        drop_pending_update(job.env, ['write_uid', 'write_date'])
++
++    job.is_done = True
++    job.env.cr.commit()
++
++    job._log_end(elapsed_time=time.time() - start_time)
+
+--- a/None
++++ b/addons/populate/models/model_data.py
+@@ -0,0 +1,22 @@
++from odoo import fields, models
++
++
++class ModelData(models.Model):
++    """
++    External reference to records created via the populate.
++    This allows referencing those records, either for modification during the populate process,
++    or to remove them all at after testing.
++    """
++    _name = 'populate.model.data'
++    _description = 'Reference to Populated Records.'
++    _log_access = False
++
++    res_model = fields.Char('Model', related='job_id.model_name')
++    res_id = fields.Many2oneReference('Record', model_field='res_model', required=True)
++
++    job_id = fields.Many2one('populate.job', required=True, ondelete='cascade')
++    ref = fields.Char(related='job_id.ref')
++    session_id = fields.Many2one(related='job_id.session_id')
++    blueprint_id = fields.Many2one(related='job_id.blueprint_id')
++
++    _job_records_idx = models.UniqueIndex('(job_id, res_id)')
+
+--- a/None
++++ b/addons/populate/models/session.py
+@@ -0,0 +1,488 @@
++from __future__ import annotations
++
++import importlib
++import json
++import logging
++import math
++import multiprocessing as mp
++import os
++import secrets
++import sys
++import time
++from abc import ABC, abstractmethod
++from collections import defaultdict
++from concurrent.futures import ProcessPoolExecutor, as_completed
++from contextlib import contextmanager
++from functools import cached_property
++from pathlib import Path
++from typing import TYPE_CHECKING, Self
++
++import psycopg2
++from psycopg2.errors import (
++    CheckViolation,
++    ExclusionViolation,
++    NotNullViolation,
++    UniqueViolation,
++)
++
++from odoo import SUPERUSER_ID, api, fields, models, modules
++from odoo.exceptions import ConcurrencyError, LockError, UserError, ValidationError
++from odoo.http.retrying import retrying
++from odoo.modules.registry import Registry
++from odoo.tools import SQL, config, str2bool
++
++from ..utils.seed import derive_seed_from
++from .job import execution_scope
++
++if TYPE_CHECKING:
++    from collections.abc import Callable
++
++    from .job import Job
++
++PG_EXCEPTIONS_TO_RETRY = (
++    CheckViolation,
++    ExclusionViolation,
++    NotNullViolation,
++    UniqueViolation,
++)
++POPULATE_SESSION_LOCK_NAMESPACE = 'odoo.populate.session.running'
++
++_worker_logger = logging.getLogger('odoo.addons.populate.worker')
++
++
++def has_platform_enabled_multiprocessing() -> bool:
++    """Checks if the platform has allowed multiprocessing for the `populate` feature."""
++    # opt-in by default, easier user onboarding.
++    return str2bool(os.getenv('ODOO_POPULATE_MULTIPROCESS_ENABLE', 'True'))
++
++
++class Session(models.Model):
++    """
++    Single execution run of a blueprint.
++
++    A session owns the full set of ``populate.job`` records produced
++    from its blueprint and tracks their completion state.
++    Interrupted sessions can be resumed — only pending jobs are re-executed.
++    """
++    _name = 'populate.session'
++    _description = 'Data Population Session'
++
++    seed = fields.Integer("Seed", default=lambda _: max(secrets.randbits(31) - 1, 0))
++    scaling_factor = fields.Float("Scaling Factor")
++    worker_count = fields.Integer("Number of parallel workers that will run jobs at the same time", default=1)
++    blueprint_id = fields.Many2one('populate.blueprint', required=True)
++    job_ids = fields.One2many('populate.job', inverse_name='session_id', domain=[('parent_id', '=', False)])
++
++    @api.constrains('job_ids')
++    def _check_has_jobs(self):
++        for session in self:
++            if not session.job_ids:
++                raise ValidationError(self.env._("A created session should have jobs associated from a blueprint."))
++
++    @property
++    def is_done(self) -> bool:
++        return self.job_ids and all(self.job_ids.mapped('is_done'))
++
++    @property
++    def is_parallel(self) -> bool:
++        return self.worker_count > 1
++
++    @property
++    def pending_jobs(self):
++        return self.job_ids.filtered(lambda job: not job.is_done)
++
++    @property
++    def progress(self) -> float:
++        """Get the progress of the session as value between [0, 1]"""
++        return sum(job.progress for job in self.job_ids) / (len(self.job_ids) or 1)
++
++    @property
++    def is_running(self) -> bool:
++        """The session is running if its advisory lock is currently held."""
++        self.ensure_one()
++
++        lock_namespace, session_id = self._running_lock_key()
++        return self.env.execute_query(SQL("""
++            SELECT EXISTS (
++                SELECT 1
++                  FROM pg_locks
++                 WHERE locktype = 'advisory'
++                   -- For pg_advisory_lock(int, int), PostgreSQL stores the first key
++                   -- in classid, the second key in objid, and marks objsubid as 2.
++                   AND database = (
++                        SELECT oid
++                          FROM pg_database
++                         WHERE datname = current_database()
++                   )
++                   AND classid::int = hashtext(%s)
++                   AND objid::int = %s
++                   AND objsubid = 2
++                   -- Ignore processes waiting for the lock; only the holder means "running".
++                   AND granted
++            )
++        """, lock_namespace, session_id))[0][0]
++
++    def _running_lock_key(self):
++        """Return the PostgreSQL advisory lock key used to guard this session.
++
++        :return: Namespace and session id used as the two advisory lock parts.
++        """
++        return POPULATE_SESSION_LOCK_NAMESPACE, self.ensure_one().id
++
++    @api.model_create_multi
++    def create(self, vals_list):
++        """Create sessions and instantiate their jobs from the selected blueprint.
++
++        :param vals_list: Values for the new ``populate.session`` records.
++        :return: Created session records.
++        """
++        sessions = super().create(vals_list)
++        assert not sessions.job_ids
++
++        for session in sessions:
++            session._instantiate()
++
++        return sessions
++
++    def _instantiate(self):
++        """Create new jobs to be run from the session's blueprint."""
++        self.ensure_one()
++        assert self.blueprint_id
++
++        if self.job_ids:
++            return  # Session already has jobs -> do nothing
++
++        scaling_factor = self.scaling_factor or 1
++        vals_list = []
++        write_target_counts = defaultdict(lambda: defaultdict(int))  # {ref | None: {model_name: count}}
++        for index, model in enumerate(self.blueprint_id.definition):
++            model_name = model['name']
++            ref, _, ref_relation = (part or None for part in model.get('ref', '').partition('.'))
++            vals = {
++                'model_name': model_name,
++                'instructions': model['fields'],
++                'session_id': self.id,
++                'seed': derive_seed_from(self.seed, index),
++            }
++            if 'count' in model:
++                factor = scaling_factor if model.get('scale', True) else 1
++                vals['record_count'] = math.floor(model['count'] * factor)
++
++            vals.update(**{k: v for k, v in model.items() if k in ('type', 'ref', 'parallel', 'context')})
++
++            defaults = self.env['populate.job'].default_get(['type', 'record_count'])
++            is_create = vals.get('type', defaults['type']) == 'create'
++
++            if is_create:
++                write_target_counts[ref][model_name] += vals.get('record_count', defaults['record_count'])
++            else:
++                # Compute write job record_count:
++                # - with 'ref': count from the matching 'create' job
++                # - without 'ref': existing DB records + all preceding 'create' jobs for this model
++                if ref:
++                    assert ref in write_target_counts, f"Create 'refs' should be present before its' writes, missing: {ref}"
++                    if ref_relation:
++                        # The count of the corecords is unknown at creation time.
++                        vals['record_count'] = None
++                    else:
++                        vals['record_count'] = write_target_counts[ref][model_name]
++                else:
++                    existing = self.env[model_name].with_context(active_test=False).search_count([])
++                    from_creates = write_target_counts[None][model_name]
++                    total = existing + from_creates
++                    if total > 0:
++                        vals['record_count'] = total
++
++            vals_list.append(vals)
++
++        jobs = self.env['populate.job'].create(vals_list)
++        jobs._create_subjobs()
++
++
++class JobExecutor(ABC):
++    """
++    Abstract base class for job execution strategies.
++
++    Selects the appropriate concrete executor based on the session configuration.
++    Use as a context manager to get a ready-to-use executor::
++
++        with JobExecutor.from_session(session) as executor:
++            executor.execute(session.pending_jobs)
++    """
++
++    def __init__(self, session: Session) -> Self:
++        pass
++
++    def __enter__(self) -> Self:
++        return self
++
++    def __exit__(self, exc_type, exc_value, exc_traceback):
++        pass
++
++    @abstractmethod
++    def execute(self, jobs: Job):
++        """Execute a collection of jobs following the JobExecutor's strategy"""
++        ...
++
++    @staticmethod
++    def _execute_with_retry(job: Job):
++        """
++        Execute a single job, with a retry mechanism on extended retrying conditions.
++
++        For the SequentialExecutor, retrying is necessary for potential complex multi-field constraints
++        that cannot be avoided with parameters in a blueprint.
++        For the ParallelExecutor, retrying is a must for multi-worker serialization issues,
++        in addition to the above-mentioned issues.
++
++        :param job: Job or subjob to execute.
++        """
++        seed = job.seed
++        retry_count = 0
++
++        def execute_job():
++            """
++            Small wrapper to retry on additional database exceptions.
++
++            Usually these exceptions are due to a user error,
++            but in the context of populating data,
++            they're due to randomness, so we want to retry on them
++            instead of failing the populate session.
++            """
++            nonlocal seed, retry_count
++            try:
++                job._execute(seed=seed)
++            except PG_EXCEPTIONS_TO_RETRY as exc:
++                # Re-roll the seed in case of a violation
++                # to avoid re-generating the same values,
++                # leading to the same violation.
++                seed = derive_seed_from(seed, retry_count)
++                retry_count += 1
++
++                error = psycopg2.errorcodes.lookup(exc.pgcode)
++
++                msg = None
++                if isinstance(exc, CheckViolation | ExclusionViolation):
++                    msg = job.env._("Adapt the generator parameter to generate values within the constraint")
++                if isinstance(exc, NotNullViolation):
++                    msg = job.env._("The field is implicitly required, consider adding `null_ratio=0`")
++                if isinstance(exc, UniqueViolation):
++                    msg = job.env._("Consider using a generator (or combination of) that produces more varied values")
++
++                raise ConcurrencyError(f"{error} ({msg})" if msg else error) from exc
++
++        retrying(execute_job, job.env, close_on_commit=False)
++
++
++class SequentialExecutor(JobExecutor):
++    """
++    Executes jobs one at a time in the current process.
++
++    Jobs are run sequentially in the order they are provided.
++    """
++
++    def execute(self, jobs: Job):
++        for job in jobs:
++            self._execute_with_retry(job)
++
++
++class ParallelExecutor(JobExecutor):
++    """
++    Executes jobs using a pool of worker sub-processes via ``ProcessPoolExecutor``.
++
++    Parallel execution is only applied to jobs that have child subjobs *and* have
++    ``parallel=True``; all other jobs fall back to in-process sequential execution.
++    """
++
++    def __init__(self, session: Session):
++        super().__init__(session)
++        self.dbname = session.env.cr.dbname
++        assert session.worker_count > 1
++        self.worker_count = session.worker_count
++        self.pool: ProcessPoolExecutor | None = None
++        self._options = dict(config.options)
++
++    def __getstate__(self):
++        payload = {
++            'dbname': self.dbname,
++            'worker_count': self.worker_count,
++            # `ProcessPoolExecutor` cannot be pickled
++            # due to an internal thread.lock.
++            # A worker doesn't need the pool anyway.
++            'pool': None,
++            '_options': self._options,
++        }
++        json.dumps(payload)  # safety
++        return payload
++
++    def __enter__(self) -> Self:
++        self.start()
++        return self
++
++    def __exit__(self, exc_type, exc_value, exc_traceback):
++        self.stop()
++
++    @cached_property
++    def _worker_init(self) -> Callable:
++        """Load the worker initializer without importing through ``odoo.addons``.
++
++        ``ProcessPoolExecutor`` with ``spawn`` imports the initializer before it
++        runs it. Loading ``populate_worker`` as a top-level module avoids an
++        early import of ``odoo.addons.populate``, which may only become
++        available after the worker initializes Odoo's addons' path.
++        """
++        utils_path_str = str(Path(__file__).resolve().parents[1] / 'utils')
++        if utils_path_str not in sys.path:
++            # sys.path is inherited in the spawn
++            sys.path.append(utils_path_str)
++            importlib.invalidate_caches()
++
++        # Import target: odoo/addons/populate/utils/populate_worker:initialize
++        return importlib.import_module('populate_worker').initialize
++
++    def _worker_execute(self, job_id: int, context: dict):
++        """Execute a subjob inside a worker process with a fresh registry cursor.
++
++        :param job_id: Database id of the subjob to execute.
++        :param context: Serializable environment context copied from the parent process.
++        """
++        registry = Registry(self.dbname)
++        with registry.cursor() as cr:
++            uid = context['uid'] = SUPERUSER_ID
++            env = api.Environment(cr, uid, context)
++            job: Job = env['populate.job'].browse(job_id)
++
++            assert job.exists()
++
++            if job.context:
++                job = job.with_context(job.context)
++
++            self._execute_with_retry(job)
++
++    def start(self):
++        """Start the process pool and eagerly initialize all workers."""
++        _worker_logger.info(
++            "Creating worker pool with %d processes for database '%s'",
++            self.worker_count,
++            self.dbname,
++        )
++        self.pool = ProcessPoolExecutor(
++            max_workers=self.worker_count,
++            initializer=self._worker_init,
++            initargs=(self.dbname, self._options),
++            mp_context=mp.get_context('spawn'),
++        )
++        # Eagerly spawn all workers at the beginning.
++        # By default, they are lazily created only on the first jobs submitted.
++        # There is no API exposed for this, so we submit dummy jobs.
++        # A no-op task may finish before the executor has dispatched work to every worker;
++        # sleeping briefly makes each dummy task last long enough for the pool to spawn.
++        list(self.pool.map(time.sleep, [0.1] * self.worker_count))
++
++    def stop(self):
++        if self.pool:
++            _worker_logger.info("Shutting down worker pool...")
++            self.pool.shutdown(wait=True, cancel_futures=True)
++
++    def execute(self, jobs: Job):
++        """Execute pending jobs, dispatching eligible subjobs to worker processes.
++
++        :param jobs: Top-level jobs to execute in blueprint order.
++        """
++        for job in jobs:
++            if job.child_ids and job.parallel:
++                with execution_scope(job):
++                    context = dict(job.env.context)
++                    json.dumps(context)  # safety
++                    futures = {
++                        self.pool.submit(
++                            self._worker_execute, subjob.id, context,
++                        ): subjob
++                        for subjob in job.pending_subjobs
++                    }
++
++                    failures = []
++                    for future in as_completed(futures):
++                        subjob = futures[future]
++                        try:
++                            future.result()
++                        except KeyboardInterrupt:
++                            raise  # Will be caught at CLI level
++                        except Exception as exc:  # noqa: BLE001
++                            exc.add_note(job.env._("in Job %s", subjob.parent_path[:-1]))
++                            failures.append((subjob, exc))
++
++                    if failures:
++                        raise ExceptionGroup(
++                            job.env._("%(count)s parallel job(s) failed", count=len(failures)),
++                            [exc for _, exc in failures],
++                        )
++            else:
++                self._execute_with_retry(job)
++
++
++def start_populate(session: Session):
++    """Execute a single populate session.
++
++    This function is intentionally kept outside the ``populate.session`` model
++    API so it can only be reached by trusted Python callers, such as the
++    populate CLI.
++
++    If the session was previously interrupted, only pending jobs are executed.
++
++    :param session: Singleton ``populate.session`` to run.
++    """
++
++    # We do not allow starting multiple sessions at once
++    session.ensure_one()
++    if session.is_done:
++        raise UserError(session.env._(
++            "The session %(session_id)s is already done. Create a new session.",
++            session_id=session.id,
++        ))
++
++    assert session.job_ids, "A created session should have jobs instantiated"
++
++    try:
++        with populate_session_lock(session):
++            if session.is_parallel:
++                if not has_platform_enabled_multiprocessing():
++                    raise RuntimeError(session.env._(
++                        "The multiprocessing feature of the populate module has been disabled at the platform level.",
++                    ))
++                if modules.module.current_test:
++                    raise RuntimeError(session.env._("Cannot run a parallel session during tests."))
++
++                executor = ParallelExecutor(session)
++            else:
++                executor = SequentialExecutor(session)
++
++            with executor:
++                executor.execute(session.pending_jobs)
++
++    except LockError as exc:
++        raise UserError(session.env._("Session %(session_id)s is already running.", session_id=session.id)) from exc
++
++
++@contextmanager
++def populate_session_lock(session: Session):
++    """Acquire the advisory lock that prevents concurrent execution of a session.
++
++    :param session: Singleton session to protect.
++    :return: Context manager that releases the lock on exit.
++    :raise LockError: If another transaction already holds the session lock.
++    """
++    session.ensure_one()
++    lock_key = session._running_lock_key()
++    if not session.env.execute_query(SQL(
++        'SELECT pg_try_advisory_lock(hashtext(%s), %s)',
++        *lock_key,
++    ))[0][0]:
++        raise LockError(session.env._("Cannot grab the advisory lock on the session %s.", session.id))
++
++    try:
++        yield
++    finally:
++        session.env.execute_query(SQL(
++            'SELECT pg_advisory_unlock(hashtext(%s), %s)',
++            *lock_key,
++        ))

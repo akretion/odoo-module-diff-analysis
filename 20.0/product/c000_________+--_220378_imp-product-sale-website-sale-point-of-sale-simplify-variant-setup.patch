@@ -1,0 +1,462 @@
+PR: https://github.com/odoo/odoo/pull/220378
+
+From: cdc7a76aef0303d4582e15968328e709d2ffdbd0
+From: Mazen
+Date: 2025-10-07 12:47:18
+
+Breaking data model changes scores: del:6 + add:1, change matches:
+-    product_template_attribute_value_id = fields.Many2one(
+-    product_tmpl_id = fields.Many2one(
+-    value_ids = fields.Many2many(
+-    exclude_for = fields.One2many(
++    excluded_value_ids = fields.Many2many(
+
+Total Changes: 200
+
+[IMP] product, sale, website_sale, point_of_sale: simplify variant setup
+
+This commit will overhaul product variant setup:
+* Allow managing product variants from the list directly
+  instead of from a form
+* Simplify exclusions: users can now only exclude values on
+  the same product and not on optional products
+* Allow users to show/hide the extra added price separately
+  on the shop page for specific product variants
+
+Users used to be able to exclude values for optional products not just
+the same product they're editing, and this was removed to simplify the
+flow for setting up variants and also because users could still add
+the excluded values of the order product simply by adding them in a
+new order line.
+
+Because we don't need to keep track of exclusions across different
+products, exclusions were simplified and they are now simply just a
+many2many field instead of a whole separate model.
+
+task-4731792
+
+closes odoo/odoo#220378
+
+Related: odoo/enterprise#90929
+Related: odoo/upgrade#8116
+Signed-off-by: Victor Feyens (vfe) <vfe@odoo.com>
+
+================================= pseudo patch: =================================
+
+--- a/addons/product/models/__init__.py
++++ b/addons/product/models/__init__.py
+@@ -21,7 +21,6 @@ from . import product_pricelist_item
+ from . import product_supplierinfo
+ from . import product_tag
+ from . import product_template_attribute_line
+-from . import product_template_attribute_exclusion
+ from . import product_template_attribute_value
+ from . import product_uom
+ from . import res_company
+
+--- a/addons/product/models/product_product.py
++++ b/addons/product/models/product_product.py
+@@ -847,21 +847,20 @@ class ProductProduct(models.Model):
+ 
+         return name
+ 
+-    def _is_variant_possible(self, parent_combination=None):
++    def _is_variant_possible(self):
+         """Return whether the variant is possible based on its own combination,
+         and optionally a parent combination.
+ 
+         See `_is_combination_possible` for more information.
+ 
+-        :param parent_combination: combination from which `self` is an
+-            optional or accessory product.
+-        :type parent_combination: recordset `product.template.attribute.value`
+-
+         :return: ẁhether the variant is possible based on its own combination
+         :rtype: bool
+         """
+         self.ensure_one()
+-        return self.product_tmpl_id._is_combination_possible(self.product_template_attribute_value_ids, parent_combination=parent_combination, ignore_no_variant=True)
++        return self.product_tmpl_id._is_combination_possible(
++            self.product_template_attribute_value_ids,
++            ignore_no_variant=True,
++        )
+ 
+     def get_contextual_price(self):
+         return self._get_contextual_price()
+
+--- a/addons/product/models/product_template.py
++++ b/addons/product/models/product_template.py
+@@ -828,7 +828,7 @@ class ProductTemplate(models.Model):
+         for record in self:
+             record.valid_product_template_attribute_line_ids = record.attribute_line_ids.filtered(lambda ptal: ptal.value_ids)
+ 
+-    def _get_possible_variants(self, parent_combination=None):
++    def _get_possible_variants(self):
+         """Return the existing variants that are possible.
+ 
+         For dynamic attributes, it will only return the variants that have been
+@@ -842,44 +842,26 @@ class ProductTemplate(models.Model):
+         should strongly consider doing things differently if you consider using
+         this method.
+ 
+-        :param parent_combination: combination from which `self` is an
+-            optional or accessory product.
+-        :type parent_combination: recordset `product.template.attribute.value`
+-
+         :return: the existing variants that are possible.
+         :rtype: recordset of `product.product`
+         """
+         self.ensure_one()
+-        return self.product_variant_ids.filtered(lambda p: p._is_variant_possible(parent_combination))
++        return self.product_variant_ids.filtered(lambda p: p._is_variant_possible())
+ 
+-    def _get_attribute_exclusions(
+-        self, parent_combination=None, parent_name=None, combination_ids=None
+-    ):
++    def _get_attribute_exclusions(self, combination_ids=None):
+         """Return the list of attribute exclusions of a product.
+ 
+-        :param parent_combination: the combination from which
+-            `self` is an optional or accessory product. Indeed exclusions
+-            rules on one product can concern another product.
+-        :type parent_combination: recordset `product.template.attribute.value`
+-        :param parent_name: the name of the parent product combination.
+-        :type parent_name: str
+         :param list combination_ids: The combination of the product, as a
+             list of `product.template.attribute.value` ids.
+ 
+         :return: dict of exclusions
+             - exclusions: from this product itself
+             - archived_combinations: list of archived combinations
+-            - parent_combination: ids of the given parent_combination
+-            - parent_exclusions: from the parent_combination
+-           - parent_product_name: the name of the parent product if any, used in the interface
+-               to explain why some combinations are not available.
+-               (e.g: Not available with Customizable Desk (Legs: Steel))
+            - mapped_attribute_names: the name of every attribute values based on their id,
+                used to explain in the interface why that combination is not available
+                (e.g: Not available with Color: Black)
+         """
+         self.ensure_one()
+-        parent_combination = parent_combination or self.env['product.template.attribute.value']
+         archived_products = self.with_context(active_test=False).product_variant_ids.filtered(lambda l: not l.active)
+         active_combinations = set(tuple(product.product_template_attribute_value_ids.ids) for product in self.product_variant_ids)
+         return {
+@@ -894,10 +876,7 @@ class ProductTemplate(models.Model):
+                     for ptav in product.product_template_attribute_value_ids
+                 )
+             ) - active_combinations),
+-            'parent_exclusions': self._get_parent_attribute_exclusions(parent_combination),
+-            'parent_combination': parent_combination.ids,
+-            'parent_product_name': parent_name,
+-            'mapped_attribute_names': self._get_mapped_attribute_names(parent_combination),
++            'mapped_attribute_names': self._get_mapped_attribute_names(),
+         }
+ 
+     @api.model
+@@ -927,43 +906,13 @@ class ProductTemplate(models.Model):
+         self.ensure_one()
+         product_template_attribute_values = self.valid_product_template_attribute_line_ids.product_template_value_ids
+         return {
+-            ptav.id: [
+-                value.id
+-                for filter_line in ptav.exclude_for.filtered(
+-                    lambda filter_line: filter_line.product_tmpl_id == self
+-                ) for value in filter_line.value_ids if value.ptav_active
+-            ]
++            ptav.id: [p.id for p in ptav.excluded_value_ids if p.ptav_active]
+             for ptav in product_template_attribute_values if (
+                 ptav.ptav_active or combination_ids and ptav.id in combination_ids
+             )
+         }
+ 
+-    def _get_parent_attribute_exclusions(self, parent_combination):
+-        """Get exclusions coming from the parent combination.
+-
+-        Dictionnary, each parent's ptav is a key, and for each of them the value is
+-        an array with the other ptav that are excluded because of the parent.
+-        """
+-        self.ensure_one()
+-        if not parent_combination:
+-            return {}
+-
+-        result = {}
+-        for product_attribute_value in parent_combination:
+-            for filter_line in product_attribute_value.exclude_for.filtered(
+-                lambda filter_line: filter_line.product_tmpl_id == self
+-            ):
+-                # Some exclusions don't have attribute value. This means that the template is not
+-                # compatible with the parent combination. If such an exclusion is found, it means that all
+-                # attribute values are excluded.
+-                if filter_line.value_ids:
+-                    result[product_attribute_value.id] = filter_line.value_ids.ids
+-                else:
+-                    result[product_attribute_value.id] = filter_line.product_tmpl_id.mapped('attribute_line_ids.product_template_value_ids').ids
+-
+-        return result
+-
+-    def _get_mapped_attribute_names(self, parent_combination=None):
++    def _get_mapped_attribute_names(self):
+         """ The name of every attribute values based on their id,
+         used to explain in the interface why that combination is not available
+         (e.g: Not available with Color: Black).
+@@ -973,8 +922,6 @@ class ProductTemplate(models.Model):
+         """
+         self.ensure_one()
+         all_product_attribute_values = self.valid_product_template_attribute_line_ids.product_template_value_ids
+-        if parent_combination:
+-            all_product_attribute_values |= parent_combination
+ 
+         return {
+             attribute_value.id: attribute_value.display_name
+@@ -1034,11 +981,10 @@ class ProductTemplate(models.Model):
+         # Returns False on StopIteration. Empty combination should return True.
+         return isinstance(next(self._filter_combinations_impossible_by_config([combination], ignore_no_variant), False), models.BaseModel)
+ 
+-    def _is_combination_possible(self, combination, parent_combination=None, ignore_no_variant=False):
++    def _is_combination_possible(self, combination, ignore_no_variant=False):
+         """
+         The combination is possible if it is not excluded by any rule
+-        coming from the current template, not excluded by any rule from the
+-        parent_combination (if given), and there should not be any archived
++        coming from the current template, and there should not be any archived
+         variant with the exact same combination.
+ 
+         If the template does not have any dynamic attribute, the combination
+@@ -1053,10 +999,6 @@ class ProductTemplate(models.Model):
+         :param ignore_no_variant: whether no_variant attributes should be ignored
+         :type ignore_no_variant: bool
+ 
+-        :param parent_combination: combination from which `self` is an
+-            optional or accessory product.
+-        :type parent_combination: recordset `product.template.attribute.value`
+-
+         :return: whether the combination is possible
+         :rtype: bool
+         """
+@@ -1076,15 +1018,6 @@ class ProductTemplate(models.Model):
+                 # not dynamic, the variant has been archived or deleted
+                 return False
+ 
+-        parent_exclusions = self._get_parent_attribute_exclusions(parent_combination)
+-        if parent_exclusions:
+-            # parent_exclusion are mapped by ptav but here we don't need to know
+-            # where the exclusion comes from so we loop directly on the dict values
+-            for exclusions_values in parent_exclusions.values():
+-                for exclusion in exclusions_values:
+-                    if exclusion in combination.ids:
+-                        return False
+-
+         return True
+ 
+     def _get_variant_for_combination(self, combination):
+@@ -1187,7 +1120,7 @@ class ProductTemplate(models.Model):
+         self.ensure_one()
+         return self._create_first_product_variant().id
+ 
+-    def _get_first_possible_combination(self, parent_combination=None, necessary_values=None):
++    def _get_first_possible_combination(self, necessary_values=None):
+         """See `_get_possible_combinations` (one iteration).
+ 
+         This method return the same result (empty recordset) if no
+@@ -1198,9 +1131,9 @@ class ProductTemplate(models.Model):
+         with `_is_combination_possible` if it's important to know if the
+         resulting empty combination is actually possible or not.
+         """
+-        return next(self._get_possible_combinations(parent_combination, necessary_values), self.env['product.template.attribute.value'])
++        return next(self._get_possible_combinations(necessary_values), self.env['product.template.attribute.value'])
+ 
+-    def _cartesian_product(self, product_template_attribute_values_per_line, parent_combination):
++    def _cartesian_product(self, product_template_attribute_values_per_line):
+         """
+         Generate all possible combination for attributes values (aka cartesian product).
+         It is equivalent to itertools.product except it skips invalid partial combinations before they are complete.
+@@ -1232,8 +1165,6 @@ class ProductTemplate(models.Model):
+         # Each time a value is included in the considered combination, the values it rejects are incremented
+         # When a value is discarded from the considered combination, the values it rejects are decremented
+         current_exclusions = defaultdict(int)
+-        for exclusion in self._get_parent_attribute_exclusions(parent_combination):
+-            current_exclusions[self.env['product.template.attribute.value'].browse(exclusion)] += 1
+         partial_combination = self.env['product.template.attribute.value']
+ 
+         # The following list reflects product_template_attribute_values_per_line
+@@ -1299,7 +1230,7 @@ class ProductTemplate(models.Model):
+                 # else we go to the next line
+                 line_index += 1
+ 
+-    def _get_possible_combinations(self, parent_combination=None, necessary_values=None):
++    def _get_possible_combinations(self, necessary_values=None):
+         """Generator returning combinations that are possible, following the
+         sequence of attributes and values.
+ 
+@@ -1310,10 +1241,6 @@ class ProductTemplate(models.Model):
+ 
+         Ignore attributes that have no values.
+ 
+-        :param parent_combination: combination from which `self` is an
+-            optional or accessory product.
+-        :type parent_combination: recordset `product.template.attribute.value`
+-
+         :param necessary_values: values that must be in the returned combination
+         :type necessary_values: recordset of `product.template.attribute.value`
+ 
+@@ -1330,7 +1257,7 @@ class ProductTemplate(models.Model):
+         attribute_lines = self.valid_product_template_attribute_line_ids.filtered(
+             lambda ptal: ptal not in necessary_attribute_lines)
+ 
+-        if not attribute_lines and self._is_combination_possible(necessary_values, parent_combination):
++        if not attribute_lines and self._is_combination_possible(necessary_values):
+             yield necessary_values
+ 
+         product_template_attribute_values_per_line = []
+@@ -1341,9 +1268,9 @@ class ProductTemplate(models.Model):
+                 values_to_add = self.env['product.template.attribute.value']
+             product_template_attribute_values_per_line.append(values_to_add)
+ 
+-        for partial_combination in self._cartesian_product(product_template_attribute_values_per_line, parent_combination):
++        for partial_combination in self._cartesian_product(product_template_attribute_values_per_line):
+             combination = partial_combination + necessary_values
+-            if self._is_combination_possible(combination, parent_combination):
++            if self._is_combination_possible(combination):
+                 yield combination
+ 
+         return _("There are no remaining possible combination.")
+
+--- a/addons/product/models/product_template_attribute_exclusion.py
++++ b/None
+@@ -1,47 +0,0 @@
+-# Part of Odoo. See LICENSE file for full copyright and licensing details.
+-
+-from odoo import api, fields, models
+-
+-
+-class ProductTemplateAttributeExclusion(models.Model):
+-    _name = 'product.template.attribute.exclusion'
+-    _description = "Product Template Attribute Exclusion"
+-    _order = 'product_tmpl_id, id'
+-
+-    product_template_attribute_value_id = fields.Many2one(
+-        comodel_name='product.template.attribute.value',
+-        string="Attribute Value",
+-        ondelete='cascade',
+-        index=True)
+-    product_tmpl_id = fields.Many2one(
+-        comodel_name='product.template',
+-        string="Product Template",
+-        ondelete='cascade',
+-        required=True,
+-        index=True)
+-    value_ids = fields.Many2many(
+-        comodel_name='product.template.attribute.value',
+-        relation='product_attr_exclusion_value_ids_rel',
+-        string="Attribute Values",
+-        domain="[('product_tmpl_id', '=', product_tmpl_id), ('ptav_active', '=', True)]")
+-
+-    @api.model_create_multi
+-    def create(self, vals_list):
+-        exclusions = super().create(vals_list)
+-        exclusions.product_tmpl_id._create_variant_ids()
+-        return exclusions
+-
+-    def unlink(self):
+-        # Keep a reference to the related templates before the deletion.
+-        templates = self.product_tmpl_id
+-        res = super().unlink()
+-        templates._create_variant_ids()
+-        return res
+-
+-    def write(self, vals):
+-        templates = self.env['product.template']
+-        if 'product_tmpl_id' in vals:
+-            templates = self.product_tmpl_id
+-        res = super().write(vals)
+-        (templates | self.product_tmpl_id)._create_variant_ids()
+-        return res
+
+--- a/addons/product/models/product_template_attribute_line.py
++++ b/addons/product/models/product_template_attribute_line.py
+@@ -272,13 +272,12 @@ class ProductTemplateAttributeLine(models.Model):
+     def action_open_attribute_values(self):
+         return {
+             'type': 'ir.actions.act_window',
+-            'name': _("Product Variant Values"),
++            'name': self.attribute_id.name,
+             'res_model': 'product.template.attribute.value',
+             'view_mode': 'list,form',
+             'domain': [('id', 'in', self.product_template_value_ids.ids)],
+             'views': [
+                 (self.env.ref('product.product_template_attribute_value_view_tree').id, 'list'),
+-                (self.env.ref('product.product_template_attribute_value_view_form').id, 'form'),
+             ],
+             'context': {
+                 'search_default_active': 1,
+
+--- a/addons/product/models/product_template_attribute_value.py
++++ b/addons/product/models/product_template_attribute_value.py
+@@ -13,7 +13,7 @@ class ProductTemplateAttributeValue(models.Model):
+ 
+     _name = 'product.template.attribute.value'
+     _description = "Product Template Attribute Value"
+-    _order = 'attribute_line_id, product_attribute_value_id, id'
++    _order = 'sequence, attribute_line_id, product_attribute_value_id, id'
+ 
+     def _get_default_color(self):
+         return randint(1, 11)
+@@ -22,6 +22,7 @@ class ProductTemplateAttributeValue(models.Model):
+     # specific case, as opposed to `active_test`.
+     ptav_active = fields.Boolean(string="Active", default=True)
+     name = fields.Char(string="Value", related="product_attribute_value_id.name")
++    sequence = fields.Integer(string="Sequence", help="Determine the display order")
+ 
+     # defining fields: the product template attribute line and the product attribute value
+     product_attribute_value_id = fields.Many2one(
+@@ -40,12 +41,20 @@ class ProductTemplateAttributeValue(models.Model):
+             " eg. 200 price extra, 1000 + 200 = 1200.")
+     currency_id = fields.Many2one(related='attribute_line_id.product_tmpl_id.currency_id')
+ 
+-    exclude_for = fields.One2many(
+-        comodel_name='product.template.attribute.exclusion',
+-        inverse_name='product_template_attribute_value_id',
+-        string="Exclude for",
+-        help="Make this attribute value not compatible with "
+-             "other values of the product or some attribute values of optional and accessory products.")
++    show_price_extra = fields.Boolean(
++        string="Show Extra Price",
++        help="Show separately the extra price for this attribute value."
++    )
++
++    excluded_value_ids = fields.Many2many(
++        string="Exclude For",
++        help="Make this attribute value not compatible with other values of the product.",
++        comodel_name='product.template.attribute.value',
++        relation='product_template_attribute_excluded_value_ids_rel',
++        column1='product_template_attribute_value_id',
++        column2='excluded_product_template_attribute_value_id',
++        domain="[('product_tmpl_id', '=', product_tmpl_id), ('attribute_line_id', '!=', attribute_line_id), ('ptav_active', '=', True)]",
++    )
+ 
+     # related fields: product template and product attribute
+     product_tmpl_id = fields.Many2one(
+@@ -110,7 +119,7 @@ class ProductTemplateAttributeValue(models.Model):
+                         product=ptav.product_tmpl_id.display_name,
+                     ))
+         res = super().write(values)
+-        if 'exclude_for' in values:
++        if 'excluded_value_ids' in values:
+             self.product_tmpl_id._create_variant_ids()
+         return res
+ 
+@@ -196,3 +205,13 @@ class ProductTemplateAttributeValue(models.Model):
+         if only_active:
+             all_values = all_values._only_active()
+         return len(all_values) == 1
++
++    @api.readonly
++    def action_edit_product_attribute_value(self):
++        return {
++            'type': 'ir.actions.act_window',
++            'res_model': 'product.attribute.value',
++            'res_id': self.product_attribute_value_id.id,
++            'view_mode': 'form',
++            'target': 'new',
++        }

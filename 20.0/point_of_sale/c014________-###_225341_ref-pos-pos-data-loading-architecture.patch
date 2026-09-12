@@ -1,0 +1,1411 @@
+PR: https://github.com/odoo/odoo/pull/225341
+
+From: 142473d8358b73f74960fb8d3f1e902290aaad75
+From: Adrien Guilliams (adgu)
+Date: 2026-08-27 09:35:04
+
+Breaking data model changes scores: del:1 + add:0, change matches:
+-    _inherit = ['pos.load.mixin', 'ir.module.module']
+
+Total Changes: 830
+
+[REF] pos*: pos data loading architecture
+
+pos*: l10n_ar_pos, l10n_es_edi_verifactu_pos, l10n_in_pos, l10n_pe_pos,
+l10n_sa_edi_pos, point_of_sale, pos_discount, pos_event, pos_glory_cash,
+pos_hr, pos_loyalty, pos_online_payment_self_order, pos_qfpay,
+pos_restaurant, pos_sale, pos_self_order, pos_self_order_event,
+pos_self_order_qfpay
+
+Rework the POS data loading mechanism to improve scalability and support
+incremental syncing based on `write_date` timestamps.
+
+* Move field/relation metadata computation into `PosLoadMixin` via new
+  `_load_data_relations()` and `_load_pos_data_domain_and_dependencies()`
+  methods, removing the centralized logic from `pos_session.py`
+* Refactor `load_data()` to accept a `local_data` dict (model → {id:
+  write_date}) so the frontend can request only records newer than what
+  is already cached in IndexedDB
+* Add `_load_pos_metadata()` and `_read_pos_data_from_metadata()` to
+  clearly separate metadata collection from record reading
+* Add `load_pos_data_force_loading()` hook for models that always require
+  a full reload regardless of local cache
+* Automatically append `write_date` to loaded fields for cache comparison
+* Add template as record in the indexedDB cache
+* Refactor `data_service.js`: extract `syncInitialData`, `cleanLocalData`,
+  `cleanOldModels`, and `handleLoadingDataError`; handle stale model
+  cleanup in IndexedDB when modules are uninstalled
+* Compress multiple calls (load_data, load_data_params,
+  filter_local_data, ..) into a single load_data call.
+* Change some loading method to use load_data instead of a custom method
+  for each model.
+
+closes odoo/odoo#225341
+
+Task-id: 4982785
+Related: odoo/enterprise#93803
+Related: odoo/upgrade#10903
+Signed-off-by: Adrien Guilliams (adgu) <adgu@odoo.com>
+
+================================= pseudo patch: =================================
+
+--- a/addons/point_of_sale/models/__init__.py
++++ b/addons/point_of_sale/models/__init__.py
+@@ -14,6 +14,7 @@ from . import account_move_line
+ from . import pos_bus_mixin
+ from . import barcode_rule
+ from . import digest
++from . import ir_ui_view
+ from . import pos_category
+ from . import pos_config
+ from . import pos_order
+@@ -32,7 +33,6 @@ from . import res_partner
+ from . import res_company
+ from . import res_config_settings
+ from . import ir_http
+-from . import ir_module_module
+ from . import pos_payment
+ from . import pos_payment_method
+ from . import pos_bill
+
+--- a/addons/point_of_sale/models/account_account.py
++++ b/addons/point_of_sale/models/account_account.py
+@@ -12,6 +12,5 @@ class AccountAccount(models.Model):
+         ]
+ 
+     @api.model
+-    def _load_pos_data_domain(self, data, config):
+-        property_account_receivable_ids = {partner['property_account_receivable_id'] for partner in data['res.partner']}
+-        return [('id', 'in', property_account_receivable_ids)]
++    def _load_pos_data_domain(self, data):
++        return [('id', 'in', data['res.partner'].property_account_receivable_id.ids)]
+
+--- a/addons/point_of_sale/models/account_cash_rounding.py
++++ b/addons/point_of_sale/models/account_cash_rounding.py
+@@ -19,8 +19,8 @@ class AccountCashRounding(models.Model):
+                 _("You are not allowed to change the rounding configuration while a pos session using it is already opened. Make sure to close all open pos session before proceeding."))
+ 
+     @api.model
+-    def _load_pos_data_domain(self, data, config):
+-        return [('id', '=', config.rounding_method.id)]
++    def _load_pos_data_domain(self, data):
++        return [('id', '=', data['pos.config'].rounding_method.id)]
+ 
+     @api.model
+     def _load_pos_data_fields(self, config):
+
+--- a/addons/point_of_sale/models/account_fiscal_position.py
++++ b/addons/point_of_sale/models/account_fiscal_position.py
+@@ -6,10 +6,13 @@ class AccountFiscalPosition(models.Model):
+     _inherit = ['account.fiscal.position', 'pos.load.mixin']
+ 
+     @api.model
+-    def _load_pos_data_domain(self, data, config):
+-        fp_ids = [preset['fiscal_position_id'] for preset in data['pos.preset']]
+-        partner_fp_ids = list({partner['fiscal_position_id'] for partner in data['res.partner'] if partner['fiscal_position_id']}) if 'res.partner' in data.keys() else []
+-        return [('id', 'in', config.fiscal_position_ids.ids + fp_ids + partner_fp_ids)]
++    def _load_pos_data_domain(self, data):
++        partner_fp_ids = data['res.partner'].fiscal_position_id.ids if data['res.partner'] else []
++        return [('id', 'in', data['pos.config'].fiscal_position_ids.ids + data['pos.preset'].fiscal_position_id.ids + partner_fp_ids)]
++
++    @api.model
++    def _load_pos_data_dependencies(self):
++        return ['res.partner', 'pos.preset']
+ 
+     @api.model
+     def _load_pos_data_fields(self, config):
+
+--- a/addons/point_of_sale/models/account_move.py
++++ b/addons/point_of_sale/models/account_move.py
+@@ -115,5 +115,5 @@ class AccountMove(models.Model):
+         return result or ['id', 'name', 'amount_residual', 'move_type']
+ 
+     @api.model
+-    def _load_pos_data_domain(self, data, config):
++    def _load_pos_data_domain(self, data):
+         return False
+
+--- a/addons/point_of_sale/models/account_tax.py
++++ b/addons/point_of_sale/models/account_tax.py
+@@ -46,8 +46,12 @@ class AccountTax(models.Model):
+         return super().write(vals)
+ 
+     @api.model
+-    def _load_pos_data_domain(self, data, config):
+-        return self.env['account.tax']._check_company_domain(config.company_id.id)
++    def _load_pos_data_domain(self, data):
++        return self._check_company_domain(data['pos.config'].company_id)
++
++    @api.model
++    def _load_pos_data_dependencies(self):
++        return ['account.tax.group']
+ 
+     @api.model
+     def _load_pos_data_fields(self, config):
+
+--- a/addons/point_of_sale/models/account_tax_group.py
++++ b/addons/point_of_sale/models/account_tax_group.py
+@@ -6,9 +6,8 @@ class AccountTaxGroup(models.Model):
+     _inherit = ['account.tax.group', 'pos.load.mixin']
+ 
+     @api.model
+-    def _load_pos_data_domain(self, data, config):
+-        tax_group_ids = [tax_data['tax_group_id'] for tax_data in data['account.tax']]
+-        return [('id', 'in', tax_group_ids)]
++    def _load_pos_data_domain(self, data):
++        return [('id', 'in', data['account.tax'].tax_group_id.ids)]
+ 
+     @api.model
+     def _load_pos_data_fields(self, config):
+
+--- a/addons/point_of_sale/models/ir_module_module.py
++++ b/None
+@@ -1,14 +0,0 @@
+-from odoo import api, models
+-
+-
+-class IrModuleModule(models.Model):
+-    _name = 'ir.module.module'
+-    _inherit = ['pos.load.mixin', 'ir.module.module']
+-
+-    @api.model
+-    def _load_pos_data_fields(self, config):
+-        return ['id', 'name', 'state']
+-
+-    @api.model
+-    def _load_pos_data_domain(self, data, config):
+-        return [('name', '=', 'pos_settle_due')]
+
+--- a/None
++++ b/addons/point_of_sale/models/ir_ui_view.py
+@@ -0,0 +1,45 @@
++from odoo import api, models
++
++
++class IrUiView(models.Model):
++    _name = 'ir.ui.view'
++    _inherit = ['ir.ui.view', 'pos.load.mixin']
++
++    @api.model
++    def _load_pos_data_domain(self, data):
++        return False
++
++    @api.model
++    def _load_pos_data_fields(self, config):
++        return ['key']
++
++    @api.model
++    def _load_pos_data_read(self, records, config):
++        read_records = super()._load_pos_data_read(records, config)
++
++        for key in self._get_xml_ids_to_load():
++            read_records.append({
++                'key': key,
++                '_template': self.env['ir.qweb']._get_template(key)[1],
++            })
++
++        return read_records
++
++    @api.model
++    def _get_xml_ids_to_load(self):
++        return [
++            'point_of_sale.pos_order_receipt_header',
++            'point_of_sale.pos_order_receipt_style',
++            'point_of_sale.company_info_receipt',
++            'point_of_sale.pos_orderline_receipt_information',
++            'point_of_sale.pos_orderline_receipt',
++            'point_of_sale.pos_order_receipt_footer',
++            'point_of_sale.pos_order_receipt',
++            'point_of_sale.pos_order_change_receipt',
++            'point_of_sale.pos_order_change_receipt_zpl',
++            'point_of_sale.pos_order_change_receipt_line',
++            'point_of_sale.pos_cash_move_receipt',
++            'point_of_sale.pos_tip_receipt',
++            'point_of_sale.pos_sale_details_receipt',
++            'point_of_sale.pos_sale_details_receipt_product_line',
++        ]
+
+--- a/addons/point_of_sale/models/pos_bill.py
++++ b/addons/point_of_sale/models/pos_bill.py
+@@ -19,8 +19,8 @@ class PosBill(models.Model):
+                 raise ValidationError(_("The value of a coin/bill must be greater than 0."))
+ 
+     @api.model
+-    def _load_pos_data_domain(self, data, config):
+-        return ['|', ('id', 'in', config.default_bill_ids.ids), ('pos_config_ids', '=', False)]
++    def _load_pos_data_domain(self, data):
++        return ['|', ('id', 'in', data['pos.config'].default_bill_ids.ids), ('pos_config_ids', '=', False)]
+ 
+     @api.model
+     def _load_pos_data_fields(self, config):
+
+--- a/addons/point_of_sale/models/pos_category.py
++++ b/addons/point_of_sale/models/pos_category.py
+@@ -46,12 +46,12 @@ class PosCategory(models.Model):
+     product_count = fields.Integer(compute="_compute_product_count")
+ 
+     @api.model
+-    def _load_pos_data_domain(self, data, config):
++    def _load_pos_data_domain(self, data):
+         domain = []
++        config = data['pos.config']
+         if config.limit_categories:
+-            preparation_categories = [printer['product_categories_ids'] for printer in data['pos.printer']]
+-            flattened_preparation_categories = [item for sublist in preparation_categories for item in sublist]
+-            domain += [('id', 'in', flattened_preparation_categories + config.iface_available_categ_ids.ids)]
++            preparation_categories = data['pos.printer'].product_categories_ids
++            domain += [('id', 'in', preparation_categories.ids + config.iface_available_categ_ids.ids)]
+         return domain
+ 
+     @api.model
+
+--- a/addons/point_of_sale/models/pos_config.py
++++ b/addons/point_of_sale/models/pos_config.py
+@@ -234,11 +234,30 @@ class PosConfig(models.Model):
+ 
+     def _notify_synchronisation(self, session_id, device_identifier, records={}, deleted_record_ids=None):
+         self.ensure_one()
+-        static_records = {}
++        models = []
++        search_params = {}
+ 
+         for model, ids in records.items():
+-            records = self.env[model].browse(ids).exists()
+-            static_records[model] = self.env[model]._load_pos_data_read(records, self)
++            models.append(model)
++            search_params[model] = {
++                'domain': [('id', 'in', ids)],
++            }
++
++        if len(models) == 0:
++            self._notify('SYNCHRONISATION', {
++                'static_records': {},
++                'session_id': session_id,
++                'device_identifier': device_identifier,
++                'records': records,
++            })
++            return
++
++        static_records = self.current_session_id.load_data({
++            'models': models,
++            'records': {},
++            'search_params': search_params,
++            'only_records': True,
++        })
+ 
+         self._notify('SYNCHRONISATION', {
+             'static_records': static_records,
+@@ -288,8 +307,8 @@ class PosConfig(models.Model):
+         }
+ 
+     @api.model
+-    def _load_pos_data_domain(self, data, config):
+-        return [('id', '=', config.id)]
++    def _load_pos_data_domain(self, data):
++        return [('id', '=', data['pos.session'].config_id.id)]
+ 
+     @api.model
+     def _load_pos_data_read(self, records, config):
+@@ -307,7 +326,6 @@ class PosConfig(models.Model):
+         record['_data_server_date'] = self.env.context.get('pos_last_server_date') or self.env.cr.now()
+         record['_has_cash_move_perm'] = self.env.user._has_cash_move_permission()
+         record['_has_cash_delete_perm'] = self.env.user._has_cash_delete_permission()
+-        record['_pos_special_products_ids'] = self.env['pos.config']._get_special_products().ids
+         record["_unit_uom_id"] = self.env.ref('uom.product_uom_unit').id
+ 
+         session = config.current_session_id
+@@ -316,7 +334,7 @@ class PosConfig(models.Model):
+ 
+         # Add custom fields for 'formula' taxes.
+         # We can ignore data for _load_pos_data_domain since isn't needed in the domain computation of account.tax
+-        taxes = self.env['account.tax'].search(self.env['account.tax']._load_pos_data_domain({}, config))
++        taxes = self.env['account.tax'].search(self.env['account.tax']._load_pos_data_domain({'pos.config': config}))
+         product_fields = taxes._eval_taxes_computation_prepare_product_fields()
+         record['_product_default_values'] = \
+             self.env['account.tax']._eval_taxes_computation_prepare_product_default_values(product_fields)
+@@ -1020,22 +1038,9 @@ class PosConfig(models.Model):
+             'type': 'ir.actions.act_window',
+         }
+ 
+-    def get_limited_product_count(self):
++    def _get_limited_product_count(self):
+         return self.env['ir.config_parameter'].sudo().get_int('point_of_sale.limited_product_count') or DEFAULT_LIMIT_LOAD_PRODUCT
+ 
+-    def get_product_loading_info(self):
+-        """Return total product.template count matching the PoS domain and the configured loading limit.
+-
+-        Used by the frontend to warn the user before triggering a full sync when the product
+-        count exceeds the configured limit or crosses the dangerous threshold (20 000+).
+-        """
+-        self.ensure_one()
+-        ProductTemplate = self.env['product.template']
+-        domain = ProductTemplate._load_pos_data_domain({}, self)
+-        total_count = ProductTemplate.search_count(domain)
+-        limit = self.get_limited_product_count()
+-        return {'total_count': total_count, 'limit': limit}
+-
+     def _get_limited_partner_count(self):
+         return self.env['ir.config_parameter'].sudo().get_int('point_of_sale.limited_customer_count') or DEFAULT_LIMIT_LOAD_PARTNER
+ 
+
+--- a/addons/point_of_sale/models/pos_load_mixin.py
++++ b/addons/point_of_sale/models/pos_load_mixin.py
+@@ -2,8 +2,7 @@
+ from collections import defaultdict
+ 
+ from odoo import api, models
+-from odoo.fields import Domain
+-from odoo.exceptions import AccessError
++from math import floor
+ 
+ 
+ class PosLoadMixin(models.AbstractModel):
+@@ -11,39 +10,14 @@ class PosLoadMixin(models.AbstractModel):
+     _description = "PoS data loading mixin"
+ 
+     @api.model
+-    def _load_pos_data_search_read(self, data, config):
+-        """ Search and return records to be loaded in the pos """
+-        if not config:
+-            raise ValueError("config must be provided to search for PoS data.")
+-
+-        domain = self._server_date_to_domain(self._load_pos_data_domain(data, config))
+-        if domain is False:
+-            return []
+-
+-        records = self.search(domain)
+-        return self._load_pos_data_read(records, config)
+-
+-    @api.model
+-    def _load_pos_data_domain(self, data, config):
++    def _load_pos_data_domain(self, data):
+         """ Return the domain used to filter records """
+         return []
+ 
+     @api.model
+-    def _server_date_to_domain(self, domain):
+-        """ Optionally restrict the domain to records modified after the last server sync """
+-        if domain is False:
+-            return domain
+-
+-        if last_server_date := self._last_server_date_to_load():
+-            domain = Domain.AND([domain, [('write_date', '>', last_server_date)]])
+-
+-        return domain
+-
+-    def _last_server_date_to_load(self):
+-        last_server_date = self.env.context.get('pos_last_server_date', False)
+-        limited_loading = self.env.context.get('pos_limited_loading', True)
+-        model_included = self._name not in ['pos.session', 'pos.config', 'res.users']
+-        return limited_loading and model_included and last_server_date
++    def _load_pos_data_fields(self, config):
++        """ Return the list of fields to be loaded """
++        return []
+ 
+     @api.model
+     def _load_pos_data_read(self, records, config):
+@@ -52,25 +26,91 @@ class PosLoadMixin(models.AbstractModel):
+             raise ValueError("config must be provided to read PoS data.")
+ 
+         fields = self._load_pos_data_fields(config)
++        if fields and 'write_date' not in fields:
++            fields.append('write_date')
+         records = records._filtered_access("read").read(fields, load=False)
+         return records or []
+ 
+-    def _unrelevant_records(self, config):
+-        unrelevant_record_ids = []
+-        for record in self:
+-            try:
+-                if not record.active:
+-                    unrelevant_record_ids.append(record.id)
+-            except AccessError:
+-                # If the user has no read access, consider the record as unrelevant
+-                unrelevant_record_ids.append(record.id)
+-        return unrelevant_record_ids
+-
+     @api.model
+-    def _load_pos_data_fields(self, config):
+-        """ Return the list of fields to be loaded """
++    def _load_pos_data_dependencies(self):
+         return []
+ 
++    @api.model
++    def _load_data_relations(self, fields):
++        model_fields = self._fields
++        relations = {}
++
++        for name, params in model_fields.items():
++            if (len(fields) and name not in fields) or (not len(fields) and params.manual):
++                continue
++
++            if params.relational:
++                relations[name] = {
++                    'name': name,
++                    'model': params.model_name,
++                    'compute': bool(params.compute),
++                    'related': bool(params.related),
++                    'relation': params.comodel_name,
++                    'type': params.type,
++                }
++                if params.type == 'many2one' and params.ondelete:
++                    relations[name]['ondelete'] = params.ondelete
++                if params.type == 'one2many' and params.inverse_name:
++                    relations[name]['inverse_name'] = params.inverse_name
++                if params.type == 'many2many':
++                    relations[name]['relation_table'] = params.relation
++            else:
++                relations[name] = {
++                    'name': name,
++                    'type': params.type,
++                    'compute': bool(params.compute),
++                    'related': bool(params.related),
++                }
++
++        return relations
++
++    @api.model
++    def load_pos_data_force_loading(self):
++        """ Override this method to force loading of all records of this model
++        each time the POS starts (ignoring the local cache).
++        """
++        return False
++
++    @api.model
++    def _load_pos_data_domain_and_dependencies(self, data):
++        adapted_data = {model: d['records'] for model, d in data.items()}
++        fields = self._load_pos_data_fields(data["pos.config"]["records"] if data.get("pos.config") else None)
++        return {
++            'domain': self._load_pos_data_domain(adapted_data),
++            'dependencies': self._load_pos_data_dependencies(),
++            'fields': fields,
++            'relations': self._load_data_relations(fields),
++        }
++
++    @api.model
++    def _load_pos_metadata(self, data, search_params={}):
++        result = self._load_pos_data_domain_and_dependencies(data)
++        data[self._name] = {
++            **result,
++            'records': self.search(domain=search_params.get('domain', False) or result['domain'],
++                                   limit=search_params.get('limit', False),
++                                   offset=search_params.get('offset', 0))
++        }
++        return data
++
++    @api.model
++    def _read_pos_data_from_metadata(self, server_data, local_data, config_id):
++        model = self._name
++        if model in local_data['models'] and model in local_data['records'] and len(local_data['records'][model]):
++            ids = local_data['records'][model].keys()
++            records = server_data['records'].filtered(lambda x: self.load_pos_data_force_loading() or not str(x.id) in ids or (x.write_date and floor(x.write_date.timestamp()) > local_data['records'][model][str(x.id)]))
++        else:
++            records = server_data['records']
++        return {
++            **server_data,
++            'records': records._load_pos_data_read(records, config_id),
++        }
++
+     @api.model
+     def _convert_pos_data_currency(self, records, config, price_field, currency_field):
+         """ Convert ``price_field`` of each loaded record to the POS currency.
+
+--- a/addons/point_of_sale/models/pos_note.py
++++ b/addons/point_of_sale/models/pos_note.py
+@@ -27,7 +27,8 @@ class PosNote(models.Model):
+         return vals_list
+ 
+     @api.model
+-    def _load_pos_data_domain(self, data, config):
++    def _load_pos_data_domain(self, data):
++        config = data['pos.config']
+         return [('id', 'in', config.note_ids.ids)] if config.note_ids else []
+ 
+     @api.model
+
+--- a/addons/point_of_sale/models/pos_order.py
++++ b/addons/point_of_sale/models/pos_order.py
+@@ -55,8 +55,12 @@ class PosOrder(models.Model):
+         raise UserError(_('No open session available. Please open a new session to capture the order.'))
+ 
+     @api.model
+-    def _load_pos_data_domain(self, data, config):
+-        return [('state', '=', 'draft'), ('config_id', '=', config.id)]
++    def _load_pos_data_domain(self, data):
++        return [('state', '=', 'draft'), ('config_id', '=', data['pos.config'].id)]
++
++    @api.model
++    def _load_pos_data_dependencies(self):
++        return ['res.partner']
+ 
+     @api.model
+     def _process_order(self, order, existing_order):
+@@ -937,7 +941,6 @@ class PosOrder(models.Model):
+         account_moves = self.sudo().account_move | self.sudo().payment_ids.account_move_id | self.session_id.sale_move_ids | self.session_id.refund_move_ids
+         return {
+             'pos.order': self._load_pos_data_read(self, config) if config else [],
+-            'pos.session': [],
+             'pos.payment': self.env['pos.payment']._load_pos_data_read(self.payment_ids, config) if config else [],
+             'pos.order.line': self.env['pos.order.line']._load_pos_data_read(self.lines, config) if config else [],
+             'product.attribute.custom.value': self.env['product.attribute.custom.value']._load_pos_data_read(self.lines.custom_attribute_value_ids, config) if config else [],
+
+--- a/addons/point_of_sale/models/pos_order_line.py
++++ b/addons/point_of_sale/models/pos_order_line.py
+@@ -75,8 +75,12 @@ class PosOrderLine(models.Model):
+     prep_line_ids = fields.One2many('pos.prep.line', 'pos_order_line_id', string='Preparation lines')
+ 
+     @api.model
+-    def _load_pos_data_domain(self, data, config):
+-        return [('order_id', 'in', [order['id'] for order in data['pos.order']]), ('product_id.active', '=', True)]
++    def _load_pos_data_domain(self, data):
++        return [('order_id', 'in', data['pos.order'].ids), ('product_id.active', '=', True)]
++
++    @api.model
++    def _load_pos_data_dependencies(self):
++        return ['pos.order']
+ 
+     @api.model
+     def _load_pos_data_fields(self, config):
+
+--- a/addons/point_of_sale/models/pos_payment.py
++++ b/addons/point_of_sale/models/pos_payment.py
+@@ -62,8 +62,12 @@ class PosPayment(models.Model):
+     _unique_uuid = models.Constraint('unique (uuid)', 'A payment with this uuid already exists')
+ 
+     @api.model
+-    def _load_pos_data_domain(self, data, config):
+-        return [('pos_order_id', 'in', [order['id'] for order in data['pos.order']])]
++    def _load_pos_data_domain(self, data):
++        return [('pos_order_id', 'in', data['pos.order'].ids)]
++
++    @api.model
++    def _load_pos_data_dependencies(self):
++        return ['pos.order']
+ 
+     @api.model
+     def _get_additional_payment_fields(self):
+
+--- a/addons/point_of_sale/models/pos_payment_method.py
++++ b/addons/point_of_sale/models/pos_payment_method.py
+@@ -132,7 +132,7 @@ class PosPaymentMethod(models.Model):
+         ]
+ 
+     @api.model
+-    def _load_pos_data_domain(self, data, config):
++    def _load_pos_data_domain(self, data):
+         return ['|', ('active', '=', False), ('active', '=', True)]
+ 
+     @api.model
+
+--- a/addons/point_of_sale/models/pos_prep_line.py
++++ b/addons/point_of_sale/models/pos_prep_line.py
+@@ -31,5 +31,5 @@ class PosPrepLine(models.Model):
+                 )
+ 
+     @api.model
+-    def _load_pos_data_domain(self, data, config):
+-        return [('prep_order_id', 'in', [order['id'] for order in data['pos.prep.order']])]
++    def _load_pos_data_domain(self, data):
++        return [('prep_order_id', 'in', data['pos.prep.order'].ids)]
+
+--- a/addons/point_of_sale/models/pos_prep_order.py
++++ b/addons/point_of_sale/models/pos_prep_order.py
+@@ -12,8 +12,8 @@ class PosPrepOrder(models.Model):
+     uuid = fields.Char(string='Uuid', readonly=True, default=lambda self: str(uuid4()), copy=False)
+ 
+     @api.model
+-    def _load_pos_data_domain(self, data, config):
+-        return [('pos_order_id', 'in', [order['id'] for order in data['pos.order']])]
++    def _load_pos_data_domain(self, data):
++        return [('pos_order_id', 'in', data['pos.order'].ids)]
+ 
+     @api.model
+     def update_last_order_change(self, order):
+
+--- a/addons/point_of_sale/models/pos_preset.py
++++ b/addons/point_of_sale/models/pos_preset.py
+@@ -57,9 +57,14 @@ class PosPreset(models.Model):
+                     raise ValidationError(_('The start time must be before the end time.'))
+ 
+     @api.model
+-    def _load_pos_data_domain(self, data, config):
+-        preset_ids = config.available_preset_ids.ids + [config.default_preset_id.id]
+-        return [('id', 'in', preset_ids)]
++    def _load_pos_data_domain(self, data):
++        config = data['pos.config']
++        preset_ids = config.available_preset_ids + config.default_preset_id
++        return [('id', 'in', preset_ids.ids)]
++
++    @api.model
++    def _load_pos_data_dependencies(self):
++        return ['account.fiscal.position', 'product.pricelist', 'resource.calendar.attendance']
+ 
+     @api.model
+     def _load_pos_data_fields(self, config):
+
+--- a/addons/point_of_sale/models/pos_printer.py
++++ b/addons/point_of_sale/models/pos_printer.py
+@@ -104,7 +104,8 @@ class PosPrinter(models.Model):
+                 rec.use_cashdrawer = False
+ 
+     @api.model
+-    def _load_pos_data_domain(self, data, config):
++    def _load_pos_data_domain(self, data):
++        config = data['pos.config']
+         return [('id', 'in', config.preparation_printer_ids.ids + config.receipt_printer_ids.ids)]
+ 
+     @api.model
+
+--- a/addons/point_of_sale/models/pos_session.py
++++ b/addons/point_of_sale/models/pos_session.py
+@@ -152,40 +152,6 @@ class PosSession(models.Model):
+                 }))
+         return super().write(vals)
+ 
+-    @api.model
+-    def _load_pos_data_relations(self, model, fields):
+-        model_fields = self.env[model]._fields
+-        relations = {}
+-
+-        for name, params in model_fields.items():
+-            if (name not in fields and len(fields)) or (params.manual and not len(fields)):
+-                continue
+-
+-            if params.relational:
+-                relations[name] = {
+-                    'name': name,
+-                    'model': params.model_name,
+-                    'compute': bool(params.compute),
+-                    'related': bool(params.related),
+-                    'relation': params.comodel_name,
+-                    'type': params.type,
+-                }
+-                if params.type == 'many2one' and params.ondelete:
+-                    relations[name]['ondelete'] = params.ondelete
+-                if params.type == 'one2many' and params.inverse_name:
+-                    relations[name]['inverse_name'] = params.inverse_name
+-                if params.type == 'many2many':
+-                    relations[name]['relation_table'] = self.env[model]._fields[name].relation
+-            else:
+-                relations[name] = {
+-                    'name': name,
+-                    'type': params.type,
+-                    'compute': bool(params.compute),
+-                    'related': bool(params.related),
+-                }
+-
+-        return relations
+-
+     @api.model
+     def _load_pos_data_models(self, config):
+         return [
+@@ -198,12 +164,11 @@ class PosSession(models.Model):
+             'product.uom', 'decimal.precision', 'uom.uom', 'res.country', 'res.country.state',
+             'res.lang', 'product.category', 'product.pricelist', 'product.pricelist.item',
+             'account.cash.rounding', 'account.fiscal.position', 'res.currency', 'pos.note',
+-            'product.tag', 'ir.module.module', 'account.move', 'account.account',
+-            'pos.snooze', 'pos.prep.order', 'pos.prep.line',
+-        ]
++            'product.tag', 'account.move', 'account.account',
++            'pos.snooze', 'pos.prep.order', 'pos.prep.line', 'ir.ui.view']
+ 
+     @api.model
+-    def _load_pos_data_domain(self, data, config):
++    def _load_pos_data_domain(self, data):
+         return [('id', '=', self.id)]
+ 
+     @api.model
+@@ -213,49 +178,110 @@ class PosSession(models.Model):
+             'payment_method_ids', 'state', 'access_token',
+         ]
+ 
+-    def load_data(self, models_to_load):
+-        response = {}
+-        response['pos.session'] = self._load_pos_data_search_read(response, self.config_id)
++    def load_data(self, local_data={}):
++        """
++        Load POS data for the session, optionally scoped by what the client already holds.
+ 
+-        for model in self._load_pos_data_models(self.config_id):
+-            if models_to_load and model not in models_to_load:
+-                continue
++        param local_data: dict with the following optional keys:
+ 
+-            try:
+-                response[model] = self.env[model]._load_pos_data_search_read(response, self.config_id)
+-            except AccessError as e:
+-                response[model] = []
+-                _logger.info("Could not load model %s due to AccessError: %s", model, e)
++        - ``models`` (list): restrict the response to these model names only.
++        - ``records`` (dict): per-model mapping of ``{id: write_date}`` already in the client cache;
++          used to compute records that should be removed locally, or updated.
++        - ``search_params`` (dict): per-model overrides for ``domain``, ``offset``, ``limit``, and ``context`` passed to ``_load_pos_metadata``.
++        - ``only_records`` (bool): if ``True``, return ``{model: [records]}`` without metadata (fields, relations, etc.).
+ 
+-        return response
++        :return: A dictionary where the keys are the model names and the values are list of records
++         if ``only_records`` is ``True``, or a dictionary with the following keys:
+ 
+-    def load_data_params(self):
+-        response = {}
+-        fields = self._load_pos_data_fields(self.config_id)
+-        response['pos.session'] = {
+-            'fields': fields,
+-            'relations': self._load_pos_data_relations('pos.session', fields),
++        - ``records``: list of records
++        - ``fields``: list of fields
++        - ``relations``: list of relations
++        - ``to_remove``: list of ids that should be removed from the client cache.
++          Present only if local_data['records'] is not empty.
++        """
++        default_params = {
++            'models': [],
++            'records': {},
++            'search_params': {},
++            'only_records': False,
+         }
++        local_data = default_params | local_data
++        models = self._load_pos_data_models(self.config_id)
++        metadata = self._load_metadata(models, local_data['search_params'])
++        to_read = metadata
++        if local_data['models']:
++            to_read = {model: data for model, data in metadata.items() if model in local_data['models']}
++        data = self._read_from_metadata(to_read, local_data, self.config_id)
++        if local_data['only_records']:
++            return {model: d['records'] for model, d in data.items()}
++        if local_data['records']:
++            # Add data to remove from the indexedDB
++            data_to_remove = self.filter_local_data({model: list(d.keys()) for model, d in local_data['records'].items()})
++            for model, ids in data_to_remove.items():
++                if model in data:
++                    data[model]['to_remove'] = ids
++
++        # If there are more models than last time, we need to add the metadata (especially fields and relations) to the response
++        for model, d in metadata.items():
++            if not model in data:
++                data[model] = {
++                    'records': [],
++                }
++            del d['records']
++            data[model].update(d)
++        return data
++
++    def _load_metadata(self, models, search_params={}):
++        records = {}
++        self._load_pos_metadata(records, search_params.get('pos.session', {'limit': 1}))
++        self.env['pos.config']._load_pos_metadata(records, search_params.get('pos.config', {'limit': 1}))
++        for model in models:
++            if model in ['pos.session', 'pos.config']:
++                continue
++            try:
++                params = search_params.get(model, {})
++                context = {**self.env.context, **params.get('context', {})}
++                self.env[model].with_context(context)._load_pos_metadata(records, params)
++            except AccessError as e:
++                records[model] = {
++                    **self.env[model]._load_pos_data_domain_and_dependencies(records),
++                    'records': self.env[model],
++                }
++                if model != 'ir.ui.view':
++                    # The model ir.ui.view can rarely be accessed so it will raise a warning
++                    # almost every single time. We load it only to load the templates.
++                    _logger.info("Could not load model %s due to AccessError: %s", model, e)
++        return records
+ 
+-        for model in self._load_pos_data_models(self.config_id):
+-            fields = self.env[model]._load_pos_data_fields(self.config_id)
+-            response[model] = {
+-                'fields': fields,
+-                'relations': self._load_pos_data_relations(model, fields),
+-            }
++    @api.model
++    def _read_from_metadata(self, server_data, local_data, config_id):
++        response = {}
++        for model, data in server_data.items():
++            try:
++                del data['domain']
++                response[model] = self.env[model]._read_pos_data_from_metadata(data, local_data, config_id)
++            except AccessError as e:
++                response[model] = {
++                    **data,
++                    'records': [],
++                }
++                _logger.info("Could not load model %s due to AccessError: %s", model, e)
+ 
+         return response
+ 
+     def filter_local_data(self, models_to_filter):
+-        response = {}
++        non_existent_and_inactive_ids = {}
+         for model, ids in models_to_filter.items():
+-            existing_records = self.env[model].browse(ids).exists()
++            ids = list(map(int, ids))
++            try:
++                existing_active_records = self.env[model].search_read([('id', 'in', ids)], ['id'])
++            except AccessError:
++                continue
++            existing_active_records = [r['id'] for r in existing_active_records]
+ 
+-            non_existent_ids = set(ids) - set(existing_records.ids)
+-            inactive_ids = set(existing_records._unrelevant_records(self.config_id))
++            non_existent_and_inactive_ids[model] = list(set(ids) - set(existing_active_records))
+ 
+-            response[model] = list(non_existent_ids | inactive_ids)
+-        return response
++        return non_existent_and_inactive_ids
+ 
+     def delete_opening_control_session(self):
+         self.ensure_one()
+
+--- a/addons/point_of_sale/models/product_attribute.py
++++ b/addons/point_of_sale/models/product_attribute.py
+@@ -19,8 +19,12 @@ class ProductAttributeCustomValue(models.Model):
+     pos_order_line_id = fields.Many2one('pos.order.line', string="PoS Order Line", ondelete='cascade', index='btree_not_null')
+ 
+     @api.model
+-    def _load_pos_data_domain(self, data, config):
+-        return [('pos_order_line_id', 'in', [line['id'] for line in data['pos.order.line']])]
++    def _load_pos_data_domain(self, data):
++        return [('pos_order_line_id', 'in', data['pos.order.line'].ids)]
++
++    @api.model
++    def _load_pos_data_dependencies(self):
++        return ['pos.order.line']
+ 
+     @api.model
+     def _load_pos_data_fields(self, config):
+@@ -36,9 +40,12 @@ class ProductTemplateAttributeLine(models.Model):
+         return ['display_name', 'attribute_id', 'product_template_value_ids', 'active']
+ 
+     @api.model
+-    def _load_pos_data_domain(self, data, config):
+-        loaded_product_tmpl_ids = list({p['id'] for p in data['product.template']})
+-        return [('product_tmpl_id', 'in', loaded_product_tmpl_ids)]
++    def _load_pos_data_domain(self, data):
++        return [('product_tmpl_id', 'in', data['product.template'].ids)]
++
++    @api.model
++    def _load_pos_data_dependencies(self):
++        return ['product.template', 'product.template.attribute.value']
+ 
+ 
+ class ProductTemplateAttributeValue(models.Model):
+@@ -46,15 +53,19 @@ class ProductTemplateAttributeValue(models.Model):
+     _inherit = ['product.template.attribute.value', 'pos.load.mixin']
+ 
+     @api.model
+-    def _load_pos_data_domain(self, data, config):
+-        ptav_ids = {ptav_id for p in data['product.product'] for ptav_id in p['product_template_variant_value_ids']}
+-        ptav_ids.update({ptav_id for ptal in data['product.template.attribute.line'] for ptav_id in ptal['product_template_value_ids']})
++    def _load_pos_data_domain(self, data):
++        ptav_ids = data['product.product'].product_template_variant_value_ids.ids + data['product.template.attribute.line'].product_template_value_ids.ids
++
+         return [
+             ('ptav_active', '=', True),
+-            ('attribute_id', 'in', [attr['id'] for attr in data['product.attribute']]),
++            ('attribute_id', 'in', data['product.attribute'].ids),
+             ('id', 'in', list(ptav_ids)),
+         ]
+ 
++    @api.model
++    def _load_pos_data_dependencies(self):
++        return ['product.attribute']
++
+     @api.model
+     def _load_pos_data_fields(self, config):
+         return ['attribute_id', 'attribute_line_id', 'product_attribute_value_id', 'price_extra', 'name', 'is_custom', 'html_color', 'image', 'excluded_value_ids']
+
+--- a/addons/point_of_sale/models/product_combo.py
++++ b/addons/point_of_sale/models/product_combo.py
+@@ -13,8 +13,13 @@ class ProductCombo(models.Model):
+     is_upsell = fields.Boolean(string="Is Upsell", default=False, help="Indicates if the combo is an upsell to the customer. This can be compared to a minimum quantity of 0.")
+ 
+     @api.model
+-    def _load_pos_data_domain(self, data, config):
+-        return [('id', 'in', list(set().union(*[product.get('combo_ids') for product in data['product.template']])))]
++    def _load_pos_data_domain(self, data):
++        combo_ids = data['product.template'].combo_ids.ids
++        return [('id', 'in', combo_ids)]
++
++    @api.model
++    def _load_pos_data_dependencies(self):
++        return ['product.combo.item']
+ 
+     @api.model
+     def _load_pos_data_fields(self, config):
+
+--- a/addons/point_of_sale/models/product_combo_item.py
++++ b/addons/point_of_sale/models/product_combo_item.py
+@@ -8,11 +8,9 @@ class ProductComboItem(models.Model):
+     _inherit = ['product.combo.item', 'pos.load.mixin']
+ 
+     @api.model
+-    def _load_pos_data_domain(self, data, config):
+-        return [
+-            ('product_id.active', '=', True),
+-            ('id', 'in', list(set().union(*[combo.get('combo_item_ids') for combo in data['product.combo']]))),
+-        ]
++    def _load_pos_data_domain(self, data):
++        combo_item_ids = data['product.combo'].combo_item_ids.ids
++        return [('product_id.active', '=', True), ('id', 'in', combo_item_ids)]
+ 
+     @api.model
+     def _load_pos_data_fields(self, config):
+
+--- a/addons/point_of_sale/models/product_pricelist.py
++++ b/addons/point_of_sale/models/product_pricelist.py
+@@ -2,7 +2,6 @@
+ from collections import defaultdict
+ 
+ from odoo import api, fields, models
+-from odoo.fields import Domain
+ 
+ 
+ class ProductPricelist(models.Model):
+@@ -10,9 +9,9 @@ class ProductPricelist(models.Model):
+     _inherit = ['product.pricelist', 'pos.load.mixin']
+ 
+     @api.model
+-    def _load_pos_data_domain(self, data, config):
+-        pricelist_ids = [preset['pricelist_id'] for preset in data['pos.preset']]
+-        all_ids = config._get_available_pricelists().ids + pricelist_ids
++    def _load_pos_data_domain(self, data):
++        pricelist_ids = data['pos.preset'].pricelist_id.ids
++        all_ids = data['pos.config']._get_available_pricelists().ids + pricelist_ids
+         referenced_base_pricelist_ids = self.env['product.pricelist.item'].search([
+             ('pricelist_id', 'in', all_ids),
+             ('base', '=', 'pricelist'),
+@@ -46,36 +45,25 @@ class ProductPricelistItem(models.Model):
+     _inherit = ['product.pricelist.item', 'pos.load.mixin']
+ 
+     @api.model
+-    def _load_pos_data_domain(self, data, config):
+-        pricelist_ids = [p['id'] for p in data['product.pricelist']]
+-        domain = [('pricelist_id', 'in', pricelist_ids)]
++    def _load_pos_data_domain(self, data):
++        pricelist_ids = data['product.pricelist'].ids
++        product_tmpl_ids = data['product.product'].product_tmpl_id.ids
++        product_ids = data['product.product'].ids
++        product_categ = data['product.category'].ids
+ 
+-        if not self._last_server_date_to_load():
+-            product_tmpl_ids = [p['product_tmpl_id'] for p in data['product.product']]
+-            product_ids = [p['id'] for p in data['product.product']]
+-            product_categ = [c['id'] for c in data['product.category']]
+-            now = fields.Datetime.now()
+-            domain += [
+-                '|', ('product_tmpl_id', '=', False), ('product_tmpl_id', 'in', product_tmpl_ids),
+-                '|', ('product_id', '=', False), ('product_id', 'in', product_ids),
+-                '|', ('categ_id', '=', False), ('categ_id', 'in', product_categ),
+-                '|', ('date_start', '=', False), ('date_start', '<=', now),
+-                '|', ('date_end', '=', False), ('date_end', '>', now),
+-            ]
+-        return domain
++        now = fields.Datetime.now()
++        return [
++            ('pricelist_id', 'in', pricelist_ids),
++            '|', ('product_tmpl_id', '=', False), ('product_tmpl_id', 'in', product_tmpl_ids),
++            '|', ('product_id', '=', False), ('product_id', 'in', product_ids),
++            '|', ('categ_id', '=', False), ('categ_id', 'in', product_categ),
++            '|', ('date_start', '=', False), ('date_start', '<=', now),
++            '|', ('date_end', '=', False), ('date_end', '>', now),
++        ]
+ 
+     @api.model
+-    def _server_date_to_domain(self, domain):
+-        if last_server_date := self._last_server_date_to_load():
+-            now = fields.Datetime.now()
+-            domain = Domain.AND([
+-                domain,
+-                Domain.OR([
+-                    [('write_date', '>', last_server_date)],
+-                    ['&', ('date_start', '>', last_server_date), ('date_start', '<=', now)],
+-                ]),
+-            ])
+-        return domain
++    def _load_pos_data_dependencies(self):
++        return ['product.pricelist', 'product.product', 'product.category']
+ 
+     @api.model
+     def _load_pos_data_fields(self, config):
+
+--- a/addons/point_of_sale/models/product_product.py
++++ b/addons/point_of_sale/models/product_product.py
+@@ -24,8 +24,12 @@ class ProductProduct(models.Model):
+         return new_product
+ 
+     @api.model
+-    def _load_pos_data_domain(self, data, config):
+-        return [('product_tmpl_id', 'in', [p['id'] for p in data['product.template']])]
++    def _load_pos_data_domain(self, data):
++        return [('product_tmpl_id', 'in', data['product.template'].ids)]
++
++    @api.model
++    def _load_pos_data_dependencies(self):
++        return ['product.template.attribute.value', 'product.template']
+ 
+     @api.model
+     def _load_pos_data_fields(self, config):
+@@ -46,6 +50,9 @@ class ProductProduct(models.Model):
+         read_records = super()._load_pos_data_read(records, config)
+         self._convert_pos_data_currency(read_records, config, 'lst_price', 'currency_id')
+         self._convert_pos_data_currency(read_records, config, 'standard_price', 'cost_currency_id')
++        special_product_ids = config._get_special_products().ids
++        for product in read_records:
++            product['_is_pos_special_product'] = product['id'] in special_product_ids
+         return read_records
+ 
+     def _can_return_content(self, field_name=None, access_token=None):
+
+--- a/addons/point_of_sale/models/product_template.py
++++ b/addons/point_of_sale/models/product_template.py
+@@ -84,9 +84,10 @@ class ProductTemplate(models.Model):
+         }
+ 
+     @api.model
+-    def _load_pos_data_domain(self, data, config):
++    def _load_pos_data_domain(self, data):
++        config = data['pos.config']
+         domain = [
+-            *self.env['product.template']._check_company_domain(config.company_id),
++            *self._check_company_domain(config.company_id),
+             ('available_in_pos', '=', True),
+             ('sale_ok', '=', True),
+         ]
+@@ -94,86 +95,42 @@ class ProductTemplate(models.Model):
+             domain += [('pos_categ_ids', 'in', config.iface_available_categ_ids.ids)]
+         return domain
+ 
++    @api.model
++    def _load_pos_data_dependencies(self):
++        # account.tax is added to ensure that taxes are loaded when loading product templates in the pos
++        return ['product.combo', 'pos.category', 'account.tax']
++
+     @api.model
+     def load_product_from_pos(self, config_id, domain, offset=0, limit=None):
+-        load_archived = self.env.context.get('load_archived', False)
+-        domain = Domain(domain)
++        if self.env.context.get('load_archived', False):
++            domain = Domain.AND([domain, ['|', ('active', '=', False), ('active', '=', True)]])
+         config = self.env['pos.config'].browse(config_id)
+-        product_tmpls = self._load_product_with_domain(domain, load_archived, offset, limit)
+-
+-        # product.combo and product.combo.item loading
+-        for product_tmpl in product_tmpls:
+-            if product_tmpl.type == 'combo':
+-                product_tmpls += product_tmpl.combo_ids.combo_item_ids.product_id.product_tmpl_id
+-
+-        combo_domain = Domain('id', 'in', product_tmpls.combo_ids.ids)
+-        combo_records = self.env['product.combo'].search(combo_domain)
+-        combo_read = self.env['product.combo']._load_pos_data_read(combo_records, config)
+-        combo_item_domain = Domain('combo_id', 'in', product_tmpls.combo_ids.ids)
+-        combo_item_records = self.env['product.combo.item'].search(combo_item_domain)
+-        combo_item_read = self.env['product.combo.item']._load_pos_data_read(combo_item_records, config)
+-
+-        products = product_tmpls.product_variant_ids
+-
+-        # product.pricelist_item & product.pricelist loading
+-        pricelists = config.current_session_id.get_pos_ui_product_pricelist_item_by_product(
+-            product_tmpls.ids,
+-            products.ids,
+-            config.id
+-        )
+-
+-        # product.template.attribute.value & product.template.attribute.line loading
+-        product_tmpl_attr_line = product_tmpls.attribute_line_ids
+-        product_tmpl_attr_line_read = product_tmpl_attr_line._load_pos_data_read(product_tmpl_attr_line, config)
+-        product_tmpl_attr_value = product_tmpls.attribute_line_ids.product_template_value_ids
+-        product_tmpl_attr_value_read = product_tmpl_attr_value._load_pos_data_read(product_tmpl_attr_value, config)
+-
+-        # product.attribute loading — include archived attributes so that archived attribute lines
+-        # (kept for referential integrity when used in a sale order) resolve correctly on the frontend
+-        product_attr = product_tmpl_attr_line.attribute_id
+-        product_attr_read = product_attr._load_pos_data_read(product_attr, config)
+-
+-        # product.product loading
+-        product_read = products._load_pos_data_read(products.with_context(display_default_code=False), config)
+-
+-        # product.template loading
+-        product_tmpl_read = self._load_pos_data_read(product_tmpls, config)
+-
+-        # product.uom loading
+-        packaging_domain = Domain('product_id', 'in', products.ids)
+-        barcode_in_domain = any('barcode' in condition.field_expr for condition in domain.iter_conditions())
+-
+-        if barcode_in_domain:
+-            barcode = [condition.value for condition in domain.iter_conditions() if 'barcode' in condition.field_expr]
+-            flat = [item for sublist in barcode for item in sublist]
+-            packaging_domain |= Domain('barcode', 'in', flat)
+ 
+-        product_uom = self.env['product.uom']
+-        packaging = product_uom.search(packaging_domain)
+-        condition = packaging and packaging.product_id
+-        packaging_read = product_uom._load_pos_data_read(packaging, config) if condition else []
+-
+-        # account.tax loading
+-        account_tax = self.env['account.tax']
+-        tax_domain = Domain(account_tax._check_company_domain(config.company_id.id))
+-        tax_domain &= Domain('id', 'in', product_tmpls.taxes_id.ids)
+-        tax_read = account_tax._load_pos_data_read(account_tax.search(tax_domain), config)
+-
+-        return {
+-            **pricelists,
+-            'account.tax': tax_read,
+-            'product.attribute': product_attr_read,
+-            'product.product': product_read,
+-            'product.template': product_tmpl_read,
+-            'product.uom': packaging_read,
+-            'product.combo': combo_read,
+-            'product.combo.item': combo_item_read,
+-            'product.template.attribute.value': product_tmpl_attr_value_read,
+-            'product.template.attribute.line': product_tmpl_attr_line_read,
+-        }
++        return config.current_session_id.load_data({
++            'models': ['product.pricelist',
++                       'product.pricelist.item',
++                       'account.tax',
++                       'product.product',
++                       'product.attribute',
++                       'product.template',
++                       'product.uom',
++                       'product.combo',
++                       'product.combo.item',
++                       'product.template.attribute.value',
++                       'product.template.attribute.line'],
++            'records': {},
++            'search_params': {
++                'product.template': {
++                    'domain': domain,
++                    'offset': offset,
++                    'limit': limit or False,
++                },
++            },
++            'only_records': True,
++        })
+ 
+     @api.model
+-    def _load_pos_data_fields(self, config_id):
++    def _load_pos_data_fields(self, config):
+         return [
+             'id', 'display_name', 'standard_price', 'categ_id', 'pos_categ_ids', 'taxes_id', 'barcode', 'name', 'list_price', 'is_favorite',
+             'default_code', 'to_weight', 'uom_id', 'description_sale', 'description', 'type', 'service_tracking', 'is_storable',
+@@ -181,41 +138,39 @@ class ProductTemplate(models.Model):
+             'pos_optional_product_ids', 'sequence', 'product_tag_ids', 'currency_id', 'cost_currency_id',
+         ]
+ 
+-    @api.model
+-    def _load_pos_data_search_read(self, data, config):
+-        limit_count = config.get_limited_product_count()
+-        pos_limited_loading = self.env.context.get('pos_limited_loading', True)
+-        if limit_count and pos_limited_loading:
+-            query = self._search(self._load_pos_data_domain(data, config), bypass_access=True)
+-            sql = self._get_load_product_template_sql(query, limit_count)
+-            product_tmpl_ids = [r[0] for r in self.env.execute_query(sql)]
+-            products = self._load_product_with_domain([('id', 'in', product_tmpl_ids)])
+-        else:
+-            domain = self._load_pos_data_domain(data, config)
+-            products = self._load_product_with_domain(domain)
++    def _load_pos_metadata(self, data, search_params={}):
++        result = self._load_pos_data_domain_and_dependencies(data)
++        config = data['pos.config']['records'][0]
++        limit_count = config._get_limited_product_count()
++        query = self._search(search_params.get('domain', False) or result['domain'], bypass_access=True)
++        sql = self._get_load_product_template_sql(query, limit_count)
++        product_tmpl_ids = [r[0] for r in self.env.execute_query(sql)]
++        products = self._load_product_with_domain([('id', 'in', product_tmpl_ids)])
+ 
+         product_combo = products.filtered(lambda p: p['type'] == 'combo')
+-        products += product_combo.combo_ids.combo_item_ids.product_id.product_tmpl_id
+-
+-        special_products = config._get_special_products().filtered(
+-                    lambda product: not product.sudo().company_id
+-                                    or product.sudo().company_id == self.env.company
+-                )
+-        products += special_products.product_tmpl_id
+-        if config.tip_product_id:
+-            tip_company_id = config.tip_product_id.sudo().company_id
+-            if not tip_company_id or tip_company_id == self.env.company:
+-                products += config.tip_product_id.product_tmpl_id
+-
++        products |= product_combo.combo_ids.combo_item_ids.product_id.product_tmpl_id
+         # Ensure optional products are loaded when configured.
+-        if products.filtered(lambda p: p.pos_optional_product_ids):
+-            products |= products.mapped("pos_optional_product_ids")
+-
++        products |= products.pos_optional_product_ids
+         # Ensure products from loaded orders are loaded
+-        if data.get('pos.order.line'):
+-            products += self.env['product.product'].browse([l['product_id'] for l in data['pos.order.line']]).product_tmpl_id
++        products |= data['pos.order.line']['records'].product_id.product_tmpl_id
++
++        if not search_params.get('domain', False):
++            special_products = config._get_special_products().filtered(
++                        lambda product: not product.sudo().company_id
++                                        or product.sudo().company_id == self.env.company
++                    )
++            products |= special_products.product_tmpl_id
++            if config.tip_product_id:
++                tip_company_id = config.tip_product_id.sudo().company_id
++                if not tip_company_id or tip_company_id == self.env.company:
++                    products |= config.tip_product_id.product_tmpl_id
++
++        data['product.template'] = {
++            **result,
++            'records': products._filtered_access('read'),
++        }
+ 
+-        return self._load_pos_data_read(products, config)
++        return data
+ 
+     @api.model
+     def _load_pos_data_read(self, records, config):
+@@ -224,8 +179,7 @@ class ProductTemplate(models.Model):
+         return read_records
+ 
+     def _load_product_with_domain(self, domain, load_archived=False, offset=0, limit=None):
+-        context = {**self.env.context, 'display_default_code': False, 'active_test': not load_archived}
+-        domain = self._server_date_to_domain(domain)
++        context = {'display_default_code': False, 'active_test': not load_archived, 'bin_size': True, **self.env.context}
+         return self.with_context(context).search(
+             domain,
+             order='sequence,default_code,name',
+
+--- a/addons/point_of_sale/models/product_uom.py
++++ b/addons/point_of_sale/models/product_uom.py
+@@ -10,6 +10,5 @@ class ProductUom(models.Model):
+         return ['id', 'barcode', 'product_id', 'uom_id']
+ 
+     @api.model
+-    def _load_pos_data_domain(self, data, config):
+-        product_ids = [product['id'] for product in data['product.product']]
+-        return [('product_id', 'in', product_ids)]
++    def _load_pos_data_domain(self, data):
++        return [('product_id', 'in', data['product.product'].ids)]
+
+--- a/addons/point_of_sale/models/res_company.py
++++ b/addons/point_of_sale/models/res_company.py
+@@ -30,8 +30,8 @@ class ResCompany(models.Model):
+             record.receipt_address = ", ".join(filter(None, [record.street, record.city, record.state_id.code, record.zip]))
+ 
+     @api.model
+-    def _load_pos_data_domain(self, data, config):
+-        return [('id', '=', config.company_id.id)]
++    def _load_pos_data_domain(self, data):
++        return [('id', '=', data['pos.config'].company_id.id)]
+ 
+     @api.model
+     def _load_pos_data_fields(self, config):
+
+--- a/addons/point_of_sale/models/res_country_state.py
++++ b/addons/point_of_sale/models/res_country_state.py
+@@ -8,3 +8,7 @@ class ResCountryState(models.Model):
+     @api.model
+     def _load_pos_data_fields(self, config):
+         return ['id', 'name', 'code', 'country_id']
++
++    @api.model
++    def _load_pos_data_domain(self, data):
++        return [('id', 'in', data['res.country'].state_ids.ids + data['res.company'].state_id.ids)]
+
+--- a/addons/point_of_sale/models/res_currency.py
++++ b/addons/point_of_sale/models/res_currency.py
+@@ -6,11 +6,10 @@ class ResCurrency(models.Model):
+     _inherit = ['res.currency', 'pos.load.mixin']
+ 
+     @api.model
+-    def _load_pos_data_domain(self, data, config):
+-        currency_ids = {config.company_id.currency_id.id, config.currency_id.id}
+-        currency_ids.update(pricelist['currency_id'] for pricelist in data['product.pricelist'])
+-        currency_list = list(currency_ids) + config.payment_method_ids.currency_ids.ids
+-        return [('id', 'in', currency_list)]
++    def _load_pos_data_domain(self, data):
++        config = data['pos.config']
++        currency_ids = config.company_id.currency_id | config.currency_id | data['product.pricelist'].currency_id | config.payment_method_ids.currency_ids
++        return [('id', 'in', currency_ids.ids)]
+ 
+     @api.model
+     def _load_pos_data_fields(self, config):
+
+--- a/addons/point_of_sale/models/res_partner.py
++++ b/addons/point_of_sale/models/res_partner.py
+@@ -31,22 +31,6 @@ class ResPartner(models.Model):
+             data_list[partner.id].append(stat_info)
+         return data_list
+ 
+-    @api.model
+-    def get_new_partner(self, config_id, domain, offset):
+-        config = self.env['pos.config'].browse(config_id)
+-        if len(domain) == 0:
+-            limited_partner_ids = {partner[0] for partner in config.get_limited_partners_loading(offset)}
+-            domain += [('id', 'in', list(limited_partner_ids))]
+-            new_partners = self.search(domain)
+-        else:
+-            # If search domain is not empty, we need to search inside all partners
+-            new_partners = self.search(domain, offset=offset, limit=100)
+-        fiscal_positions = new_partners.fiscal_position_id
+-        return {
+-            'res.partner': self._load_pos_data_read(new_partners, config),
+-            'account.fiscal.position': self.env['account.fiscal.position']._load_pos_data_read(fiscal_positions, config),
+-        }
+-
+     @api.constrains('barcode')
+     def _check_barcode_prefix(self):
+         for partner in self:
+@@ -56,12 +40,12 @@ class ResPartner(models.Model):
+             })
+ 
+     @api.model
+-    def _load_pos_data_domain(self, data, config):
++    def _load_pos_data_domain(self, data):
+         # Collect partner IDs from loaded orders
+-        loaded_order_partner_ids = {order['partner_id'] for order in data['pos.order']}
++        loaded_order_partner_ids = set(data.get('pos.order', self.env['pos.order']).partner_id.ids)
+ 
+         # Extract partner IDs from the tuples returned by get_limited_partners_loading
+-        limited_partner_ids = {partner[0] for partner in config.get_limited_partners_loading()}
++        limited_partner_ids = {partner[0] for partner in data['pos.config'].get_limited_partners_loading()}
+ 
+         limited_partner_ids.add(self.env.user.partner_id.id)  # Ensure current user is included
+         partner_ids = limited_partner_ids.union(loaded_order_partner_ids)
+
+--- a/addons/point_of_sale/models/res_users.py
++++ b/addons/point_of_sale/models/res_users.py
+@@ -6,7 +6,7 @@ class ResUsers(models.Model):
+     _inherit = ['res.users', 'pos.load.mixin']
+ 
+     @api.model
+-    def _load_pos_data_domain(self, data, config):
++    def _load_pos_data_domain(self, data):
+         return [('id', '=', self.env.uid)]
+ 
+     @api.model
+
+--- a/addons/point_of_sale/models/resource_calendar_attendance.py
++++ b/addons/point_of_sale/models/resource_calendar_attendance.py
+@@ -6,10 +6,8 @@ class ResourceCalendarAttendance(models.Model):
+     _inherit = ['resource.calendar.attendance', 'pos.load.mixin']
+ 
+     @api.model
+-    def _load_pos_data_domain(self, data, config):
+-        attendance_ids = []
+-        for preset in data['pos.preset']:
+-            attendance_ids += preset['attendance_ids']
++    def _load_pos_data_domain(self, data):
++        attendance_ids = data['pos.preset'].attendance_ids.ids
+         return [('id', 'in', attendance_ids)]
+ 
+     @api.model
+
+--- a/addons/point_of_sale/models/uom.py
++++ b/addons/point_of_sale/models/uom.py
+@@ -8,8 +8,8 @@ class UomUom(models.Model):
+     is_pos_groupable = fields.Boolean(string='Group Products in POS', help="Check if you want to group products of this unit in point of sale orders")
+ 
+     @api.model
+-    def _load_pos_data_search_read(self, data, config):
+-        return super(UomUom, self.with_context(active_test=False))._load_pos_data_search_read(data, config)
++    def _load_pos_metadata(self, data, search_params={}):
++        return super(UomUom, self.with_context(active_test=False))._load_pos_metadata(data, search_params)
+ 
+     @api.model
+     def _load_pos_data_fields(self, config):

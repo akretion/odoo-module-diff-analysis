@@ -1,0 +1,1128 @@
+PR: https://github.com/odoo/odoo/pull/258353
+
+From: 4965926cd5634860b4cdd5a99178df295ab7974a
+From: Pierre-Yves Dufays
+Date: 2026-06-16 14:54:06
++    recipient_cc_ids = fields.Many2many('res.partner', relation='mail_mail_res_partner_cc_rel',
++    partner_cc_ids = fields.Many2many('res.partner', relation='mail_message_res_partner_cc_rel',
++    partner_cc_ids = fields.Many2many('res.partner', relation='mail_scheduled_message_res_partner_cc_rel',
+
+Total Changes: 428
+
+[IMP] mail, various: add support for Cc recipients in the mail API
+
+We allow the user to specify whether a mail should be sent in "To" or "Cc" for
+each recipient, and we display in the notification popover whether the
+recipient has received the mail in "To" or in "Cc".
+
+We modify the following components:
+* the composer (wizard and JavaScript version)
+* the notification popover
+* the suggestion mechanism
+* the processing of incoming message
+* the templating system
+* the pseudo header (By adding "X-Msg-Cc-Add" on top of "X-Msg-To-Add")
+
+We add the following fields:
+* partner_cc_ids in mail_message
+* recipient_cc_ids in mail_mail
+* partner_cc in mail_template
+* some fields in wizard model
+
+Technical notes:
+* To avoid migration and a massive rename, we use the partner_ids field for the
+partners in "To" and we add a new field partner_cc_ids for the partners in
+"Cc". We do the same for mail_mail with recipient_cc_ids.
+* We have increased the number of queries in the performance tests because we
+now need to retrieve mail_mail.recipient_cc_ids in addition to the
+mail_mail.recipient_ids we were previously fetching when preparing the emails
+to be sent (mail_mail._prepare_outgoing_list).
+* We also increase the number of queries because we now need to retrieve
+mail_message.partner_cc_ids in addition to mail_message.partner_ids when
+preparing the emails to be sent
+(mail_compose_message._prepare_mail_values_rendered and in
+mail_message.unlink).
+
+various: account, base, calendar, crm, hr, project, sms, snailmail, test_mail,
+test_mail_full, test_mass_mailing, website_event_track, website_slides
+
+Task-5910857
+
+closes odoo/odoo#258353
+
+Related: odoo/enterprise#113415
+Signed-off-by: Thibault Delavallee (tde) <tde@openerp.com>
+
+================================= pseudo patch: =================================
+
+--- a/addons/mail/models/discuss/discuss_channel.py
++++ b/addons/mail/models/discuss/discuss_channel.py
+@@ -888,7 +888,7 @@ class DiscussChannel(models.Model):
+ 
+         recipients_data = []
+         author_id = message.author_id.id
+-        pids = message.partner_ids.ids
++        pids = (message.partner_ids | message.partner_cc_ids).ids
+         if pids:
+             email_from = tools.email_normalize(message.email_from)
+             self.env['res.partner'].flush_model(['active', 'email', 'partner_share'])
+@@ -919,6 +919,7 @@ class DiscussChannel(models.Model):
+                     'active': True,
+                     'email_normalized': email_normalized,
+                     'id': partner_id,
++                    'is_cc': False,
+                     'is_follower': False,
+                     'groups': [],
+                     'lang': lang,
+@@ -968,6 +969,7 @@ class DiscussChannel(models.Model):
+             recipients_data.append({
+                 "active": True,
+                 "id": member.partner_id.id,
++                "is_cc": False,
+                 "is_follower": False,
+                 "groups": [],
+                 "lang": member.partner_id.lang,
+
+--- a/addons/mail/models/mail_followers.py
++++ b/addons/mail/models/mail_followers.py
+@@ -64,24 +64,30 @@ class MailFollowers(models.Model):
+         """
+         if not mail_ids:
+             return {}
+-        self.env['mail.mail'].flush_model(['mail_message_id', 'recipient_ids'])
++        self.env['mail.mail'].flush_model(['mail_message_id', 'recipient_ids', 'recipient_cc_ids'])
+         self.env['mail.followers'].flush_model(['partner_id', 'res_model', 'res_id'])
+         self.env['mail.message'].flush_model(['model', 'res_id'])
+-        # mail_mail_res_partner_rel is the join table for the m2m recipient_ids field
++        # mail_mail_res_partner_rel and mail_mail_res_partner_cc_rel are the join tables
++        # for the m2m recipient_ids and recipient_cc_ids fields
+         self.env.cr.execute("""
++              WITH mail_partner AS (
++                    SELECT mail_mail_id, res_partner_id FROM mail_mail_res_partner_rel
++                 UNION ALL
++                    SELECT mail_mail_id, res_partner_id FROM mail_mail_res_partner_cc_rel)
+             SELECT message.model, message.res_id, mail_partner.res_partner_id
+               FROM mail_mail mail
+-              JOIN mail_mail_res_partner_rel mail_partner ON mail_partner.mail_mail_id = mail.id
++              JOIN mail_partner ON mail_partner.mail_mail_id = mail.id
+               JOIN mail_message message ON mail.mail_message_id = message.id
+               JOIN mail_followers follower ON message.model = follower.res_model
+                AND message.res_id = follower.res_id
+                AND mail_partner.res_partner_id = follower.partner_id
+              WHERE mail.id IN %(mail_ids)s
+         """, {'mail_ids': tuple(mail_ids)})
+-        res = defaultdict(list)
++        # Using a set because of the union all that could return duplicate partner if send in "To" and "Cc".
++        res = defaultdict(set)
+         for model, doc_id, partner_id in self.env.cr.fetchall():
+-            res[(model, doc_id)].append(partner_id)
+-        return res
++            res[model, doc_id].add(partner_id)
++        return {k: list(v) for k, v in res.items()}
+ 
+     def _get_recipient_data(self, records, message_type, subtype_id, pids=None):
+         """Private method allowing to fetch recipients data based on a subtype.
+@@ -322,6 +328,7 @@ class MailFollowers(models.Model):
+                     'active': is_active,
+                     'email_normalized': email_normalized,
+                     'id': partner_id,
++                    'is_cc': False,
+                     'is_follower': is_follower,
+                     'lang': lang,
+                     'name': name,
+
+--- a/addons/mail/models/mail_mail.py
++++ b/addons/mail/models/mail_mail.py
+@@ -71,6 +71,8 @@ class MailMail(models.Model):
+     email_cc = fields.Char('Cc', help='Carbon copy message recipients')
+     recipient_ids = fields.Many2many('res.partner', string='To (Partners)',
+         context={'active_test': False})
++    recipient_cc_ids = fields.Many2many('res.partner', relation='mail_mail_res_partner_cc_rel',
++                                        string='Cc (Partners)', context={'active_test': False})
+     # process
+     state = fields.Selection([
+         ('outgoing', 'Outgoing'),
+@@ -424,7 +426,7 @@ class MailMail(models.Model):
+                 )
+         headers.setdefault('Return-Path', self.record_alias_domain_id.bounce_email or self.env.company.bounce_email)
+ 
+-        # prepare recipients: use email_to if defined then check recipient_ids
++        # prepare recipients: use email_to if defined then check recipient_ids/recipient_cc_ids
+         # that receive a specific email, notably due to link shortening / redirect
+         # that is recipients-dependent. Keep original email/partner as this is
+         # used in post-processing to know failures, like missing recipients
+@@ -456,16 +458,17 @@ class MailMail(models.Model):
+                     'partner_id': False,
+                 })
+         # specific behavior to customize the send email for notified partners
+-        for partner in self.recipient_ids:
++        for partner in self.recipient_ids | self.recipient_cc_ids:
++            is_cc = partner not in self.recipient_ids
+             # check partner email content
+             email_to_normalized = tools.mail.email_normalize_all(partner.email)
+-            email_to = [
++            partner_email = [
+                 tools.formataddr((partner.name or "", email or "False"))
+                 for email in email_to_normalized or [partner.email]
+             ]
+             email_list.append({
+-                'email_cc': [],
+-                'email_to': email_to,
++                'email_cc': partner_email if is_cc else [],
++                'email_to': partner_email if not is_cc else [],
+                 # list of normalized emails to help extract_rfc2822
+                 'email_to_normalized': email_to_normalized,
+                 # keep raw initial value for incoming pre processing of outgoing emails
+@@ -627,42 +630,47 @@ class MailMail(models.Model):
+             ('notification_status', 'not in', ('sent', 'canceled'))
+         ])
+         for mail in self.sorted(lambda k: (k.create_date, k.id)):
++            all_recipients = mail.recipient_ids | mail.recipient_cc_ids
+             if mail_server.owner_limit_count >= MAX_SEND:
+                 to_delay |= mail
+-            elif mail_server.owner_limit_count + (len(mail.recipient_ids) or 1) > MAX_SEND:
++            elif mail_server.owner_limit_count + (len(all_recipients) or 1) > MAX_SEND:
+                 # Because we split for each recipient, if we want to
+                 # respect the limit we have to create new mails
+                 # (the first one keep the email_to and the email_cc
+                 # so it might send 2 emails instead of 1,
+                 # see `_prepare_outgoing_list`)
+                 to_keep = MAX_SEND - mail_server.owner_limit_count
+-                recipient_ids = mail.recipient_ids
++                current_recipients = all_recipients[:to_keep]
++                delayed_recipients = all_recipients[to_keep:]
+                 new_mail = mail.with_user(mail.create_uid).sudo().copy({
+                     'headers': mail.headers,
+                     'mail_message_id': mail.mail_message_id.id,
+-                    'recipient_ids': recipient_ids[:to_keep].ids,
++                    'recipient_ids': current_recipients.filtered(lambda r: r in mail.recipient_ids),
++                    'recipient_cc_ids': current_recipients.filtered(lambda r: r not in mail.recipient_ids),
+                 })
+                 mail.write({
+-                    'recipient_ids': recipient_ids[to_keep:],
++                    'recipient_ids': delayed_recipients.filtered(lambda r: r in mail.recipient_ids),
++                    'recipient_cc_ids': delayed_recipients.filtered(lambda r: r not in mail.recipient_ids),
+                     'email_cc': False,
+                     'email_to': False,
+                 })
+                 mail_server.owner_limit_count += to_keep or 1
+-                notifs.filtered(lambda n: n.mail_mail_id == mail and n.res_partner_id in recipient_ids[:to_keep]).mail_mail_id = new_mail
++                notifs.filtered(lambda n: n.mail_mail_id == mail and n.res_partner_id in current_recipients).mail_mail_id = new_mail
+                 to_send |= new_mail
+                 to_delay |= mail
+             else:
+                 to_send |= mail
+-                mail_server.owner_limit_count += len(mail.recipient_ids) or 1
++                mail_server.owner_limit_count += len(all_recipients) or 1
+ 
+         # Delay if necessary
+         if to_delay:
+             owner_limit_count = mail_server.owner_limit_count
+             for mail in to_delay:
++                all_recipients = mail.recipient_ids | mail.recipient_cc_ids
+                 if owner_limit_count < MAX_SEND:
+-                    owner_limit_count += len(mail.recipient_ids) or 1
++                    owner_limit_count += len(all_recipients) or 1
+                 else:
+-                    owner_limit_count = len(mail.recipient_ids) or 1
++                    owner_limit_count = len(all_recipients) or 1
+                     server_limit_minute += timedelta(minutes=1)
+ 
+                 mail.scheduled_date = server_limit_minute
+@@ -793,7 +801,8 @@ class MailMail(models.Model):
+                 mail = self.browse(mail_id)
+                 if mail.state != 'outgoing':
+                     continue
+-                no_recipients = (not (mail.email_to or '').strip() and not mail.recipient_ids and not (mail.email_cc or '').strip())
++                no_recipients = (not (mail.email_to or '').strip() and not mail.recipient_ids
++                                 and not (mail.email_cc or '').strip() and not mail.recipient_cc_ids)
+ 
+                 # Writing on the mail object may fail (e.g. lock on user) which
+                 # would trigger a rollback *after* actually sending the email.
+
+--- a/addons/mail/models/mail_message.py
++++ b/addons/mail/models/mail_message.py
+@@ -252,7 +252,9 @@ class MailMessage(models.Model):
+     is_current_user_or_guest_author = fields.Boolean(compute='_compute_is_current_user_or_guest_author')
+     # recipients: include inactive partners (they may have been archived after
+     # the message was sent, but they should remain visible in the relation)
+-    partner_ids = fields.Many2many('res.partner', string='Recipients', context={'active_test': False})
++    partner_ids = fields.Many2many('res.partner', string='Recipients (To)', context={'active_test': False})
++    partner_cc_ids = fields.Many2many('res.partner', relation='mail_message_res_partner_cc_rel',
++                                      string='Recipients (Cc)', context={'active_test': False})
+     # email recipients of incoming emails: comma separated list of emails (not necessarily normalized)
+     incoming_email_to = fields.Text('Emails To')
+     incoming_email_cc = fields.Char('Emails Cc')
+@@ -517,6 +519,7 @@ class MailMessage(models.Model):
+             Domain('create_uid', '=', self.env.uid),
+             # force an IN condition with a list of values
+             Domain('partner_ids', 'any!', partner._as_query()),
++            Domain('partner_cc_ids', 'any!', partner._as_query()),
+             Domain('notified_partner_ids', 'any!', partner._as_query()),
+             # User_notification notified relevant partners, hence covered by
+             # 'partner_ids' domain part (which is why it is ok to exclude them
+@@ -539,12 +542,12 @@ class MailMessage(models.Model):
+             - read: if any
+                 - author_id == pid, uid is the author
+                 - create_uid == uid, uid is the creator
+-                - pid is in the recipients (partner_ids)
++                - pid is in the recipients (partner_ids + partner_cc_ids)
+                 - pid has been notified (needaction)
+                 - uid has access on the related document
+             - write: if any
+                 - author_id == pid, uid is the author
+-                - pid is in the recipients (partner_ids)
++                - pid is in the recipients (partner_ids + partner_cc_ids)
+                 - pid has been notified (needaction)
+                 - uid has access on the related document
+             - create: if any
+@@ -570,9 +573,9 @@ class MailMessage(models.Model):
+         # once we know they are accessible. At the end, the remaining entries
+         # are the invalid ones.
+         if self:
+-            self.flush_recordset(['model', 'res_id', 'author_id', 'create_uid', 'parent_id', 'message_type', 'partner_ids'])
++            self.flush_recordset(['model', 'res_id', 'author_id', 'create_uid', 'parent_id', 'message_type', 'partner_ids', 'partner_cc_ids'])
+         else:
+-            self.flush_model(['model', 'res_id', 'author_id', 'create_uid', 'parent_id', 'message_type', 'partner_ids'])
++            self.flush_model(['model', 'res_id', 'author_id', 'create_uid', 'parent_id', 'message_type', 'partner_ids', 'partner_cc_ids'])
+         self.env['mail.notification'].flush_model(['mail_message_id', 'res_partner_id'])
+         pid = self.env.user.partner_id.id
+ 
+@@ -583,15 +586,18 @@ class MailMessage(models.Model):
+         if operation in ('read', 'write'):
+             id_sql = table.id
+             query.groupby = id_sql
+-            # notified: partner_ids or needaction
++            # notified: partner_ids or partner_cc_ids or needaction
+             query.add_join('LEFT JOIN', 'partner_rel', 'mail_message_res_partner_rel',
+                 SQL('partner_rel.mail_message_id = %s AND partner_rel.res_partner_id = %s', id_sql, pid))
++            query.add_join('LEFT JOIN', 'partner_cc_rel', 'mail_message_res_partner_cc_rel',
++                SQL('partner_cc_rel.mail_message_id = %s AND partner_cc_rel.res_partner_id = %s', id_sql, pid))
+             query.add_join('LEFT JOIN', 'needaction_rel', 'mail_notification',
+                 SQL('needaction_rel.mail_message_id = %s AND needaction_rel.res_partner_id = %s', id_sql, pid))
+             query = query.select(*(
+                 table[fname]
+                 for fname in ('id', 'model', 'res_id', 'author_id', 'parent_id', 'message_type', 'create_uid')
+-            ), SQL('bool_or(partner_rel.res_partner_id IS NOT NULL OR needaction_rel.res_partner_id IS NOT NULL) AS notified'))
++            ), SQL('bool_or(partner_rel.res_partner_id IS NOT NULL OR partner_cc_rel.res_partner_id IS NOT NULL '
++                   'OR needaction_rel.res_partner_id IS NOT NULL) AS notified'))
+         elif operation in ('create', 'unlink'):
+             query = query.select(*(
+                 table[fname]
+@@ -673,12 +679,16 @@ class MailMessage(models.Model):
+                     parent_ids_msg_ids[message['parent_id']].append(mid)
+             if parent_ids_msg_ids:
+                 query = SQL(
+-                    """ SELECT m.id
+-                        FROM "mail_message" m
+-                        JOIN "mail_message_res_partner_rel" partner_rel
+-                            ON partner_rel.mail_message_id = m.id AND partner_rel.res_partner_id = %s
+-                        WHERE m.id = ANY(%s) """,
+-                    pid, list(parent_ids_msg_ids),
++                    """ SELECT mail_message_id
++                          FROM mail_message_res_partner_rel
++                         WHERE res_partner_id = %s
++                           AND mail_message_id = ANY (%s)
++                         UNION
++                        SELECT mail_message_id
++                          FROM mail_message_res_partner_cc_rel
++                         WHERE res_partner_id = %s
++                           AND mail_message_id = ANY (%s) """,
++                    pid, list(parent_ids_msg_ids), pid, list(parent_ids_msg_ids),
+                 )
+                 for [parent_id] in self.env.execute_query(query):
+                     for mid in parent_ids_msg_ids[parent_id]:
+@@ -842,10 +852,10 @@ class MailMessage(models.Model):
+             lambda attach: attach.res_model == self._name and (attach.res_id in self.ids or attach.res_id == 0)
+         ).unlink()
+         messages_by_partner = defaultdict(lambda: self.env['mail.message'])
+-        partners_with_user = self.partner_ids.filtered('user_ids')
++        partners_with_user = (self.partner_ids | self.partner_cc_ids).filtered('user_ids')
+         for elem in self:
+             for partner in (
+-                elem.partner_ids & partners_with_user | elem.notification_ids.author_id
++                (elem.partner_ids | elem.partner_cc_ids) & partners_with_user | elem.notification_ids.author_id
+             ):
+                 messages_by_partner[partner] |= elem
+         # Notify front-end of messages deletion for partners having a user
+@@ -1178,6 +1188,14 @@ class MailMessage(models.Model):
+             sort="id",
+             sudo=True,
+         )
++        res.many(
++            "partner_cc_ids",
++            lambda res: res.from_method("_store_avatar_fields"),
++            dynamic_fields="_store_partner_name_dynamic_fields",
++            predicate=lambda m: m.model != "discuss.channel",
++            sort="id",
++            sudo=True,
++        )
+         res.attr("pinned_at")
+         res.from_method("_store_reaction_group_fields")
+         res.attr(
+
+--- a/addons/mail/models/mail_scheduled_message.py
++++ b/addons/mail/models/mail_scheduled_message.py
+@@ -52,7 +52,9 @@ class MailScheduledMessage(models.Model):
+     # origin
+     author_id = fields.Many2one('res.partner', 'Author', required=True)
+     # recipients
+-    partner_ids = fields.Many2many('res.partner', string='Recipients')
++    partner_ids = fields.Many2many('res.partner', string='Recipients (To)')
++    partner_cc_ids = fields.Many2many('res.partner', relation='mail_scheduled_message_res_partner_cc_rel',
++                                      string='Recipients (Cc)', context={'active_test': False})
+     # characteristics
+     is_note = fields.Boolean('Is a note', default=False, help="If the message will be posted as a Note.")
+     # notify parameters (email_from, mail_server_id, force_email_lang,...)
+@@ -196,6 +198,7 @@ class MailScheduledMessage(models.Model):
+                     subject=scheduled_message.subject,
+                     body=scheduled_message.body,
+                     partner_ids=list(scheduled_message.partner_ids.ids),
++                    partner_cc_ids=list(scheduled_message.partner_cc_ids.ids),
+                     subtype_xmlid='mail.mt_note' if scheduled_message.is_note else 'mail.mt_comment',
+                     **{k: v for k, v in json.loads(scheduled_message.notification_parameters or '{}').items() if k in notification_parameters_whitelist},
+                 )
+
+--- a/addons/mail/models/mail_template.py
++++ b/addons/mail/models/mail_template.py
+@@ -6,7 +6,7 @@ from ast import literal_eval
+ from odoo import _, api, fields, models, tools
+ from odoo.exceptions import ValidationError, UserError
+ from odoo.fields import Domain
+-from odoo.tools import BinaryBytes
++from odoo.tools import BinaryBytes, email_normalize, unique
+ from odoo.tools.safe_eval import safe_eval, time
+ 
+ _logger = logging.getLogger(__name__)
+@@ -60,8 +60,10 @@ class MailTemplate(models.Model):
+              "- email (using email_from or email field)")
+     email_to = fields.Char('To (Emails)', help="Comma-separated recipient addresses (placeholders may be used here)")
+     partner_to = fields.Char('To (Partners)',
+-                             help="Comma-separated ids of recipient partners (placeholders may be used here)")
++                             help="Comma-separated ids of recipient To partners (placeholders may be used here)")
+     email_cc = fields.Char('Cc', help="Carbon copy recipients (placeholders may be used here)")
++    partner_cc = fields.Char('Cc (Partners)',
++                             help="Comma-separated ids of recipient Cc partners (placeholders may be used here)")
+     reply_to = fields.Char('Reply To Address')
+     # content
+     body_html = fields.Html(
+@@ -247,6 +249,7 @@ class MailTemplate(models.Model):
+             'email_from',
+             'email_to',
+             'lang',
++            'partner_cc',
+             'partner_to',
+             'reply_to',
+             'scheduled_date',
+@@ -420,8 +423,8 @@ class MailTemplate(models.Model):
+         given by 'res_ids'. Default values can be generated instead of the template
+         values if requested by template (see 'use_default_to' field). Email fields
+         ('email_cc', 'email_to') are transformed into partners if requested
+-        (finding or creating partners). 'partner_to' field is transformed into
+-        'partner_ids' field.
++        (finding or creating partners). 'partner_to' and 'partner_cc' fields are
++        respectively transformed into 'partner_ids' and 'partner_cc_ids' field.
+ 
+         Note: for performance reason, information from records are transferred to
+         created partners no matter the company. For example, if we have a record of
+@@ -432,7 +435,7 @@ class MailTemplate(models.Model):
+ 
+         :param list res_ids: list of record IDs on which template is rendered;
+         :param list render_fields: list of fields to render on template which
+-          are specific to recipients, e.g. email_cc, email_to, partner_to);
++          are specific to recipients, e.g. email_cc, email_to, partner_cc, partner_to);
+         :param boolean allow_suggested: when computing default recipients,
+           include suggested recipients in addition to minimal defaults;
+         :param boolean find_or_create_partners: transform emails into partners
+@@ -440,11 +443,11 @@ class MailTemplate(models.Model):
+         :param dict render_results: res_ids-based dictionary of render values.
+           For each res_id, a dict of values based on render_fields is given;
+ 
+-        :return: updated (or new) render_results. It holds a 'partner_ids' key
++        :return: updated (or new) render_results. It holds 'partner_ids' and 'partner_cc_ids' keys
+           holding partners given by ``_message_get_default_recipients`` and/or
+-          generated based on 'partner_to'. If ``find_or_create_partners`` is
++          generated based on 'partner_to' and 'partner_cc'. If ``find_or_create_partners`` is
+           False emails are present, otherwise they are included as partners
+-          contained in ``partner_ids``.
++          contained in ``partner_ids`` and ``partner_cc_ids``.
+         """
+         self.ensure_one()
+         if render_results is None:
+@@ -462,22 +465,25 @@ class MailTemplate(models.Model):
+                     reply_discussion=True, no_create=not find_or_create_partners,
+                 )
+                 for res_id, suggested_list in suggested_recipients.items():
+-                    pids = [r['partner_id'] for r in suggested_list if r['partner_id']]
+-                    email_to_lst = [
+-                        tools.mail.formataddr(
+-                            (r['name'] or '', r['email'] or '')
+-                        ) for r in suggested_list if not r['partner_id']
+-                    ]
+-                    render_results.setdefault(res_id, {})
+-                    render_results[res_id]['partner_ids'] = pids
+-                    render_results[res_id]['email_to'] = ', '.join(email_to_lst)
++                    for (recipient_type, field_partner, field_email) in (('to', 'partner_ids', 'email_to'),
++                                                                         ('cc', 'partner_cc_ids', 'email_cc')):
++                        pids = [r['partner_id'] for r in suggested_list if r['partner_id']
++                                if r['recipient_type'] == recipient_type]
++                        email_lst = [
++                            tools.mail.formataddr(
++                                (r['name'] or '', r['email'] or '')
++                            ) for r in suggested_list if not r['partner_id'] and r['recipient_type'] == recipient_type
++                        ]
++                        render_results.setdefault(res_id, {})
++                        render_results[res_id][field_partner] = pids
++                        render_results[res_id][field_email] = ', '.join(email_lst)
+             else:
+                 default_recipients = Model.browse(res_ids)._message_get_default_recipients()
+                 for res_id, recipients in default_recipients.items():
+                     render_results.setdefault(res_id, {}).update(recipients)
+         # render fields dynamically which generates recipients
+         else:
+-            for field in set(render_fields) & {'email_cc', 'email_to', 'partner_to'}:
++            for field in set(render_fields) & {'email_cc', 'email_to', 'partner_to', 'partner_cc'}:
+                 generated_field_values = self._render_field(field, res_ids)
+                 for res_id in res_ids:
+                     render_results.setdefault(res_id, {})[field] = generated_field_values[res_id]
+@@ -486,35 +492,48 @@ class MailTemplate(models.Model):
+         if find_or_create_partners:
+             email_to_res_ids = {}
+             records_emails = {}
++            emails_cc_by_res_id = {}
+             for record in Model.browse(res_ids):
+                 record_values = render_results.setdefault(record.id, {})
+-                mails = tools.email_split(record_values.pop('email_to', '')) + \
+-                        tools.email_split(record_values.pop('email_cc', ''))
+-                records_emails[record] = mails
+-                for mail in mails:
++                record_email_cc_lst = tools.email_split(record_values.pop('email_cc', ''))
++                record_email_all_lst = tools.email_split(record_values.pop('email_to', '')) + record_email_cc_lst
++                records_emails[record] = record_email_all_lst
++                for mail in record_email_all_lst:
+                     email_to_res_ids.setdefault(mail, []).append(record.id)
++                emails_cc_by_res_id[record.id] = [email_normalize(e) for e in record_email_cc_lst]
+ 
+             if hasattr(Model, '_partner_find_from_emails'):
+                 records_partners = Model.browse(res_ids)._partner_find_from_emails(records_emails)
+             else:
+                 records_partners = self.env['mail.thread']._partner_find_from_emails(records_emails)
++            all_partner = list(unique(pid for p in records_partners.values() for pid in p.ids))
++            partner_by_email = {p.email_normalized: p for p in self.env['res.partner'].browse(all_partner)}
+             for res_id, partners in records_partners.items():
+-                render_results[res_id].setdefault('partner_ids', []).extend(partners.ids)
+-
+-        # update 'partner_to' rendered value to 'partner_ids'
+-        all_partner_to = {
++                record_email_cc_lst = emails_cc_by_res_id[res_id]
++                partners_cc_ids = [partner.id
++                                   for email in record_email_cc_lst
++                                   if (partner := partner_by_email.get(email)) in partners]
++                render_results[res_id].setdefault('partner_cc_ids', []).extend(partners_cc_ids)
++                partners_cc_ids_set = set(partners_cc_ids)
++                render_results[res_id].setdefault('partner_ids', []).extend(
++                    [partner.id for partner in partners if partner.id not in partners_cc_ids_set])
++
++        # update 'partner_to' and 'partner_cc' rendered values to 'partner_ids' and 'partner_cc_ids'
++        all_partner = {
+             pid
+             for record_values in render_results.values()
+-            for pid in self._parse_partner_to(record_values.get('partner_to', ''))
++            for field in ('partner_to', 'partner_cc')
++            for pid in self._parse_partner_list_ids(record_values.get(field, ''))
+         }
+         existing_pids = set()
+-        if all_partner_to:
+-            existing_pids = set(self.env['res.partner'].sudo().browse(list(all_partner_to)).exists().ids)
++        if all_partner:
++            existing_pids = set(self.env['res.partner'].sudo().browse(list(all_partner)).exists().ids)
+         for record_values in render_results.values():
+-            partner_to = record_values.pop('partner_to', '')
+-            if partner_to:
+-                tpl_partner_ids = set(self._parse_partner_to(partner_to)) & existing_pids
+-                record_values.setdefault('partner_ids', []).extend(tpl_partner_ids)
++            for src, dst in [('partner_to', 'partner_ids'), ('partner_cc', 'partner_cc_ids')]:
++                partner = record_values.pop(src, '')
++                if partner:
++                    tpl_partner_ids = set(self._parse_partner_list_ids(partner)) & existing_pids
++                    record_values.setdefault(dst, []).extend(tpl_partner_ids)
+ 
+         return render_results
+ 
+@@ -604,6 +623,7 @@ class MailTemplate(models.Model):
+             'email_cc',  # recipients
+             'email_to',  # recipients
+             'partner_to',  # recipients
++            'partner_cc',  # recipients
+             'report_template_ids',  # attachments
+             'scheduled_date',  # specific
+             # not rendered (static)
+@@ -629,7 +649,7 @@ class MailTemplate(models.Model):
+                     render_results.setdefault(res_id, {})[field] = field_value
+ 
+             # render recipients
+-            if render_fields_set & {'email_cc', 'email_to', 'partner_to'}:
++            if render_fields_set & {'email_cc', 'email_to', 'partner_to', 'partner_cc'}:
+                 template._generate_template_recipients(
+                     template_res_ids, render_fields_set,
+                     render_results=render_results,
+@@ -662,13 +682,13 @@ class MailTemplate(models.Model):
+         return render_results
+ 
+     @classmethod
+-    def _parse_partner_to(cls, partner_to):
++    def _parse_partner_list_ids(cls, partner_list_ids):
+         try:
+-            partner_to = literal_eval(partner_to or '[]')
++            partner_list_ids = literal_eval(partner_list_ids or '[]')
+         except (ValueError, SyntaxError):
+-            partner_to = partner_to.split(',')
+-        if not isinstance(partner_to, (list, tuple)):
+-            partner_to = [partner_to]
++            partner_list_ids = partner_list_ids.split(',')
++        if not isinstance(partner_list_ids, (list, tuple)):
++            partner_list_ids = [partner_list_ids]
+ 
+         def to_id(v):
+             if isinstance(v, str):
+@@ -679,7 +699,7 @@ class MailTemplate(models.Model):
+                 return int(v)
+             except ValueError:
+                 return None
+-        return [pid for pto in partner_to if (pid := to_id(pto))]
++        return [pid for pto in partner_list_ids if (pid := to_id(pto))]
+ 
+     # ------------------------------------------------------------
+     # EMAIL
+@@ -743,6 +763,7 @@ class MailTemplate(models.Model):
+                  'mail_server_id',
+                  'model',
+                  'partner_to',
++                 'partner_cc',
+                  'reply_to',
+                  'report_template_ids',
+                  'res_id',
+@@ -769,6 +790,7 @@ class MailTemplate(models.Model):
+                 record = RecordModel.browse(res_id).with_prefetch(prefetch_ids)
+                 values = res_ids_values[record.id]
+                 values['recipient_ids'] = [(4, pid) for pid in (values.get('partner_ids') or [])]
++                values['recipient_cc_ids'] = [(4, pid) for pid in (values.get('partner_cc_ids') or [])]
+                 values['attachment_ids'] = [(4, aid) for aid in (values.get('attachment_ids') or [])]
+                 values.update(email_values or {})
+ 
+
+--- a/addons/mail/models/mail_thread.py
++++ b/addons/mail/models/mail_thread.py
+@@ -9,6 +9,7 @@ import email.policy
+ import encodings
+ import hashlib
+ import hmac
++from itertools import chain, repeat
+ import json
+ import lxml
+ import logging
+@@ -27,7 +28,7 @@ from markupsafe import Markup, escape
+ from requests import Session
+ from werkzeug import urls
+ 
+-from odoo import _, api, exceptions, fields, models, modules, tools
++from odoo import _, api, Command, exceptions, fields, models, modules, tools
+ from odoo.addons.mail.tools.discuss import Store
+ from odoo.addons.mail.tools.web_push import (
+     push_to_end_point, DeviceUnreachableError,
+@@ -1235,7 +1236,9 @@ class MailThread(models.AbstractModel):
+         email_to_localparts = list(filter(None, (_filter_excluded_local_part(email_to) for email_to in email_to_list)))
+         # Delivered-To is a safe bet in most modern MTAs, but we have to fallback on To + Cc values
+         # for all the odd MTAs out there, as there is no standard header for the envelope's `rcpt_to` value.
+-        rcpt_tos_list = [e.lower() for e in email_split(message_dict['recipients'])]
++        rcpt_tos_list = [
++            e.lower()
++            for e in email_split(message_dict['recipients']) + email_split(message_dict['recipients_cc'])]
+         rcpt_tos_localparts = list(filter(None, (_filter_excluded_local_part(email_to) for email_to in rcpt_tos_list)))
+         rcpt_tos_valid_list = list(rcpt_tos_list)
+ 
+@@ -1370,6 +1373,7 @@ class MailThread(models.AbstractModel):
+         self = self.with_context(attachments_mime_plainxml=True) # import XML attachments as text
+         # postpone setting message_dict.partner_ids after message_post, to avoid double notifications
+         original_partner_ids = message_dict.pop('partner_ids', [])
++        original_partner_cc_ids = message_dict.pop('partner_cc_ids', [])
+         thread = self.browse()
+         for model, thread_id, custom_values, user_id, alias in routes or ():
+             subtype_id = False
+@@ -1436,7 +1440,7 @@ class MailThread(models.AbstractModel):
+                 **message_dict,
+             )
+             # remove computational values not stored on mail.message and avoid warnings when creating it
+-            for x in ('from', 'recipients',
++            for x in ('from', 'recipients', 'recipients_cc',
+                       'cc', 'to',  # use cc_filtered, to_filtered
+                       'references', 'in_reply_to', 'x_odoo_message_id',
+                       'is_bounce', 'bounced_email', 'bounced_message', 'bounced_msg_ids', 'bounced_partner'):
+@@ -1450,10 +1454,15 @@ class MailThread(models.AbstractModel):
+                 thread_root = thread_root.with_context(mail_post_autofollow_author_skip=not message_dict.get('author_id'))
+                 new_msg = thread_root.message_post(**post_params)
+ 
+-            if new_msg and original_partner_ids:
++            if new_msg and (original_partner_ids or original_partner_cc_ids):
+                 # postponed after message_post, because this is an external message and we don't want to create
+                 # duplicate emails due to notifications
+-                new_msg.write({'partner_ids': original_partner_ids})
++                update_vals = {}
++                if original_partner_ids:
++                    update_vals['partner_ids'] = original_partner_ids
++                if original_partner_cc_ids:
++                    update_vals['partner_cc_ids'] = original_partner_cc_ids
++                new_msg.write(update_vals)
+         return thread.with_env(self.env)
+ 
+     @api.model
+@@ -1821,9 +1830,10 @@ class MailThread(models.AbstractModel):
+                 { 'message_id': msg_id,
+                   'subject': subject,
+                   'email_from': from,
+-                  'to': to + delivered-to,
++                  'to': to + delivered-to (unless in cc),
+                   'cc': cc,
+-                  'recipients': delivered-to + to + cc + resent-to + resent-cc,
++                  'recipients': delivered-to (unless in recipients_cc) + to + resent-to,
++                  'recipients_cc': cc + resent-cc
+                   'body': unified_body,
+                   'references': references,
+                   'in_reply_to': in-reply-to,
+@@ -1850,33 +1860,24 @@ class MailThread(models.AbstractModel):
+             msg_dict['subject'] = decode_message_header(message, 'Subject')
+ 
+         email_from = decode_message_header(message, 'From', separator=',')
+-        email_cc = decode_message_header(message, 'cc', separator=',')
+         email_from_list = email_split_and_format(email_from)
+-        email_cc_list = email_split_and_format(email_cc)
+         msg_dict['email_from'] = email_from_list[0] if email_from_list else email_from
+         msg_dict['from'] = msg_dict['email_from']  # compatibility for message_new
+-        msg_dict['cc'] = ','.join(email_cc_list) if email_cc_list else email_cc
+         # Delivered-To is a safe bet in most modern MTAs, but we have to fallback on To + Cc values
+         # for all the odd MTAs out there, as there is no standard header for the envelope's `rcpt_to` value.
+-        msg_dict['recipients'] = ','.join(set(formatted_email
+-            for address in [
+-                decode_message_header(message, 'Delivered-To', separator=','),
+-                decode_message_header(message, 'To', separator=','),
+-                decode_message_header(message, 'Cc', separator=','),
+-                decode_message_header(message, 'Resent-To', separator=','),
+-                decode_message_header(message, 'Resent-Cc', separator=',')
+-            ] if address
+-            for formatted_email in email_split_and_format(address))
+-        )
+-        email_to_list = list({
+-            formatted_email
+-            for address in [
+-                decode_message_header(message, 'Delivered-To', separator=','),
+-                decode_message_header(message, 'To', separator=',')
+-            ] if address
+-            for formatted_email in email_split_and_format(address)
+-        })
++        # We support Ccs but Delivered-To is interpreted as "To" recipients unless present in the Cc/Resent-Cc headers.
++        delivered_to_emails, to_header_emails, resent_to_header_emails, cc_header_emails, resent_cc_header_emails = [
++            set(email_split_and_format(decode_message_header(message, field, separator=',')))
++            for field in ('Delivered-To', 'To', 'Resent-To', 'Cc', 'Resent-Cc')
++        ]
++        recipients_cc = cc_header_emails | resent_cc_header_emails
++        recipients = to_header_emails | delivered_to_emails.difference(recipients_cc) | resent_to_header_emails
++        msg_dict['recipients'] = ','.join(recipients)
++        msg_dict['recipients_cc'] = ','.join(recipients_cc.difference(recipients))
++        email_to_list = list(to_header_emails | delivered_to_emails.difference(cc_header_emails))
++        email_cc_list = list(cc_header_emails)
+         msg_dict['to'] = ','.join(email_to_list)
++        msg_dict['cc'] = ','.join(email_cc_list)
+         # filtered to / cc, excluding aliases
+         recipients_normalized_all = email_normalize_all(f'{msg_dict["to"]},{msg_dict["cc"]}')
+         alias_emails = self.env['mail.alias.domain'].sudo()._find_aliases(recipients_normalized_all)
+@@ -1928,11 +1929,12 @@ class MailThread(models.AbstractModel):
+     def _message_parse_post_process(self, message, message_dict, routes):
+         """ Parse and process incoming email values that are better computed
+         based on record we are about to create or update. This refers to
+-        message author and recipients, which can be preferentially found
++        message author, recipients, recipients_cc which can be preferentially found
+         in document followers when possible. """
+         values = {
+             'author_id': message_dict.get('author_id'),
+             'partner_ids': message_dict.get('partner_ids'),
++            'partner_cc_ids': message_dict.get('partner_cc_ids'),
+         }
+         for model, thread_id, _custom_values, _user_id, alias in routes or ():
+             link_doc = self.env[model].browse(thread_id) if thread_id else self.env[model]
+@@ -1944,8 +1946,14 @@ class MailThread(models.AbstractModel):
+                 author = link_doc._partner_find_from_emails_single([message_dict['email_from']], no_create=True)
+                 if author:
+                     values['author_id'] = author.id
+-            if not values.get('partner_ids') and message_dict['recipients']:
+-                values['partner_ids'] = link_doc._partner_find_from_emails_single(email_split(message_dict['recipients']), no_create=True).ids
++            partner_ids = link_doc._partner_find_from_emails_single(
++                email_split(message_dict.get('recipients', '')), no_create=True).ids
++            if not values['partner_ids']:
++                values['partner_ids'] = partner_ids
++            if not values['partner_cc_ids']:
++                partner_cc_ids = link_doc._partner_find_from_emails_single(
++                    email_split(message_dict.get('recipients_cc', '')), no_create=True).ids
++                values['partner_cc_ids'] = list(set(partner_cc_ids) - set(partner_ids))
+         return values
+ 
+     def _get_bounced_message_data(self, message, message_dict):
+@@ -2218,7 +2226,7 @@ class MailThread(models.AbstractModel):
+                      body='', subject=None, message_type='notification',
+                      email_from=None, author_id=None, parent_id=False,
+                      subtype_xmlid=None, subtype_id=False,
+-                     partner_ids=None, outgoing_email_to=False,
++                     partner_ids=None, partner_cc_ids=None, outgoing_email_to=False,
+                      incoming_email_to=False, incoming_email_cc=False,
+                      attachments=None, attachment_ids=None, body_is_html=False,
+                      tracking_values=None,
+@@ -2241,6 +2249,8 @@ class MailThread(models.AbstractModel):
+             notification mechanism;
+         :param list(int) partner_ids: partner_ids to notify in addition to partners
+             computed based on subtype / followers matching;
++        :param list(int) partner_cc_ids: partner_ids to notify in "Cc" in addition to partner_ids and
++            partners computed based on subtype / followers matching;
+         :param str outgoing_email_to: comma-separated list of emails to notify in
+             addition to partner_ids. Experimental support as of Odoo v19;
+         :param str incoming_email_to: comma-separated list of emails, already notified
+@@ -2302,6 +2312,15 @@ class MailThread(models.AbstractModel):
+                  )
+             )
+         partner_ids = list(partner_ids or [])
++        if partner_cc_ids and not is_list_of(partner_cc_ids, int):
++            raise ValueError(
++                _('Posting a message should receive copy carbon partners as a list of IDs (received %(pids)s)',
++                  pids=repr(partner_cc_ids),
++                 )
++            )
++        # If a partner is in "To" and "Cc", "To" wins.
++        partner_cc_ids = [pid for pid in list(partner_cc_ids or []) if pid not in partner_ids]
++        all_partner_ids = partner_ids + partner_cc_ids
+ 
+         # split message additional values from notify additional values
+         msg_kwargs = {key: val for key, val in kwargs.items()
+@@ -2327,12 +2346,12 @@ class MailThread(models.AbstractModel):
+             subtype_id = self.env['ir.model.data']._xmlid_to_res_id('mail.mt_note')
+ 
+         # automatically subscribe recipients if asked to
+-        if self.env.context.get('mail_post_autofollow') and partner_ids:
+-            self.message_subscribe(partner_ids=list(partner_ids))
++        if self.env.context.get('mail_post_autofollow') and all_partner_ids:
++            self.message_subscribe(partner_ids=list(all_partner_ids))
+         # automatically subscribe customer recipient if model expects it
+-        elif partner_ids and self.env.context.get('mail_post_autofollow') is not False and self._mail_thread_customer:
++        elif all_partner_ids and self.env.context.get('mail_post_autofollow') is not False and self._mail_thread_customer:
+             customer = self._mail_get_customer()
+-            if customer.id in partner_ids:
++            if customer.id in all_partner_ids:
+                 self.message_subscribe(partner_ids=customer.ids)
+ 
+         msg_values = dict(msg_kwargs)
+@@ -2359,6 +2378,7 @@ class MailThread(models.AbstractModel):
+             'tracking_values': tracking_values,
+             # recipients
+             'partner_ids': partner_ids,
++            'partner_cc_ids': partner_cc_ids,
+             'incoming_email_to': incoming_email_to,
+             'incoming_email_cc': incoming_email_cc,
+             'outgoing_email_to': outgoing_email_to,
+@@ -3142,7 +3162,9 @@ class MailThread(models.AbstractModel):
+ 
+         for values in values_list:
+             create_values = dict(values)
+-            create_values['partner_ids'] = [(4, pid) for pid in (create_values.get('partner_ids') or [])]
++            for field in ('partner_ids', 'partner_cc_ids'):
++                if create_values.get(field):
++                    create_values[field] = [Command.link(pid) for pid in (create_values[field])]
+             create_values_list.append(create_values)
+ 
+         # remove context, notably for default keys, as this thread method is not
+@@ -3177,6 +3199,7 @@ class MailThread(models.AbstractModel):
+             'outgoing_email_to',
+             'parent_id',
+             'partner_ids',
++            'partner_cc_ids',
+             'record_alias_domain_id',
+             'record_company_id',
+             'reply_to',
+@@ -3549,7 +3572,9 @@ class MailThread(models.AbstractModel):
+                 render_values=render_values,
+             )
+             recipients_emails = recipients_group['recipients_emails']
+-            recipients_ids = recipients_group['recipients_ids']
++            all_recipients_ids = recipients_group['recipients_ids'] + recipients_group['recipients_cc_ids']
++            recipient_ids_set = set(recipients_group['recipients_ids'])
++            recipient_cc_ids_set = set(recipients_group['recipients_cc_ids']).difference(recipient_ids_set)
+             recipients_to_emails = {r['id']: r['email_normalized'] for r in recipients_group['recipients_data']}
+ 
+             # Only keep one recipient per email address to avoid sending the exact
+@@ -3564,13 +3589,14 @@ class MailThread(models.AbstractModel):
+             deduplicated_recipient_ids = set(email_to_deduplicated_recipient_id.values())
+ 
+             # create MailMail for partners
+-            for recipients_ids_chunk in split_every(gen_batch_size, recipients_ids):
++            for recipients_ids_chunk in split_every(gen_batch_size, all_recipients_ids):
+                 deduplicated_recipient_ids_chunk = [pid for pid in recipients_ids_chunk if pid in deduplicated_recipient_ids]
+                 if deduplicated_recipient_ids_chunk:
+                     mail_values = self._notify_by_email_get_final_mail_values(
+-                        deduplicated_recipient_ids_chunk,
++                        [rid for rid in deduplicated_recipient_ids_chunk if rid in recipient_ids_set],
+                         base_mail_values,
+-                        additional_values={'body_html': mail_body}
++                        additional_values={'body_html': mail_body},
++                        recipient_cc_ids=[rid for rid in deduplicated_recipient_ids_chunk if rid in recipient_cc_ids_set],
+                     )
+                     new_email = SafeMail.create(mail_values)
+                 else:
+@@ -3947,22 +3973,23 @@ class MailThread(models.AbstractModel):
+         # including external people (aka share partners to notify + emails
+         # notified by incoming email (incoming_email_cc and incoming_email_to)
+         # that were not transformed into partners to notify
+-        external_emails = [
+-            formataddr((r['name'], r['email_normalized']))
++        external_emails_info = [
++            (formataddr((r['name'], r['email_normalized'])), r['is_cc'])
+             for r in recipients_data if r['active'] and r['email_normalized'] and r['share']
+         ]
+         external_emails_normalized = [
+             r['email_normalized']
+             for r in recipients_data if r['active'] and r['email_normalized'] and r['share']
+         ]
+-        external_emails += list({
+-            email for email in email_split_and_format_normalize(
+-                f"{message_sudo.incoming_email_to or ''},{message_sudo.incoming_email_cc or ''}"
+-            )
++        external_emails_info += list({
++            (email, is_cc) for email, is_cc in chain(
++                zip(email_split_and_format_normalize(message_sudo.incoming_email_to or ''), repeat(False)),
++                zip(email_split_and_format_normalize(message_sudo.incoming_email_cc or ''), repeat(True)))
+             if email_normalize(email) not in external_emails_normalized
+         })
+-        if external_emails and len(external_emails) < self._CUSTOMER_HEADERS_LIMIT_COUNT:  # more than threshold = considered as public record (slide, forum, ...) -> do not leak
+-            headers['X-Msg-To-Add'] = ','.join(external_emails)
++        if external_emails_info and len(external_emails_info) < self._CUSTOMER_HEADERS_LIMIT_COUNT:  # more than threshold = considered as public record (slide, forum, ...) -> do not leak
++            headers['X-Msg-To-Add'] = ','.join(email for email, is_cc in external_emails_info if not is_cc)
++            headers['X-Msg-Cc-Add'] = ','.join(email for email, is_cc in external_emails_info if is_cc)
+         # sudo: access to mail.alias.domain, restricted
+         if message_sudo.record_alias_domain_id.bounce_email:
+             headers['Return-Path'] = message_sudo.record_alias_domain_id.bounce_email
+@@ -3972,13 +3999,14 @@ class MailThread(models.AbstractModel):
+         return base_mail_values
+ 
+     def _notify_by_email_get_final_mail_values(self, recipient_ids, mail_values,
+-                                               additional_values=None):
++                                               recipient_cc_ids=None, additional_values=None):
+         """ Perform final formatting of values to create notification emails.
+         Basic method just set the recipient partners as mail_mail recipients.
+         Override to generate other mail values like email_to or email_cc.
+ 
+-        :param list recipient_ids: res.partner IDs to notify;
++        :param list recipient_ids: res.partner IDs to notify in To;
+         :param dict mail_values: notification mail values;
++        :param list recipient_cc_ids: res.partner IDs to notify in Cc;
+         :param dict additional_values: optional additional values to add (ease
+           custom calls and inheritance);
+ 
+@@ -3986,6 +4014,7 @@ class MailThread(models.AbstractModel):
+         """
+         final_mail_values = dict(mail_values)
+         final_mail_values['recipient_ids'] = [(4, pid) for pid in recipient_ids]
++        final_mail_values['recipient_cc_ids'] = [(4, pid) for pid in recipient_cc_ids or []]
+         if additional_values:
+             final_mail_values.update(additional_values)
+         return final_mail_values
+@@ -4167,6 +4196,7 @@ class MailThread(models.AbstractModel):
+                     'name': partner name;
+                     'lang': partner lang;
+                     'groups': res.group IDs if linked to a user;
++                    'is_cc': whether to send in "Cc" or "To";
+                     'notif': notification type, one of 'inbox', 'email', 'sms' (SMS App),
+                         'whatsapp (WhatsAapp);
+                     'share': is partner a customer (partner.partner_share);
+@@ -4180,7 +4210,7 @@ class MailThread(models.AbstractModel):
+         """
+         msg_sudo = message.sudo()
+ 
+-        pids = msg_sudo.partner_ids.ids
++        pids = (msg_sudo.partner_ids | msg_sudo.partner_cc_ids).ids
+         if kwargs.get('notify_skip_followers'):
+             # when skipping followers, message acts like user notification, which means
+             # relying on required recipients (pids) only
+@@ -4215,6 +4245,7 @@ class MailThread(models.AbstractModel):
+             f"{msg_sudo.incoming_email_cc or ''}"
+         )]
+ 
++        partner_cc_ids = message.partner_cc_ids
+         for pid, pdata in res.items():
+             if pid and pid == skip_author_id:
+                 continue
+@@ -4222,6 +4253,7 @@ class MailThread(models.AbstractModel):
+                 continue
+             if pdata['email_normalized'] in emailed_normalized:
+                 continue
++            pdata['is_cc'] = pid in partner_cc_ids.ids
+             recipients_data.append(pdata)
+ 
+         # include emails only
+@@ -4230,6 +4262,7 @@ class MailThread(models.AbstractModel):
+                 'active': True,
+                 'email_normalized': email,
+                 'id': False,
++                'is_cc': False,
+                 'is_follower': False,
+                 'name': name or email,
+                 'lang': False,
+@@ -4364,6 +4397,7 @@ class MailThread(models.AbstractModel):
+             group_data.setdefault('recipients_data', [])
+             group_data.setdefault('recipients_emails', [])
+             group_data.setdefault('recipients_ids', [])
++            group_data.setdefault('recipients_cc_ids', [])
+             group_button_access = group_data.setdefault('button_access', {})
+             group_button_access.setdefault('url', access_link)
+             group_button_access.setdefault('title', view_title)
+@@ -4413,7 +4447,10 @@ class MailThread(models.AbstractModel):
+                 if group_data['active'] and group_func(recipient_data):
+                     group_data['recipients_data'].append(recipient_data)
+                     if recipient_data['id']:
+-                        group_data['recipients_ids'].append(recipient_data['id'])
++                        if recipient_data.get('is_cc'):
++                            group_data['recipients_cc_ids'].append(recipient_data['id'])
++                        else:
++                            group_data['recipients_ids'].append(recipient_data['id'])
+                     elif recipient_data['email_normalized']:
+                         group_data['recipients_emails'].append(recipient_data['email_normalized'])
+                     break
+@@ -4486,7 +4523,7 @@ class MailThread(models.AbstractModel):
+         # extract internal users being notified to check their OOO status
+         # done manually (not when computing recipients data) as it would be costly
+         # and difficult with potential inheritance (calendar, ...)
+-        pids = message.partner_ids.ids
++        pids = (message.partner_ids | message.partner_cc_ids).ids
+         internal_uids = [
+             r['uid'] for r in recipients_data if (
+                 r['active'] and
+
+--- a/addons/mail/models/models.py
++++ b/addons/mail/models/models.py
+@@ -419,7 +419,9 @@ class Base(models.AbstractModel):
+         for record in self:
+             suggested[record.id] = {
+                 'email_to_lst': suggested_record[record.id]['email_to_lst'].copy(),
++                'email_cc_lst': [],
+                 'partners': suggested_record[record.id]['partners'] + (additional_partners or self.env['res.partner']),
++                'cc_partners': self.env['res.partner'],
+             }
+ 
+         # find last relevant message
+@@ -437,8 +439,11 @@ class Base(models.AbstractModel):
+                     continue
+                 # direct recipients, and author if not archived / root
+                 suggested[record.id]['partners'] += (record_msg.partner_ids | record_msg.author_id).filtered(lambda p: p.active)
++                suggested[record.id]['cc_partners'] += record_msg.partner_cc_ids.filtered(lambda p: p.active)
+                 # To and Cc emails (mainly for incoming email), and email_from if not linked to hereabove author
+-                suggested[record.id]['email_to_lst'] += [record_msg.incoming_email_to or '', record_msg.incoming_email_cc or '', record_msg.email_from or '']
++                suggested[record.id]['email_to_lst'] += (email_split_and_format(record_msg.incoming_email_to) +
++                                                         ([record_msg.email_from] if record_msg.email_from else []))
++                suggested[record.id]['email_cc_lst'] += email_split_and_format(record_msg.incoming_email_cc or '')
+                 from_normalized = email_normalize(record_msg.email_from)
+                 if from_normalized and from_normalized != record_msg.author_id.email_normalized:
+                     suggested[record.id]['email_to_lst'].append(record_msg.email_from)
+@@ -447,16 +452,19 @@ class Base(models.AbstractModel):
+         records_emails = {}
+         all_emails = set()
+         for record in self:
+-            email_to_lst, partners = suggested[record.id]['email_to_lst'], suggested[record.id]['partners']
++            partners = suggested[record.id]['partners']
++            cc_partners = suggested[record.id]['cc_partners']
+             # organize and deduplicate partners, exclude followers, keep ordering
+             followers = record.message_partner_ids if is_mail_thread else record.env['res.partner']
+             # sanitize email inputs, exclude followers and aliases, add some banned emails, keep ordering, then link to partners
+-            skip_emails_normalized = (followers | partners).mapped('email_normalized') + (followers | partners).mapped('email')
++            skip_emails_normalized = (followers | partners | cc_partners).mapped('email_normalized') + (followers | partners | cc_partners).mapped('email')
++            email_lst = suggested[record.id]['email_to_lst'] + suggested[record.id]['email_cc_lst']
+             records_emails[record] = [
+-                e for email_input in email_to_lst for e in email_split_and_format(email_input)
++                e for email_input in email_lst for e in email_split_and_format(email_input)
+                 if e and e.strip() and email_key(e) not in skip_emails_normalized
+             ]
+-            all_emails |= set(records_emails[record]) | set(partners.mapped('email_normalized'))
++            all_emails |= (set(records_emails[record]) | set(partners.mapped('email_normalized'))
++                           | set(cc_partners.mapped('email_normalized')))
+         # ban emails: never propose odoobot nor aliases
+         ban_emails = [self.env.ref('base.partner_root').email_normalized]
+         ban_emails += self.env['mail.alias.domain'].sudo()._find_aliases(
+@@ -476,7 +484,9 @@ class Base(models.AbstractModel):
+         for record in self:
+             followers = record.message_partner_ids if is_mail_thread else record.env['res.partner']
+             partners = self.env['res.partner'].browse(tools.misc.unique(
+-                p.id for p in (suggested[record.id]['partners'] + records_partners[record.id])
++                p.id for p in (suggested[record.id]['partners']
++                               + suggested[record.id]['cc_partners']
++                               + records_partners[record.id])
+                 if (
+                     # skip followers, unless being a customer suggested by record (mostly defaults)
+                     (
+@@ -488,35 +498,47 @@ class Base(models.AbstractModel):
+                     not p.is_public
+                 )
+             ))
++            # Add partner to cc_partners_filter if it was always sent in "cc" and not in "to"
++            cc_partners_filter = suggested[record.id]['cc_partners']
++            partner_by_email = {key: p for p in partners if p.email and (key := email_key(p.email))}
++            for email in ({email_key(e) for e in suggested[record.id]['email_cc_lst']}
++                          - {email_key(e) for e in suggested[record.id]['partners'].mapped('email') if e}
++                          - {email_key(e) for e in suggested[record.id]['email_to_lst']}):
++                if partner := partner_by_email.get(email_normalize(email, False)):
++                    cc_partners_filter |= partner
++
+             existing_mails = {
+                 email_key(e)
+                 for rec in (followers | partners)
+                 for e in ([rec.email_normalized] if rec.email_normalized else []) + email_split_and_format(rec.email or '')
+             }
+-            email_to_lst = list(tools.misc.unique(
+-                e for email_input in suggested[record.id]['email_to_lst'] for e in email_split_and_format(email_input)
+-                if (
+-                    e and e.strip() and
+-                    email_key(e) not in ban_emails and
+-                    email_key(e) not in existing_mails
+-                )
+-            ))
+-
+             recipients = [{
+                 **({'display_name': partner.display_name} if not partner.name else {}),
+                 'email': partner.email_normalized,
+                 'name': partner.name,
+                 'partner_id': partner.id,
+                 'create_values': {},
++                'recipient_type': 'cc' if partner in cc_partners_filter else 'to',
+             } for partner in partners]
+-            for email_input in email_to_lst:
+-                name, email_normalized = parse_contact_from_email(email_input)
+-                recipients.append({
+-                    'email': email_normalized,
+-                    'name': emails_normalized_info.get(email_normalized, {}).pop('name', False) or name,
+-                    'partner_id': False,
+-                    'create_values': emails_normalized_info.get(email_normalized, {}),
+-                })
++            for lst_field, recipient_type in (('email_to_lst', 'to'), ('email_cc_lst', 'cc')):
++                email_lst = list(tools.misc.unique(
++                    e for email_input in suggested[record.id][lst_field] for e in email_split_and_format(email_input)
++                    if (
++                        e.strip() and
++                        email_key(e) not in ban_emails and
++                        email_key(e) not in existing_mails
++                    )
++                ))
++                for email_input in email_lst:
++                    name, email_normalized = parse_contact_from_email(email_input)
++                    existing_mails.add(email_key(email_input))
++                    recipients.append({
++                        'email': email_normalized,
++                        'name': emails_normalized_info.get(email_normalized, {}).pop('name', False) or name,
++                        'partner_id': False,
++                        'create_values': emails_normalized_info.get(email_normalized, {}),
++                        'recipient_type': recipient_type,
++                    })
+             suggested_recipients[record.id] = recipients
+         return suggested_recipients
+ 

@@ -1,0 +1,200 @@
+PR: https://github.com/odoo/odoo/pull/233836
+
+From: f15abb0baf23e4c40dfce6eadc8d33feeda9a549
+From: Andrzej(pian)
+Date: 2026-06-19 09:36:23
++    artifact_ids = fields.One2many("mail.call.artifact", "discuss_call_history_id", string="Artifacts")
+
+Total Changes: 106
+
+[IMP] mail: introduce call artifacts, call_debrief player widget
+
+This commit introduces a unified way to store and visualize post-call
+artifacts (call recordings). It also lays the groundwork for introducing
+transcripts, primarily for Discuss and VoIP.
+
+CALL ARTIFACT - What is that?
+*--
+A call.artifact represents a discrete "product" of a call. For example,
+it can be a call's recording or a call transcription. Each artifact acts
+as a thin metadata layer (start_ms, end_ms, source) for a maximum of one
+ir.attachment. This keeps the generic ir.attachment table lean while
+allowing us to store the complex, multi-segment timing metadata required
+for chunked playback and AI transcription pipelines.
+
+RECORDING STORAGE
+*--
+Odoo's infrastructure is not designed for the mass storage of media.
+Even though a single recording's size is negligible, VoIP systems are
+expected to generate a massive number of them. Therefore, the persistent
+call recording feature will ONLY be available when the cloud storage
+module is installed and configured, allowing media to be offloaded to
+providers like S3 or GCS.
+
+Note: Transient recordings used for transcriptions are not bound by this
+requirement. (Check out the enterprise commit for more details.)
+
+CALL DEBRIEF - New UI Media Player
+*--
+The presentation of the artifacts is realized with the Call Debrief
+Widget - a new field widget. It provides a modern synchronized player
+supporting audio/video recordings (with support for synchronized
+transcripts), drag-to-seek functionality, keyboard shortcuts with live
+feedback, and variable playback rates.
+
+task-5153790
+
+closes odoo/odoo#233836
+
+Related: odoo/enterprise#101741
+Related: odoo/upgrade#9521
+Signed-off-by: Adrien Schoffeniels (adsc) <adsc@odoo.com>
+
+================================= pseudo patch: =================================
+
+--- a/addons/mail/models/__init__.py
++++ b/addons/mail/models/__init__.py
+@@ -75,6 +75,7 @@ from . import res_users
+ from . import update
+ 
+ # after mail specifically as discuss module depends on mail
++from . import mail_call_artifact
+ from . import discuss
+ 
+ # discuss_channel_member must be loaded first
+
+--- a/addons/mail/models/discuss/discuss_call_history.py
++++ b/addons/mail/models/discuss/discuss_call_history.py
+@@ -10,6 +10,7 @@ class DiscussCallHistory(models.Model):
+     _explanation = "Stores the history of internal discuss calls (audio/video), tracking the start time, end time, duration, and the associated channel."
+ 
+     channel_id = fields.Many2one("discuss.channel", index=True, required=True, ondelete="cascade")
++    artifact_ids = fields.One2many("mail.call.artifact", "discuss_call_history_id", string="Artifacts")
+     duration_hour = fields.Float(compute="_compute_duration_hour")
+     start_dt = fields.Datetime(index=True, required=True)
+     end_dt = fields.Datetime()
+@@ -26,6 +27,10 @@ class DiscussCallHistory(models.Model):
+     )
+     _channel_id_end_dt_idx = models.Index("(channel_id, end_dt) WHERE end_dt IS NULL")
+ 
++    @api.ondelete(at_uninstall=False)
++    def _unlink_cleanup_artifacts_attachments(self):
++        self.artifact_ids.unlink()
++
+     @api.depends("start_dt", "end_dt")
+     def _compute_duration_hour(self):
+         for record in self:
+
+--- a/addons/mail/models/ir_attachment.py
++++ b/addons/mail/models/ir_attachment.py
+@@ -11,6 +11,11 @@ from odoo.addons.mail.tools.discuss import Store
+ class IrAttachment(models.Model):
+     _inherit = 'ir.attachment'
+ 
++    _mail_call_artifact_uniq = models.UniqueIndex(
++        "(res_id) WHERE res_model = 'mail.call.artifact'",
++        message="Only one attachment per call artifact is allowed.",
++    )
++
+     thumbnail = fields.Image()
+     has_thumbnail = fields.Boolean(compute="_compute_has_thumbnail")
+ 
+
+--- a/None
++++ b/addons/mail/models/mail_call_artifact.py
+@@ -0,0 +1,95 @@
++from odoo import api, fields, models
++from odoo.exceptions import ValidationError
++
++
++class MailCallArtifact(models.Model):
++    """Represent a discrete product of a call (audio, transcript etc.)
++
++    For media artifacts, each record acts as a thin metadata wrapper (timing, source, etc.) for
++    exactly one media file, keeping the ir_attachment table lean"""
++
++    _name = "mail.call.artifact"
++    _description = "Call Artifact"
++    _order = "start_ms, id"
++
++    # required=False as artifact can also owned by other call models (ensured by constraints)
++    discuss_call_history_id = fields.Many2one(
++        "discuss.call.history", string="Discuss Call History",
++        ondelete="cascade", required=False, index=True,
++    )
++    media_id = fields.Many2one(
++        "ir.attachment", string="Media Attachment", compute="_compute_media_id",
++    )
++    start_ms = fields.Integer(
++        string="Start (ms)", default=0, required=True,
++        help="Offset from the start of the call in milliseconds",
++    )
++    end_ms = fields.Integer(
++        string="End (ms)", default=0, required=True,
++        help="Offset from the start of the call in milliseconds",
++    )
++
++    # ---------------------------------------------------------------------
++    # Constraints
++
++    _start_before_end = models.Constraint(
++        "CHECK(start_ms < end_ms)", "End time must be after the start time.",
++    )
++    _artifact_has_possessor = models.Constraint(
++        "CHECK(num_nonnulls(discuss_call_history_id) = 1)", "Artifact must be linked to a call source.",
++    )
++
++    @api.constrains("start_ms", "end_ms", "discuss_call_history_id")
++    def _constrains_artifacts_overlap(self):
++        """Check that artifacts within the same call do not overlap."""
++        grouped_artifacts = self._get_artifacts_grouped_by_call()
++        for key, artifacts in grouped_artifacts.items():
++            if not key:
++                continue
++            self._check_artifacts_overlap(artifacts)
++
++    def _get_artifacts_grouped_by_call(self):
++        """Return a dict mapping call records to their respective artifact recordsets.
++
++        This hook allows other modules to include artifacts linked to different
++        call models (e.g., voip.call) in the overlap validation"""
++        all_artifacts = self.discuss_call_history_id.artifact_ids
++        return all_artifacts.grouped('discuss_call_history_id')
++
++    def _is_overlap_candidate(self):
++        """Determine if self should be checked for overlap"""
++        return True
++
++    def _check_artifacts_overlap(self, artifacts):
++        """Check if the provided artifacts overlap in time"""
++        candidates = sorted(
++            (a for a in artifacts if a._is_overlap_candidate()),
++            key=lambda x: x.start_ms,
++        )
++        for i in range(len(candidates) - 1):
++            if candidates[i].end_ms > candidates[i + 1].start_ms:
++                raise ValidationError(self.env._("Media artifacts overlap."))
++
++    # ---------------------------------------------------------------------
++    # Computes
++
++    def _compute_media_id(self):
++        attachments = self.env["ir.attachment"].search_fetch([
++            ("res_model", "=", self._name),
++            ("res_id", "in", self.ids),
++        ], ['res_id'])
++        attachment_by_res_id = attachments.grouped('res_id')
++        for artifact in self:
++            artifact.media_id = attachment_by_res_id.get(artifact.id)
++
++    # ---------------------------------------------------------------------
++    # Methods
++
++    def _get_related_call(self):
++        """Return the parent call record (discuss.call.history, voip.call, etc.)"""
++        self.ensure_one()
++        return self.discuss_call_history_id
++
++    @api.ondelete(at_uninstall=False)
++    def _unlink_cleanup_media_attachment(self):
++        self.media_id.sudo().unlink()

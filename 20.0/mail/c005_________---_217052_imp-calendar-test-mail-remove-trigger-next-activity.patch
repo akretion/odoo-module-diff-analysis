@@ -1,0 +1,306 @@
+PR: https://github.com/odoo/odoo/pull/217052
+
+From: 0d41fffffbf2beb227d5f33378b55de1d5b013b3
+From: aktr-odoo
+Date: 2026-02-04 06:42:21
+
+Breaking data model changes scores: del:10 + add:0, change matches:
+-    recommended_activity_type_id = fields.Many2one('mail.activity.type', string="Recommended Activity Type")
+-    previous_activity_type_id = fields.Many2one('mail.activity.type', string='Previous Activity Type', readonly=True)
+-    has_recommended_activities = fields.Boolean(
+-    chaining_type = fields.Selection(related='activity_type_id.chaining_type', readonly=True)
+-    next_activity_ids = fields.Many2many(
+-    triggered_next_type_id = fields.Many2one(
+-    chaining_type = fields.Selection([
+-    suggested_next_type_ids = fields.Many2many(
+
+Total Changes: 137
+
+[IMP] calendar, test_(mail): remove trigger next activity
+
+Purpose:
+Simplify the activity flow and improve usability by removing the
+'Trigger Next Activity' feature.
+
+Specifications:
+This commit removes the 'Trigger Next Activity' feature and the recommended
+activities list. The next activity flow is now simplified to keep only one
+'Suggested Next Activity' on the activity type. When marking an activity as done
+and scheduling the next one, this suggested activity is automatically set as the
+default in the scheduler popup.
+
+Additionally, the 'Done & Schedule Next' flow now consistently uses the
+scheduler popup (activity schedule wizard), providing a unified experience
+and allowing the use of activity plans when scheduling the next activity.
+
+Task-4863143
+
+closes odoo/odoo#217052
+
+Related: odoo/enterprise#89228
+Related: odoo/upgrade#7985
+Signed-off-by: Warnon Aurélien (awa) <awa@odoo.com>
+
+================================= pseudo patch: =================================
+
+--- a/addons/mail/models/mail_activity.py
++++ b/addons/mail/models/mail_activity.py
+@@ -103,13 +103,7 @@ class MailActivity(models.Model):
+         ('planned', 'Planned'),
+         ('done', 'Done')], 'State',
+         compute='_compute_state')
+-    recommended_activity_type_id = fields.Many2one('mail.activity.type', string="Recommended Activity Type")
+-    previous_activity_type_id = fields.Many2one('mail.activity.type', string='Previous Activity Type', readonly=True)
+-    has_recommended_activities = fields.Boolean(
+-        'Next activities available',
+-        compute='_compute_has_recommended_activities') # technical field for UX purpose
+     mail_template_ids = fields.Many2many(related='activity_type_id.mail_template_ids', readonly=True)
+-    chaining_type = fields.Selection(related='activity_type_id.chaining_type', readonly=True)
+     # access
+     can_write = fields.Boolean(compute='_compute_can_write') # used to hide buttons if the current user has no access
+     active = fields.Boolean(default=True)
+@@ -130,17 +124,6 @@ class MailActivity(models.Model):
+         'Activities must be assigned if not attached to a document.',
+     )
+ 
+-    @api.onchange('previous_activity_type_id')
+-    def _compute_has_recommended_activities(self):
+-        for record in self:
+-            record.has_recommended_activities = bool(record.previous_activity_type_id.suggested_next_type_ids)
+-
+-    @api.onchange('previous_activity_type_id')
+-    def _onchange_previous_activity_type_id(self):
+-        for record in self:
+-            if record.previous_activity_type_id.triggered_next_type_id:
+-                record.activity_type_id = record.previous_activity_type_id.triggered_next_type_id
+-
+     @api.depends('active')
+     def _compute_date_done(self):
+         unarchived = self.filtered('active')
+@@ -195,11 +178,6 @@ class MailActivity(models.Model):
+             if self.activity_type_id.default_note:
+                 self.note = self.activity_type_id.default_note
+ 
+-    @api.onchange('recommended_activity_type_id')
+-    def _onchange_recommended_activity_type_id(self):
+-        if self.recommended_activity_type_id:
+-            self.activity_type_id = self.recommended_activity_type_id
+-
+     def _check_access(self, operation: str) -> tuple | None:
+         """ Determine the subset of ``self`` for which ``operation`` is allowed.
+         A custom implementation is done on activities as this document has some
+@@ -486,7 +464,7 @@ class MailActivity(models.Model):
+         return action
+ 
+     def action_feedback(self, feedback=False, attachment_ids=None):
+-        messages, _next_activities = self.with_context(
++        messages = self.with_context(
+             clean_context(self.env.context)
+         )._action_done(feedback=feedback, attachment_ids=attachment_ids)
+         return messages[0].id if messages else False
+@@ -499,36 +477,33 @@ class MailActivity(models.Model):
+     def action_feedback_schedule_next(self, feedback=False, attachment_ids=None):
+         ctx = dict(
+             clean_context(self.env.context),
+-            default_previous_activity_type_id=self.activity_type_id.id,
+             activity_previous_deadline=self.date_deadline,
+-            default_res_id=self.res_id,
+-            default_res_model=self.res_model,
++            active_id=self.res_id,
++            active_model=self.res_model,
+         )
+-        _messages, next_activities = self._action_done(feedback=feedback, attachment_ids=attachment_ids)  # will unlink activity, dont access self after that
+-        if next_activities:
+-            return False
++        # Only set if suggested; sending False disables compute fallback
++        if self.activity_type_id.suggested_next_type_id:
++            ctx['default_activity_type_id'] = self.activity_type_id.suggested_next_type_id.id
++        self._action_done(feedback=feedback, attachment_ids=attachment_ids)  # will unlink activity, dont access self after that
+         return {
+-            'name': _('Schedule an Activity'),
++            'name': _('Schedule Activity'),
+             'context': ctx,
+             'view_mode': 'form',
+-            'res_model': 'mail.activity',
++            'res_model': 'mail.activity.schedule',
+             'views': [(False, 'form')],
+             'type': 'ir.actions.act_window',
+             'target': 'new',
+         }
+ 
+     def _action_done(self, feedback=False, attachment_ids=None):
+-        """ Private implementation of marking activity as done: posting a message, archiving activity
+-            (since done), and eventually create the automatical next activity (depending on config).
++        """ Private implementation of marking activity as done: posting a message and
++            archiving activity (since done).
+             :param feedback: optional feedback from user when marking activity as done
+             :param attachment_ids: list of ir.attachment ids to attach to the posted mail.message
+-            :returns (messages, activities) where
+-                - messages is a recordset of posted mail.message
+-                - activities is a recordset of mail.activity of forced automically created activities
++            :returns: recordset of posted mail.message
+         """
+         # marking as 'done'
+         messages = self.env['mail.message']
+-        next_activities_values = []
+         ongoing_activities = self.filtered(lambda a: not a.date_done)
+ 
+         # Search for all attachments linked to the activities we are about to archive. This way, we
+@@ -547,10 +522,6 @@ class MailActivity(models.Model):
+             records_sudo = self.env[model].sudo().browse(activity_data['record_ids'])
+             existing = records_sudo.exists()  # in case record was cascade-deleted in DB, skipping unlink override
+             for record_sudo, activity in zip(records_sudo, activity_data['activities']):
+-                # extract value to generate next activities
+-                if activity.chaining_type == 'trigger':
+-                    vals = activity.with_context(activity_previous_deadline=activity.date_deadline)._prepare_next_activity_values()
+-                    next_activities_values.append(vals)
+ 
+                 # post message on activity, before deleting it
+                 if record_sudo in existing:
+@@ -590,10 +561,6 @@ class MailActivity(models.Model):
+                     attachments_to_remove += message_attachments
+                 messages += activity_message
+ 
+-        next_activities = self.env['mail.activity']
+-        if next_activities_values:
+-            next_activities = self.env['mail.activity'].create(next_activities_values)
+-
+         # remove lost activities and attachments, not actionnable anyway anymore
+         if attachments_to_remove:
+             attachments_to_remove.unlink()
+@@ -604,7 +571,7 @@ class MailActivity(models.Model):
+         (self - activities_to_remove).action_archive()
+         if feedback:
+             (self - activities_to_remove).feedback = feedback
+-        return messages, next_activities
++        return messages
+ 
+     @api.readonly
+     def action_close_dialog(self):
+@@ -663,7 +630,7 @@ class MailActivity(models.Model):
+     def _store_activity_fields(self, res: Store.FieldList):
+         res.attr("activity_category")
+         res.one("activity_type_id", ["name"])
+-        res.extend(["can_write", "chaining_type", "create_date"])
++        res.extend(["can_write", "create_date"])
+         res.one("create_uid", lambda res: res.one("partner_id", ["name"]))
+         res.extend(["date_deadline", "date_done", "icon", "note"])
+         res.extend(["res_id", "res_model", "state", "summary"])
+@@ -835,24 +802,6 @@ class MailActivity(models.Model):
+             data_by_model[activity.res_model]['record_ids'].append(activity.res_id)
+         return data_by_model
+ 
+-    def _prepare_next_activity_values(self):
+-        """ Prepare the next activity values based on the current activity record and applies _onchange methods
+-        :returns a dict of values for the new activity
+-        """
+-        self.ensure_one()
+-        vals = self.default_get(self.fields_get())
+-
+-        vals.update({
+-            'previous_activity_type_id': self.activity_type_id.id,
+-            'res_id': self.res_id,
+-            'res_model': self.res_model,
+-            'res_model_id': self.env['ir.model']._get(self.res_model).id if self.res_model else False,
+-        })
+-        virtual_activity = self.new(vals)
+-        virtual_activity._onchange_previous_activity_type_id()
+-        virtual_activity._onchange_activity_type_id()
+-        return virtual_activity._convert_to_write(virtual_activity._cache)
+-
+     @api.autovacuum
+     def _gc_delete_old_overdue_activities(self):
+         """
+
+--- a/addons/mail/models/mail_activity_plan_template.py
++++ b/addons/mail/models/mail_activity_plan_template.py
+@@ -51,9 +51,7 @@ class MailActivityPlanTemplate(models.Model):
+         'Assigned to',
+         check_company=True, compute="_compute_responsible_id", store=True, readonly=False)
+     note = fields.Html('Note', compute="_compute_note", store=True, readonly=False)
+-    next_activity_ids = fields.Many2many(
+-        'mail.activity.type', string='Next Activities',
+-        compute='_compute_next_activity_ids', readonly=False, store=True)
++    suggested_next_type_id = fields.Many2one(string='Suggested Next Activity', related='activity_type_id.suggested_next_type_id')
+ 
+     @api.constrains('activity_type_id', 'plan_id')
+     def _check_activity_type_res_model(self):
+@@ -80,19 +78,6 @@ class MailActivityPlanTemplate(models.Model):
+             if template.responsible_type == 'other' and not template.responsible_id:
+                 raise ValidationError(_('When selecting "Default user" assignment, you must specify a responsible.'))
+ 
+-    @api.depends('activity_type_id')
+-    def _compute_next_activity_ids(self):
+-        """ Update next activities only when changing activity type on template.
+-        Any change on type configuration should not be propagated. """
+-        for template in self:
+-            activity_type = template.activity_type_id
+-            if activity_type.triggered_next_type_id:
+-                template.next_activity_ids = activity_type.triggered_next_type_id.ids
+-            elif activity_type.suggested_next_type_ids:
+-                template.next_activity_ids = activity_type.suggested_next_type_ids.ids
+-            else:
+-                template.next_activity_ids = False
+-
+     @api.depends('activity_type_id')
+     def _compute_note(self):
+         for template in self:
+
+--- a/addons/mail/models/mail_activity_type.py
++++ b/addons/mail/models/mail_activity_type.py
+@@ -48,19 +48,10 @@ class MailActivityType(models.Model):
+     res_model = fields.Selection(selection=_get_model_selection, string="Model",
+         help='Specify a model if the activity should be specific to a model'
+              ' and not available when managing activities for other models.')
+-    triggered_next_type_id = fields.Many2one(
+-        'mail.activity.type', string='Trigger', compute='_compute_triggered_next_type_id',
+-        inverse='_inverse_triggered_next_type_id', store=True, readonly=False,
+-        domain="['|', ('res_model', '=', False), ('res_model', '=', res_model)]", ondelete='restrict',
+-        help="Automatically schedule this activity once the current one is marked as done.")
+-    chaining_type = fields.Selection([
+-        ('suggest', 'Suggest Next Activity'), ('trigger', 'Trigger Next Activity')
+-    ], string="Chaining Type", required=True, default="suggest")
+-    suggested_next_type_ids = fields.Many2many(
+-        'mail.activity.type', 'mail_activity_rel', 'activity_id', 'recommended_id', string='Suggest',
++    suggested_next_type_id = fields.Many2one(
++        'mail.activity.type', string='Suggest Next Activity',
+         domain="['|', ('res_model', '=', False), ('res_model', '=', res_model)]",
+-        compute='_compute_suggested_next_type_ids', inverse='_inverse_suggested_next_type_ids', store=True, readonly=False,
+-        help="Suggest these activities once the current one is marked as done.")
++        help="Suggest this activity once the current one is marked as done.")
+     previous_type_ids = fields.Many2many(
+         'mail.activity.type', 'mail_activity_rel', 'recommended_id', 'activity_id',
+         domain="['|', ('res_model', '=', False), ('res_model', '=', res_model)]",
+@@ -111,32 +102,6 @@ class MailActivityType(models.Model):
+             unit = selection_description_values[activity_type.delay_unit]
+             activity_type.delay_label = '%s %s' % (activity_type.delay_count, unit)
+ 
+-    @api.depends('chaining_type')
+-    def _compute_suggested_next_type_ids(self):
+-        """suggested_next_type_ids and triggered_next_type_id should be mutually exclusive"""
+-        for activity_type in self:
+-            if activity_type.chaining_type == 'trigger':
+-                activity_type.suggested_next_type_ids = False
+-
+-    def _inverse_suggested_next_type_ids(self):
+-        for activity_type in self:
+-            if activity_type.suggested_next_type_ids:
+-                activity_type.chaining_type = 'suggest'
+-
+-    @api.depends('chaining_type')
+-    def _compute_triggered_next_type_id(self):
+-        """suggested_next_type_ids and triggered_next_type_id should be mutually exclusive"""
+-        for activity_type in self:
+-            if activity_type.chaining_type == 'suggest':
+-                activity_type.triggered_next_type_id = False
+-
+-    def _inverse_triggered_next_type_id(self):
+-        for activity_type in self:
+-            if activity_type.triggered_next_type_id:
+-                activity_type.chaining_type = 'trigger'
+-            else:
+-                activity_type.chaining_type = 'suggest'
+-
+     def write(self, vals):
+         # Protect some master types against model change when they are used
+         # as default in apps, in business flows, plans, ...

@@ -1,0 +1,134 @@
+PR: https://github.com/odoo/odoo/pull/254900
+
+From: 01bf3fa613481345f961cfb15e1888f0f7b2cfe3
+From: FedericoBraidi
+Date: 2026-04-16 07:44:08
+
+Breaking data model changes scores: del:4 + add:0, change matches:
+-    work_entry_source = fields.Selection(readonly=False, related="version_id.work_entry_source", inherited=True, groups="base.group_system,hr.group_hr_manager")
+-    work_entry_source = fields.Selection(string="Tracking Method", selection=[
+-    work_entry_source = fields.Selection(string="Tracking Method", selection=[
+-    work_entry_source = fields.Selection(string='Default Tracking', related='company_id.work_entry_source',
+
+Total Changes: 27
+
+[REF] hr*: refactor work_entry_source field
+
+As of now, the work_entry_source field is a Selection field that is
+defined in hr_work_entry with only 1 option (Time Off) and then
+overridden in hr_work_entry_attendance to add another option
+(Attendance). This doesn't make sense anymore, because:
+
+1) Time Off is always considered, that option makes it so that the time
+   is based on the working schedule.
+
+2) There are at most 2 options, so it doesn't need to be a selection.
+
+For these reasons we remove the field and substitute it with a Boolean
+field attendance_based. This field will be defined in
+hr_work_entry_attendance and, since in the code work_entry_source was
+sometimes referenced even without the attendance module installed, we
+change those references to instead use a function result.
+
+In other words, anything in hr_work_entry_attendance or that depends on
+it can directly use the attendance_based field, while if we need to use
+code that is not dependant on it, we instead call a new
+_get_work_entry_source function that by defualt returns 'calendar' (the
+name of the Time Off option in the selection, but is then overridden in
+hr_work_entry_attendance to return 'attendance' if the attendance_based
+field is checked.
+
+closes odoo/odoo#254900
+
+Task: 6050497
+Related: odoo/enterprise#111329
+Related: odoo/upgrade#9767
+Signed-off-by: Yannick Tivisse (yti) <yti@odoo.com>
+
+================================= pseudo patch: =================================
+
+--- a/addons/hr_work_entry/models/hr_employee.py
++++ b/addons/hr_work_entry/models/hr_employee.py
+@@ -6,7 +6,6 @@ from odoo import models, fields
+ class HrEmployee(models.Model):
+     _inherit = 'hr.employee'
+ 
+-    work_entry_source = fields.Selection(readonly=False, related="version_id.work_entry_source", inherited=True, groups="base.group_system,hr.group_hr_manager")
+     external_code = fields.Char("External Code", copy=False, help="Use this code to export your data to a third party", groups="hr.group_hr_user")
+ 
+     # YTI TODO: Rename private method into _get_work_entries_vals()
+
+--- a/addons/hr_work_entry/models/hr_version.py
++++ b/addons/hr_work_entry/models/hr_version.py
+@@ -15,15 +15,6 @@ from odoo.tools.intervals import Intervals
+ class HrVersion(models.Model):
+     _inherit = 'hr.version'
+ 
+-    work_entry_source = fields.Selection(string="Tracking Method", selection=[
+-        ('calendar', 'Time Off'),
+-    ], default=lambda self: self.env.company.sudo().work_entry_source, tracking=True, required=True, help='''
+-            Defines the source for work entries generation
+-
+-            Working Schedule: Work entries will be generated from the working hours below.
+-            Attendances: Work entries will be generated from the employee's attendances. (requires Attendance app)
+-        ''', groups="base.group_system,hr.group_hr_manager")
+-
+     def _get_default_work_entry_type_id(self):
+         country_code = self.country_code
+         country_attendance = self.env['hr.work.entry.type'].search([
+@@ -81,7 +72,7 @@ class HrVersion(models.Model):
+     def _get_attendance_intervals(self, start_dt, end_dt):
+         assert start_dt.tzinfo and end_dt.tzinfo, "function expects localized date"
+         # {resource: intervals}
+-        versions_with_calendar_work_entry_source = self.filtered(lambda version: version.work_entry_source == 'calendar')
++        versions_with_calendar_work_entry_source = self.filtered(lambda version: version.has_static_work_entries())
+         result = dict()
+         for calendar, versions in versions_with_calendar_work_entry_source.grouped('resource_calendar_id').items():
+             fully_flex_versions = versions.filtered('is_fully_flexible')
+@@ -107,10 +98,6 @@ class HrVersion(models.Model):
+         self.ensure_one()
+         return [interval]
+ 
+-    @api.model
+-    def _get_whitelist_fields_from_template(self):
+-        return super()._get_whitelist_fields_from_template() + ['work_entry_source']
+-
+     def _get_no_wet_or_wet_match(self, leave, leave_entry_type):
+         return not leave[2].work_entry_type_id or leave[2].work_entry_type_id.id == leave_entry_type.id
+ 
+@@ -299,10 +286,10 @@ class HrVersion(models.Model):
+         return version_vals
+ 
+     def has_static_work_entries(self):
+-        # Static work entries as in the same are to be generated each month
+-        # Useful to differentiate attendance based versions from regular ones
++        # True means this is calendar based, False it is attendance based.
++        # This function gets overridden in hr_work_entry_attendance to correctly check if it's attendance based
+         self.ensure_one()
+-        return self.work_entry_source == 'calendar'
++        return True
+ 
+     def generate_work_entries(self, date_start, date_stop):
+         # Generate work entries between 2 dates (datetime.date)
+
+--- a/addons/hr_work_entry/models/res_company.py
++++ b/addons/hr_work_entry/models/res_company.py
+@@ -7,9 +7,6 @@ class ResCompany(models.Model):
+     _inherit = 'res.company'
+ 
+     external_code = fields.Char("External Code", groups="hr.group_hr_user", copy=False, help="Use this code to export your data to a third party")
+-    work_entry_source = fields.Selection(string="Tracking Method", selection=[
+-        ('calendar', 'Time'),
+-    ], default='calendar', required=True, groups="hr.group_hr_user")
+     allowed_work_entry_type_ids = fields.Many2many(
+         'hr.work.entry.type', compute='_compute_allowed_work_entry_type_ids')
+ 
+
+--- a/addons/hr_work_entry/models/res_config_settings.py
++++ b/addons/hr_work_entry/models/res_config_settings.py
+@@ -8,5 +8,3 @@ class ResConfigSettings(models.TransientModel):
+ 
+     external_code = fields.Char(
+         related='company_id.external_code', string="External Code", readonly=False)
+-    work_entry_source = fields.Selection(string='Default Tracking', related='company_id.work_entry_source',
+-                                         groups="hr.group_hr_user", readonly=False)

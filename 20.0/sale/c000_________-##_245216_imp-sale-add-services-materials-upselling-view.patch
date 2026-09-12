@@ -1,0 +1,600 @@
+PR: https://github.com/odoo/odoo/pull/245216
+
+From: cd6325d7476b20d9d0a3d298306990dd1cf7ef77
+From: Nisarg (nipl)
+Date: 2026-02-12 18:58:14
+
+Breaking data model changes scores: del:1 + add:0, change matches:
+-    _inherit = "account.analytic.line"
+
+Total Changes: 410
+
+[IMP] sale, _*: add Services & Materials upselling view
+
+_*= sale_project, sale_timesheet
+
+Added a new *Services & Materials* view to allow users to create additional delivered
+flat fees service or consumable product entries directly in a sale order.
+
+This feature allows:
+* Creating analytic lines from a sale order for extra services and materials.
+* Automatically creating or updating related sale order lines from those
+  analytic lines.
+* Handling SO line creation based on product expense policy:
+   * `cost` → create a new SO line.
+   * `sales_price` → update an existing line if available.
+* Updating delivered quantities when analytic lines are changed.
+* Reverting effect/deleting SO line when analytic lines are deleted.
+
+All analytic lines created from this flow are assigned to the analytic plan
+`sale.analytic_plan_sale_orders`, which ensures an analytic account is created
+and set on the sale order.
+
+Products with reinvoicing policy `no` will only be eligible for manual delivery.
+
+If a product has reinvoicing policy anything other than `no` it will be eligible
+for upselling from our new view, and delivered quantity will be aggregated
+from AALs.
+
+If a project is selected on the sale order, the analytic account is deduced from
+that project instead.
+
+Added a stat button on invoices to easily view analytic lines linked to that
+invoice.
+
+Technical changes:
+
+* Field `timesheet_invoice_id` is renamed to `reinvoice_move_id` as it's not
+  timesheet specific anymore.
+* Made `product_uom_id` field on AAL compute to make sure we get expected
+  `uom_id` on AAL.
+* Changed field `order_id` from `related` to `compute` since we need it to work
+  as normal m2o in sale.
+* Centralized analytic line reinvoicing logic in the sale module.
+* Improved `_get_analytic_lines_to_link` to support timesheet-based
+  subscriptions with date filtering.
+* `qty_delivered` will now be sum of upsell AALs and stock moves(for
+   consu products) and recorded timesheet hours(for timesheets).
+
+task-5490517
+
+closes odoo/odoo#245216
+
+Related: odoo/enterprise#105158
+Related: odoo/upgrade#9366
+Signed-off-by: Victor Feyens (vfe) <vfe@odoo.com>
+
+================================= pseudo patch: =================================
+
+--- a/addons/sale/models/__init__.py
++++ b/addons/sale/models/__init__.py
+@@ -1,6 +1,7 @@
+ # Part of Odoo. See LICENSE file for full copyright and licensing details.
+ 
+-from . import analytic
++from . import account_analytic_applicability
++from . import account_analytic_line
+ from . import account_move
+ from . import account_move_line
+ from . import crm_team
+
+--- a/addons/sale/models/analytic.py
++++ b/addons/sale/models/account_analytic_applicability.py
+@@ -3,12 +3,6 @@
+ from odoo import fields, models
+ 
+ 
+-class AccountAnalyticLine(models.Model):
+-    _inherit = "account.analytic.line"
+-
+-    so_line = fields.Many2one('sale.order.line', string='Sales Order Item', domain=[('qty_delivered_method', '=', 'analytic')], index='btree_not_null')
+-
+-
+ class AccountAnalyticApplicability(models.Model):
+     _inherit = 'account.analytic.applicability'
+     _description = "Analytic Plan's Applicabilities"
+
+--- a/None
++++ b/addons/sale/models/account_analytic_line.py
+@@ -0,0 +1,231 @@
++# Part of Odoo. See LICENSE file for full copyright and licensing details.
++
++from odoo import api, fields, models
++from odoo.exceptions import UserError
++from odoo.fields import Domain
++
++
++class AccountAnalyticLine(models.Model):
++    _inherit = 'account.analytic.line'
++
++    reinvoice_move_id = fields.Many2one(
++        string="Invoice",
++        comodel_name='account.move',
++        readonly=True,
++        copy=False,
++        help="Invoice created from related SO line",
++        index='btree_not_null',
++    )
++    so_line = fields.Many2one(
++        string='Sales Order Item',
++        comodel_name='sale.order.line',
++        compute='_compute_so_line',
++        store=True,
++        readonly=False,
++        index='btree_not_null',
++        domain=lambda self: self._domain_so_line(),
++    )
++    order_id = fields.Many2one(
++        string="Customer Order",
++        comodel_name='sale.order',
++        compute='_compute_order_id',
++        store=True,
++        readonly=False,
++        index=True,
++    )
++
++    def _compute_so_line(self):
++        return
++
++    def _domain_so_line(self):
++        return Domain('qty_delivered_method', '=', 'analytic')
++
++    def _compute_order_id(self):
++        return
++
++    @api.model_create_multi
++    def create(self, vals_list):
++        lines = super().create(vals_list)
++        if self.env.context.get('from_services_and_material'):
++            lines._sync_so_accounts_and_partners()
++            lines._sync_so_lines()
++        return lines
++
++    def write(self, vals):
++        if self and self.env.context.get('from_services_and_material'):
++            order_changed_aals = self.env['account.analytic.line']
++            product_changed_aals = self.env['account.analytic.line']
++
++            if vals.get('order_id'):
++                order_changed_aals = self.filtered(
++                    lambda aal: aal.order_id.id != vals['order_id']
++                )
++
++            if vals.get('product_id'):
++                product_changed_aals = self.filtered(
++                    lambda aal: aal.product_id.id != vals['product_id']
++                )
++
++            product_or_order_changed_aals = order_changed_aals | product_changed_aals
++
++            res = super().write(vals)
++
++            # if order changed then we need to reassign accounts and partners
++            order_changed_aals._sync_so_accounts_and_partners()
++
++            product_or_order_changed_aals._unsync_so_lines()
++            product_or_order_changed_aals._sync_so_lines()
++        else:
++            res = super().write(vals)
++        return res
++
++    def _check_can_write(self, vals):
++        if self.filtered(
++            lambda aal: aal.reinvoice_move_id and aal.reinvoice_move_id.state != 'cancel'
++        ):
++            if any(field_name in vals for field_name in self._restricted_fields_when_invoiced()):
++                raise UserError(self._get_invoiced_line_write_error())
++
++        if 'unit_amount' in vals and vals['unit_amount'] < 0 and self.so_line:
++            raise UserError(self.env._("You cannot set a negative quantity on services."))
++
++        super()._check_can_write(vals)
++
++    def _restricted_fields_when_invoiced(self):
++        return ['unit_amount', 'order_id', 'product_id', 'so_line', 'date', 'partner_id']
++
++    def _get_invoiced_line_write_error(self):
++        return self.env._("You cannot modify already invoiced services.")
++
++    @api.ondelete(at_uninstall=False)
++    def _unlink_so_lines_except_invoiced(self):
++        """Cleanup related sale order lines when analytic lines are deleted.
++
++        Analytic lines linked to a posted invoice cannot be removed.
++
++        For other lines, the related sale order line is deleted only if its
++        delivery method is manual. Lines originating from timesheets or
++        expenses are left unchanged.
++        """
++        if any(
++            line.reinvoice_move_id and line.reinvoice_move_id.state == 'posted' for line in self
++        ):
++            raise UserError(self._get_invoiced_line_delete_error())
++        self._unsync_so_lines()
++
++    def _get_invoiced_line_delete_error(self):
++        return self.env._("You cannot remove already invoiced services.")
++
++    def _sync_so_lines(self):
++        """Ensure that a corresponding sale order line exists and is synchronized
++        with the current analytic line.
++
++        Depending on the product's expense policy:
++
++        - For 'cost' policy:
++          A new sale order line with product's cost is always created with delivered quantity
++          equal to the analytic line's unit amount.
++
++        - For 'sales_price' policy:
++          The method first attempts to find an existing sale order line
++          matching the product. If found, its delivered quantity is recomputed.
++          Otherwise, a new sale order line is created with product's sales price.
++
++        The analytic line is then linked to the resulting sale order line.
++        """
++        for line in self:
++            if not line.order_id or not line.product_id:
++                continue
++
++            so_line = self.env['sale.order.line']
++            if line.product_id.expense_policy == 'sales_price':
++                so_line = line._get_existing_so_line()
++            line.so_line = so_line or line._create_so_line()
++
++    def _get_existing_so_line(self):
++        """Retrieve the first matching sale order line from the related order, if any."""
++        self.ensure_one()
++        return self.order_id.order_line.filtered(
++            lambda line: line.product_id == self.product_id
++            and line.product_uom_id == self.product_uom_id
++            and line._is_reinvoicing_line()
++        )[:1]
++
++    def _create_so_line(self):
++        """Create a new sale order line corresponding to this analytic line.
++
++        The created line is initialized with delivered quantity based on the
++        analytic line amount, unit price derived from the product's expense
++        policy, and an optional custom description.
++
++        :rtype: sale.order.line
++        :return: The newly created sale order line record.
++        """
++        self.ensure_one()
++        values = {
++            'order_id': self.order_id.id,
++            'product_id': self.product_id.id,
++            'product_uom_id': self.product_uom_id.id,
++            'product_uom_qty': 0,
++        }
++
++        if self.product_id.expense_policy == 'cost':
++            product = self.product_id.with_company(self.order_id.company_id)
++            values['price_unit'] = product.currency_id._convert(
++                product.standard_price, self.order_id.currency_id, round=False
++            )
++
++        return self.env['sale.order.line'].create(values)
++
++    def _unsync_so_lines(self):
++        """Revert synchronization of delivered quantities on related sale order lines.
++
++        If the linked sale order line has an expense policy of `cost` and no
++        ordered quantity, it indicates that the line was created solely for
++        reinvoicing purposes and can be safely removed.
++        If not, the analytic line update will automatically trigger the recomputation
++        of the `qty_delivered` field on the linked so lines .
++        """
++        for line in self.filtered(lambda line: line.so_line):
++            if not line.so_line._is_reinvoicing_line():
++                continue
++            if (
++                line.product_id.expense_policy == 'cost'
++                and not line.so_line.product_uom_qty
++                and line.unit_amount == line.so_line.qty_delivered
++            ):
++                line.so_line.unlink()
++
++    def _sync_so_accounts_and_partners(self):
++        """Synchronize analytic account fields and partner with the related sale order.
++
++        This method ensures that each analytic line is linked to the correct
++        analytic account derived from its associated sale order.
++
++        The analytic account is retrieved (or created if necessary) using
++        the analytic plan dedicated to sale orders. If that plan no longer
++        exists, the project plan is used as a fallback.
++
++        Since analytic plans are stored as dynamic columns on the analytic
++        line model, the method determines the effective column name based
++        on the plan actually used and assigns the corresponding analytic
++        account to that field.
++        """
++        if not self:
++            return
++
++        plan_id = self.env.ref('sale.analytic_plan_sale_orders', raise_if_not_found=False)
++        if not plan_id:
++            plan_id, _other_plans = self.env['account.analytic.plan']._get_all_plans()
++        column_name = plan_id._column_name()
++
++        for line in self:
++            line.partner_id = line.order_id.partner_id
++            analytic_account = line.order_id._get_or_create_analytic_account(plan_id)
++            used_plan_id = analytic_account.plan_id
++
++            effective_column_name = column_name
++            if used_plan_id != plan_id:
++                effective_column_name = used_plan_id._column_name()
++
++            line[effective_column_name] = analytic_account.id
+
+--- a/addons/sale/models/account_move.py
++++ b/addons/sale/models/account_move.py
+@@ -1,5 +1,6 @@
+ # Part of Odoo. See LICENSE file for full copyright and licensing details.
+ from odoo import _, api, fields, models
++from odoo.fields import Domain
+ from odoo.tools import groupby, OrderedSet
+ 
+ 
+@@ -22,6 +23,7 @@ class AccountMove(models.Model):
+         "Sale Warning",
+         help="Internal warning for the partner or the products as set by the user.",
+         compute="_compute_sale_warning_text")
++    service_line_count = fields.Integer(compute="_compute_service_line_count")
+ 
+     def unlink(self):
+         downpayment_lines = self.mapped('line_ids.sale_line_ids').filtered(lambda line: line.is_downpayment and line.invoice_lines <= self.mapped('line_ids'))
+@@ -48,6 +50,16 @@ class AccountMove(models.Model):
+         for move in self:
+             move.sale_order_count = len(move.line_ids.sale_line_ids.order_id)
+ 
++    def _domain_services_analytic_line(self):
++        return Domain('reinvoice_move_id', 'in', self.ids)
++
++    @api.depends('line_ids.sale_line_ids')
++    def _compute_service_line_count(self):
++        for move in self:
++            move.service_line_count = self.env['account.analytic.line'].search_count(
++                move._domain_services_analytic_line(),
++            )
++
+     @api.depends('partner_id.name', 'partner_id.sale_warn_msg', 'invoice_line_ids.product_id.sale_line_warn_msg', 'invoice_line_ids.product_id.display_name')
+     def _compute_sale_warning_text(self):
+         if not self.env.user.has_group('sale.group_warning_sale'):
+@@ -161,6 +173,12 @@ class AccountMove(models.Model):
+             result = {'type': 'ir.actions.act_window_close'}
+         return result
+ 
++    def action_view_services_analytic_lines(self):
++        self.ensure_one()
++        result = self.env['ir.actions.act_window']._for_xml_id('sale.action_service_material')
++        result['domain'] = self._domain_services_analytic_line()
++        return result
++
+     def _is_downpayment(self):
+         # OVERRIDE
+         self.ensure_one()
+@@ -204,3 +222,39 @@ class AccountMove(models.Model):
+             )
+             exclude_amount += order_amount_company
+         return exclude_amount
++
++    def _link_analytic_lines_to_invoice(self):
++        """Link analytic lines originating from a sale order to the corresponding invoice.
++
++        When an invoice is generated from a sale order, this method associates all
++        related analytic lines with the invoice by setting their `reinvoice_move_id` field.
++
++        This allows tracking which analytic entries have already been invoiced.
++        """
++        invoices = self.filtered(lambda i: i.move_type == 'out_invoice' and i.state == 'draft')
++        for invoice in invoices:
++            invoice._get_reinvoiced_analytic_lines_to_link().reinvoice_move_id = invoice
++
++    def _get_reinvoiced_analytic_lines_to_link(self):
++        # This method is kept separate because some modules require more granular control
++        # over how analytic lines are retrieved. Instead of aggregating all sale order lines
++        # from invoice lines at once, certain implementations need to search analytic lines
++        # per invoice line individually. See the override in `sale_subscription_timesheet`.
++        so_lines = self.invoice_line_ids.sale_line_ids.filtered(lambda line: line._is_line_reinvoicable())
++
++        return self.env['account.analytic.line'].sudo().search(
++            self._analytic_line_domain_get_invoiced_lines(so_lines)
++        )
++
++    @api.model
++    def _analytic_line_domain_get_invoiced_lines(self, so_lines):
++        return (
++            Domain('so_line', 'in', so_lines.ids)
++            & (
++                Domain('reinvoice_move_id', '=', False)
++                | Domain('reinvoice_move_id', 'any', (
++                    Domain('payment_state', '=', 'reversed')
++                    | (Domain('state', '=', 'cancel') & Domain('payment_state', '!=', 'invoicing_legacy')
++                )))
++            )
++        )
+
+--- a/addons/sale/models/sale_order.py
++++ b/addons/sale/models/sale_order.py
+@@ -361,6 +361,8 @@ class SaleOrder(models.Model):
+     show_update_pricelist = fields.Boolean(
+         string="Has Pricelist Changed", store=False)  # True if the pricelist was changed
+ 
++    analytic_account_id = fields.Many2one(string="Analytic Account", comodel_name='account.analytic.account')
++
+     _date_order_id_idx = models.Index("(date_order desc, id desc)")
+ 
+     #=== COMPUTE METHODS ===#
+@@ -1803,6 +1805,8 @@ class SaleOrder(models.Model):
+                 moves_to_switch.action_switch_move_type()
+                 self.invoice_ids._set_reversed_entry(moves_to_switch)
+ 
++        moves._link_analytic_lines_to_invoice()
++
+         for move in moves:
+             move.message_post_with_source(
+                 'mail.message_origin_link',
+@@ -2098,7 +2102,7 @@ class SaleOrder(models.Model):
+                 user_id=order.user_id.id or order.partner_id.user_id.id,
+                 note=_("Upsell %(order)s for customer %(customer)s", order=order_ref, customer=customer_ref))
+ 
+-    def _prepare_analytic_account_data(self, prefix=None):
++    def _prepare_analytic_account_data(self, prefix=None, plan_id=None):
+         """ Prepare SO analytic account creation values.
+ 
+         :return: `account.analytic.account` creation values
+@@ -2108,12 +2112,13 @@ class SaleOrder(models.Model):
+         name = self.name
+         if prefix:
+             name = prefix + ": " + self.name
+-        project_plan, _other_plans = self.env['account.analytic.plan']._get_all_plans()
++        if not plan_id:
++            plan_id, _other_plans = self.env['account.analytic.plan']._get_all_plans()
+         return {
+             'name': name,
+             'code': self.client_order_ref,
+             'company_id': self.company_id.id,
+-            'plan_id': project_plan.id,
++            'plan_id': plan_id.id,
+             'partner_id': self.partner_id.id,
+         }
+ 
+@@ -2269,6 +2274,15 @@ class SaleOrder(models.Model):
+             for line in order.order_line:
+                 line.qty_delivered = line.product_uom_qty
+ 
++    def _get_or_create_analytic_account(self, plan_id):
++        self.ensure_one()
++
++        if not self.analytic_account_id:
++            self.analytic_account_id = self.env['account.analytic.account'].create(
++                self._prepare_analytic_account_data(plan_id=plan_id)
++            )
++        return self.analytic_account_id
++
+     # === CATALOG === #
+ 
+     def _get_product_catalog_order_data(self, products, **kwargs):
+
+--- a/addons/sale/models/sale_order_line.py
++++ b/addons/sale/models/sale_order_line.py
+@@ -904,7 +904,7 @@ class SaleOrderLine(models.Model):
+     def _compute_customer_lead(self):
+         self.customer_lead = 0.0
+ 
+-    @api.depends('is_expense')
++    @api.depends('is_expense', 'product_id')
+     def _compute_qty_delivered_method(self):
+         """ Sale module compute delivered qty for product [('type', 'in', ['consu']), ('service_type', '=', 'manual')]
+                 - consu + expense_policy : analytic (sum of analytic unit_amount)
+@@ -914,17 +914,34 @@ class SaleOrderLine(models.Model):
+             This is true when only sale is installed: sale_stock redifine the behavior for 'consu' type,
+             and sale_timesheet implements the behavior of 'service' + service_type=timesheet.
+         """
++        self.qty_delivered_method = 'manual'
+         for line in self:
+             if line.is_expense:
+                 line.qty_delivered_method = 'analytic'
+-            else:  # service and consu
+-                line.qty_delivered_method = 'manual'
++            elif line.product_id.type == 'service':
++                line.qty_delivered_method = line.product_id.service_type
++            elif line.product_id.type == 'consu':
++                line.qty_delivered_method = line._get_consu_qty_delivered_method()
++
++            # If product has a reinvoice policy and no specific delivered method, its delivered
++            # quantities should still be computed through analytic lines.
++            # For other delivery methods, they are expected to add their own quantities to the
++            # quantities already provided by the `_prepare_qty_delivered` method, including
++            # analytic lines quantities for reinvoiceable products.
++            if line.qty_delivered_method == 'manual' and line.product_id.expense_policy != 'no':
++                line.qty_delivered_method = 'analytic'
++
++    def _get_consu_qty_delivered_method(self):
++        return 'manual'
+ 
+     @api.depends(
+         'qty_delivered_method',
++        'analytic_line_ids',
+         'analytic_line_ids.so_line',
+         'analytic_line_ids.unit_amount',
+-        'analytic_line_ids.product_uom_id')
++        'analytic_line_ids.product_uom_id',
++        'analytic_line_ids.product_id',
++    )
+     def _compute_qty_delivered(self):
+         """ This method compute the delivered quantity of the SO lines: it covers the case provide by sale module, aka
+             expense/vendor bills (sum of unit_amount of AAL), and manual case.
+@@ -952,12 +969,19 @@ class SaleOrderLine(models.Model):
+     def _prepare_qty_delivered(self):
+         # compute for analytic lines
+         delivered_qties = defaultdict(float)
+-        lines_by_analytic = self.filtered(lambda sol: sol.qty_delivered_method == 'analytic')
+-        mapping = lines_by_analytic._get_delivered_quantity_by_analytic([('amount', '<=', 0.0)])
++        lines_by_analytic = self.filtered(
++            lambda sol: sol.qty_delivered_method == 'analytic' or sol._is_reinvoicing_line()
++        )
++        domain = lines_by_analytic._get_delivered_quantity_by_analytic_domain()
++        mapping = lines_by_analytic._get_delivered_quantity_by_analytic(domain)
+         for so_line in lines_by_analytic:
+             delivered_qties[so_line] = mapping.get(so_line.id or so_line._origin.id, 0.0)
+         return delivered_qties
+ 
++    @api.model
++    def _get_delivered_quantity_by_analytic_domain(self):
++        return Domain('amount', '<=', 0.0)
++
+     def _get_downpayment_state(self):
+         self.ensure_one()
+ 
+@@ -1464,6 +1488,8 @@ class SaleOrderLine(models.Model):
+         * Lines cannot be deleted if the order is confirmed.
+         * Down payment lines who have not yet been invoiced bypass that exception.
+         * Sections and Notes can always be deleted.
++        * Lines with expense policy `cost` and an ordered quantity 0 bypass this restriction
++          when deleted from the services and material view.
+ 
+         :returns: Sales Order Lines that cannot be deleted
+         :rtype: `sale.order.line` recordset
+@@ -1473,6 +1499,12 @@ class SaleOrderLine(models.Model):
+                 line.state == 'sale'
+                 and (line.invoice_lines or not line.is_downpayment)
+                 and not line.display_type
++                and not (
++                    self.env.context.get('from_services_and_material')
++                    and not line.product_uom_qty
++                    and len(line.analytic_line_ids) == 1
++                    and line.analytic_line_ids.unit_amount == line.qty_delivered
++                )
+         )
+ 
+     @api.ondelete(at_uninstall=False)
+@@ -1838,3 +1870,25 @@ class SaleOrderLine(models.Model):
+     def _get_rounding(self):
+         self.ensure_one()
+         return self.product_uom_id.rounding
++
++    def _is_reinvoicing_line(self):
++        self.ensure_one()
++        return (
++            not self.is_expense
++            and self.product_id.expense_policy != 'no'
++            and self.qty_delivered_method != 'manual'
++        )
++
++    def _is_line_reinvoicable(self):
++        """Determine whether this sale order line should be used to retrieve analytic lines
++        to be linked to the generated invoice.
++
++        Only non-expense lines invoiced based on delivered quantities are considered
++        valid sources for analytic line reinvoicing.
++        """
++        self.ensure_one()
++        return (
++            not self.is_expense
++            and self.product_id.invoice_policy == 'delivery'
++            and self.product_id.expense_policy != 'no'
++        )

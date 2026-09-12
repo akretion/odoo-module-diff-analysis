@@ -1,0 +1,1267 @@
+PR: https://github.com/odoo/odoo/pull/246700
+
+From: 31b77987ad1d1dc9552043e08cb563fd866c6ef5
+From: Ziri
+Date: 2026-06-19 12:58:32
+
+Breaking data model changes scores: del:8.8 + add:0, change matches:
+-    attendance_ids_1st_week = fields.One2many('resource.calendar.attendance', 'calendar_id', 'Working Time 1st Week',
+-    attendance_ids_2nd_week = fields.One2many('resource.calendar.attendance', 'calendar_id', 'Working Time 2nd Week',
+-    two_weeks_calendar = fields.Boolean(string="Calendar in 2 weeks mode")
+-    two_weeks_explanation = fields.Char('Explanation', compute="_compute_two_weeks_explanation")
+-    hour_from = fields.Float(string='Work from', default=0, required=True, index=True,
++    hour_from = fields.Float(string='Work from', compute="_compute_hours", store=True, default=0,
+-    hour_to = fields.Float(string='Work to', default=0, required=True)
++    hour_to = fields.Float(string='Work to', compute="_compute_hours", store=True, default=0,
+-    week_type = fields.Selection([
+-    two_weeks_calendar = fields.Boolean("Calendar in 2 weeks mode", related='calendar_id.two_weeks_calendar')
+
+Total Changes: 1020
+
+[IMP] resource: variable resource calendar
+
+This commit introduces the variable resource calendar. It's a type of working
+schedule where the user can specify exactly the date of an attendance. So
+instead of a Monday weekly attendance it can now be a 9 Feb 2026 attendance or
+an attendance every 4 days (supports many types of recurrencies).
+
+This replaces the old two weeks calendar offering more flexibility when
+designing working schedules.
+
+task-5452644
+odoo/enterprise#106129
+
+closes odoo/odoo#246700
+
+Related: odoo/upgrade#9396
+Signed-off-by: Mathias Lebel (lebm) <lebm@odoo.com>
+Co-authored-by: lebm-odoo <lebm@odoo.com>
+
+================================= pseudo patch: =================================
+
+--- a/addons/resource/models/resource_calendar.py
++++ b/addons/resource/models/resource_calendar.py
+@@ -10,10 +10,10 @@ from dateutil.relativedelta import relativedelta
+ from dateutil.rrule import DAILY, rrule
+ 
+ from odoo import api, fields, models
+-from odoo.exceptions import ValidationError, UserError
++from odoo.exceptions import UserError
+ from odoo.fields import Command, Domain
+ from odoo.tools import float_compare
+-from odoo.tools.date_utils import end_of, float_to_time, localized, to_timezone, start_of
++from odoo.tools.date_utils import float_to_time, localized, to_timezone
+ from odoo.tools.float_utils import float_round
+ from odoo.tools.intervals import Intervals
+ 
+@@ -37,12 +37,6 @@ class ResourceCalendar(models.Model):
+         res = super().default_get(fields)
+         if not res.get('name') and res.get('company_id'):
+             res['name'] = self.env._('Working Hours of %s', self.env['res.company'].browse(res['company_id']).name)
+-        if 'attendance_ids' in fields and not res.get('attendance_ids'):
+-            company_id = res.get('company_id', self.env.company.id)
+-            company = self.env['res.company'].browse(company_id)
+-            res["attendance_ids"] = self._get_default_attendance_ids(company)
+-            if company.resource_calendar_id.two_weeks_calendar:
+-                res["two_weeks_calendar"] = True
+         if 'full_time_required_hours' in fields and not res.get('full_time_required_hours'):
+             company_id = res.get('company_id', self.env.company.id)
+             company = self.env['res.company'].browse(company_id)
+@@ -53,12 +47,8 @@ class ResourceCalendar(models.Model):
+     active = fields.Boolean("Active", default=True,
+                             help="If the active field is set to false, it will allow you to hide the Working Time without removing it.")
+     attendance_ids = fields.One2many(
+-        'resource.calendar.attendance', 'calendar_id', 'Working Time',
++        'resource.calendar.attendance', 'calendar_id', 'Working Time', precompute=True,
+         compute='_compute_attendance_ids', store=True, readonly=False, copy=True)
+-    attendance_ids_1st_week = fields.One2many('resource.calendar.attendance', 'calendar_id', 'Working Time 1st Week',
+-        compute="_compute_two_weeks_attendance", inverse="_inverse_two_weeks_calendar")
+-    attendance_ids_2nd_week = fields.One2many('resource.calendar.attendance', 'calendar_id', 'Working Time 2nd Week',
+-        compute="_compute_two_weeks_attendance", inverse="_inverse_two_weeks_calendar")
+     company_id = fields.Many2one(
+         'res.company', 'Company', domain=lambda self: [('id', 'in', self.env.companies.ids)],
+         default=lambda self: self.env.company, index='btree_not_null')
+@@ -75,65 +65,90 @@ class ResourceCalendar(models.Model):
+         compute='_compute_global_leave_ids', store=True, readonly=False,
+         domain=[('resource_id', '=', False)],
+     )
+-    hours_per_day = fields.Float("Average Hour per Day", store=True, compute="_compute_hours_per_day", digits=(2, 2), readonly=False,
++    days_per_week = fields.Float("Days per Week", compute="_compute_days_per_week", store=True, digits=(10, 5), readonly=False)
++    hours_per_day = fields.Float("Average Hour per Day", store=True, compute="_compute_hours_per_day", digits=(10, 5),
+         help="Average hours per day a resource is supposed to work with this calendar.")
+     hours_per_week = fields.Float(
+         string="Hours per Week",
+-        compute="_compute_hours_per_week", store=True, readonly=False, copy=False)
++        compute="_compute_hours_per_week", store=True, digits=(10, 5), readonly=False, copy=False)
+     is_fulltime = fields.Boolean(compute='_compute_is_fulltime', string="Is Full Time")
+-    two_weeks_calendar = fields.Boolean(string="Calendar in 2 weeks mode")
+-    two_weeks_explanation = fields.Char('Explanation', compute="_compute_two_weeks_explanation")
+     work_resources_count = fields.Integer("Work Resources count", compute='_compute_work_resources_count')
+     work_time_rate = fields.Float(string='Work Time Rate', compute='_compute_work_time_rate', store=True,
+         help='Work time rate versus full time working schedule, should be between 0 and 100 %.')
+-
+-    # --------------------------------------------------
+-    # Constrains
+-    # --------------------------------------------------
+-
+-    @api.constrains('attendance_ids')
+-    def _check_attendance_ids(self):
+-        for res_calendar in self:
+-            # Avoid superimpose in attendance
+-            attendance_ids = res_calendar.attendance_ids
+-            if res_calendar.two_weeks_calendar:
+-                res_calendar._check_overlap(attendance_ids.filtered(lambda attendance: attendance.week_type == '0'))
+-                res_calendar._check_overlap(attendance_ids.filtered(lambda attendance: attendance.week_type == '1'))
+-            else:
+-                res_calendar._check_overlap(attendance_ids)
++    calendar_type = fields.Selection([
++        ('fixed', 'Fixed'),
++        ('variable', 'Variable')],
++        string='Calendar Type', default='fixed', required=True)
++
++    def _get_attendances_to_unlink(self, next_calendar_type=None):
++        """ To retrieve attendances with date, to unlink when the calendar will be/is fixed
++            Or attendance without date, to unlink when the calendar will be/is variable"""
++        return self.attendance_ids.filtered(lambda a: a.date if (next_calendar_type or a.calendar_id.calendar_type) == "fixed" else not a.date)
++
++    def _convert_single_occurrence_recurrencies(self):
++        """Convert recurrent attendances with only one visible occurrence into ad-hoc attendances."""
++        def _has_single_remaining_occurrence(att):
++            if not att.recurrency or not att.date or att.recurrency_end_type == 'forever':
++                return False
++            excluded = set(att.recurrency_excluded_occurences or [])
++            delta = timedelta(**{att.recurrency_type: att.recurrency_interval})
++            current = att.date + delta
++            while current <= att.recurrency_until:
++                if fields.Date.to_string(current) not in excluded:
++                    return False
++                current += delta
++            return True
++
++        single_occurrence = self.attendance_ids.filtered(_has_single_remaining_occurrence)
++        single_occurrence.write({'recurrency': False, 'recurrency_excluded_occurences': False})
++
++    def _clean_excluded_occurrences(self):
++        """Remove stale or duplicate entries from recurrency_excluded_occurences.
++
++        Removes dates before the attendance start, dates past recurrency_until,
++        dates that don't fall on a valid recurrency occurrence, and duplicates —
++        in a single pass per attendance.
++        """
++        for att in self.attendance_ids.filtered(lambda a: a.recurrency and a.recurrency_excluded_occurences and a.date):
++            date_str = fields.Date.to_string(att.date)
++            until_str = fields.Date.to_string(att.recurrency_until) if att.recurrency_end_type != 'forever' else None
++            seen = set()
++            cleaned = []
++            for d in att.recurrency_excluded_occurences:
++                if d < date_str or (until_str and d > until_str) or d in seen:
++                    continue
++                diff_days = (fields.Date.from_string(d) - att.date).days
++                if att.recurrency_type == 'days' and diff_days % att.recurrency_interval:
++                    continue
++                if att.recurrency_type == 'weeks' and (diff_days % 7 or (diff_days // 7) % att.recurrency_interval):
++                    continue
++                seen.add(d)
++                cleaned.append(d)
++            if cleaned != att.recurrency_excluded_occurences:
++                att.recurrency_excluded_occurences = cleaned
++
++    def _calendar_clean_up(self):
++        """Clean up attendance records that should not be kept."""
++        calendars = self or self.search([])
++        calendars._get_attendances_to_unlink().unlink()
++        calendars._clean_excluded_occurrences()
++        calendars._convert_single_occurrence_recurrencies()
+ 
+     # --------------------------------------------------
+     # Compute Methods
+     # --------------------------------------------------
+ 
+-    @api.depends('two_weeks_calendar')
+-    def _compute_two_weeks_attendance(self):
+-        for calendar in self:
+-            if not calendar.two_weeks_calendar:
+-                continue
+-            calendar.attendance_ids_1st_week = calendar.attendance_ids.filtered(lambda a: a.week_type == '0')
+-            calendar.attendance_ids_2nd_week = calendar.attendance_ids.filtered(lambda a: a.week_type == '1')
+-
+-    def _inverse_two_weeks_calendar(self):
+-        for calendar in self:
+-            if not calendar.two_weeks_calendar:
+-                continue
+-            calendar.attendance_ids = calendar.attendance_ids_1st_week + calendar.attendance_ids_2nd_week
+-
+     @api.depends('hours_per_week', 'company_id.resource_calendar_id.hours_per_week')
+     def _compute_full_time_required_hours(self):
+         for calendar in self.filtered("company_id"):
+             calendar.full_time_required_hours = calendar.company_id.resource_calendar_id.hours_per_week
+ 
+-    @api.depends('company_id')
++    @api.depends('company_id', 'calendar_type')
+     def _compute_attendance_ids(self):
+-        for calendar in self.filtered(lambda c: not c._origin or (c._origin.company_id != c.company_id and c.company_id)):
+-            company_calendar = calendar.company_id.resource_calendar_id
+-            calendar.update({
+-                'two_weeks_calendar': company_calendar.two_weeks_calendar,
+-                'attendance_ids': [(5, 0, 0)] + [
+-                    (0, 0, attendance._copy_attendance_vals()) for attendance in company_calendar.attendance_ids],
+-            })
++        for calendar in self:
++            calendar_changed = calendar._origin and calendar._origin.company_id != calendar.company_id
++            if (not calendar.id or calendar_changed) and calendar.calendar_type == "fixed" and not calendar.attendance_ids:
++                calendar.attendance_ids = calendar._get_default_attendance_ids(calendar.company_id)
+ 
+     @api.depends('company_id')
+     def _compute_global_leave_ids(self):
+@@ -143,32 +158,26 @@ class ResourceCalendar(models.Model):
+                     (0, 0, leave._copy_leave_vals()) for leave in calendar.company_id.resource_calendar_id.global_leave_ids],
+             })
+ 
+-    @api.depends('attendance_ids', 'attendance_ids.hour_from', 'attendance_ids.hour_to', 'two_weeks_calendar')
++    @api.depends('attendance_ids.dayofweek', 'calendar_type')
++    def _compute_days_per_week(self):
++        for calendar in self:
++            if calendar.calendar_type == 'variable':
++                continue
++            calendar.days_per_week = len(set(calendar._get_working_attendances().mapped('dayofweek')))
++
++    @api.depends('days_per_week', 'hours_per_week')
+     def _compute_hours_per_day(self):
+-        """ Compute the average hours per day.
+-            Cannot directly depend on hours_per_week because of rounding issues. """
+         for calendar in self:
+-            calendar.hours_per_day = float_round(calendar._get_hours_per_day(), precision_digits=2)
++            calendar.hours_per_day = calendar.hours_per_week / calendar.days_per_week if calendar.days_per_week else 0
+ 
+-    @api.depends('attendance_ids', 'attendance_ids.hour_from', 'attendance_ids.hour_to', 'two_weeks_calendar')
++    @api.depends('attendance_ids.duration_hours', 'calendar_type')
+     def _compute_hours_per_week(self):
+         """ Compute the average hours per week """
+         for calendar in self:
+-            calendar.hours_per_week = float_round(calendar._get_hours_per_week(), precision_digits=2)
+-
+-    @api.depends('two_weeks_calendar')
+-    def _compute_two_weeks_explanation(self):
+-        today = fields.Date.context_today(self)
+-        week_type = self.env['resource.calendar.attendance'].get_week_type(today)
+-        week_type_str = self.env._("even") if week_type else self.env._("odd")
+-        first_day = start_of(today, 'week')
+-        last_day = end_of(today, 'week')
+-        self.two_weeks_explanation = self.env._(
+-            "The current week (from %(first_day)s to %(last_day)s) corresponds to %(number)s week.",
+-            first_day=first_day,
+-            last_day=last_day,
+-            number=week_type_str,
+-        )
++            if calendar.calendar_type == 'variable':
++                continue
++            attendances = calendar._get_working_attendances()
++            calendar.hours_per_week = sum(attendances.mapped('duration_hours'))
+ 
+     def _compute_work_resources_count(self):
+         resources_per_calendar = dict(self.env['resource.resource']._read_group(
+@@ -191,21 +200,20 @@ class ResourceCalendar(models.Model):
+             else:
+                 calendar.work_time_rate = 1.0
+ 
+-    # --------------------------------------------------
+-    # Actions
+-    # --------------------------------------------------
+-
+-    def switch_calendar_type(self):
++    def is_calendar_referenced(self):
+         self.ensure_one()
+-        if not self.two_weeks_calendar:
+-            self.two_weeks_calendar = True
+-            final_attendances = self._get_two_weeks_attendance()
+-            self.attendance_ids = [Command.clear()] + final_attendances
+-
+-        else:
+-            self.two_weeks_calendar = False
+-            self.attendance_ids.unlink()
+-            self.attendance_ids = self._get_default_attendance_ids(self.company_id)
++        relations = self.env['ir.model.fields'].sudo().search([
++            ('ttype', '=', 'many2one'),
++            ('store', '=', True),
++            ('model', 'not ilike', 'resource.calendar'),
++            ('model_id.abstract', '=', False),
++            ('relation', '=', "resource.calendar")
++        ])
++        for field in relations:
++            count = self.env[field.model].sudo().search_count([(field.name, '=', self.id)], limit=1)
++            if count:
++                return True
++        return False
+ 
+     # --------------------------------------------------
+     # Overrides
+@@ -215,6 +223,17 @@ class ResourceCalendar(models.Model):
+         vals_list = super().copy_data(default=default)
+         return [dict(vals, name=self.env._("%s (copy)", calendar.name)) for calendar, vals in zip(self, vals_list)]
+ 
++    @api.model_create_multi
++    def create(self, vals_list):
++        calendars = super().create(vals_list)
++        calendars._get_attendances_to_unlink().unlink()
++        return calendars
++
++    def write(self, vals):
++        res = super().write(vals)
++        self._get_attendances_to_unlink().unlink()
++        return res
++
+     # --------------------------------------------------
+     # Computation API
+     # --------------------------------------------------
+@@ -229,29 +248,6 @@ class ResourceCalendar(models.Model):
+         if not resources_per_tz:
+             resources_per_tz = {start_dt.tzinfo: self.env['resource.resource']}
+ 
+-        attendances_domain = Domain.AND([
+-            Domain(domain or Domain.TRUE),
+-            Domain('calendar_id', '=', self.id),
+-        ])
+-
+-        attendances = self.env['resource.calendar.attendance'].search(attendances_domain)
+-        duration_based_attendances = attendances.filtered('duration_based')
+-        all_duration_based_attendances = attendances.calendar_id.attendance_ids.filtered('duration_based')
+-        # Resource specific attendances
+-        # Calendar attendances per day of the week
+-        # * 7 days per week * 2 for two week calendars
+-        attendances_per_day = [self.env['resource.calendar.attendance']] * 7 * 2
+-        weekdays = set()
+-        for attendance in attendances:
+-            weekday = int(attendance.dayofweek)
+-            weekdays.add(weekday)
+-            if self.two_weeks_calendar:
+-                weektype = int(attendance.week_type)
+-                attendances_per_day[weekday + 7 * weektype] |= attendance
+-            else:
+-                attendances_per_day[weekday] |= attendance
+-                attendances_per_day[weekday + 7] |= attendance
+-
+         start = start_dt.astimezone(UTC)
+         end = end_dt.astimezone(UTC)
+         bounds_per_tz = {
+@@ -262,30 +258,27 @@ class ResourceCalendar(models.Model):
+         for low, high in bounds_per_tz.values():
+             start = min(start, low.replace(tzinfo=UTC))
+             end = max(end, high.replace(tzinfo=UTC))
++
++        domain = Domain(domain or Domain.TRUE)
++        if self:
++            attendances_per_day = self._get_attendances_by_date(start.date(), end.date(), domain)
++        else:
++            attendances_per_day = defaultdict(lambda: self.env['resource.calendar.attendance'])
++
+         # Generate once with utc as timezone
+-        days = rrule(DAILY, start.date(), until=end.date(), byweekday=weekdays)
+         base_result = []
+-        for day in days:
+-            week_type = self.env['resource.calendar.attendance'].get_week_type(day)
+-            attendances = attendances_per_day[day.weekday() + 7 * week_type]
+-
++        for day, all_attendances in attendances_per_day.items():
+             # If all attendance lines are duration based, compute correct intervals
++            all_duration_based_attendances = all_attendances.filtered('duration_based')
++            attendances = all_attendances.filtered(domain)
+             if all(att.duration_based for att in attendances):
+-                if not self.two_weeks_calendar:
+-                    week_type = False
+-                else:
+-                    week_type = str(week_type)
+-                day_all_duration_based_attendances = all_duration_based_attendances.filtered(
+-                    lambda att: int(att.dayofweek) == day.weekday() and att.week_type == week_type)
+-                day_duration_based_attendances = duration_based_attendances.filtered(
+-                    lambda att: int(att.dayofweek) == day.weekday() and att.week_type == week_type)
+-                total_hours = sum(day_all_duration_based_attendances.mapped('duration_hours'))
++                total_hours = sum(all_duration_based_attendances.mapped('duration_hours'))
+                 hours_per_attendance = {}
+                 current_hour_from = 12 - total_hours / 2
+-                for att in day_all_duration_based_attendances:
++                for att in all_duration_based_attendances:
+                     hours_per_attendance[att] = (current_hour_from, current_hour_from + att.duration_hours)
+                     current_hour_from += att.duration_hours
+-                for att in day_duration_based_attendances:
++                for att in attendances:
+                     hour_from, hour_to = hours_per_attendance[att]
+                     day_from = datetime.combine(day, float_to_time(hour_from))
+                     day_to = datetime.combine(day, float_to_time(hour_to))
+@@ -535,30 +528,6 @@ class ResourceCalendar(models.Model):
+             result[resource.id] = full_interval_UTC - utc_work_intervals
+         return result
+ 
+-    # --------------------------------------------------
+-    # Private Methods / Helpers
+-    # --------------------------------------------------
+-
+-    def _check_overlap(self, attendance_ids):
+-        """ attendance_ids correspond to attendance of a week,
+-            will check for each day of week that there are no superimpose. """
+-        result = []
+-        hours_based_weekdays = set()
+-        duration_based_weekdays = set()
+-        for attendance in attendance_ids:
+-            if attendance.duration_based and attendance.dayofweek in hours_based_weekdays or not attendance.duration_based and attendance.dayofweek in duration_based_weekdays:
+-                raise ValidationError(self.env._("You cannot define hours and duration based attendances for the same day."))
+-            if attendance.duration_based:
+-                duration_based_weekdays.add(attendance.dayofweek)
+-            else:
+-                hours_based_weekdays.add(attendance.dayofweek)
+-                # 0.000001 is added to each start hour to avoid to detect two contiguous intervals as superimposing.
+-                # Indeed Intervals function will join 2 intervals with the start and stop hour corresponding.
+-                result.append((int(attendance.dayofweek) * 24 + attendance.hour_from + 0.000001, int(attendance.dayofweek) * 24 + attendance.hour_to, attendance))
+-
+-        if len(Intervals(result)) != len(result):
+-            raise ValidationError(self.env._("Attendances can't overlap."))
+-
+     def _get_attendance_intervals_days_data(self, attendance_intervals):
+         """
+         helper function to compute duration of `intervals` that have
+@@ -579,10 +548,11 @@ class ResourceCalendar(models.Model):
+             interval_hours = (stop - start).total_seconds() / 3600
+             day_hours[start.date()] += interval_hours
+ 
++        duration_based_attendances = self.attendance_ids.filtered('duration_based')
+         for day, hours in day_hours.items():
+-            if len(self) == 1 and self._is_duration_based_on_date(day):
+-                hours_per_day = self._get_duration_based_work_hours_on_date(day)
+-                day_days[start.date()] += hours / hours_per_day if hours_per_day else 0
++            if attendances := duration_based_attendances._filter_by_date(day):
++                hours_per_day = sum(attendances.mapped('duration_hours'))
++                day_days[day] += hours / hours_per_day if hours_per_day else 0
+             else:
+                 day_days[day] = 0.5 if hours <= self.hours_per_day * 3 / 4 else 1
+ 
+@@ -628,35 +598,15 @@ class ResourceCalendar(models.Model):
+         )
+         return interval_dt(work_intervals[0]) if work_intervals else None
+ 
+-    def _get_days_per_week(self):
+-        # If the employee didn't work a full day, it is still counted, i.e. 19h / week (M/T/W(half day)) -> 3 days
+-        self.ensure_one()
+-        attendances = self._get_global_attendances()
+-        if not self.two_weeks_calendar:
+-            return len(set(attendances.mapped('dayofweek')))
+-        number_of_days = len(set(attendances.filtered(lambda cal: cal.week_type == '1').mapped('dayofweek')))
+-        number_of_days += len(set(attendances.filtered(lambda cal: cal.week_type == '0').mapped('dayofweek')))
+-        return number_of_days / 2
+-
+-    def _get_hours_per_week(self):
+-        """ Calculate the average hours worked per week. """
+-        self.ensure_one()
+-        hour_count = 0.0
+-        for attendance in self._get_global_attendances():
+-            if attendance.duration_based:
+-                hour_count += attendance.duration_hours
+-            else:
+-                hour_count += attendance.hour_to - attendance.hour_from
+-        return hour_count / 2 if self.two_weeks_calendar else hour_count
+-
+-    def _get_hours_per_day(self):
+-        """ Calculate the average hours worked per workday. """
+-        hour_per_week = self._get_hours_per_week()
+-        number_of_days = self._get_days_per_week()
+-        return hour_per_week / number_of_days if number_of_days else 0
+-
+-    def _get_global_attendances(self):
+-        return self.attendance_ids
++    def _get_working_attendances(self):
++        # If the calendar is variable, we want all attendances that have a date.
++        # If the calendar is fixed, we want all attendances that don't have a date.
++        return self.attendance_ids.filtered(lambda attendance:
++            attendance._is_work_period() and (
++                (attendance.calendar_id.calendar_type == 'fixed' and not attendance.date) or
++                (attendance.calendar_id.calendar_type == 'variable' and attendance.date)
++            ),
++        )
+ 
+     def _get_unusual_days(self, start_dt, end_dt, company_id=False, resource=None):
+         if self:
+@@ -680,38 +630,17 @@ class ResourceCalendar(models.Model):
+ 
+     def _get_default_attendance_ids(self, company_id=None):
+         """ return a copy of the company's calendar attendance or default 40 hours/week """
+-        if company_id and (attendances := company_id.resource_calendar_id.attendance_ids):
+-            return [
+-                Command.create(attendance._copy_attendance_vals()) for attendance in attendances
+-            ]
+-        return [
+-            Command.create({'dayofweek': '0', 'duration_hours': 8, 'hour_from': 0, 'hour_to': 0}),
+-            Command.create({'dayofweek': '1', 'duration_hours': 8, 'hour_from': 0, 'hour_to': 0}),
+-            Command.create({'dayofweek': '2', 'duration_hours': 8, 'hour_from': 0, 'hour_to': 0}),
+-            Command.create({'dayofweek': '3', 'duration_hours': 8, 'hour_from': 0, 'hour_to': 0}),
+-            Command.create({'dayofweek': '4', 'duration_hours': 8, 'hour_from': 0, 'hour_to': 0}),
++        if company_id and company_id.resource_calendar_id.calendar_type == "fixed" and (attendances := company_id.resource_calendar_id.attendance_ids):
++            return [Command.clear()] + [Command.create(attendance) for attendance in attendances._to_dict()]
++        return [Command.clear()] + [
++            Command.create({'dayofweek': str(dayofweek), 'duration_hours': 8, 'hour_from': 0, 'hour_to': 0})
++            for dayofweek in range(5)
+         ]
+ 
+-    def _get_two_weeks_attendance(self):
+-        final_attendances = []
+-        for idx, att in enumerate(self.attendance_ids):
+-            final_attendances.append(Command.create(dict(att._copy_attendance_vals(), week_type='0', sequence=idx + 1)))
+-            final_attendances.append(Command.create(dict(att._copy_attendance_vals(), week_type='1', sequence=idx + 26)))
+-        return final_attendances
+-
+     # --------------------------------------------------
+     # External API
+     # --------------------------------------------------
+ 
+-    def get_attendances(self, target_date):
+-        if isinstance(target_date, datetime):
+-            target_date = target_date.date()
+-        self.ensure_one()
+-        weektype = False
+-        if self.two_weeks_calendar:
+-            weektype = str(self.env['resource.calendar.attendance'].get_week_type(target_date))
+-        return self.attendance_ids.filtered(lambda a: a.week_type == weektype and a.dayofweek == str(target_date.weekday()))
+-
+     def get_work_hours_count(self, start_dt, end_dt, compute_leaves=True, domain=None):
+         """
+             `compute_leaves` controls whether or not this method is taking into
+@@ -868,47 +797,62 @@ class ResourceCalendar(models.Model):
+         return revert(day_dt)
+ 
+     def _works_on_date(self, date):
+-        self.ensure_one()
++        return bool(self._get_working_attendances()._filter_by_date(date))
+ 
+-        working_days = self._get_working_hours()
+-        dayofweek = str(date.weekday())
+-        weektype = False
+-        if self.two_weeks_calendar:
+-            weektype = str(self.env['resource.calendar.attendance'].get_week_type(date))
+-        return working_days[weektype][dayofweek]
++    def _get_attendances_by_date(self, date_from, date_to, domain=None):
++        """
++        Get the attendances between date_from and date_to, grouped by day, as a recordset of resource.calendar.attendance.
++            - For variable schedule, only attendances with a date are considered. If an attendance has a recurrency rule, it will be repeated on the corresponding days.
++            - For fixed schedule, only attendances without a date are considered. They will be grouped by their dayofweek and returned on the corresponding days.
+ 
+-    def _is_duration_based_on_date(self, date):
+-        self.ensure_one()
+-        week_type = False
+-        if self.two_weeks_calendar:
+-            week_type = str(self.env['resource.calendar.attendance'].get_week_type(date))
+-        return bool(self.attendance_ids.filtered(lambda a: a.duration_based and int(a.dayofweek) == date.weekday() and a.week_type == week_type))
+-
+-    def _get_duration_based_work_hours_on_date(self, date):
+-        attendances_per_week_type = self.attendance_ids.filtered(lambda a: int(a.dayofweek) == date.weekday()).grouped('week_type')
+-        week_type = False
+-        if self.two_weeks_calendar:
+-            week_type = str(self.env['resource.calendar.attendance'].get_week_type(date))
+-        return sum(attendances_per_week_type[week_type].mapped('duration_hours'))
+-
+-    def _get_nb_working_day(self, start_date, stop_date):
++        :param date_from: start date of the period (included)
++        :param date_to: end date of the period (included)
++        :param domain: optional domain to filter attendances
++        """
+         self.ensure_one()
+-        schedule = self._get_working_hours()
+-        nb_of_work_days = 0
+-        if not self.two_weeks_calendar:
+-            for day in rrule(DAILY, dtstart=start_date, until=stop_date):
+-                nb_of_work_days += int(schedule[False][str(day.weekday())])
+-        else:
+-            for day in rrule(DAILY, dtstart=start_date, until=stop_date):
+-                week_type = str(self.env['resource.calendar.attendance'].get_week_type(day))
+-                nb_of_work_days += int(schedule[week_type][str(day.weekday())])
+-        return nb_of_work_days
++        result = defaultdict(lambda: self.env['resource.calendar.attendance'])
+ 
+-    @api.ormcache('self.id')
+-    def _get_working_hours(self):
+-        self.ensure_one()
++        domain_fixed = Domain([('date', '=', False)])
++        domain_variable_recurrency = Domain([
++            ('recurrency', '=', True),
++            ('date', '<=', date_to),
++            ('recurrency_until', '>=', date_from),
++        ])
++        domain_variable_adhoc = Domain([
++            ('recurrency', '=', False),
++            ('date', '>=', date_from),
++            ('date', '<=', date_to),
++        ])
++        domain_to_fetch = Domain.AND([
++            domain or Domain.TRUE,
++            Domain.OR([
++                domain_fixed,
++                domain_variable_recurrency,
++                domain_variable_adhoc,
++            ]),
++            Domain('calendar_id', '=', self.id),
++        ])
++        attendances = self.env["resource.calendar.attendance"].search_fetch(domain_to_fetch)
++        recurrent_attendances = attendances.filtered("recurrency")
++        ad_hoc_attendances = (attendances - recurrent_attendances).grouped(lambda a: a.date or a.dayofweek)
++        for day in rrule(DAILY, date_from, until=date_to):
++            result[day.date()] = ad_hoc_attendances.get(day.date(), self.env['resource.calendar.attendance'])
++            result[day.date()] += ad_hoc_attendances.get(str(day.weekday()), self.env['resource.calendar.attendance'])
++            result[day.date()] += recurrent_attendances._filter_by_date(day.date())
++        return result
+ 
+-        working_days = defaultdict(lambda: defaultdict(lambda: False))
+-        for attendance in self.attendance_ids:
+-            working_days[attendance.week_type][attendance.dayofweek] = True
+-        return working_days
++    def get_attendances(self, date_from, date_to, fields_to_fetch, domain=None):
++        date_from = fields.Date.from_string(date_from)
++        date_to = fields.Date.from_string(date_to)
++        attendances_per_date = self._get_attendances_by_date(date_from, date_to, domain)
++        formatted_attendances = defaultdict(self.env["resource.calendar.attendance"].browse)
++        for att_date, attendances in attendances_per_date.items():
++            new_formatted_attendances = attendances._read_format(fnames=fields_to_fetch)
++            for attendance in new_formatted_attendances:
++                if formatted_attendances[attendance['id']]:
++                    formatted_attendances[attendance['id']]['other_dates'].append(att_date)
++                else:
++                    attendance['date'] = att_date
++                    attendance['other_dates'] = []
++                    formatted_attendances[attendance['id']] = attendance
++        return list(formatted_attendances.values())
+
+--- a/addons/resource/models/resource_calendar_attendance.py
++++ b/addons/resource/models/resource_calendar_attendance.py
+@@ -1,46 +1,274 @@
+ # Part of Odoo. See LICENSE file for full copyright and licensing details.
++from collections import defaultdict
++from datetime import date, timedelta
+ 
+-import math
++from dateutil.relativedelta import relativedelta
+ 
+ from odoo import api, fields, models
++from odoo.addons.resource.models.utils import get_collision_new_rucurrency
++from odoo.exceptions import UserError
++from odoo.fields import Domain
++from odoo.tools import format_time
++from odoo.tools.date_utils import float_to_time, parse_iso_date
++from odoo.tools.intervals import Intervals
++from odoo.tools.misc import format_date, format_duration
+ 
+ 
+ class ResourceCalendarAttendance(models.Model):
+     _name = 'resource.calendar.attendance'
+     _description = "Work Detail"
+-    _order = 'sequence, week_type, dayofweek, hour_from'
++    _order = 'sequence, date, dayofweek, hour_from'
+ 
+-    dayofweek = fields.Selection([
+-        ('0', 'Monday'),
+-        ('1', 'Tuesday'),
+-        ('2', 'Wednesday'),
+-        ('3', 'Thursday'),
+-        ('4', 'Friday'),
+-        ('5', 'Saturday'),
+-        ('6', 'Sunday')
+-        ], 'Day of Week', required=True, index=True, default='0')
+-    hour_from = fields.Float(string='Work from', default=0, required=True, index=True,
++    hour_from = fields.Float(string='Work from', compute="_compute_hours", store=True, default=0,
++        readonly=False, required=True, index=True, precompute=True,
+         help="Start and End time of working.\n"
+              "A specific value of 24:00 is interpreted as 23:59:59.999999.")
+-    hour_to = fields.Float(string='Work to', default=0, required=True)
++    hour_to = fields.Float(string='Work to', compute="_compute_hours", store=True, default=0,
++        readonly=False, required=True, precompute=True)
+     # For the hour duration, the compute function is used to compute the value
+     # unambiguously, while the duration in days is computed for the default
+     # value but can be manually overridden.
+     duration_hours = fields.Float(compute='_compute_duration_hours', string='Hours', store=True, readonly=False)
+     calendar_id = fields.Many2one("resource.calendar", string="Resource's Calendar", required=True, index=True, ondelete='cascade')
+-    duration_based = fields.Boolean(compute='_compute_duration_based', store=True)
++    calendar_type = fields.Selection(related='calendar_id.calendar_type', readonly=True)
++    duration_based = fields.Boolean(compute='_compute_duration_based', store=True, precompute=True)
+     day_period = fields.Selection([
+         ('morning', 'Morning'),
+         ('afternoon', 'Afternoon'),
+         ('full_day', 'Full Day')], store=True, compute='_compute_day_period')
+-    week_type = fields.Selection([
+-        ('1', 'Second'),
+-        ('0', 'First'),
+-        ], 'Week Number', default=False)
+-    two_weeks_calendar = fields.Boolean("Calendar in 2 weeks mode", related='calendar_id.two_weeks_calendar')
+     sequence = fields.Integer(default=10,
+         help="Gives the sequence of this line when displaying the resource calendar.")
+ 
++    # Fixed
++    dayofweek = fields.Selection([
++        ('0', 'Monday'),
++        ('1', 'Tuesday'),
++        ('2', 'Wednesday'),
++        ('3', 'Thursday'),
++        ('4', 'Friday'),
++        ('5', 'Saturday'),
++        ('6', 'Sunday')
++        ], 'Day of Week', required=True, index=True, precompute=True,
++        compute="_compute_dayofweek", store=True, readonly=False)
++
++    # Variable
++    date = fields.Date()
++    recurrency = fields.Boolean()
++    recurrency_excluded_occurences = fields.Json()
++    recurrency_type = fields.Selection([
++        ('days', 'Days'),
++        ('weeks', 'Weeks'),
++    ], default='weeks')
++    recurrency_interval = fields.Integer(string="Interval", default=1, help="Number of days or weeks between each occurrence.")
++    recurrency_end_type = fields.Selection([
++        ('forever', 'Forever'),
++        ('times', 'Occurrences'),
++        ('date', 'Until'),
++    ], default='forever', string="Recurrence End Condition")
++    recurrency_count = fields.Integer(string="Number of Repetitions", default=1)
++    recurrency_until = fields.Date(string="Recurrence End Date", compute="_compute_recurrency_until", store=True, readonly=False, precompute=True)
++
++    _check_interval = models.Constraint(
++        "CHECK(recurrency IS NOT TRUE OR recurrency_interval >= 1)",
++        "The recurrency interval should be greater than 0",
++    )
++
++    _check_duration_hours = models.Constraint(
++        "CHECK(duration_hours > 0 AND duration_hours <= 24)",
++        "The attendance should have a duration between 0 and 24 hours",
++    )
++
++    _check_count = models.Constraint(
++        "CHECK(recurrency IS NOT TRUE OR recurrency_end_type != 'times' OR recurrency_count > 0)",
++        "The recurrency count should be greater than 0",
++    )
++
++    _check_recurrency_until = models.Constraint(
++        "CHECK(recurrency IS NOT TRUE OR recurrency_until >= date)",
++        "A recurrency should finish after the first occurence",
++    )
++
++    def _format_attendance(self):
++        self.ensure_one()
++        return {
++            'ids': {self.id},
++            'period': (timedelta(**{self.recurrency_type: self.recurrency_interval}).days) if self.recurrency else 0,
++            'date': self.date,
++            'excluded_ocurrences': set(self.recurrency_excluded_occurences or []),
++            'until': self.recurrency_until,
++            'max_id': self.id,
++        }
++
++    def _check_attendance_for_date(self, check_date=None):
++        issue = ""
++        if sum(self.mapped('duration_hours')) > 24:
++            issue = self.env._("Total duration of attendances cannot exceed 24 hours")
++        elif len(set(self.mapped('duration_based'))) > 1:
++            issue = self.env._("You can't have duration based and time based attendances on the same day")
++        elif not self[0].duration_based and len(self) != len(Intervals([(att.hour_from, att.hour_to, att) for att in self], keep_distinct=True)):
++            issue = self.env._("Overlap of attendances")
++        if not issue:
++            return
++        if isinstance(check_date, date):
++            header = self.env._("Issue on %(date)s:", date=format_date(self.env, check_date))
++        elif isinstance(check_date, str):
++            header = self.env._("Issue on %(dayofweek)s:", dayofweek=check_date)
++        else:
++            header = self.env._("Issue:")
++        raise UserError(self.env._("%(header)s\n%(issue)s", header=header, issue=issue))
++
++    def _lock_calendars_for_overlap_check(self):
++        """Serialize concurrent overlap checks on the same calendar.
++
++        The recurrence-collision detection below relies on search(), which
++        cannot see rows written by a concurrent transaction that has not
++        committed yet, so two transactions could each pass the check and commit
++        a real overlap. Recurrence collisions cannot be expressed as a SQL
++        EXCLUDE constraint, so instead we take a per-calendar lock: two
++        transactions touching the same calendar can no longer run their checks
++        concurrently. The lock is released at COMMIT, so it must be taken before
++        the search and outlive it. Calendars are locked in a deterministic order
++        to avoid deadlocks when several are involved.
++        """
++        calendar_ids = sorted(set(self.calendar_id.ids))
++        if not calendar_ids:
++            return
++        self.env.cr.execute(
++            "SELECT id FROM resource_calendar WHERE id IN %s ORDER BY id FOR NO KEY UPDATE",
++            [tuple(calendar_ids)],
++        )
++
++    def _check_attendances_variable_for_calendar(self, ids_to_check):
++        # 1. SORT THE ATTENDANCES - the recurring ones become the leaves of the collision tree,
++        #    the single-date ones are grouped by their date for the last step
++        recurrent_attendance_leaves = []
++        ad_hoc_attendances = defaultdict(lambda: self.env['resource.calendar.attendance'])
++        for attendance in self:
++            if attendance.recurrency:
++                recurrent_attendance_leaves.append(attendance._format_attendance())
++            else:
++                ad_hoc_attendances[attendance.date] |= attendance
++        # 2. BUILD THE COLLISION TREE - we compare each recurring attendance with the others.
++        #    When two of them overlap, that overlap becomes a new node of the tree, which we
++        #    then compare again with the leaves. We keep going level by level until no new
++        #    overlap is found (this way overlaps between overlaps are also caught).
++        collision_tree = list(recurrent_attendance_leaves)
++        current_level_recurrent_attendance_nodes = list(recurrent_attendance_leaves)
++        while current_level_recurrent_attendance_nodes:
++            # 2a. SAFETY STOP - too many nodes means the calendar is too complicated, we stop
++            if len(collision_tree) > 1000:
++                raise UserError(self.env._("Too Complex Calendar"))
++            next_level_recurrent_attendance_nodes = []
++            for node_reccurency in current_level_recurrent_attendance_nodes:
++                for leaf_reccurency in recurrent_attendance_leaves:
++                    # 2b. compare each pair only once (not A with B and then B with A)
++                    if node_reccurency['max_id'] >= leaf_reccurency['max_id']:
++                        continue
++                    collision = get_collision_new_rucurrency(node_reccurency, leaf_reccurency)
++                    if not collision:
++                        continue
++                    new_period, new_date, new_excluded, new_until = collision
++                    new_ids = node_reccurency['ids'] | leaf_reccurency['ids']
++                    # 2c. only raise an error if one of the attendances we are saving is part of this overlap
++                    if not ids_to_check.isdisjoint(new_ids):
++                        attendances = self.browse(new_ids)
++                        attendances._check_attendance_for_date(new_date)
++                    next_level_recurrent_attendance_nodes.append({
++                        'ids': new_ids,
++                        'period': new_period,
++                        'date': new_date,
++                        'excluded_ocurrences': new_excluded,
++                        'until': new_until,
++                        'max_id': leaf_reccurency['max_id'],
++                    })
++            collision_tree.extend(next_level_recurrent_attendance_nodes)
++            current_level_recurrent_attendance_nodes = list(next_level_recurrent_attendance_nodes)
++
++        # 3. CHECK THE AD-HOCS ATTENDANCES - for each one, go through the collision tree to
++        #    find every node that falls on that day, and check all those attendances together
++        for attendance_date, attendances in ad_hoc_attendances.items():
++            ids_in_conflict = set()
++            for node in collision_tree:
++                days_diff = (attendance_date - node['date']).days
++                if days_diff >= 0 and days_diff % node['period'] == 0:
++                    if str(attendance_date) not in node['excluded_ocurrences']:
++                        ids_in_conflict.update(node['ids'])
++            if ids_in_conflict or attendances:
++                attendances_to_validate = attendances | self.browse(ids_in_conflict)
++                if len(attendances_to_validate) > 1:
++                    attendances_to_validate._check_attendance_for_date(attendance_date)
++
++    def _check_attendances_fixed_for_calendar(self, ids_to_check):
++        dayofweek_labels = dict(self._fields['dayofweek'].get_description(self.env)['selection'])
++        for dayofweek, attendances in self.grouped('dayofweek').items():
++            if ids_to_check.isdisjoint(attendances.ids):
++                continue
++            formated_date = dayofweek_labels[dayofweek]
++            if len(attendances) > 1:
++                attendances._check_attendance_for_date(formated_date)
++
++    @api.constrains('hour_from', 'hour_to', 'duration_hours', 'duration_based', 'date', 'dayofweek',
++                    'recurrency', 'recurrency_interval', 'recurrency_type', 'recurrency_until', 'recurrency_excluded_occurences')
++    def _check_attendances(self):
++        """Will apply the good check behavior depending on the calendar_type of each calendar"""
++        # 1. LOCK THE CALENDARS - so two transactions cannot save an overlap on the same calendar at the same time
++        self._lock_calendars_for_overlap_check()
++        domain = Domain.FALSE
++        # 2. BUILD THE SEARCH DOMAIN - for each calendar, look for every attendance that could overlap
++        #    with the ones we are saving (so we can check them all together later)
++        for calendar, attendances in self.grouped('calendar_id').items():
++            if calendar.calendar_type == "variable":
++                # for a variable calendar we want:
++                # - every single-date attendance (ad-hocs) on the same dates
++                # - every recurring attendance still active inside the dates we check
++                all_dates = attendances.mapped('date')
++                min_date = min(all_dates)
++                max_date_list = all_dates + [a.recurrency_until for a in attendances if a.recurrency]
++                max_date = max(max_date_list)
++                domain |= Domain.AND([
++                    Domain('calendar_id', '=', calendar.id),
++                    Domain.OR([
++                        Domain.AND([
++                            Domain('recurrency', '=', True),
++                            Domain('date', '<=', max_date),
++                            Domain.OR([
++                                Domain('recurrency_until', '=', False),
++                                Domain('recurrency_until', '>=', min_date),
++                            ]),
++                        ]),
++                        Domain.AND([
++                            Domain('recurrency', '=', False),
++                            Domain('date', '>=', min_date),
++                            Domain('date', '<=', max_date),
++                        ]),
++                    ]),
++                ])
++            else:
++                # for a fixed calendar we want every attendance on the same day of the week
++                domain |= Domain.AND([
++                    Domain('calendar_id', '=', calendar.id),
++                    Domain('dayofweek', 'in', attendances.mapped('dayofweek')),
++                    Domain('date', '=', False),
++                ])
++        # 3. FETCH THE ATTENDANCES - grouped by calendar, then run the right check on each group
++        attendances_by_calendar = self.env['resource.calendar.attendance']._read_group(
++            domain,
++            groupby=['calendar_id'],
++            aggregates=["id:recordset"],
++        )
++        ids_to_check = set(self.ids)
++        for calendar, attendances in attendances_by_calendar:
++            if calendar.calendar_type == "variable":
++                attendances._check_attendances_variable_for_calendar(ids_to_check)
++            else:
++                attendances._check_attendances_fixed_for_calendar(ids_to_check)
++
++    @api.constrains('date', 'recurrency_excluded_occurences')
++    def _check_prevent_date_on_excluded_occurences(self):
++        for attendance in self:
++            if attendance.date and fields.Date.to_string(attendance.date) in (attendance.recurrency_excluded_occurences or []):
++                raise UserError(self.env._("This date is excluded of the recurrency, to start a new one on this date you should create it from scratch"))
++
+     @api.onchange('hour_from')
+     def _onchange_hour_from(self):
+         # avoid negative or after midnight
+@@ -74,10 +302,13 @@ class ResourceCalendarAttendance(models.Model):
+         for attendance in self:
+             attendance.duration_based = not attendance.hour_from and not attendance.hour_to
+ 
+-    @api.depends('duration_hours', 'hour_from', 'hour_to')
++    @api.depends('duration_hours', 'hour_from', 'hour_to', 'calendar_id.hours_per_day', 'calendar_id.company_id.resource_calendar_id.hours_per_day')
+     def _compute_day_period(self):
+         for attendance in self:
+-            if attendance.duration_hours > (0.75 * attendance.calendar_id.hours_per_day) or (not attendance.hour_from and not attendance.hour_to):
++            reference_hours_per_day = attendance.calendar_id.hours_per_day
++            if attendance.calendar_id.company_id:
++                reference_hours_per_day = attendance.calendar_id.company_id.resource_calendar_id.hours_per_day
++            if attendance.duration_hours > (0.75 * reference_hours_per_day) or attendance.duration_based:
+                 attendance.day_period = 'full_day'
+             elif attendance.hour_from and attendance.hour_to:
+                 if attendance.hour_from > 12 or (12 - attendance.hour_from <= attendance.hour_to - 12):
+@@ -87,42 +318,159 @@ class ResourceCalendarAttendance(models.Model):
+             else:
+                 attendance.day_period = 'morning'
+ 
+-    @api.depends('hour_from', 'hour_to')
++    @api.depends('date')
++    def _compute_dayofweek(self):
++        for attendance in self:
++            if attendance.date:
++                attendance.dayofweek = str(attendance.date.weekday())
++            elif not attendance.dayofweek:  # default value
++                attendance.dayofweek = '0'
++
++    @api.depends('hour_from', 'hour_to', 'duration_based')
+     def _compute_duration_hours(self):
+-        for attendance in self.filtered(lambda att: att.hour_from or att.hour_to):
+-            attendance.duration_hours = max(0, attendance.hour_to - attendance.hour_from)
++        for attendance in self:
++            if not attendance.duration_based:
++                attendance.duration_hours = max(0, attendance.hour_to - attendance.hour_from)
++
++    @api.depends('duration_based')
++    def _compute_hours(self):
++        for attendance in self:
++            if attendance.duration_based:
++                attendance.hour_from = attendance.hour_to = 0
++
++    @api.depends('recurrency', 'recurrency_end_type', 'recurrency_type', 'recurrency_interval', 'recurrency_count', 'date')
++    def _compute_recurrency_until(self):
++        for attendance in self:
++            if not attendance.recurrency:
++                attendance.recurrency_until = attendance.date
++                continue
++            match attendance.recurrency_end_type:
++                case 'date' if attendance.recurrency_until == date.max:
++                    attendance.recurrency_until = date.today()
++                case 'times' if attendance.date and attendance.recurrency_type and attendance.recurrency_interval and attendance.recurrency_count:
++                    attendance.recurrency_until = attendance.date + timedelta(**{attendance.recurrency_type: attendance.recurrency_interval * (attendance.recurrency_count - 1)})
++                case 'forever':
++                    attendance.recurrency_until = date.max
+ 
+-    @api.depends('week_type')
+     def _compute_display_name(self):
+-        super()._compute_display_name()
+-        section_names = {'0': self.env._('First week'), '1': self.env._('Second week')}
+-        dayofweek_selection = dict(self._fields['dayofweek']._description_selection(self.env))
+-        day_period_selection = dict(self._fields['day_period']._description_selection(self.env))
+-        for record in self:
+-            record.display_name = f"{dayofweek_selection[record.dayofweek]} ({day_period_selection[record.day_period]})"
+-            if record.two_weeks_calendar:
+-                record.display_name = section_names[record.weektype] + ' - ' + record.display_name
+-
+-    @api.model
+-    def get_week_type(self, date):
+-        # week_type is defined by
+-        #  * counting the number of days from January 1 of year 1
+-        #    (extrapolated to dates prior to the first adoption of the Gregorian calendar)
+-        #  * converted to week numbers and then the parity of this number is asserted.
+-        # It ensures that an even week number always follows an odd week number. With classical week number,
+-        # some years have 53 weeks. Therefore, two consecutive odd week number follow each other (53 --> 1).
+-        return int(math.floor((date.toordinal() - 1) / 7) % 2)
+-
+-    def _copy_attendance_vals(self):
+-        self.ensure_one()
+-        return {
+-            'dayofweek': self.dayofweek,
+-            'duration_hours': self.duration_hours,
+-            'hour_from': self.hour_from,
+-            'hour_to': self.hour_to,
+-            'week_type': self.week_type,
+-            'sequence': self.sequence,
+-        }
++        for attendance in self:
++            duration = format_duration(attendance.duration_hours)
++            if attendance.duration_based:
++                attendance.display_name = self.env._("%(duration)s hours A", duration=duration)
++            else:
++                attendance.display_name = self.env._("%(hour_from)s - %(hour_to)s (%(duration)s) A",
++                                                     hour_from=format_time(self.env, float_to_time(attendance.hour_from), time_format="short"),
++                                                     hour_to=format_time(self.env, float_to_time(attendance.hour_to), time_format="short"),
++                                                     duration=duration)
++
++    @classmethod
++    def _to_dict_fields(cls):
++        return [
++            'date',
++            'dayofweek',
++            'day_period',
++            'duration_hours',
++            'hour_from',
++            'hour_to',
++            'sequence',
++        ]
++
++    def _to_dict(self):
++        return self.read(self._to_dict_fields(), load=None)
+ 
+     def _is_work_period(self):
++        self.ensure_one()
+         return True
++
++    def _filter_by_date(self, date: date, additional_filter=None):
++        """
++        Get the attendances for a specific date. For variable schedule, it will return the attendances with the same date or with a recurrency rule matching the date. For fixed schedule, it will return the attendances with the same day of week as the date.
++
++        :param date
++        :param additional_filter: optional callable to apply extra filtering in the same loop
++        """
++        if additional_filter is not None:
++            assert callable(additional_filter)
++        date_string = fields.Date.to_string(date)
++
++        def date_filter(a):
++            if additional_filter and not additional_filter(a):
++                return False
++            if a.recurrency:
++                return a.recurrency_interval and (
++                    date_string not in (a.recurrency_excluded_occurences or []) and a.date <= date <= a.recurrency_until
++                    and (
++                        (a.recurrency_type == 'days' and not (date - a.date).days % a.recurrency_interval)
++                        or (a.recurrency_type == 'weeks' and not (date - a.date).days % 7 and not ((date - a.date).days // 7) % a.recurrency_interval)
++                    )
++                )
++            return a.date == date if a.date else a.dayofweek == str(date.weekday())
++        return self.filtered(date_filter)
++
++    def _filter_between_dates(self, date_from, date_to):
++        def _is_between_dates(att):
++            att.ensure_one()
++            if att.date:
++                if att.recurrency:
++                    return att.date <= date_to and att.recurrency_until >= date_from
++                return date_from <= att.date <= date_to
++            return not att.date
++
++        return self.filtered(_is_between_dates)
++
++    def exclude_occurence(self, date):
++        self.ensure_one()
++        if (parsed_date := parse_iso_date(date)) == self.date:
++            new_date = parsed_date
++            excluded = [fields.Date.to_string(self.date), *(self.recurrency_excluded_occurences or [])]
++            while new_date <= self.recurrency_until and fields.Date.to_string(new_date) in excluded:
++                new_date += timedelta(**{self.recurrency_type: self.recurrency_interval})
++            if new_date <= self.recurrency_until:
++                if self.recurrency_end_type == 'times':
++                    self.recurrency_end_type = 'date'
++                self.date = new_date
++            else:
++                self.unlink()
++                return
++        excluded_ocurrences = self.recurrency_excluded_occurences or []
++        if date not in excluded_ocurrences:
++            excluded_ocurrences.append(date)
++            self.recurrency_excluded_occurences = excluded_ocurrences
++
++    def exclude_multiple_occurences(self, dates):
++        for attendance in self:
++            for date_to_exclude in dates:
++                attendance.exclude_occurence(date_to_exclude)
++                if not attendance.exists():
++                    break
++
++    def stop_recurrency(self, date):
++        self.ensure_one()
++        self.update({
++            'recurrency_until': parse_iso_date(date) - relativedelta(days=1),
++            'recurrency_end_type': 'date',
++        })
++
++    def create_ad_hoc(self, date, changes):
++        self.ensure_one()
++        data = self.copy_data()[0]
++        self.exclude_occurence(date)
++        new_data = {
++            **data,
++            **changes,
++        }
++        new_data_without_recurrency = {f: v for f, v in new_data.items() if "recurrency" not in f}
++        return self.create(new_data_without_recurrency)
++
++    def create_new_recurrency(self, date, changes):
++        self.ensure_one()
++        data = self.copy_data()[0]
++        self.stop_recurrency(date)
++        new_data = {
++            **data,
++            **changes,
++        }
++        if ('recurrency_end_type' in new_data and 'recurrency_until' in new_data
++            and (new_data['recurrency_end_type'] != 'date' or not new_data['recurrency_until'])):
++            del new_data['recurrency_until']
++        return self.create(new_data)
+
+--- a/addons/resource/models/utils.py
++++ b/addons/resource/models/utils.py
+@@ -1,3 +1,5 @@
++import math
++from dateutil.relativedelta import relativedelta
+ from odoo.fields import Domain, parse_field_expr
+ 
+ # Default hour per day value. The one should
+@@ -130,3 +132,125 @@ def get_light_color(color, factor, is_open_shift):
+     g = round(g + (255 - g) * factor)
+     b = round(b + (255 - b) * factor)
+     return f"#{r:02x}{g:02x}{b:02x}"
++
++
++def extended_gcd(a, b):
++    """Extended Euclidean Algorithm: compute the greatest common divisor of
++    ``a`` and ``b`` together with the Bézout coefficients.
++
++    Returns a tuple ``(gcd, x, y)`` such that ``a * x + b * y == gcd``, where
++    ``gcd`` is the greatest common divisor of ``a`` and ``b``. The Bézout
++    coefficients ``x`` and ``y`` are what allow the caller to solve the linear
++    congruences used to detect when two periodic recurrences fall on the same
++    day (see :func:`get_collision_new_rucurrency`).
++
++    Example::
++
++        >>> extended_gcd(12, 18)
++        (6, -1, 1)  # 12 * -1 + 18 * 1 == 6
++        >>> extended_gcd(3, 4)
++        (1, -1, 1)  # 3 * -1 + 4 * 1 == 1
++    """
++    if a == 0:
++        return b, 0, 1
++    gcd, x1, y1 = extended_gcd(b % a, a)
++    x = y1 - (b // a) * x1
++    y = x1
++    return gcd, x, y
++
++
++def get_collision_new_rucurrency(atti, attj):
++    """Find the first date on which two periodic recurrences happen on the same day.
++
++    Each argument is a recurrence described by a dict with:
++
++    - ``date``: the date of its first occurrence;
++    - ``period``: the number of days between two consecutive occurrences;
++    - ``excluded_ocurrences``: a set of date strings on which the occurrence is skipped;
++    - ``until``: the last date the recurrence may occur on.
++
++    The two recurrences collide on a common day only if the offset between their
++    start dates is a multiple of ``gcd(period_i, period_j)``; otherwise they can
++    never align and ``None`` is returned. When they can align, the Chinese
++    Remainder Theorem (solved via the Extended Euclidean Algorithm,
++    :func:`extended_gcd`) gives the first colliding date, which is then advanced
++    to fall within both ranges and to skip any excluded occurrence.
++
++    Mathematical breakdown
++    ----------------------
++    An occurrence of recurrence ``i`` lands on day ``d`` iff there is an integer
++    ``n_i >= 0`` with ``d = date_i + n_i * period_i``. A collision is a day ``d``
++    reached by both recurrences, i.e. a solution of the system of congruences::
++
++        d ≡ date_i  (mod period_i)
++        d ≡ date_j  (mod period_j)
++
++    Writing ``p = period_i``, ``q = period_j`` and ``delta = date_j - date_i``
++    (counted in days), substituting ``d`` yields the linear Diophantine equation::
++
++        n_i * p - n_j * q = delta
++
++    1. **Solvability.** Such ``(n_i, n_j)`` exist iff ``gcd(p, q)`` divides
++       ``delta``. This is the early-exit test ``delta % gcd != 0 -> None``.
++
++    2. **A particular solution.** The Extended Euclidean Algorithm returns
++       ``x0`` with ``p * x0 + q * (...) = gcd(p, q)``. Scaling Bézout's identity
++       by ``delta / gcd`` gives a valid count for the first recurrence::
++
++           n_i = (delta * x0 / gcd)  (mod q / gcd)
++
++       reduced mod ``q / gcd`` to pick the smallest non-negative one. The
++       collision date is then ``date_i + n_i * p``.
++
++    3. **Combined period.** Once aligned, both recurrences realign every
++       ``lcm(p, q)`` days, so the collisions themselves form a recurrence of
++       period ``new_period = lcm(p, q)``.
++
++    4. **Clamping.** The first collision date may fall before the later of the
++       two start dates (the congruence solution can be "in the past"); it is
++       pushed forward by whole ``new_period`` steps until it is ``>=
++       max(date_i, date_j)``, and again until it is not an excluded occurrence.
++       If it ends up past ``min(until_i, until_j)``, there is no usable
++       collision and ``None`` is returned.
++
++    Returns a tuple ``(new_period, new_date, new_excluded, new_until)`` describing
++    the merged recurrence of the collisions, or ``None`` if the two recurrences
++    never collide within their bounds.
++
++    Examples::
++
++        # Every 2 days from Jan 1st vs every 3 days from Jan 2nd:
++        # they first coincide on Jan 7th, then every lcm(2, 3) = 6 days.
++        atti = {'date': date(2024, 1, 1), 'period': 2, 'until': date(2024, 2, 1), 'excluded_ocurrences': set()}
++        attj = {'date': date(2024, 1, 2), 'period': 3, 'until': date(2024, 2, 1), 'excluded_ocurrences': set()}
++        get_collision_new_rucurrency(atti, attj)  # -> (6, date(2024, 1, 7), set(), date(2024, 2, 1))
++
++        # Every 4 days from Jan 1st vs every 4 days from Jan 2nd:
++        # the 1-day offset is not a multiple of gcd(4, 4) = 4, so they never align.
++        atti = {'date': date(2024, 1, 1), 'period': 4, 'until': date(2024, 2, 1), 'excluded_ocurrences': set()}
++        attj = {'date': date(2024, 1, 2), 'period': 4, 'until': date(2024, 2, 1), 'excluded_ocurrences': set()}
++        get_collision_new_rucurrency(atti, attj)  # -> None
++    """
++    gcd, x0, _ = extended_gcd(atti['period'], attj['period'])
++    delta_dates = (attj['date'] - atti['date']).days
++    if delta_dates % gcd != 0:
++        return None
++
++    new_period = math.lcm(atti['period'], attj['period'])
++    n_i_colide = (delta_dates * x0 // gcd) % (attj['period'] // gcd)
++    new_date = relativedelta(days=atti['period'] * n_i_colide) + atti['date']
++    start_date_max = max(atti['date'], attj['date'])
++    if new_date < start_date_max:
++        diff_days = (start_date_max - new_date).days
++        nb_jumps = (diff_days + new_period - 1) // new_period
++        new_date += relativedelta(days=nb_jumps * new_period)
++
++    new_excluded = atti['excluded_ocurrences'] | attj['excluded_ocurrences']
++    new_until = min(atti['until'], attj['until'])
++    while str(new_date) in new_excluded:
++        new_date += relativedelta(days=new_period)
++
++    if new_date > new_until:
++        return None
++
++    return new_period, new_date, new_excluded, new_until

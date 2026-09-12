@@ -1,0 +1,151 @@
+PR: https://github.com/odoo/odoo/pull/240202
+
+From: 553fbd1afaf9d78fa83ec767490b3825ae7c4acb
+From: Frantisek Binovsky
+Date: 2026-02-13 05:49:16
+
+Breaking data model changes scores: del:1 + add:0, change matches:
+-    assignment_optout = fields.Boolean('Pause assignment')
+
+Total Changes: 47
+
+[IMP] crm,sales_team: update lead assignment for sales teams
+
+Changed lead assignment UI/behavior:
+* replaced the lead assignment opt-out with a selection field, adding a new
+option to not limit the assignment max
+
+New selection options:
+* limited: 'standard' behavior with a monthly limit
+* unlimited: to avoid introducing new fields to the model, we set a very large
+limit in the background (1000 leads per day) acting as 'unlimited'
+* opt-out: do not assign any new leads. In the background we set the max to 0
+    -> no need for an explicit opt-out field anymore
+
+Purpose: Make it easier to dispatch all leads, as most SMEs don't have "limits",
+they want everything to be assigned ASAP
+=> If you want to pause, you can simply set a limit of 0
+
+UI specific changes:
+The gauge requires a maximum value - in the kanban view, ti now shows an
+artificial maximum of a 100 (or actual assigned leads) if set to 'unlimited'
+(tooltip specifies unlimited)
+The maximum number of assignable leads per team is not shown in the form if any
+of its members have unlimited assignment enabled
+
+Task-5262571
+
+Part-of: odoo/odoo#240202
+Related: odoo/enterprise#102231
+Related: odoo/upgrade#9219
+Signed-off-by: Thibault Delavallee (tde) <tde@openerp.com>
+
+================================= pseudo patch: =================================
+
+--- a/addons/crm/models/crm_team.py
++++ b/addons/crm/models/crm_team.py
+@@ -8,6 +8,7 @@ from ast import literal_eval
+ from markupsafe import Markup
+ 
+ from odoo import api, exceptions, fields, models, modules, _
++from odoo.addons.crm.models.crm_team_member import MEMBER_MAX_LEAD_ASSIGNMENT_QUOTA
+ from odoo.fields import Domain
+ from odoo.tools import float_compare, float_round
+ from odoo.tools.safe_eval import safe_eval
+@@ -27,13 +28,14 @@ class CrmTeam(models.Model):
+     # assignment
+     assignment_enabled = fields.Boolean('Lead Assign', compute='_compute_assignment_enabled')
+     assignment_auto_enabled = fields.Boolean('Auto Assignment', compute='_compute_assignment_enabled')
+-    assignment_optout = fields.Boolean('Skip auto assignment')
++    assignment_optout = fields.Boolean('Pause auto assignment')
+     assignment_max = fields.Integer(
+         'Lead Average Capacity', compute='_compute_assignment_max',
+         help='Monthly average leads capacity for all salesmen belonging to the team')
+     assignment_domain = fields.Char(
+         'Assignment Domain', tracking=True,
+         help='Additional filter domain when fetching unassigned leads to allocate to the team.')
++    show_assignment_max = fields.Boolean(compute='_compute_show_assignment_max')
+     # statistics about leads / opportunities / both
+     lead_unassigned_count = fields.Integer(
+         string='# Unassigned Leads', compute='_compute_lead_unassigned_count')
+@@ -52,6 +54,16 @@ class CrmTeam(models.Model):
+         for team in self:
+             team.assignment_max = sum(member.assignment_max for member in team.crm_team_member_ids)
+ 
++    @api.depends('crm_team_member_ids.assignment_max')
++    def _compute_show_assignment_max(self):
++        for team in self:
++            show_max = True
++            for member in team.crm_team_member_ids:
++                if member.assignment_max >= MEMBER_MAX_LEAD_ASSIGNMENT_QUOTA:
++                    show_max = False
++
++            team.show_assignment_max = show_max
++
+     def _compute_assignment_enabled(self):
+         assign_enabled = self.env['crm.lead']._is_rule_based_assignment_activated()
+         auto_assign_enabled = False
+@@ -628,7 +640,7 @@ class CrmTeam(models.Model):
+ 
+         for team, leads_to_assign_ids in leads_per_team.items():
+             members_to_assign = list(team.crm_team_member_ids.filtered(lambda member:
+-                not member.assignment_optout and quota_per_member.get(member, 0) > 0
++                member.assignment_max != 0 and quota_per_member.get(member, 0) > 0
+             ).sorted(key=lambda member: quota_per_member.get(member, 0), reverse=True))
+             if not members_to_assign:
+                 continue
+
+--- a/addons/crm/models/crm_team_member.py
++++ b/addons/crm/models/crm_team_member.py
+@@ -11,6 +11,8 @@ from odoo.tools import float_round
+ 
+ _logger = logging.getLogger(__name__)
+ 
++MEMBER_MAX_LEAD_ASSIGNMENT_QUOTA = 30000  # Arbitrarily large - 1000 per day (math.inf causes issues on runbot)
++
+ 
+ class CrmTeamMember(models.Model):
+     _inherit = 'crm.team.member'
+@@ -19,8 +21,13 @@ class CrmTeamMember(models.Model):
+     assignment_enabled = fields.Boolean(related="crm_team_id.assignment_enabled")
+     assignment_domain = fields.Char('Assignment Domain', tracking=True)
+     assignment_domain_preferred = fields.Char('Preference assignment Domain', tracking=True)
+-    assignment_optout = fields.Boolean('Pause assignment')
+-    assignment_max = fields.Integer('Average Leads Capacity (on 30 days)', default=30)
++    assignment_max = fields.Integer('Average Leads Capacity (on 30 days)', default=MEMBER_MAX_LEAD_ASSIGNMENT_QUOTA)
++    assignment_rules = fields.Selection([
++        ('unlimited', 'Always in rotation'),
++        ('limited', 'In rotation, with a limit'),
++        ('opt-out', 'Out of rotation')
++    ], string='Auto-Assignment Rules', compute='_compute_assignment_rules',
++        store=False, readonly=False)
+     lead_day_count = fields.Integer(
+         'Leads (last 24h)', compute='_compute_lead_day_count',
+         help='Number of leads assigned to this member in the last 24 hours (lost leads excluded)')
+@@ -28,6 +35,26 @@ class CrmTeamMember(models.Model):
+         'Leads (30 days)', compute='_compute_lead_month_count',
+         help='Number of leads assigned to this member in the last 30 days')
+ 
++    @api.depends('assignment_max')
++    def _compute_assignment_rules(self):
++        for member in self:
++            if member.assignment_max >= MEMBER_MAX_LEAD_ASSIGNMENT_QUOTA:
++                member.assignment_rules = 'unlimited'
++            elif member.assignment_max == 0:
++                member.assignment_rules = 'opt-out'
++            else:
++                member.assignment_rules = 'limited'
++
++    @api.onchange('assignment_rules')
++    def _onchange_assignment_rules(self):
++        for member in self:
++            if member.assignment_rules == 'unlimited':
++                member.assignment_max = MEMBER_MAX_LEAD_ASSIGNMENT_QUOTA
++            elif member.assignment_rules == 'opt-out':
++                member.assignment_max = 0
++            else:
++                member.assignment_max = 30
++
+     @api.depends('user_id', 'crm_team_id')
+     def _compute_lead_day_count(self):
+         day_date = fields.Datetime.now() - datetime.timedelta(hours=24)

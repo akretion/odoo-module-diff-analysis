@@ -1,0 +1,136 @@
+PR: https://github.com/odoo/odoo/pull/249545
+
+From: 1ef1b73ee2ec3c1adfdffe32c34bb441b97dfbec
+From: anko-odoo
+Date: 2026-06-11 14:02:14
+
+Breaking data model changes scores: del:1 + add:0, change matches:
+-    payment_provider_state = fields.Selection(
+
+Total Changes: 45
+
+[IMP] payment, *: rework payment provider views and state field
+
+This commit brings several improvements to the payment provider views to
+put more visibility on available payment methods and ease the
+configuration of providers.
+
+In particular, the `state` field is removed in favor of two separate
+mechanisms:
+* `is_live`: controls whether the provider processes transactions in its
+  live or test environment.
+* `active`: a provider that is no longer needed is archived.
+
+A provider is now considered available as soon as its module is
+installed and it is not archived.
+
+task-5722022
+
+closes odoo/odoo#249545
+
+Related: odoo/enterprise#113307
+Related: odoo/upgrade#10000
+Signed-off-by: Antoine Vandevenne (anv) <anv@odoo.com>
+
+================================= pseudo patch: =================================
+
+--- a/addons/account_payment/models/account_journal.py
++++ b/addons/account_payment/models/account_journal.py
+@@ -7,20 +7,15 @@ from odoo.exceptions import UserError
+ class AccountJournal(models.Model):
+     _inherit = "account.journal"
+ 
+-    def _get_available_payment_method_lines(self, payment_type):
+-        lines = super()._get_available_payment_method_lines(payment_type)
+-
+-        return lines.filtered(lambda l: l.payment_provider_state != 'disabled')
+-
+     @api.ondelete(at_uninstall=False)
+     def _unlink_except_linked_to_payment_provider(self):
+         if self.env.context.get('force_delete'):
+             return
+         linked_providers = self.env['payment.provider'].sudo().search([]).filtered(
+-            lambda p: p.journal_id.id in self.ids and p.state != 'disabled'
++            lambda p: p.journal_id.id in self.ids
+         )
+         if linked_providers:
+             raise UserError(_(
+-                "You must first deactivate a payment provider before deleting its journal.\n"
++                "You must first uninstall a payment provider before deleting its journal.\n"
+                 "Linked providers: %s", ', '.join(p.display_name for p in linked_providers)
+             ))
+
+--- a/addons/account_payment/models/account_payment_method_line.py
++++ b/addons/account_payment/models/account_payment_method_line.py
+@@ -15,9 +15,6 @@ class AccountPaymentMethodLine(models.Model):
+         readonly=False,
+         domain="[('code', '=', code)]",
+     )
+-    payment_provider_state = fields.Selection(
+-        related='payment_provider_id.state'
+-    )
+ 
+     @api.depends('payment_provider_id.name')
+     def _compute_name(self):
+@@ -62,16 +59,17 @@ class AccountPaymentMethodLine(models.Model):
+                     line.payment_provider_id = next(iter(candidates_provider_ids))
+ 
+     @api.ondelete(at_uninstall=False)
+-    def _unlink_except_active_provider(self):
+-        """ Ensure we don't remove an account.payment.method.line that is linked to a provider
+-        in the test or enabled state.
++    def _unlink_except_installed_payment_provider(self):
++        """Ensure we don't remove an account.payment.method.line that is linked to an installed
++        provider.
+         """
+-        active_provider = self.payment_provider_id.filtered(lambda provider: provider.state in ['enabled', 'test'])
+-        if active_provider:
++        if active_providers := self.payment_provider_id.filtered(
++            lambda p: p.module_state != "to remove"
++        ):
+             raise UserError(_(
+-                "You can't delete a payment method that is linked to a provider in the enabled "
+-                "or test state.\n""Linked providers(s): %s",
+-                ', '.join(a.display_name for a in active_provider),
++                "You can't delete a payment method that is linked to an installed provider."
++                "\nLinked providers(s): %s",
++                ', '.join(a.display_name for a in active_providers),
+             ))
+ 
+     def action_open_provider_form(self):
+
+--- a/addons/account_payment/models/payment_provider.py
++++ b/addons/account_payment/models/payment_provider.py
+@@ -99,7 +99,7 @@ class PaymentProvider(models.Model):
+         ).id
+         return outstanding_account_id
+ 
+-    @api.depends('code', 'state', 'company_id')
++    @api.depends('code', 'is_live', 'company_id')
+     def _compute_journal_id(self):
+         for provider in self:
+             pay_method_line = self.env['account.payment.method.line'].search([
+@@ -109,17 +109,15 @@ class PaymentProvider(models.Model):
+ 
+             if pay_method_line:
+                 provider.journal_id = pay_method_line.journal_id
+-            elif provider.state in ('enabled', 'test'):
+-                provider.journal_id = self.env['account.journal'].search(
+-                    [
+-                        ('company_id', '=', provider.company_id.id),
+-                        ('type', '=', 'bank'),
+-                    ],
+-                    limit=1,
+-                )
++            else:
++                domain = provider._get_journal_domain()
++                provider.journal_id = self.env["account.journal"].search(domain, limit=1)
+                 if provider.id:
+                     provider._ensure_payment_method_line()
+ 
++    def _get_journal_domain(self):
++        return [("company_id", "=", self.company_id.id), ("type", "=", "bank")]
++
+     def _inverse_journal_id(self):
+         for provider in self:
+             provider._ensure_payment_method_line()

@@ -1,0 +1,139 @@
+PR: https://github.com/odoo/odoo/pull/239243
+
+From: b9754eb4e680b892c31abb52f3efe4fdacdbef90
+From: chha-odoo
+Date: 2026-04-20 06:33:47
+
+Breaking data model changes scores: del:3 + add:0, change matches:
+-    bom_product_id = fields.Many2one(related='bom_id.product_id')
+-    bom_product_qty = fields.Float(related='bom_id.product_qty', string="BoM Quantity")
+-    bom_product_uom_id = fields.Many2one(related='bom_id.uom_id', string="BoM Unit")
+
+Total Changes: 47
+
+[IMP] mrp: make component replacement faster across boms
+
+* When `replacing a product` with another, users often need to update all
+  related `Bill of Materials` to keep manufacturing data consistent.
+  However, the current flow makes this difficult because users cannot
+  easily `multi-edit` the underlying `BoM lines` where the `product` is
+  actually used.
+* This leads to a `time-consuming` and `error-prone` process, where users
+  must open each `BoM` individually, search for the `product` manually, and
+  update lines one by one.
+
+This improvement introduces a streamlined workflow by allowing users to directly
+access and edit all BoM lines referencing a product in one place. This
+significantly improves the product-replacement use case by reducing manual work,
+avoiding overlooked BoM updates, and ensuring consistency whenever a component
+replaced across multiple BoMs.
+
+Previously added list view is being replaced in this commit, so removed the
+fields that are no longer used in the new list view.
+old list view introduced here: https://github.com/odoo/odoo/pull/212727
+
+Ent PR odoo/enterprise#105842
+
+task-5365739
+
+Part-of: odoo/odoo#239243
+Related: odoo/upgrade#9584
+Signed-off-by: Arnold Moyaux (arm) <arm@odoo.com>
+
+================================= pseudo patch: =================================
+
+--- a/addons/mrp/models/mrp_bom.py
++++ b/addons/mrp/models/mrp_bom.py
+@@ -709,10 +709,7 @@ class MrpBomLine(models.Model):
+     tracking = fields.Selection(related='product_id.tracking')
+     bom_code = fields.Char(related='bom_id.code')
+     bom_type = fields.Selection(related='bom_id.type')
+-    bom_product_id = fields.Many2one(related='bom_id.product_id')
+     bom_product_tmpl_id = fields.Many2one(related='bom_id.product_tmpl_id')
+-    bom_product_qty = fields.Float(related='bom_id.product_qty', string="BoM Quantity")
+-    bom_product_uom_id = fields.Many2one(related='bom_id.uom_id', string="BoM Unit")
+ 
+     _bom_qty_zero = models.Constraint(
+         'CHECK (product_qty>=0)',
+@@ -757,6 +754,17 @@ class MrpBomLine(models.Model):
+                 values['uom_id'] = self.env['product.product'].browse(values['product_id']).uom_id.id
+         return super(MrpBomLine, self).create(vals_list)
+ 
++    def write(self, vals):
++        res = super().write(vals)
++        if 'product_id' in vals:
++            self.bom_id._check_bom_cycle()
++        self.bom_id._set_outdated_bom_in_productions()
++        return res
++
++    @api.ondelete(at_uninstall=False)
++    def _unlink_and_update_outdated_bom(self):
++        self.bom_id._set_outdated_bom_in_productions()
++
+     def _skip_bom_line(self, product, never_attribute_values=False):
+         """ Control if a BoM line should be produced, can be inherited to add custom control.
+             cases:
+@@ -806,6 +814,15 @@ class MrpBomLine(models.Model):
+             'search_view_id': self.env.ref('product.product_document_search').ids
+         }
+ 
++    def action_open_parent_bom(self):
++        self.ensure_one()
++        return {
++            'type': 'ir.actions.act_window',
++            'res_model': 'mrp.bom',
++            'res_id': self.bom_id.id,
++            'view_mode': 'form',
++        }
++
+     # -------------------------------------------------------------------------
+     # CATALOG
+     # -------------------------------------------------------------------------
+@@ -814,16 +831,6 @@ class MrpBomLine(models.Model):
+         bom = self.env['mrp.bom'].browse(self.env.context.get('order_id'))
+         return bom.with_context(child_field='bom_line_ids').action_add_from_catalog()
+ 
+-    def action_open_parent_bom(self, *args):
+-        return {
+-            'res_model': 'mrp.bom',
+-            'type': 'ir.actions.act_window',
+-            'views': [[False, 'form']],
+-            'view_mode': 'form',
+-            'res_id': self.bom_id.id,
+-            'target': 'current',
+-        }
+-
+     def _get_product_catalog_lines_data(self, default=False, **kwargs):
+         if self and not default:
+             self.product_id.ensure_one()
+
+--- a/addons/mrp/models/product.py
++++ b/addons/mrp/models/product.py
+@@ -80,12 +80,7 @@ class ProductTemplate(models.Model):
+         self.ensure_one()
+         action = self.env["ir.actions.actions"]._for_xml_id("mrp.mrp_bom_line_action_used_in_boms")
+         action['domain'] = [('product_tmpl_id', '=', self.id)]
+-        action['context'] = {
+-            'component_variant_count': len(
+-                self.product_variant_ids.filtered(lambda variant: variant.bom_line_ids)
+-            ),
+-            'search_default_bom_active': True,
+-        }
++        action['context'] = {'search_default_bom_active': True}
+         return action
+ 
+     def _compute_mrp_product_qty(self):
+@@ -249,12 +244,7 @@ class ProductProduct(models.Model):
+         self.ensure_one()
+         action = self.env["ir.actions.actions"]._for_xml_id("mrp.mrp_bom_line_action_used_in_boms")
+         action['domain'] = [('product_id', '=', self.id)]
+-        action['context'] = {
+-            'component_variant_count': len(
+-                self.product_tmpl_id.product_variant_ids.filtered(lambda variant: variant.bom_line_ids)
+-            ),
+-            'search_default_bom_active': True,
+-        }
++        action['context'] = {'search_default_bom_active': True}
+         return action
+ 
+     def _compute_mrp_product_qty(self):

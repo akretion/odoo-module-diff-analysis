@@ -1,0 +1,160 @@
+PR: https://github.com/odoo/odoo/pull/235670
+
+From: b3fb73158883fd33e04a0d1c8e017c1e05367acf
+From: hapt-odoo
+Date: 2026-04-21 11:14:47
+
+Breaking data model changes scores: del:1 + add:0, change matches:
+-    service_to_purchase = fields.Boolean(
+
+Total Changes: 73
+
+[IMP] sale_purchase: make subcontract service option easier to discover
+
+In Odoo, it was already possible to configure a service product to generate a
+subcontracting RFQ upon Sales Order confirmation. However, this option
+was hard to discover, as it was located in the Purchase tab.
+
+To improve usability, this option has been moved to the 'Create on Order
+selection field' in the General Information tab, alongside other similar actions
+making it more visible and accessible.
+
+Overall, this enhancement centralises subcontract service configuration for
+service-type products and improves clarity and usability.
+
+Related test cases have been updated to reflect the new logic.
+
+Task ID: 5249083
+
+closes odoo/odoo#235670
+
+Related: odoo/enterprise#99481
+Related: odoo/upgrade#8850
+Signed-off-by: William Henrotin (whe) <whe@odoo.com>
+
+================================= pseudo patch: =================================
+
+--- a/addons/sale_purchase/models/product_template.py
++++ b/addons/sale_purchase/models/product_template.py
+@@ -1,37 +1,53 @@
+ # -*- coding: utf-8 -*-
+ # Part of Odoo. See LICENSE file for full copyright and licensing details.
+ 
+-from odoo import api, fields, models, _
++from odoo import api, fields, models
+ from odoo.exceptions import ValidationError
+ 
+ 
+ class ProductTemplate(models.Model):
+     _inherit = 'product.template'
+ 
+-    service_to_purchase = fields.Boolean(
+-        "Subcontract Service", company_dependent=True, copy=False,
+-        help="If ticked, each time you sell this product through a SO, a RfQ is automatically created to buy the product. Tip: don't forget to set a vendor on the product.")
++    service_tracking = fields.Selection(selection_add=[
++        ('subcontract', 'Subcontracting RFQ')
++    ], ondelete={'subcontract': 'set default'})
+ 
+-    @api.constrains('service_to_purchase', 'seller_ids', 'type')
+-    def _check_service_to_purchase(self):
+-        for template in self:
+-            if template.service_to_purchase:
+-                if template.type != 'service':
+-                    raise ValidationError(_("Product that is not a service can not create RFQ."))
+-                template._check_vendor_for_service_to_purchase(template.seller_ids)
++    @api.depends('service_tracking')
++    def _compute_purchase_ok(self):
++        super()._compute_purchase_ok()
++        self.filtered(lambda t: t.service_tracking == 'subcontract' and not t.purchase_ok).purchase_ok = True
++
++    @api.depends('purchase_ok', 'reinvoice_policy')
++    def _compute_service_tracking(self):
++        super()._compute_service_tracking()
++        self.filtered(lambda t: t.service_tracking == 'subcontract' and (not t.purchase_ok or t.reinvoice_policy != 'no')).service_tracking = 'no'
++
++    @api.model
++    def _get_saleable_tracking_types(self):
++        return super()._get_saleable_tracking_types() + ['subcontract']
++
++    @api.model
++    def _get_product_types_allow_zero_price(self):
++        return super()._get_product_types_allow_zero_price() + ['subcontract']
+ 
+     @api.model_create_multi
+     def create(self, vals_list):
+-        for vals in vals_list:
+-            if vals.get('service_to_purchase'):
+-                self._check_vendor_for_service_to_purchase(vals.get('seller_ids'))
+-        return super().create(vals_list)
+-
+-    def _check_vendor_for_service_to_purchase(self, sellers):
++        templates = super().create(vals_list)
++        for template in templates.filtered(lambda t: t.service_tracking == 'subcontract'):
++            template._check_vendor_for_service_tracking_subcontract(template.seller_ids)
++        return templates
++
++    def write(self, vals):
++        res = super().write(vals)
++        for template in self.filtered(lambda t: t.service_tracking == 'subcontract'):
++            template._check_vendor_for_service_tracking_subcontract(template.seller_ids)
++        return res
++
++    def _prepare_service_tracking_tooltip(self):
++        if self.service_tracking == 'subcontract':
++            return self.env._("Each time you sell this product through a SO, a RfQ is automatically created to buy the product. Tip: don't forget to set a vendor on the product.")
++        return super()._prepare_service_tracking_tooltip()
++
++    def _check_vendor_for_service_tracking_subcontract(self, sellers):
+         if not sellers:
+-            raise ValidationError(_("Please define the vendor from whom you would like to purchase this service automatically."))
+-
+-    @api.onchange('type', 'reinvoice_policy')
+-    def _onchange_service_to_purchase(self):
+-        products_template = self.filtered(lambda p: p.type != 'service' or p.reinvoice_policy != 'no')
+-        products_template.service_to_purchase = False
++            raise ValidationError(self.env._("Please define the vendor from whom you would like to purchase this service automatically."))
+
+--- a/addons/sale_purchase/models/sale_order.py
++++ b/addons/sale_purchase/models/sale_order.py
+@@ -63,7 +63,8 @@ class SaleOrder(models.Model):
+         purchase_order_lines = self.env['purchase.order.line'].search([
+             ('sale_line_id', 'in', self.mapped('order_line').ids),
+             ('state', '!=', 'cancel'),
+-            ('product_id.service_to_purchase', '=', True),
++            ('product_id.service_tracking', '=', 'subcontract'),
++            ('company_id', 'in', self.mapped('company_id').ids),
+         ])
+         for purchase_line in purchase_order_lines:
+             purchase_to_notify_map.setdefault(purchase_line.order_id, self.env['sale.order.line'])
+
+--- a/addons/sale_purchase/models/sale_order_line.py
++++ b/addons/sale_purchase/models/sale_order_line.py
+@@ -24,7 +24,7 @@ class SaleOrderLine(models.Model):
+ 
+     @api.onchange('product_uom_qty')
+     def _onchange_service_product_uom_qty(self):
+-        if self.state == 'sale' and self.product_id.type == 'service' and self.product_id.with_company(self._purchase_service_get_company()).service_to_purchase:
++        if self.state == 'sale' and self.product_id.type == 'service' and self.product_id.with_company(self._purchase_service_get_company()).service_tracking == 'subcontract':
+             if self.product_uom_qty < self._origin.product_uom_qty:
+                 if self.product_uom_qty < self.qty_delivered:
+                     return {}
+@@ -55,8 +55,8 @@ class SaleOrderLine(models.Model):
+         decreased_values = {}
+         if 'product_uom_qty' in vals:
+             precision = self.env['decimal.precision'].precision_get('Product Unit')
+-            increased_lines = self.sudo().filtered(lambda r: r.product_id.with_company(r._purchase_service_get_company()).service_to_purchase and r.purchase_line_count and float_compare(r.product_uom_qty, vals['product_uom_qty'], precision_digits=precision) == -1)
+-            decreased_lines = self.sudo().filtered(lambda r: r.product_id.with_company(r._purchase_service_get_company()).service_to_purchase and r.purchase_line_count and float_compare(r.product_uom_qty, vals['product_uom_qty'], precision_digits=precision) == 1)
++            increased_lines = self.sudo().filtered(lambda r: r.product_id.with_company(r._purchase_service_get_company()).service_tracking == 'subcontract' and r.purchase_line_count and float_compare(r.product_uom_qty, vals['product_uom_qty'], precision_digits=precision) == -1)
++            decreased_lines = self.sudo().filtered(lambda r: r.product_id.with_company(r._purchase_service_get_company()).service_tracking == 'subcontract' and r.purchase_line_count and float_compare(r.product_uom_qty, vals['product_uom_qty'], precision_digits=precision) == 1)
+             increased_values = {line.id: line.product_uom_qty for line in increased_lines}
+             decreased_values = {line.id: line.product_uom_qty for line in decreased_lines}
+ 
+@@ -300,7 +300,7 @@ class SaleOrderLine(models.Model):
+         for line in self:
+             line = line.with_company(line._purchase_service_get_company())
+             # Do not regenerate PO line if the SO line has already created one in the past (SO cancel/reconfirmation case)
+-            if line.product_id.service_to_purchase and not line.purchase_line_count:
++            if line.product_id.service_tracking == 'subcontract' and not line.purchase_line_count:
+                 result = line._purchase_service_create()
+                 sale_line_purchase_map.update(result)
+         return sale_line_purchase_map

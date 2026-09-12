@@ -1,0 +1,167 @@
+PR: https://github.com/odoo/odoo/pull/231878
+
+From: a0357db9f13268c9d1c0a03e07f4e64e882b4049
+From: Martin Lefèvre (mlef)
+Date: 2025-11-17 15:57:54
+
+Breaking data model changes scores: del:3 + add:0, change matches:
+-    is_leave = fields.Boolean(related='work_entry_type_id.is_leave')
+-    is_leave = fields.Boolean(
+-    is_work = fields.Boolean(
+
+Total Changes: 47
+
+[IMP] hr_payroll: refactor work entry type form view
+
+The Work Entry Type form view needed to be refactored.
+The form view is now split into new groups (computation, display,
+exports code, benegit eligibility and description).
+
+Tooltips and placeholders have been added to avoid further confusion of
+the fields, and some naming repetition has been removed (e.g.: "Partena
+Code" under the "Exports Code" group).
+
+Some hidden columns and some filters have been added to the list view.
+Here is a visualization of all the visual changes that needed to be
+done:
+https://app.excalidraw.com/l/65VNwvy7c4X/4LJSOZo8W3D
+
+`_is_unforeseen` (and anything related to it) has been deleted, since it
+was not used anywhere.
+
+After the UI cleanup, some views became unused. I had to remove them in migrations.
+
+`is_leave` (and its mirrror, `is_work`) are redundant, especially now
+that we want to use a selection field instead. So I had to remove them
+both and replace every single one of their occurences in the code by a
+new selection field named `category`.
+A migration making sure `category` reflects the old `is_leave` needed to
+be put in place.
+
+task-5162567
+
+closes odoo/odoo#231878
+
+Related: odoo/enterprise#97351
+Related: odoo/upgrade#8643
+Signed-off-by: Yannick Tivisse (yti) <yti@odoo.com>
+
+================================= pseudo patch: =================================
+
+--- a/addons/hr_work_entry/models/hr_version.py
++++ b/addons/hr_work_entry/models/hr_version.py
+@@ -461,7 +461,8 @@ class HrVersion(models.Model):
+     def _generate_work_entries_postprocess_adapt_to_calendar(self, vals):
+         if 'work_entry_type_id' not in vals:
+             return False
+-        return self.env['hr.work.entry.type'].browse(vals['work_entry_type_id']).is_leave
++        work_entry_type = self.env['hr.work.entry.type'].browse(vals['work_entry_type_id'])
++        return work_entry_type.category == 'absence'
+ 
+     @api.model
+     def _generate_work_entries_postprocess(self, vals_list):
+
+--- a/addons/hr_work_entry/models/hr_work_entry.py
++++ b/addons/hr_work_entry/models/hr_work_entry.py
+@@ -36,7 +36,7 @@ class HrWorkEntry(models.Model):
+     code = fields.Char(related='work_entry_type_id.code')
+     external_code = fields.Char(related='work_entry_type_id.external_code')
+     color = fields.Integer(related='work_entry_type_id.color', readonly=True)
+-    is_leave = fields.Boolean(related='work_entry_type_id.is_leave')
++    category = fields.Selection(related='work_entry_type_id.category')
+     is_manual = fields.Boolean(help="Marks if the work entry came from manual creation or split")
+     state = fields.Selection([
+         ('draft', 'New'),
+@@ -177,7 +177,7 @@ class HrWorkEntry(models.Model):
+         return bool(conflict_ids)
+ 
+     def _get_leaves_entries_outside_schedule(self):
+-        return self.filtered(lambda w: w.work_entry_type_id.is_leave and w.state not in ('validated', 'cancelled'))
++        return self.filtered(lambda w: w.work_entry_type_id.category == 'absence' and w.state not in ('validated', 'cancelled'))
+ 
+     def _mark_leaves_outside_schedule(self):
+         """
+
+--- a/addons/hr_work_entry/models/hr_work_entry_type.py
++++ b/addons/hr_work_entry/models/hr_work_entry_type.py
+@@ -10,7 +10,7 @@ class HrWorkEntryType(models.Model):
+ 
+     name = fields.Char(required=True, translate=True)
+     display_code = fields.Char(string="Display Code", size=3, translate=True, help="This code can be changed, it is only for a display purpose (3 letters max)")
+-    code = fields.Char(string="Payroll Code", required=True, help="Careful, the Code is used in many references, changing it could lead to unwanted changes.")
++    code = fields.Char(string="Payroll Code", required=True, help="The code is used as a reference in salary rules. Careful, changing an existing code can lead to unwanted behaviors.")
+     external_code = fields.Char(help="Use this code to export your data to a third party")
+     color = fields.Integer(default=0)
+     sequence = fields.Integer(default=25)
+@@ -23,11 +23,12 @@ class HrWorkEntryType(models.Model):
+         domain=lambda self: [('id', 'in', self.env.companies.country_id.ids)]
+     )
+     country_code = fields.Char(related='country_id.code')
+-    is_leave = fields.Boolean(
+-        default=False, string="Is Time Off", help="Allow the work entry type to be linked with time off types.")
+-    is_work = fields.Boolean(
+-        compute='_compute_is_work', inverse='_inverse_is_work', string="Working Time", readonly=False,
+-        help="If checked, the work entry is counted as work time in the working schedule")
++    category = fields.Selection(
++        [("working_time", "Working Time"), ("absence", "Absence")],
++        default="working_time",
++        required=True,
++        help="Determines if the entry counts as working time or absence.",
++    )
+     amount_rate = fields.Float(
+         string="Rate",
+         default=1.0,
+@@ -58,12 +59,3 @@ class HrWorkEntryType(models.Model):
+             ])
+             if invalid_work_entry_types:
+                 raise UserError(_("The same code cannot be associated to multiple work entry types (%s)", ', '.join(list(set(invalid_work_entry_types.mapped('code'))))))
+-
+-    @api.depends('is_leave')
+-    def _compute_is_work(self):
+-        for record in self:
+-            record.is_work = not record.is_leave
+-
+-    def _inverse_is_work(self):
+-        for record in self:
+-            record.is_leave = not record.is_work
+
+--- a/addons/hr_work_entry/models/resource_calendar.py
++++ b/addons/hr_work_entry/models/resource_calendar.py
+@@ -1,15 +1,25 @@
+ # Part of Odoo. See LICENSE file for full copyright and licensing details.
+ 
+ from odoo import api, models
++from odoo.fields import Domain
+ 
+ 
+ class ResourceCalendar(models.Model):
+     _inherit = 'resource.calendar'
+ 
+-    # Override the method to add 'attendance_ids.work_entry_type_id.is_leave' to the dependencies
+-    @api.depends('attendance_ids.work_entry_type_id.is_leave')
++    # Override the method to add 'attendance_ids.work_entry_type_id.category' to
++    # the dependencies
++    @api.depends('attendance_ids.work_entry_type_id.category')
+     def _compute_hours_per_week(self):
+         super()._compute_hours_per_week()
+ 
+     def _get_global_attendances(self):
+-        return super()._get_global_attendances().filtered(lambda a: not a.work_entry_type_id.is_leave)
++        global_attendances = super()._get_global_attendances()
++        return global_attendances.filtered_domain(
++            Domain.OR(
++                [
++                    Domain('work_entry_type_id', '=', False),
++                    Domain('work_entry_type_id.category', '=', 'working_time'),
++                ],
++            ),
++        )
+
+--- a/addons/hr_work_entry/models/resource_calendar_attendance.py
++++ b/addons/hr_work_entry/models/resource_calendar_attendance.py
+@@ -19,4 +19,4 @@ class ResourceCalendarAttendance(models.Model):
+         return res
+ 
+     def _is_work_period(self):
+-        return not self.work_entry_type_id.is_leave and super()._is_work_period()
++        return self.work_entry_type_id.category == 'working_time' and super()._is_work_period()

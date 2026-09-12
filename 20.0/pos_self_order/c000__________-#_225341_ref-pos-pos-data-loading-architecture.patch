@@ -1,0 +1,656 @@
+PR: https://github.com/odoo/odoo/pull/225341
+
+From: 142473d8358b73f74960fb8d3f1e902290aaad75
+From: Adrien Guilliams (adgu)
+Date: 2026-08-27 09:35:04
+
+Breaking data model changes scores: del:1 + add:0, change matches:
+-    _inherit = 'product.template'
+
+Total Changes: 378
+
+[REF] pos*: pos data loading architecture
+
+pos*: l10n_ar_pos, l10n_es_edi_verifactu_pos, l10n_in_pos, l10n_pe_pos,
+l10n_sa_edi_pos, point_of_sale, pos_discount, pos_event, pos_glory_cash,
+pos_hr, pos_loyalty, pos_online_payment_self_order, pos_qfpay,
+pos_restaurant, pos_sale, pos_self_order, pos_self_order_event,
+pos_self_order_qfpay
+
+Rework the POS data loading mechanism to improve scalability and support
+incremental syncing based on `write_date` timestamps.
+
+* Move field/relation metadata computation into `PosLoadMixin` via new
+  `_load_data_relations()` and `_load_pos_data_domain_and_dependencies()`
+  methods, removing the centralized logic from `pos_session.py`
+* Refactor `load_data()` to accept a `local_data` dict (model → {id:
+  write_date}) so the frontend can request only records newer than what
+  is already cached in IndexedDB
+* Add `_load_pos_metadata()` and `_read_pos_data_from_metadata()` to
+  clearly separate metadata collection from record reading
+* Add `load_pos_data_force_loading()` hook for models that always require
+  a full reload regardless of local cache
+* Automatically append `write_date` to loaded fields for cache comparison
+* Add template as record in the indexedDB cache
+* Refactor `data_service.js`: extract `syncInitialData`, `cleanLocalData`,
+  `cleanOldModels`, and `handleLoadingDataError`; handle stale model
+  cleanup in IndexedDB when modules are uninstalled
+* Compress multiple calls (load_data, load_data_params,
+  filter_local_data, ..) into a single load_data call.
+* Change some loading method to use load_data instead of a custom method
+  for each model.
+
+closes odoo/odoo#225341
+
+Task-id: 4982785
+Related: odoo/enterprise#93803
+Related: odoo/upgrade#10903
+Signed-off-by: Adrien Guilliams (adgu) <adgu@odoo.com>
+
+================================= pseudo patch: =================================
+
+--- a/addons/pos_self_order/models/__init__.py
++++ b/addons/pos_self_order/models/__init__.py
+@@ -1,6 +1,7 @@
+ # Part of Odoo. See LICENSE file for full copyright and licensing details.
+ 
+ from . import ir_http
++from . import ir_ui_view
+ from . import pos_category
+ from . import pos_config
+ from . import pos_order
+@@ -9,6 +10,7 @@ from . import pos_restaurant
+ from . import pos_payment_method
+ from . import pos_self_order_custom_link
+ from . import product_product
++from . import product_template
+ from . import product_tag
+ from . import res_config_settings
+ from . import pos_session
+
+--- a/None
++++ b/addons/pos_self_order/models/ir_ui_view.py
+@@ -0,0 +1,19 @@
++# Part of Odoo. See LICENSE file for full copyright and licensing details.
++
++from odoo import models, api
++
++
++class IrUiView(models.Model):
++    _inherit = "ir.ui.view"
++
++    @api.model
++    def _load_pos_self_data_read(self, records, config):
++        read_records = super()._load_pos_self_data_read(records, config)
++
++        for key in self._get_xml_ids_to_load():
++            read_records.append({
++                'key': key,
++                '_template': self.env['ir.qweb']._get_template(key)[1],
++            })
++
++        return read_records
+
+--- a/addons/pos_self_order/models/mail_template.py
++++ b/addons/pos_self_order/models/mail_template.py
+@@ -5,8 +5,11 @@ class MailTemplate(models.Model):
+     _inherit = ['mail.template', 'pos.load.mixin']
+ 
+     @api.model
+-    def _load_pos_data_domain(self, data, config):
+-        return [('id', 'in', [preset['mail_template_id'] for preset in data['pos.preset']])]
++    def _load_pos_data_domain(self, data):
++        return [('id', 'in', data['pos.preset'].mail_template_id.ids)]
++
++    def _load_pos_data_dependencies(self):
++        return ['pos.preset']
+ 
+     @api.model
+     def _load_pos_data_fields(self, config):
+
+--- a/addons/pos_self_order/models/pos_config.py
++++ b/addons/pos_self_order/models/pos_config.py
+@@ -298,11 +298,11 @@ class PosConfig(models.Model):
+             'account.tax.group', 'res.country', 'product.category', 'product.pricelist', 'product.pricelist.item', 'res.currency', 'account.fiscal.position',
+             'res.lang', 'product.attribute', 'product.attribute.custom.value', 'product.template.attribute.line', 'product.template.attribute.value', 'product.tag',
+             'decimal.precision', 'uom.uom', 'pos_self_order.custom_link', 'restaurant.floor', 'restaurant.table', 'account.cash.rounding',
+-            'res.country', 'res.country.state', 'mail.template', 'pos.snooze', 'pos.prep.order', 'pos.prep.line']
++            'res.country', 'res.country.state', 'mail.template', 'pos.snooze', 'pos.prep.order', 'pos.prep.line', 'ir.ui.view']
+ 
+     @api.model
+-    def _load_pos_self_data_domain(self, data, config):
+-        return [('id', '=', config.id)]
++    def _load_pos_self_data_domain(self, data):
++        return [('id', '=', data['pos.config'].id)]
+ 
+     @api.model
+     def _load_pos_self_data_read(self, records, config):
+@@ -312,7 +312,6 @@ class PosConfig(models.Model):
+         record = read_records[0]
+         record['_self_ordering_image_home_ids'] = config.self_ordering_image_home_ids.read(['mimetype'])
+         record['_self_ordering_image_background_ids'] = config.self_ordering_image_background_ids.ids
+-        record['_pos_special_products_ids'] = config._get_special_products().ids
+         record['_self_order_pos'] = True
+         google_places_api_key = self.env['ir.config_parameter'].sudo().get_str('google_address_autocomplete.google_places_api_key')
+         record['_has_google_places_api_key'] = bool(google_places_api_key)
+@@ -320,33 +319,29 @@ class PosConfig(models.Model):
+         return read_records
+ 
+     def load_self_data(self):
+-        response = {}
+-        response['pos.config'] = self.env['pos.config']._load_pos_self_data_search_read(response, self)
++        metadata = self._load_self_metadata()
++        return self._read_pos_self_data_from_metadata(metadata, self)
+ 
+-        for model in self._load_self_data_models():
+-            try:
+-                response[model] = self.env[model]._load_pos_self_data_search_read(response, self)
+-            except AccessError:
+-                response[model] = []
+-
+-        return response
+-
+-    def load_data_params(self):
+-        response = {}
++    def _load_self_metadata(self):
++        models = self._load_self_data_models()
++        records = {}
+         fields = self._load_pos_self_data_fields(self)
+-        response['pos.config'] = {
++        domain = [('id', '=', self.id)]
++        records['pos.config'] = {
++            'domain': domain,
+             'fields': fields,
+-            'relations': self.env['pos.session']._load_pos_data_relations('pos.config', fields)
++            'records': self.search(domain, limit=1),
++            'relations': self._load_data_relations(fields),
+         }
+-
+-        for model in self._load_self_data_models():
+-            fields = self.env[model]._load_pos_self_data_fields(self)
+-            response[model] = {
+-                'fields': fields,
+-                'relations': self.env['pos.session']._load_pos_data_relations(model, fields)
+-            }
+-
+-        return response
++        for model in models:
++            try:
++                self.env[model]._load_pos_self_metadata(records, {})
++            except AccessError:
++                records[model] = {
++                    **self.env[model]._load_pos_self_data_domain_and_relations(records),
++                    'records': self.env[model],
++                }
++        return records
+ 
+     def _compute_self_ordering_url(self):
+         for record in self:
+@@ -403,7 +398,7 @@ class PosConfig(models.Model):
+     def has_valid_self_payment_method(self):
+         """ Checks if the POS config has a valid payment method (terminal or online). """
+         self.ensure_one()
+-        domain = self.payment_method_ids._load_pos_self_data_domain({}, self)
++        domain = self.payment_method_ids._load_pos_self_data_domain({'pos.config': self})
+         return bool(self.payment_method_ids.filtered_domain(domain))
+ 
+     @api.model
+
+--- a/addons/pos_self_order/models/pos_load_mixin.py
++++ b/addons/pos_self_order/models/pos_load_mixin.py
+@@ -1,27 +1,18 @@
+ # Part of Odoo. See LICENSE file for full copyright and licensing details.
+ from odoo import models, api
++from odoo.exceptions import AccessError
++import logging
++
++_logger = logging.getLogger(__name__)
+ 
+ 
+ class PosLoadMixin(models.AbstractModel):
+     _inherit = "pos.load.mixin"
+ 
+     @api.model
+-    def _load_pos_self_data_search_read(self, data, config):
+-        """ Search and return records to be loaded in the self """
+-        if not config:
+-            raise ValueError("config must be provided to search for PoS data.")
+-
+-        domain = self._load_pos_self_data_domain(data, config)
+-        if domain is False:
+-            return []
+-
+-        records = self.search(domain)
+-        return self._load_pos_self_data_read(records, config)
+-
+-    @api.model
+-    def _load_pos_self_data_domain(self, data, config):
++    def _load_pos_self_data_domain(self, data):
+         """ Return the domain used to filter records """
+-        return self._load_pos_data_domain(data, config)
++        return self._load_pos_data_domain(data)
+ 
+     @api.model
+     def _load_pos_self_data_read(self, records, config):
+@@ -30,6 +21,8 @@ class PosLoadMixin(models.AbstractModel):
+             raise ValueError("config must be provided to read PoS data.")
+ 
+         fields = self._load_pos_self_data_fields(config)
++        if fields and 'write_date' not in fields:
++            fields.append('write_date')
+         records = records.read(fields, load=False)
+         return records or []
+ 
+@@ -37,3 +30,41 @@ class PosLoadMixin(models.AbstractModel):
+     def _load_pos_self_data_fields(self, config):
+         """ Return the list of fields to be loaded """
+         return self._load_pos_data_fields(config)
++
++    @api.model
++    def _load_pos_self_data_domain_and_relations(self, data):
++        adapted_data = {model: d['records'] for model, d in data.items()}
++        fields = self._load_pos_self_data_fields(data["pos.config"]["records"][0] if data.get("pos.config") else None)
++        return {
++            'domain': self._load_pos_self_data_domain(adapted_data),
++            'fields': fields,
++            'relations': self._load_data_relations(fields),
++        }
++
++    @api.model
++    def _load_pos_self_metadata(self, data, search_params={}):
++        result = self._load_pos_self_data_domain_and_relations(data)
++        data[self._name] = {
++            **result,
++            'records': self.search(domain=search_params.get('domain', False) or result['domain'],
++                                   limit=search_params.get('limit', False),
++                                   offset=search_params.get('offset', 0))
++        }
++        return data
++
++    @api.model
++    def _read_pos_self_data_from_metadata(self, server_data, config_id):
++        response = {}
++        for model, data in server_data.items():
++            try:
++                records = data['records']
++                response[model] = {
++                    **data,
++                    'records': records._load_pos_self_data_read(records, config_id),
++                }
++                del response[model]['domain']
++            except AccessError as e:
++                response[model] = []
++                _logger.info("Could not load model %s due to AccessError: %s", model, e)
++
++        return response
+
+--- a/addons/pos_self_order/models/pos_order.py
++++ b/addons/pos_self_order/models/pos_order.py
+@@ -26,7 +26,7 @@ class PosOrder(models.Model):
+         return super().write(vals)
+ 
+     @api.model
+-    def _load_pos_self_data_domain(self, data, config):
++    def _load_pos_self_data_domain(self, data):
+         return [('id', '=', False)]
+ 
+     @api.model
+
+--- a/addons/pos_self_order/models/pos_payment_method.py
++++ b/addons/pos_self_order/models/pos_payment_method.py
+@@ -14,7 +14,8 @@ class PosPaymentMethod(models.Model):
+         return False
+ 
+     @api.model
+-    def _load_pos_self_data_domain(self, data, config):
++    def _load_pos_self_data_domain(self, data):
++        config = data['pos.config']
+         if config.self_ordering_mode == 'kiosk':
+             return [('id', 'in', config.payment_method_ids.ids), '|', ('type', '=', 'cash'), ('payment_provider', '!=', False)]
+         return [('id', '=', False)]
+
+--- a/addons/pos_self_order/models/pos_prep_line.py
++++ b/addons/pos_self_order/models/pos_prep_line.py
+@@ -5,5 +5,5 @@ class PosPrepLine(models.Model):
+     _inherit = "pos.prep.line"
+ 
+     @api.model
+-    def _load_pos_self_data_domain(self, data, config):
++    def _load_pos_self_data_domain(self, data):
+         return [('id', '=', False)]
+
+--- a/addons/pos_self_order/models/pos_prep_order.py
++++ b/addons/pos_self_order/models/pos_prep_order.py
+@@ -5,5 +5,5 @@ class PosPrepOrder(models.Model):
+     _inherit = "pos.prep.order"
+ 
+     @api.model
+-    def _load_pos_self_data_domain(self, data, config):
++    def _load_pos_self_data_domain(self, data):
+         return [('id', '=', False)]
+
+--- a/addons/pos_self_order/models/pos_preset.py
++++ b/addons/pos_self_order/models/pos_preset.py
+@@ -17,7 +17,6 @@ class PosPreset(models.Model):
+         default="counter",
+         required=True,
+     )
+-
+     delivery_from_address = fields.Char(
+         string="Sender address",
+         compute="_compute_delivery_from_address",
+@@ -166,8 +165,8 @@ class PosPreset(models.Model):
+ 
+     # will be overridden.
+     @api.model
+-    def _load_pos_self_data_domain(self, data, config):
+-        return ['|', ('id', '=', config.default_preset_id.id), '&', ('available_in_self', '=', True), ('id', 'in', config.available_preset_ids.ids)]
++    def _load_pos_self_data_domain(self, data):
++        return ['|', ('id', '=', data['pos.config'].default_preset_id.id), '&', ('available_in_self', '=', True), ('id', 'in', data['pos.config'].available_preset_ids.ids)]
+ 
+     @api.model
+     def _load_pos_self_data_fields(self, config):
+
+--- a/addons/pos_self_order/models/pos_restaurant.py
++++ b/addons/pos_self_order/models/pos_restaurant.py
+@@ -2,7 +2,6 @@
+ # Part of Odoo. See LICENSE file for full copyright and licensing details.
+ 
+ import uuid
+-from typing import Dict, Callable, List, Optional
+ 
+ from odoo import api, fields, models
+ 
+@@ -32,8 +31,8 @@ class RestaurantTable(models.Model):
+         return ['table_number', 'identifier', 'floor_id']
+ 
+     @api.model
+-    def _load_pos_self_data_domain(self, data, config):
+-        return [('floor_id', 'in', [floor['id'] for floor in data['restaurant.floor']])]
++    def _load_pos_self_data_domain(self, data):
++        return [('floor_id', 'in', data['restaurant.floor'].ids)]
+ 
+ 
+ class RestaurantFloor(models.Model):
+@@ -44,5 +43,5 @@ class RestaurantFloor(models.Model):
+         return ['name', 'table_ids']
+ 
+     @api.model
+-    def _load_pos_self_data_domain(self, data, config):
+-        return [('id', 'in', config.floor_ids.ids)]
++    def _load_pos_self_data_domain(self, data):
++        return [('id', 'in', data['pos.config'].floor_ids.ids)]
+
+--- a/addons/pos_self_order/models/pos_self_order_custom_link.py
++++ b/addons/pos_self_order/models/pos_self_order_custom_link.py
+@@ -39,8 +39,8 @@ class Pos_Self_OrderCustom_Link(models.Model):
+     sequence = fields.Integer("Sequence", default=1)
+ 
+     @api.model
+-    def _load_pos_self_data_domain(self, data, config):
+-        return [('pos_config_ids', 'in', config.id)]
++    def _load_pos_self_data_domain(self, data):
++        return [('pos_config_ids', 'in', data['pos.config'].id)]
+ 
+     @api.model
+     def _load_pos_self_data_fields(self, config):
+
+--- a/addons/pos_self_order/models/pos_session.py
++++ b/addons/pos_self_order/models/pos_session.py
+@@ -18,8 +18,8 @@ class PosSession(models.Model):
+         return ['id', 'user_id', 'config_id', 'payment_method_ids', 'state']
+ 
+     @api.model
+-    def _load_pos_self_data_domain(self, data, config):
+-        return [('config_id', '=', config.id), ('state', 'not in', ['closed', 'closing_control'])]
++    def _load_pos_self_data_domain(self, data):
++        return [('config_id', '=', data['pos.config'].id), ('state', 'not in', ['closed', 'closing_control'])]
+ 
+     def _load_pos_data_read(self, records, config):
+         read_records = super()._load_pos_data_read(records, config)
+
+--- a/addons/pos_self_order/models/product_product.py
++++ b/addons/pos_self_order/models/product_product.py
+@@ -1,102 +1,7 @@
+ # Part of Odoo. See LICENSE file for full copyright and licensing details.
+ from __future__ import annotations
+ 
+-from odoo import api, fields, models
+-from odoo.fields import Domain
+-
+-
+-class ProductTemplate(models.Model):
+-    _inherit = 'product.template'
+-
+-    self_order_available = fields.Boolean(
+-        string="Available in Self Order",
+-        help="If this product is available in the Self Order screens",
+-        default=True,
+-    )
+-
+-    self_order_visible = fields.Boolean(compute='_compute_self_order_visible')
+-
+-    def _load_pos_self_data_read(self, data, config):
+-        domain = self._load_pos_self_data_domain(data, config)
+-        fields = set(self._load_pos_self_data_fields(config))
+-        products = self.search(
+-            domain,
+-            limit=config.get_limited_product_count(),
+-            order='is_favorite DESC,pos_sequence,name',
+-        )
+-        combo_products = products.combo_ids.combo_item_ids.product_id.product_tmpl_id
+-        additional_products = (combo_products + products.pos_optional_product_ids).filtered_domain([
+-            ('self_order_available', '=', True),
+-        ])
+-        presets = self.env['pos.preset'].sudo().search([
+-            '|',
+-            ('delivery_product_id', '!=', False),
+-            ('service_fee_product_id', '!=', False),
+-        ])
+-        preset_product_tmpls = (
+-            presets.delivery_product_id.product_tmpl_id
+-            | presets.service_fee_product_id.product_tmpl_id
+-        )
+-        all_products = products | additional_products | preset_product_tmpls
+-
+-        if config.tip_product_id:
+-            all_products |= config.tip_product_id.product_tmpl_id
+-
+-        read_products = all_products.read(fields, load=False)
+-        self._process_pos_self_ui_products(read_products)
+-        return read_products
+-
+-    def _process_pos_self_ui_products(self, products):
+-        self._add_archived_combinations(products)
+-        for product in products:
+-            product['image_128'] = bool(product['image_128'])
+-
+-    @api.model
+-    def _load_pos_data_fields(self, config):
+-        params = super()._load_pos_data_fields(config)
+-        params += ['self_order_available']
+-        return params
+-
+-    @api.model
+-    def _load_pos_self_data_domain(self, data, config):
+-        domain = super()._load_pos_self_data_domain(data, config)
+-        domain = Domain.AND([domain, [('self_order_available', '=', True)]])
+-        # Also include templates for delivery products referenced by active presets
+-        delivery_tmpl_ids = self.env['pos.preset'].sudo().search([
+-            ('delivery_product_id', '!=', False),
+-        ]).delivery_product_id.product_tmpl_id.ids
+-        if delivery_tmpl_ids:
+-            domain = Domain.OR([domain, [('id', 'in', delivery_tmpl_ids)]])
+-        return domain
+-
+-    @api.onchange('available_in_pos')
+-    def _on_change_available_in_pos(self):
+-        for record in self:
+-            if not record.available_in_pos:
+-                record.self_order_available = False
+-
+-    def _compute_self_order_visible(self):
+-        active_self_order_configs = self.env['pos.config'].sudo().search_count([('self_ordering_mode', '!=', 'nothing')])
+-        for product in self:
+-            product.self_order_visible = bool(active_self_order_configs)
+-
+-    def write(self, vals):
+-        if 'available_in_pos' in vals:
+-            if not vals['available_in_pos']:
+-                vals['self_order_available'] = False
+-
+-        res = super().write(vals)
+-
+-        if 'self_order_available' in vals:
+-            for record in self:
+-                for product in record.product_variant_ids:
+-                    product._send_availability_status()
+-        return res
+-
+-    def _can_return_content(self, field_name=None, access_token=None):
+-        if field_name in ["image_512", "image_128"] and self.sudo().self_order_available:
+-            return True
+-        return super()._can_return_content(field_name, access_token)
++from odoo import models
+ 
+ 
+ class ProductProduct(models.Model):
+@@ -112,7 +17,7 @@ class ProductProduct(models.Model):
+     def _send_availability_status(self):
+         config_self = self.env['pos.config'].sudo().search([('self_ordering_mode', '!=', 'nothing')])
+         for config in config_self:
+-            if config.access_token:
++            if config.access_token and config.current_session_id:
+                 records = self.env["product.template"].load_product_from_pos(config.id, [('id', '=', self.product_tmpl_id.id)])
+                 payload = {}
+                 self_models = self.env["pos.config"]._load_self_data_models()
+
+--- a/addons/pos_self_order/models/product_tag.py
++++ b/addons/pos_self_order/models/product_tag.py
+@@ -11,5 +11,5 @@ class ProductTag(models.Model):
+         return super()._can_return_content(field_name, access_token)
+ 
+     @api.model
+-    def _load_pos_self_data_domain(self, data, config):
++    def _load_pos_self_data_domain(self, data):
+         return [('visible_to_customers', '=', True)]
+
+--- a/None
++++ b/addons/pos_self_order/models/product_template.py
+@@ -0,0 +1,104 @@
++from odoo import models, fields, api
++from odoo.fields import Domain
++
++
++class ProductTemplate(models.Model):
++    _inherit = 'product.template'
++
++    self_order_available = fields.Boolean(
++        string="Available in Self Order",
++        help="If this product is available in the Self Order screens",
++        default=True,
++    )
++
++    self_order_visible = fields.Boolean(compute='_compute_self_order_visible')
++
++    @api.model
++    def _load_pos_self_data_read(self, records, config):
++        fields = set(self._load_pos_self_data_fields(config))
++        products = records.sorted('is_favorite DESC,pos_sequence,name').read(fields, load=False)
++        self._process_pos_self_ui_products(products)
++        for product in products:
++            product['_is_pos_special_product'] = product['id'] in config._get_special_products().ids
++
++        return products
++
++    def _process_pos_self_ui_products(self, products):
++        self._add_archived_combinations(products)
++        for product in products:
++            product['image_128'] = bool(product['image_128'])
++
++    @api.model
++    def _load_pos_data_fields(self, config):
++        params = super()._load_pos_data_fields(config)
++        params += ['self_order_available']
++        return params
++
++    @api.model
++    def _load_pos_self_data_domain(self, data):
++        domain = super()._load_pos_self_data_domain(data)
++        domain = Domain.AND([domain, [('self_order_available', '=', True)]])
++        # Also include templates for delivery products referenced by active presets
++        delivery_tmpl_ids = data['pos.preset'].delivery_product_id.product_tmpl_id
++        if delivery_tmpl_ids:
++            domain = Domain.OR([domain, [('id', 'in', delivery_tmpl_ids.ids)]])
++        return domain
++
++    @api.onchange('available_in_pos')
++    def _on_change_available_in_pos(self):
++        for record in self:
++            if not record.available_in_pos:
++                record.self_order_available = False
++
++    def _compute_self_order_visible(self):
++        active_self_order_configs = self.env['pos.config'].sudo().search_count([('self_ordering_mode', '!=', 'nothing')])
++        for product in self:
++            product.self_order_visible = bool(active_self_order_configs)
++
++    def write(self, vals):
++        if 'available_in_pos' in vals:
++            if not vals['available_in_pos']:
++                vals['self_order_available'] = False
++
++        res = super().write(vals)
++
++        if 'self_order_available' in vals:
++            for record in self:
++                for product in record.product_variant_ids:
++                    product._send_availability_status()
++        return res
++
++    def _can_return_content(self, field_name=None, access_token=None):
++        if field_name in ["image_512", "image_128"] and self.sudo().self_order_available:
++            return True
++        return super()._can_return_content(field_name, access_token)
++
++    @api.model
++    def _load_pos_self_metadata(self, data, search_params={}):
++        super()._load_pos_self_metadata(data, search_params)
++        old_data = data['product.template']
++        self._load_pos_metadata(data, search_params)
++        products = data['product.template']['records']
++        combo_products = products.combo_ids.combo_item_ids.product_id.product_tmpl_id
++        additional_products = (combo_products + products.pos_optional_product_ids).filtered_domain([
++            ('self_order_available', '=', True),
++        ])
++        presets = self.env['pos.preset'].sudo().search([
++            '|',
++            ('delivery_product_id', '!=', False),
++            ('service_fee_product_id', '!=', False),
++        ])
++        preset_product_tmpls = (
++            presets.delivery_product_id.product_tmpl_id
++            | presets.service_fee_product_id.product_tmpl_id
++        )
++        all_products = products | additional_products | preset_product_tmpls
++
++        if data['pos.config']['records'].tip_product_id:
++            all_products |= data['pos.config']['records'].tip_product_id.product_tmpl_id
++
++        data['product.template'] = {
++            **old_data,
++            'records': all_products,
++        }
++        return data
+
+--- a/addons/pos_self_order/models/res_partner.py
++++ b/addons/pos_self_order/models/res_partner.py
+@@ -6,7 +6,7 @@ class ResPartner(models.Model):
+     _inherit = 'res.partner'
+ 
+     @api.model
+-    def _load_pos_self_data_domain(self, data, config):
++    def _load_pos_self_data_domain(self, data):
+         return False
+ 
+     @api.model

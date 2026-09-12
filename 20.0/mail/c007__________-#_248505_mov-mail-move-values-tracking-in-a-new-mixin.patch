@@ -1,0 +1,394 @@
+PR: https://github.com/odoo/odoo/pull/248505
+
+From: d4e5b45d3e89e0c5010f1267772fd1fc602377b0
+From: Thibault Delavallée
+Date: 2026-03-23 11:06:01
+
+Breaking data model changes scores: del:1 + add:0, change matches:
+-    _inherit = 'bus.listener.mixin'
+
+Total Changes: 269
+
+[MOV] mail: move values tracking in a new mixin
+
+Some models (try to) track value changes without really inheriting
+or using mail.thread capabilities. This is for example the case with
+move lines, but also hr card wizards, payroll parameter lines, ...
+
+Tracking value changes and logging on another model is a frequent
+need on technical models. Submodels like lines often store value
+users may want to track at a higher level.
+
+In order to enable value tracking and managing them without inheriting
+from the whole mail.thread stack we add a new mixin dealing with the
+base computation of values tracking. Mail Thread then adds automatic
+change computation, chatter management, message posting, ... on top
+of it.
+
+To ease 'mail.thread' code addition, '_track_finalize' now calls
+an inner '_track_execute' receiving computed trackings and changes.
+This allows to implement override-specific behavior only without
+worrying on actual changes computation.
+
+Future commits will move some additional features to the mixin. This
+is done in several steps to ease readability and control feature move.
+
+This does not change anything for most models as mail.thread inherits
+from the new one.
+
+Task-5935695 ([mail, various] Cleanup and test tracking usage)
+Prepares Task-3645865 ([mail] In-body tracking)
+
+Part-of: odoo/odoo#248505
+Related: odoo/enterprise#107128
+Related: odoo/documentation#16464
+Related: odoo/upgrade#9638
+Signed-off-by: Thibault Delavallee (tde) <tde@openerp.com>
+
+================================= pseudo patch: =================================
+
+--- a/addons/mail/models/__init__.py
++++ b/addons/mail/models/__init__.py
+@@ -11,6 +11,7 @@ from . import mail_alias_mixin_optional
+ from . import mail_alias_mixin
+ from . import mail_render_mixin
+ from . import mail_composer_mixin
++from . import mail_track_mixin
+ from . import mail_thread
+ from . import mail_thread_blacklist
+ from . import mail_thread_main_attachment
+
+--- a/addons/mail/models/mail_thread.py
++++ b/addons/mail/models/mail_thread.py
+@@ -39,7 +39,7 @@ from odoo.tools import (
+     BinaryBytes,
+     is_html_empty, html_escape, html2plaintext,
+     clean_context, split_every, SQL,
+-    OrderedSet, ormcache, is_list_of,
++    OrderedSet, is_list_of,
+ )
+ from odoo.tools.mail import (
+     append_content_to_html, decode_message_header,
+@@ -133,7 +133,10 @@ class MailThread(models.AbstractModel):
+     '''
+     _name = 'mail.thread'
+     _description = 'Email Thread'
+-    _inherit = 'bus.listener.mixin'
++    _inherit = [
++        'bus.listener.mixin',
++        'mail.track.mixin',  # values tracking basic capabilities
++    ]
+     _mail_flat_thread = True  # link orphan messages to the first message
+     _mail_thread_customer = False  # subscribe customer when being in post recipients
+     _mail_post_access = 'write'  # access required on the document to post on it
+@@ -517,15 +520,6 @@ class MailThread(models.AbstractModel):
+         doc_name = self.env['ir.model']._get(self._name).name
+         return _('%s created', doc_name)
+ 
+-    def _valid_field_parameter(self, field, name):
+-        # allow tracking on models inheriting from 'mail.thread'
+-        return name == 'tracking' or super()._valid_field_parameter(field, name)
+-
+-    def _fallback_lang(self):
+-        if not self.env.context.get("lang"):
+-            return self.with_context(lang=self.env.user.lang)
+-        return self
+-
+     def _check_can_update_message_content(self, messages):
+         """" Checks that the current user can update the content of the message.
+         Current heuristic is
+@@ -540,79 +534,33 @@ class MailThread(models.AbstractModel):
+ 
+     # ------------------------------------------------------
+     # TRACKING / LOG
++    # see 'mail_track_mixin' for values tracking itself
+     # ------------------------------------------------------
+ 
+     # track data storage / manipulation
+     # ------------------------------------------------------
+ 
+-    def _track_disabled(self):
+-        return self.env.context.get('tracking_disable') or self.env.context.get('mail_notrack')
+-
+-    def _track_prepare(self, field_names: Iterable[str]) -> dict[int, ValuesType]:
+-        """ Prepare the tracking of `fields_iter` for `self` for tracked
+-        fields (see `_track_get_fields`). Store initial values for tracked fields
+-        in precommit data.
+-
+-        :param Iterable[str] field_names: field names to potentially track, to be
+-            checked against model-based tracked fields
+-        """
+-        tracked_fnames = self._track_get_fields().intersection(field_names)
+-        if not self or not tracked_fnames:
+-            return
+-        self.env.cr.precommit.add(self._track_finalize)
+-        initial_values = self.env.cr.precommit.data.setdefault(f'mail.tracking.{self._name}', {})
+-        for record in self.sudo().filtered(lambda r: r.id):  # be sure to compute initial values whatever current user ACLs
+-            record_values = initial_values.setdefault(record.id, {})
+-            if record_values is not None:  # None means tracking was disabled for this record
+-                for fname in tracked_fnames:
+-                    record_values.setdefault(fname, record._track_convert_value(fname, record[fname]))
+-
+-        # ease overrides by returning initial values
+-        return initial_values
+-
+-    def _track_discard(self):
+-        """ Prevent any tracking of fields on `self`. """
+-        if not self or not self._track_get_fields():
+-            return
+-        self.env.cr.precommit.add(self._track_finalize)
+-        initial_values = self.env.cr.precommit.data.setdefault(f'mail.tracking.{self._name}', {})
+-        # disable tracking by setting initial values to None
+-        for id_ in self.ids:
+-            initial_values[id_] = None
+-
+-    def _track_finalize(self):
+-        """ Generate the tracking messages for the records that have been
+-        prepared with `_tracking_prepare`.
+-
+-        Also cleans precommit data, resetting state and avoiding multiple
+-        tracking generation. """
+-        initial_values = self.env.cr.precommit.data.pop(f'mail.tracking.{self._name}', {})
+-        ids = [id_ for id_, vals in initial_values.items() if vals]
+-        if not ids:
+-            return
+-
+-        fnames = self._track_get_fields()
+-        # Clean the context to get rid of residual default_* keys that could
+-        # cause issues afterward during the mail.message generation. Example:
+-        # 'default_parent_id' would refer to the parent_id of the current
+-        # record that was used during its creation, but could refer to wrong
+-        # parent message id, leading to a traceback or a wrongly referenced
+-        # record
+-        # sudo: # be sure to compute end values whatever current user ACLs
+-        records_su = self.with_context(clean_context(self.env.context)).browse(ids).sudo()._fallback_lang()
++    def _track_execute(
++        self, track_init_values: dict[int, ValuesType],
++        trackings: dict[int, tuple[set[str], list[CommandValue]]]
++    ):
++        # override to generate tracking messages
++        super()._track_execute(track_init_values, trackings)
+ 
+-        tracked_fields_get = records_su.fields_get(fnames, attributes=('string', 'type', 'selection', 'currency_field'))
+-        trackings = dict()
+-        for record_su in records_su:
+-            try:
+-                trackings[record_su.id] = record_su._mail_track(tracked_fields_get, initial_values[record_su.id])
+-            except MissingError:
+-                continue
+-        records_su._track_log(initial_values, trackings)
++        # log tracking on records
++        self._track_log(track_init_values, trackings)
+ 
+-        for record_su in records_su:
++        # fire template-based message generation
++        for record_su in self:
+             tracked_fields, _tracking_value_ids = trackings.get(record_su.id, (None, None))
+-            record_su._message_track_post_template(tracked_fields)
++            record_su._track_post_template(tracked_fields)
++
++    def _track_finalize(self) -> dict[int, ValuesType] | None:
++        # override to cleanup precommit data specific to mailing capabilities
++        res = super()._track_finalize()
++        self.env.cr.precommit.data.get(f'mail.tracking.message.{self._name}', {})
++        self.env.cr.precommit.data.get(f'mail.tracking.author.{self._name}', {})
++        return res
+ 
+     def _track_set_log_author(self, author: BaseModel):
+         """ Set the author (res.partner) of the tracking message for `self`. """
+@@ -628,24 +576,6 @@ class MailThread(models.AbstractModel):
+         for id_ in self.ids:
+             body_values[id_] = message
+ 
+-    @ormcache('self.env.uid', 'self.env.su')
+-    def _track_get_fields(self) -> set[str]:
+-        """ Return the set of tracked fields names for the current model. """
+-        model_fields = {
+-            name
+-            for name, field in self._fields.items()
+-            if getattr(field, 'tracking', None)
+-        }
+-        # track the properties changes ONLY if the parent changed
+-        model_fields |= {
+-            fname for fname, f in self._fields.items()
+-            if f.type == "properties"
+-            and f.definition_record in model_fields
+-            and getattr(f, "tracking", None) is not False
+-        }
+-
+-        return model_fields and set(self.fields_get(model_fields, attributes=()))
+-
+     # track posting
+     # ------------------------------------------------------
+ 
+@@ -664,8 +594,8 @@ class MailThread(models.AbstractModel):
+             each existing record, changes and generate tracking values
+         """
+         # find content to log as body
+-        bodies = self.env.cr.precommit.data.pop(f'mail.tracking.message.{self._name}', {})
+-        authors = self.env.cr.precommit.data.pop(f'mail.tracking.author.{self._name}', {})
++        bodies = self.env.cr.precommit.data.get(f'mail.tracking.message.{self._name}', {})
++        authors = self.env.cr.precommit.data.get(f'mail.tracking.author.{self._name}', {})
+ 
+         for record in self:
+             changes, tracking_value_ids = trackings.get(record.id, (None, None))
+
+--- a/None
++++ b/addons/mail/models/mail_track_mixin.py
+@@ -0,0 +1,139 @@
++from __future__ import annotations
++
++import typing
++
++from odoo import models
++from odoo.exceptions import MissingError
++from odoo.tools import clean_context, ormcache
++
++if typing.TYPE_CHECKING:
++    from odoo.api import CommandValue, ValuesType
++    from odoo.models import BaseModel
++    from collections.abc import Iterable
++
++
++class MailTrackMixin(models.AbstractModel):
++    """ Base class enabling value tracking on models. What to do with values
++    is left to child model. Consider inheriting from 'mail.thread' which
++    link them to messages. """
++    _name = 'mail.track.mixin'
++    _description = 'Mail Track Mixin'
++
++    # model / crud helpers
++    # ------------------------------------------------------
++
++    def _fallback_lang(self) -> BaseModel:
++        if not self.env.context.get("lang"):
++            return self.with_context(lang=self.env.user.lang)
++        return self
++
++    def _valid_field_parameter(self, field, name):
++        # allow tracking on models inheriting from 'mail.thread'
++        return name == 'tracking' or super()._valid_field_parameter(field, name)
++
++    # track data storage / manipulation
++    # ------------------------------------------------------
++
++    def _track_disabled(self):
++        return self.env.context.get('tracking_disable') or self.env.context.get('mail_notrack')
++
++    def _track_prepare(self, field_names: Iterable[str]) -> dict[int, ValuesType]:
++        """ Prepare the tracking of `fields_iter` for `self` for tracked
++        fields (see `_track_get_fields`). Store initial values for tracked fields
++        in precommit data.
++
++        :param Iterable[str] field_names: field names to potentially track, to be
++            checked against model-based tracked fields
++        """
++        tracked_fnames = self._track_get_fields().intersection(field_names)
++        if not self or not tracked_fnames:
++            return
++        self.env.cr.precommit.add(self._track_finalize)
++        initial_values = self.env.cr.precommit.data.setdefault(f'mail.tracking.{self._name}', {})
++        for record in self.sudo().filtered(lambda r: r.id):  # be sure to compute initial values whatever current user ACLs
++            record_values = initial_values.setdefault(record.id, {})
++            if record_values is not None:  # None means tracking was disabled for this record
++                for fname in tracked_fnames:
++                    record_values.setdefault(fname, record._track_convert_value(fname, record[fname]))
++
++        # ease overrides by returning initial values
++        return initial_values
++
++    def _track_discard(self):
++        """ Prevent any tracking of fields on `self`. """
++        if not self or not self._track_get_fields():
++            return
++        self.env.cr.precommit.add(self._track_finalize)
++        initial_values = self.env.cr.precommit.data.setdefault(f'mail.tracking.{self._name}', {})
++        # disable tracking by setting initial values to None
++        for id_ in self.ids:
++            initial_values[id_] = None
++
++    def _track_execute(
++        self, track_init_values: dict[int, ValuesType],
++        trackings: dict[int, tuple[set[str], list[CommandValue]]]
++    ):
++        """ Perform model specific code based on trackings.
++        
++        :param dict[int, ValuesType] track_init_values: mapping {record_id: initial_values}
++            where initial_values is a dict {field_name: value, ... } containing
++            all initial values;
++        :param dict[int, tuple[set[str], list[CommandValue]]] trackings: for
++            each existing record, changes and generated tracking values;
++        """
++        return
++
++    def _track_finalize(self) -> dict[int, ValuesType] | None:
++        """ Generate the trackings for the records that have been prepared
++        with `_tracking_prepare`.
++
++        Also cleans precommit data, resetting state and avoiding multiple
++        tracking generation. """
++        initial_values = self.env.cr.precommit.data.pop(f'mail.tracking.{self._name}', {})
++        ids = [id_ for id_, vals in initial_values.items() if vals]
++        if not ids:
++            return
++
++        fnames = self._track_get_fields()
++        if not fnames:
++            return
++
++        # Clean the context to get rid of residual default_* keys that could
++        # cause issues afterward during the mail.message generation. Example:
++        # 'default_parent_id' would refer to the parent_id of the current
++        # record that was used during its creation, but could refer to wrong
++        # parent message id, leading to a traceback or a wrongly referenced
++        # record
++        # sudo: # be sure to compute end values whatever current user ACLs
++        records_su = self.with_context(clean_context(self.env.context)).browse(ids).sudo()._fallback_lang()
++
++        tracked_fields_get = records_su.fields_get(fnames, attributes=('string', 'type', 'selection', 'currency_field'))
++        trackings = dict()
++        for record_su in records_su:
++            try:
++                trackings[record_su.id] = record_su._mail_track(tracked_fields_get, initial_values[record_su.id])
++            except MissingError:
++                continue
++
++        # launch business flow to manage tracking values
++        records_su._track_execute(initial_values, trackings)
++
++        return records_su, initial_values, trackings
++
++    @ormcache('self.env.uid', 'self.env.su')
++    def _track_get_fields(self) -> set[str]:
++        """ Return the set of tracked fields names for the current model. """
++        model_fields = {
++            name
++            for name, field in self._fields.items()
++            if getattr(field, 'tracking', None)
++        }
++        # track the properties changes ONLY if the parent changed
++        model_fields |= {
++            fname for fname, f in self._fields.items()
++            if f.type == "properties"
++            and f.definition_record in model_fields
++            and getattr(f, "tracking", None) is not False
++        }
++
++        return model_fields and set(self.fields_get(model_fields, attributes=()))
+
+--- a/addons/mail/models/models.py
++++ b/addons/mail/models/models.py
+@@ -36,13 +36,6 @@ class Base(models.AbstractModel):
+                     mail_store.mark_field_as_written(field.model_name, ids, field.name)
+         return super()._flush()
+ 
+-    def _valid_field_parameter(self, field, name):
+-        # allow tracking on abstract models; see also 'mail.thread'
+-        return (
+-            name == 'tracking' and self._abstract
+-            or super()._valid_field_parameter(field, name)
+-        )
+-
+     def with_user(self, user):
+         """Override to ensure the guest context is removed as the target user in a with_user should
+         never be considered as being the guest of the outside env."""

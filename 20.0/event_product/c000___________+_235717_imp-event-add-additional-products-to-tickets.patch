@@ -1,0 +1,150 @@
+PR: https://github.com/odoo/odoo/pull/235717
+
+From: de276e9db20512a9b1f5d06f29daf8603abe401f
+From: Jérémy Hennecart (jeh)
+Date: 2025-12-19 13:33:07
+
+Breaking data model changes scores: del:2 + add:1, change matches:
+-    price_reduce_taxinc = fields.Float(
+-    price_incl = fields.Float(
++    additional_product_ids = fields.Many2many('product.product', string='Additional Products',
+
+Total Changes: 75
+
+[IMP] event: add additional products to tickets
+
+Add the possibilities to join products on tickets.
+This allows a better tracking on the accountability
+as the correct taxes will be applied for all related
+products added on the ticket.
+
+task-4854340
+
+closes odoo/odoo#235717
+
+Related: odoo/upgrade#9115
+Signed-off-by: Warnon Aurélien (awa) <awa@odoo.com>
+
+================================= pseudo patch: =================================
+
+--- a/addons/event_product/models/event_event_ticket.py
++++ b/addons/event_product/models/event_event_ticket.py
+@@ -6,12 +6,12 @@ class EventEventTicket(models.Model):
+     _inherit = 'event.event.ticket'
+     _order = "event_id, sequence, price, name, id"
+ 
+-    price_reduce_taxinc = fields.Float(
+-        string='Price Reduce Tax inc', compute='_compute_price_reduce_taxinc',
+-        compute_sudo=True)
+-    price_incl = fields.Float(
+-        string='Price include', compute='_compute_price_incl',
+-        digits='Product Price', readonly=False, compute_sudo=True)
++    total_price_reduce_taxinc = fields.Float(
++        string='Total Price Reduce Tax inc', compute='_compute_total_price_reduce_taxinc',
++        digits='Product Price', compute_sudo=True)
++    total_price_incl = fields.Float(
++        string='Total Price include', compute='_compute_total_price_incl',
++        digits='Product Price', compute_sudo=True)
+ 
+     @api.depends('product_id.active')
+     def _compute_sale_available(self):
+@@ -20,19 +20,31 @@ class EventEventTicket(models.Model):
+             ticket.sale_available = False
+         super(EventEventTicket, self - inactive_product_tickets)._compute_sale_available()
+ 
+-    def _compute_price_reduce_taxinc(self):
+-        for event in self:
+-            # sudo necessary here since the field is most probably accessed through the website
+-            tax_ids = event.product_id.taxes_id.filtered(lambda r: r.company_id == event.event_id.company_id)
+-            taxes = tax_ids.compute_all(event.price_reduce, event.event_id.company_id.currency_id, 1.0, product=event.product_id)
+-            event.price_reduce_taxinc = taxes['total_included']
++    def _compute_total_price_reduce_taxinc(self):
++        for ticket in self:
++            ticket_tax_ids = ticket.product_id.taxes_id.filtered(lambda r: r.company_id == ticket.event_id.company_id)
++            ticket_prices = ticket_tax_ids.compute_all(ticket.price_reduce, ticket.company_id.currency_id, 1.0, product=ticket.product_id)
++            ticket_price_reduce_taxinc = ticket_prices['total_included']
++            linked_products_price_taxinc = 0
++            for product in ticket.additional_product_ids:
++                tax_ids = product.taxes_id.filtered(lambda r: r.company_id == ticket.event_id.company_id)
++                contextual_discount = product._get_contextual_discount()
++                product_price_reduce = (1.0 - contextual_discount) * product.lst_price
++                prices = tax_ids.compute_all(product_price_reduce, ticket.company_id.currency_id or product.currency_id, 1.0, product=product)
++                linked_products_price_taxinc += prices['total_included']
++            ticket.total_price_reduce_taxinc = ticket_price_reduce_taxinc + linked_products_price_taxinc
+ 
+-    @api.depends('product_id', 'product_id.taxes_id', 'price')
+-    def _compute_price_incl(self):
+-        for event in self:
+-            if event.product_id and event.price:
+-                tax_ids = event.product_id.taxes_id.filtered(lambda r: r.company_id == event.event_id.company_id)
+-                taxes = tax_ids.compute_all(event.price, event.currency_id, 1.0, product=event.product_id)
+-                event.price_incl = taxes['total_included']
+-            else:
+-                event.price_incl = 0
++    @api.depends('additional_product_ids', 'price', 'product_id', 'product_id.taxes_id')
++    def _compute_total_price_incl(self):
++        for ticket in self:
++            ticket_price_incl = 0
++            if ticket.product_id and ticket.price:
++                ticket_tax_ids = ticket.product_id.taxes_id.filtered(lambda r: r.company_id == ticket.event_id.company_id)
++                ticket_prices = ticket_tax_ids.compute_all(ticket.price, ticket.company_id.currency_id, 1.0, product=ticket.product_id)
++                ticket_price_incl = ticket_prices['total_included']
++            linked_products_price_taxinc = 0
++            for product in ticket.additional_product_ids:
++                tax_ids = product.taxes_id.filtered(lambda r: r.company_id == ticket.event_id.company_id)
++                prices = tax_ids.compute_all(product.lst_price, ticket.company_id.currency_id or product.currency_id, 1.0, product=product)
++                linked_products_price_taxinc += prices['total_included']
++            ticket.total_price_incl = ticket_price_incl + linked_products_price_taxinc
+
+--- a/addons/event_product/models/event_type_ticket.py
++++ b/addons/event_product/models/event_type_ticket.py
+@@ -22,11 +22,18 @@ class EventTypeTicket(models.Model):
+         domain=[("service_tracking", "=", "event")], default=_default_product_id)
+     currency_id = fields.Many2one(related="product_id.currency_id", string="Currency")
+     price = fields.Float(
+-        string='Price', compute='_compute_price',
++        string='Ticket Price', compute='_compute_price',
+         digits='Product Price', readonly=False, store=True)
+     price_reduce = fields.Float(
+         string="Price Reduce", compute="_compute_price_reduce",
+         compute_sudo=True, digits='Product Price')
++    additional_product_ids = fields.Many2many('product.product', string='Additional Products',
++            domain=[('service_tracking', '!=', 'event')],
++            help="Select products to include with each registration. They will also show up separately on Sale Orders.")
++    total_price = fields.Float(string='Total Price', compute='_compute_total_price', digits='Product Price',
++        help="Price at which this ticket will be sold, which takes into account the Ticket Price and the price of every Additional Product")
++    total_price_reduce = fields.Float(string='Total Price Reduce', compute='_compute_price_reduce',
++        compute_sudo=True, digits='Product Price')
+ 
+     @api.depends('product_id')
+     def _compute_price(self):
+@@ -36,6 +43,11 @@ class EventTypeTicket(models.Model):
+             elif not ticket.price:
+                 ticket.price = 0
+ 
++    @api.depends('additional_product_ids', 'additional_product_ids.lst_price', 'price')
++    def _compute_total_price(self):
++        for ticket in self:
++            ticket.total_price = ticket.price + sum(ticket.additional_product_ids.mapped('lst_price'))
++
+     @api.depends('product_id')
+     def _compute_description(self):
+         for ticket in self:
+@@ -51,11 +63,16 @@ class EventTypeTicket(models.Model):
+     # This field usage should be restricted to the UX, and any use in effective
+     # price computation should be replaced by clear calls to the pricelist API
+     @api.depends_context(*PRICE_CONTEXT_KEYS)
+-    @api.depends('product_id', 'price')
++    @api.depends('additional_product_ids', 'product_id', 'price', 'total_price')
+     def _compute_price_reduce(self):
+         for ticket in self:
+             contextual_discount = ticket.product_id._get_contextual_discount()
+             ticket.price_reduce = (1.0 - contextual_discount) * ticket.price
++            total_additional_products_price_reduce = 0
++            for product in ticket.additional_product_ids:
++                contextual_discount = product._get_contextual_discount()
++                total_additional_products_price_reduce += (1.0 - contextual_discount) * product.lst_price
++            ticket.total_price_reduce = ticket.price_reduce + total_additional_products_price_reduce
+ 
+     def _init_column(self, column_name):
+         if column_name != "product_id":

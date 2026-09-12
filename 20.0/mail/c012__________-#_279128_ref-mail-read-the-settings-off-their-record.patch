@@ -1,0 +1,192 @@
+PR: https://github.com/odoo/odoo/pull/279128
+
+From: 05774583bda2de386cf3a487ada131d0ff94a82f
+From: Sébastien Theys
+Date: 2026-08-04 10:21:08
+
+Breaking data model changes scores: del:1 + add:0, change matches:
+-    _inherit = 'res.users.settings'
+
+Total Changes: 237
+
+[REF] mail, *: read the settings off their record
+
+Before this commit, the settings of a user were a single Settings
+record mixing two unrelated things: the res.users.settings row of the
+server and the local preferences of the device (sound, push to talk,
+blur).
+
+That record has the problem that nothing tells a reader which of its
+fields is which, and that the whole server row reaches the store,
+columns of modules taking no part in it included (calendar, google,
+microsoft, web_enterprise).
+
+This commit turns res.users.settings into a record of its own, reached
+from its owner, store.self_user.res_users_settings_id, and sent with
+the user through _store_settings_fields, the field list each module
+extends with its own columns. A write is broadcast as a plain store
+insert built from that same list, so those foreign columns never reach
+the store and the dedicated bus channel of the settings is gone.
+
+This commit also turns the volumes of the other users into records of
+res.users.settings.volumes, reached from the settings record. The
+local preferences stay a singleton, store.settings, holding no server
+column, so the livechat dummy settings record at startup is gone.
+
+closes odoo/odoo#279128
+
+Related: odoo/enterprise#126029
+Signed-off-by: Sébastien Theys (seb) <seb@odoo.com>
+
+================================= pseudo patch: =================================
+
+--- a/addons/mail/models/__init__.py
++++ b/addons/mail/models/__init__.py
+@@ -49,8 +49,6 @@ from . import mail_template
+ # discuss
+ from . import mail_ice_server
+ from . import mail_canned_response
+-from . import res_users_settings
+-from . import res_users_settings_volumes
+ 
+ # odoo models
+ from . import ir_access
+
+--- a/addons/mail/models/discuss/__init__.py
++++ b/addons/mail/models/discuss/__init__.py
+@@ -15,6 +15,7 @@ from . import discuss_channel_last_interest_update
+ from . import discuss_gif_favorite
+ from . import discuss_voice_metadata
+ from . import mail_guest
++from . import res_users_settings_volumes
+ 
+ # odoo models
+ from . import bus_listener_mixin
+@@ -23,3 +24,4 @@ from . import ir_websocket
+ from . import res_groups
+ from . import res_partner
+ from . import res_users
++from . import res_users_settings
+
+--- a/addons/mail/models/discuss/res_users.py
++++ b/addons/mail/models/discuss/res_users.py
+@@ -45,6 +45,14 @@ class ResUsers(models.Model):
+             lambda cm: (cm.channel_id.channel_type == "channel" and cm.channel_id.group_public_id)
+         ).unlink()
+ 
++    def _store_init_fields(self, res: Store.FieldList):
++        super()._store_init_fields(res)
++        res.one(
++            "res_users_settings_id",
++            "_store_settings_fields",
++            value=self.env["res.users.settings"]._find_or_create_for_user,
++        )
++
+     def _store_init_global_fields(self, res: Store.FieldList):
+         super()._store_init_global_fields(res)
+         # sudo: ir.config_parameter - reading hard-coded config params to check their existence, safe to
+
+--- a/addons/mail/models/res_users_settings.py
++++ b/addons/mail/models/discuss/res_users_settings.py
+@@ -2,9 +2,12 @@
+ 
+ from odoo import api, fields, models
+ 
++from odoo.addons.mail.tools.discuss import Store
++
+ 
+ class ResUsersSettings(models.Model):
+-    _inherit = 'res.users.settings'
++    _name = "res.users.settings"
++    _inherit = ["res.users.settings", "bus.sync.mixin"]
+ 
+     volume_settings_ids = fields.One2many('res.users.settings.volumes', 'user_setting_id', string="Volumes of other partners")
+ 
+@@ -15,6 +18,15 @@ class ResUsersSettings(models.Model):
+         help="This setting will only be applied to channels. Mentions only if not specified.",
+     )
+ 
++    def _store_settings_fields(self, res: Store.FieldList):
++        """Fields to send to the store settings singleton. Modules override to add theirs."""
++        res.extend(["channel_notifications"])
++        res.many("volume_settings_ids", "_store_volume_fields")
++
++    def _sync_field_names(self, res):
++        super()._sync_field_names(res)
++        self._store_settings_fields(res[None])
++
+     @api.model
+     def _format_settings(self, fields_to_format):
+         res = super()._format_settings(fields_to_format)
+@@ -25,11 +37,6 @@ class ResUsersSettings(models.Model):
+                 res["volumes"] = [("ADD", volume_settings)]
+         return res
+ 
+-    def set_res_users_settings(self, new_settings):
+-        formatted = super().set_res_users_settings(new_settings)
+-        self._bus_send("res.users.settings", formatted)
+-        return formatted
+-
+     def set_volume_setting(self, partner_id, volume, guest_id=None):
+         """
+         Saves the volume of a guest or a partner.
+@@ -51,6 +58,7 @@ class ResUsersSettings(models.Model):
+                 'partner_id': partner_id,
+                 'guest_id': guest_id,
+             })
+-        self._bus_send(
+-            "res.users.settings.volumes", volume_setting._discuss_users_settings_volume_format()
+-        )
++            volume_setting._bus_send(
++                "mail.record/insert",
++                Store().add(volume_setting, "_store_volume_fields"),
++            )
+
+--- a/addons/mail/models/res_users_settings_volumes.py
++++ b/addons/mail/models/discuss/res_users_settings_volumes.py
+@@ -1,12 +1,14 @@
+-# -*- coding: utf-8 -*-
+ # Part of Odoo. See LICENSE file for full copyright and licensing details.
+ 
+ from odoo import api, fields, models
+ 
++from odoo.addons.mail.tools.discuss import Store
++
+ 
+ class ResUsersSettingsVolumes(models.Model):
+     """ Represents the volume of the sound that the user of user_setting_id will receive from partner_id. """
+     _name = 'res.users.settings.volumes'
++    _inherit = ["bus.listener.mixin", "bus.sync.mixin"]
+     _description = 'User Settings Volumes'
+ 
+     user_setting_id = fields.Many2one('res.users.settings', required=True, ondelete='cascade', index=True)
+@@ -42,3 +44,16 @@ class ResUsersSettingsVolumes(models.Model):
+                 'id': volume_setting.user_setting_id.id,
+             },
+         } for volume_setting in self]
++
++    def _bus_channels(self):
++        return self.user_setting_id._bus_channels()
++
++    def _store_volume_fields(self, res: Store.FieldList):
++        res.attr("volume")
++        res.one("partner_id", "_store_avatar_fields")
++        res.one("guest_id", "_store_avatar_fields")
++        res.one("user_setting_id", [])
++
++    def _sync_field_names(self, res):
++        super()._sync_field_names(res)
++        self._store_volume_fields(res[None])
+
+--- a/addons/mail/models/res_users.py
++++ b/addons/mail/models/res_users.py
+@@ -433,9 +433,7 @@ class ResUsers(models.Model):
+         res.attr("mt_note", xmlid_to_res_id("mail.mt_note"))
+         res.one("odoobot", "_store_partner_fields", value=odoobot)
+         if not self._is_public():
+-            settings = self.env["res.users.settings"]._find_or_create_for_user(self)
+             res.one("self_user", "_store_init_fields", value=self)
+-            res.attr("settings", settings._res_users_settings_format())
+         if guest := self.env["mail.guest"]._get_guest_from_context():
+             res.one(
+                 "self_guest",

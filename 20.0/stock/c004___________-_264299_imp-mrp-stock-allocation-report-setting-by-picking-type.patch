@@ -1,0 +1,219 @@
+PR: https://github.com/odoo/odoo/pull/264299
+
+From: ef13d68b3c895d973f36c2220eecdb81ccafcf7c
+From: jodh-odoo
+Date: 2026-06-23 07:27:13
+
+Breaking data model changes scores: del:1 + add:0, change matches:
+-    group_stock_reception_report = fields.Boolean("Reception Report", implied_group='stock.group_reception_report')
+
+Total Changes: 102
+
+[IMP] mrp, stock: allocation report setting by picking type
+
+Allocation report settings
+==========================
+Before this commit, there were two settings for allocation reports:
+* Reception Report (`group_stock_reception_report`);
+* Allocation Report for Manufacturing Orders
+  (`group_mrp_reception_report`).
+
+Now, this setting is moved on the operation types and can be
+enabled/disabled by operation type (except for out operations, it's
+always disabled in this case) and this commit adapts code to this
+change.
+
+Additional change
+=================
+This commit moves the `stock.picking` `_get_autoprint_report_actions`
+code part which fetches moves' allocation report action to create
+`stock.move` own action: `action_open_allocation_report`.
+The purpose is to be able to use this part from different places (from
+the Barcode application for example) without duplicate the code.
+
+task-4894566
+
+Part-of: odoo/odoo#264299
+Related: odoo/enterprise#117220
+Related: odoo/upgrade#10320
+Signed-off-by: Arnold Moyaux (arm) <arm@odoo.com>
+
+================================= pseudo patch: =================================
+
+--- a/addons/stock/models/res_config_settings.py
++++ b/addons/stock/models/res_config_settings.py
+@@ -37,7 +37,6 @@ class ResConfigSettings(models.TransientModel):
+         help="Store products in specific locations of your warehouse (e.g. bins, racks) and to track inventory accordingly.")
+     annual_inventory_month = fields.Selection(related='company_id.annual_inventory_month', readonly=False)
+     annual_inventory_day = fields.Integer(related='company_id.annual_inventory_day', readonly=False)
+-    group_stock_reception_report = fields.Boolean("Reception Report", implied_group='stock.group_reception_report')
+     module_stock_dropshipping = fields.Boolean("Dropshipping")
+     barcode_separator = fields.Char(
+         "Separator", config_parameter='stock.barcode_separator',
+
+--- a/addons/stock/models/stock_move.py
++++ b/addons/stock/models/stock_move.py
+@@ -8,7 +8,7 @@ from re import findall as regex_findall
+ from odoo import _, api, Command, fields, models, SUPERUSER_ID
+ from odoo.exceptions import UserError, ValidationError
+ from odoo.fields import Domain
+-from odoo.tools.float_utils import float_compare, float_round
++from odoo.tools.float_utils import float_compare, float_repr, float_round
+ from odoo.tools.misc import clean_context, OrderedSet, groupby
+ 
+ PROCUREMENT_PRIORITIES = [('0', 'Normal'), ('1', 'Urgent')]
+@@ -927,6 +927,15 @@ Please change the quantity done or the rounding precision in your settings.""",
+             },
+         }
+ 
++    def action_print_reception_report(self):
++        # Quantities needs to be expressed as string to support python + js calls to report.
++        quantities = ','.join(float_repr(qty, 0) for qty in self.mapped('product_uom_qty'))
++        data = {
++            'docids': self.ids,
++            'quantity': quantities,
++        }
++        return self.env.ref('stock.label_picking').report_action(self, data=data, config=False)
++
+     def action_show_details(self):
+         """ Returns an action that will open a form view (in a popup) allowing to work on all the
+         move lines of a particular move. This form view is used when "show operations" is not
+
+--- a/addons/stock/models/stock_picking.py
++++ b/addons/stock/models/stock_picking.py
+@@ -42,7 +42,7 @@ class StockPickingType(models.Model):
+     code = fields.Selection([
+         ('incoming', 'Receipt'),
+         ('outgoing', 'Delivery'),
+-        ('internal', 'Internal Transfer')], 'Operation Category', default='incoming', required=True)
++        ('internal', 'Internal Transfer')], 'Type of Operation', default='incoming', required=True)
+     return_picking_type_id = fields.Many2one(
+         'stock.picking.type', 'Operation Type for Returns',
+         index='btree_not_null',
+@@ -75,7 +75,7 @@ class StockPickingType(models.Model):
+     reservation_days_before = fields.Integer('Days', help="Maximum number of days before scheduled date that products should be reserved.")
+     reservation_days_before_priority = fields.Integer('Days when starred', help="Maximum number of days before scheduled date that priority picking products should be reserved.")
+     auto_show_reception_report = fields.Boolean(
+-        "Show Reception Report at Validation",
++        "Show Allocation",
+         help="If this checkbox is ticked, Odoo will automatically show the reception report (if there are moves to allocate to) when validating.")
+     auto_print_delivery_slip = fields.Boolean(
+         "Auto Print Delivery Slip",
+@@ -995,10 +995,9 @@ class StockPicking(models.Model):
+     @api.depends('state', 'move_ids', 'picking_type_id')
+     def _compute_show_allocation(self):
+         self.show_allocation = False
+-        if not self.env.user.has_group('stock.group_reception_report'):
+-            return
+         for picking in self:
+-            picking.show_allocation = picking._get_show_allocation(picking.picking_type_id)
++            if picking.picking_type_id.auto_show_reception_report:
++                picking.show_allocation = picking._get_show_allocation(picking.picking_type_id)
+ 
+     @api.depends('picking_type_id', 'partner_id')
+     def _compute_location_id(self):
+@@ -1619,24 +1618,26 @@ class StockPicking(models.Model):
+             pickings_to_backorder.with_context(cancel_backorder=False)._action_done()
+         report_actions = self._get_autoprint_report_actions()
+         another_action = False
+-        if self.env.user.has_group('stock.group_reception_report'):
+-            pickings_show_report = self.filtered(lambda p: p.picking_type_id.auto_show_reception_report)
+-            lines = pickings_show_report.move_ids.filtered(lambda m: m.product_id.is_storable and m.state != 'cancel' and m.quantity and not m.move_dest_ids)
+-            if lines:
+-                # don't show reception report if all already assigned/nothing to assign
+-                wh_location_ids = self.env['stock.location']._search([('id', 'child_of', pickings_show_report.picking_type_id.warehouse_id.view_location_id.ids), ('usage', '!=', 'supplier')])
+-                if self.env['stock.move'].search_count([
+-                        ('state', 'in', ['confirmed', 'partially_available', 'waiting', 'assigned']),
+-                        ('product_qty', '>', 0),
+-                        ('location_id', 'in', wh_location_ids),
+-                        ('move_orig_ids', '=', False),
+-                        ('picking_id', 'not in', pickings_show_report.ids),
+-                        ('product_id', 'in', lines.product_id.ids)], limit=1):
+-                    action = pickings_show_report.action_view_reception_report()
+-                    action['context'] = {'default_picking_ids': pickings_show_report.ids}
+-                    if not report_actions:
+-                        return action
+-                    another_action = action
++        pickings_show_report = self.filtered(lambda p: p.picking_type_id.auto_show_reception_report)
++        moves = pickings_show_report.move_ids.filtered(lambda m: m.product_id.is_storable and m.state != 'cancel' and m.quantity and not m.move_dest_ids)
++        if moves:
++            # don't show reception report if all already assigned/nothing to assign
++            wh_location_ids = self.env['stock.location']._search([
++                ('id', 'child_of', pickings_show_report.picking_type_id.warehouse_id.view_location_id.ids),
++                ('usage', '!=', 'supplier'),
++            ])
++            if self.env['stock.move'].search_count([
++                    ('state', 'in', ['confirmed', 'partially_available', 'waiting', 'assigned']),
++                    ('product_qty', '>', 0),
++                    ('location_id', 'in', wh_location_ids),
++                    ('move_orig_ids', '=', False),
++                    ('picking_id', 'not in', pickings_show_report.ids),
++                    ('product_id', 'in', moves.product_id.ids)], limit=1):
++                action = pickings_show_report.action_view_reception_report()
++                action['context'] = {'default_picking_ids': pickings_show_report.ids}
++                if not report_actions:
++                    return action
++                another_action = action
+         if report_actions:
+             return {
+                 'type': 'ir.actions.client',
+@@ -2282,29 +2283,25 @@ class StockPicking(models.Model):
+             clean_action(action, self.env)
+             report_actions.append(action)
+ 
+-        if self.env.user.has_group('stock.group_reception_report'):
+-            reception_reports_to_print = self.filtered(
+-                lambda p: p.picking_type_id.auto_print_reception_report
+-                          and p.picking_type_id.code != 'outgoing'
+-                          and p.move_ids.move_dest_ids
+-            )
+-            if reception_reports_to_print:
+-                action = self.env.ref('stock.stock_reception_report_action').report_action(reception_reports_to_print, config=False)
+-                clean_action(action, self.env)
+-                report_actions.append(action)
+-            reception_labels_to_print = self.filtered(lambda p: p.picking_type_id.auto_print_reception_report_labels and p.picking_type_id.code != 'outgoing')
+-            if reception_labels_to_print:
+-                moves_to_print = reception_labels_to_print.move_ids.move_dest_ids
+-                if moves_to_print:
+-                    # needs to be string to support python + js calls to report
+-                    quantities = ','.join(str(qty) for qty in moves_to_print.mapped(lambda m: math.ceil(m.product_uom_qty)))
+-                    data = {
+-                        'docids': moves_to_print.ids,
+-                        'quantity': quantities,
+-                    }
+-                    action = self.env.ref('stock.label_picking').report_action(moves_to_print, data=data, config=False)
+-                    clean_action(action, self.env)
+-                    report_actions.append(action)
++        # Filters pickings and their dest. moves to print reception report and labels.
++        pickings_to_print_reception_report = self.env['stock.picking']
++        moves_to_print_label = self.env['stock.move']
++        for picking in self:
++            if not picking.picking_type_id.auto_show_reception_report or not picking.move_ids.move_dest_ids:
++                continue
++            if picking.picking_type_id.auto_print_reception_report:
++                pickings_to_print_reception_report |= picking
++            if picking.picking_type_id.auto_print_reception_report_labels:
++                moves_to_print_label |= picking.move_ids.move_dest_ids
++        if pickings_to_print_reception_report:
++            action = self.env.ref('stock.stock_reception_report_action').report_action(pickings_to_print_reception_report, config=False)
++            clean_action(action, self.env)
++            report_actions.append(action)
++        if moves_to_print_label:
++            action = moves_to_print_label.action_print_reception_report()
++            clean_action(action, self.env)
++            report_actions.append(action)
++
+         pickings_print_product_label = self.filtered(lambda p: p.picking_type_id.auto_print_product_labels)
+         pickings_by_print_formats = pickings_print_product_label.grouped(lambda p: p.picking_type_id.product_label_format)
+         for print_format in pickings_print_product_label.picking_type_id.mapped("product_label_format"):
+
+--- a/addons/stock/models/stock_warehouse.py
++++ b/addons/stock/models/stock_warehouse.py
+@@ -983,6 +983,7 @@ class StockWarehouse(models.Model):
+                 'use_existing_lots': False,
+                 'sequence': max_sequence + 1,
+                 'company_id': self.company_id.id,
++                'auto_show_reception_report': True,
+             }, 'out_type_id': {
+                 'name': _('Delivery Orders'),
+                 'code': 'outgoing',

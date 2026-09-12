@@ -1,0 +1,266 @@
+PR: https://github.com/odoo/odoo/pull/259695
+
+From: c11c14f9b6f0c5313dac3f7ab6b1035455de53d2
+From: Corentin Deruyck
+Date: 2026-07-10 08:29:32
+
+Breaking data model changes scores: del:1 + add:0, change matches:
+-    attached_on_sale = fields.Selection(
+
+Total Changes: 138
+
+[IMP] product, mrp, sale, sale_pdf_quote_builder, website_sale: Documents management improvement
+
+The goal of this PR is to improve the usage of documents linked to a product.
+
+When the website_sale module is installed, the “Publish On Website” field
+used to display documents on the product page in the eCommerce) has been
+merged into the “attached_on_sale” selection field. When this field is selected,
+it behaves the same as selecting “From quotation”, with the additional feature
+of displaying the documents on the product page in the eCommerce.
+
+When accessing documents linked to a product, it is now possible to enable
+the “On Product Page” field for a specific variant, allowing documents
+related to that variant to be displayed on its eCommerce page.
+
+When accessing the Quotation Builder from a Sales Order,
+documents are always selectable. Since the default quote builder
+includes all documents, the filter on PDFs has been moved to
+the PDF rendering stage.
+
+In Quote Builder PDF "On Product Page" and "Never" are before the quotation
+and "From Quotation" and "On Order Confirmation" are after the quotation.
+
+The following UI improvements have been made:
+* Removed the PDF icon from the document kanban view
+* On the eCommerce product page, the “Documents” title now uses
+  the same style and position as other section headers
+* Added Sales pages to the document edit view
+* Document titles are no longer truncated in the kanban view
+* “Variants” ribbons have been replaced with tags
+* The button to configure PDF forms has been redesigned and is displayed conditionally
+* Some fields have been renamed and moved
+
+task-5946575
+
+closes odoo/odoo#259695
+
+Related: odoo/enterprise#114213
+Related: odoo/upgrade#9990
+Signed-off-by: Victor Feyens (vfe) <vfe@odoo.com>
+
+================================= pseudo patch: =================================
+
+--- a/addons/sale_pdf_quote_builder/models/ir_actions_report.py
++++ b/addons/sale_pdf_quote_builder/models/ir_actions_report.py
+@@ -34,9 +34,26 @@ class IrActionsReport(models.Model):
+                 quotation_documents = order.quotation_document_ids
+                 headers = quotation_documents.filtered(lambda doc: doc.document_type == "header")
+                 footers = quotation_documents - headers
+-                has_product_document = any(line.product_document_ids for line in order.order_line)
++                product_documents_before_quote = []
++                product_documents_after_quote = []
+ 
+-                if not headers and not has_product_document and not footers:
++                for line in order.order_line:
++                    documents_before_quote, documents_after_quote = (
++                        self._get_product_documents_before_and_after_quote(
++                            line.product_document_ids
++                        )
++                    )
++                    if documents_before_quote:
++                        product_documents_before_quote.append((line, documents_before_quote))
++                    if documents_after_quote:
++                        product_documents_after_quote.append((line, documents_after_quote))
++
++                if (
++                    not headers
++                    and not product_documents_before_quote
++                    and not product_documents_after_quote
++                    and not footers
++                ):
+                     continue
+ 
+                 form_fields_values_mapping = {}
+@@ -46,28 +63,19 @@ class IrActionsReport(models.Model):
+                     use_babel=True, lang=order._get_lang() or self.env.user.lang
+                 )
+ 
+-                if headers:
+-                    for header in headers:
+-                        prefix = f"quotation_document_id_{header.id}__"
+-                        self_with_order_context._update_mapping_and_add_pages_to_writer(
+-                            writer, header, form_fields_values_mapping, prefix, order
+-                        )
+-                if has_product_document:
+-                    for line in order.order_line:
+-                        for doc in line.product_document_ids:
+-                            # Use both the id of the line and the doc as variants could use the same
+-                            # document.
+-                            prefix = f"sol_id_{line.id}_product_document_id_{doc.id}__"
+-                            self_with_order_context._update_mapping_and_add_pages_to_writer(
+-                                writer, doc, form_fields_values_mapping, prefix, order, line
+-                            )
++                self_with_order_context._add_documents_to_writer(
++                    writer, [(None, headers)], form_fields_values_mapping, order
++                )
++                self_with_order_context._add_documents_to_writer(
++                    writer, product_documents_before_quote, form_fields_values_mapping, order
++                )
+                 self._add_pages_to_writer(writer, initial_stream.getvalue())
+-                if footers:
+-                    for footer in footers:
+-                        prefix = f"quotation_document_id_{footer.id}__"
+-                        self_with_order_context._update_mapping_and_add_pages_to_writer(
+-                            writer, footer, form_fields_values_mapping, prefix, order
+-                        )
++                self_with_order_context._add_documents_to_writer(
++                    writer, product_documents_after_quote, form_fields_values_mapping, order
++                )
++                self_with_order_context._add_documents_to_writer(
++                    writer, [(None, footers)], form_fields_values_mapping, order
++                )
+                 pdf.fill_form_fields_pdf(writer, form_fields=form_fields_values_mapping)
+                 with io.BytesIO() as _buffer:
+                     writer.write(_buffer)
+@@ -76,6 +84,39 @@ class IrActionsReport(models.Model):
+ 
+         return result
+ 
++    @api.model
++    def _get_product_documents_before_and_after_quote(self, documents):
++        documents_before_quote = documents.filtered(
++            lambda doc: doc.attached_on_sale in {"hidden", "shown_on_product_page"}
++        )
++        return documents_before_quote, documents - documents_before_quote
++
++    @api.model
++    def _add_documents_to_writer(
++        self, writer, line_documents_pairs, form_fields_values_mapping, order
++    ):
++        """Add multiple documents to the writer, updating the form fields mapping.
++
++        :param PdfFileWriter writer: the writer to which pages needs to be added
++        :param list line_documents_pairs: list of (order_line_or_None, documents) tuples. When
++                                          order_line is None, the documents are quotation documents
++                                          (headers/footers); otherwise they are product documents
++                                          linked to the given sale order line.
++        :param dict form_fields_values_mapping: the existing prefixed form field names - values
++                                                mapping to update
++        :param recordset order: the sale order
++        :return: None
++        """
++        for line, documents in line_documents_pairs:
++            for doc in documents:
++                if line:
++                    prefix = f"sol_id_{line.id}_product_document_id_{doc.id}__"
++                else:
++                    prefix = f"quotation_document_id_{doc.id}__"
++                self._update_mapping_and_add_pages_to_writer(
++                    writer, doc, form_fields_values_mapping, prefix, order, line
++                )
++
+     @api.model
+     def _update_mapping_and_add_pages_to_writer(
+         self, writer, document, form_fields_values_mapping, prefix, order, order_line=None
+
+--- a/addons/sale_pdf_quote_builder/models/product_document.py
++++ b/addons/sale_pdf_quote_builder/models/product_document.py
+@@ -1,54 +1,20 @@
+ # Part of Odoo. See LICENSE file for full copyright and licensing details.
+ 
+ from odoo import api, fields, models
+-from odoo.exceptions import ValidationError
+ from odoo.fields import Command
+ 
+ 
+ class ProductDocument(models.Model):
+     _inherit = "product.document"
+ 
+-    attached_on_sale = fields.Selection(
+-        selection_add=[("inside", "Inside quote pdf")],
+-        help="Allows you to share the document with your customers within a sale.\n"
+-        "Leave it empty if you don't want to share this document with sales customer.\n"
+-        "On quote: the document will be sent to and accessible by customers at any time.\n"
+-        "e.g. this option can be useful to share Product description files.\n"
+-        "On order confirmation: the document will be sent to and accessible by customers.\n"
+-        "e.g. this option can be useful to share User Manual or digital content bought on"
+-        " ecommerce. \n"
+-        "Inside quote: The document will be included in the pdf of the quotation and sale"
+-        " order between the header pages and the quote table. ",
+-        ondelete={"inside": "set default"},
+-    )
+     form_field_ids = fields.Many2many(
+-        string="Form Fields Included",
++        string="Fields",
+         comodel_name="sale.pdf.form.field",
+         domain=[("document_type", "=", "product_document")],
+         compute="_compute_form_field_ids",
+         store=True,
+     )
+ 
+-    # === CONSTRAINT METHODS ===#
+-
+-    @api.constrains("attached_on_sale", "raw", "type")
+-    def _check_attached_on_and_raw_compatibility(self):
+-        for doc in self.filtered(lambda doc: doc.attached_on_sale == "inside"):
+-            if doc.type != "binary":
+-                raise ValidationError(
+-                    self.env._(
+-                        "When attached inside a quote, the document must be a file, not a URL."
+-                    )
+-                )
+-            if not doc.raw:
+-                continue
+-            if not doc.mimetype.endswith("pdf"):
+-                raise ValidationError(
+-                    self.env._("Only PDF documents can be attached inside a quote.")
+-                )
+-            if doc.raw:
+-                self.env["sale.pdf.form.field"]._ensure_document_not_encrypted(doc.raw)
+-
+     # === COMPUTE METHODS === #
+ 
+     @api.depends("raw", "attached_on_sale")
+@@ -56,12 +22,7 @@ class ProductDocument(models.Model):
+         # Empty the linked form fields as we want all and only those from the current raw data
+         self.form_field_ids = [Command.clear()]
+         document_to_parse = self.filtered(
+-            lambda doc: (
+-                doc.attached_on_sale == "inside"
+-                and doc.raw
+-                and doc.mimetype
+-                and doc.mimetype.endswith("pdf")
+-            )
++            lambda doc: doc.raw and doc.mimetype and doc.mimetype.endswith("pdf")
+         )
+         if document_to_parse:
+             doc_type = "product_document"
+
+--- a/addons/sale_pdf_quote_builder/models/sale_order_line.py
++++ b/addons/sale_pdf_quote_builder/models/sale_order_line.py
+@@ -40,7 +40,9 @@ class SaleOrderLine(models.Model):
+     def _compute_available_product_document_ids(self):
+         available_documents_ordered = self.env["product.document"]._read_group(
+             [
+-                ("attached_on_sale", "=", "inside"),
++                ("type", "=", "binary"),
++                ("file_size", ">", 0),
++                ("mimetype", "=", "application/pdf"),
+                 "|",
+                 "&",
+                 ("res_model", "=", "product.product"),
+
+--- a/addons/sale_pdf_quote_builder/models/sale_pdf_form_field.py
++++ b/addons/sale_pdf_quote_builder/models/sale_pdf_form_field.py
+@@ -202,9 +202,7 @@ class SalePdfFormField(models.Model):
+     @api.model
+     def _cron_post_upgrade_assign_missing_form_fields(self):
+         # Called post-upgrade as we can't access the files during the upgrade process
+-        product_documents = self.env["product.document"].search([
+-            ("attached_on_sale", "=", "inside")
+-        ])
++        product_documents = self.env["product.document"].search([])
+         quote_documents = self.env["quotation.document"].search([])
+         self._create_or_update_form_fields_on_pdf_records(product_documents, "product_document")
+         self._create_or_update_form_fields_on_pdf_records(quote_documents, "quotation_document")

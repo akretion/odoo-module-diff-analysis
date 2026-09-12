@@ -1,0 +1,277 @@
+PR: https://github.com/odoo/odoo/pull/235719
+
+From: dd0c51ec1855a4bcf532c70a54f8d927496633b0
+From: Prakash Prajapati
+Date: 2026-04-16 09:00:31
+
+Breaking data model changes scores: del:15 + add:0, change matches:
+-    tracking_value_ids = fields.One2many(
+-    field_id = fields.Many2one(
+-    field_info = fields.Json('Removed field information')
+-    old_value_integer = fields.Integer('Old Value Integer', readonly=True)
+-    old_value_float = fields.Float('Old Value Float', readonly=True)
+-    old_value_char = fields.Char('Old Value Char', readonly=True)
+-    old_value_text = fields.Text('Old Value Text', readonly=True)
+-    old_value_datetime = fields.Datetime('Old Value DateTime', readonly=True)
+-    new_value_integer = fields.Integer('New Value Integer', readonly=True)
+-    new_value_float = fields.Float('New Value Float', readonly=True)
+-    new_value_char = fields.Char('New Value Char', readonly=True)
+-    new_value_text = fields.Text('New Value Text', readonly=True)
+-    new_value_datetime = fields.Datetime('New Value Datetime', readonly=True)
+-    mail_message_id = fields.Many2one('mail.message', 'Message ID', required=True, index=True, ondelete='cascade')
+
+Total Changes: 121
+
+[ADD] mail, mail_tracking: move mail tracking value model to a separate module
+
+Moved the `mail.tracking.value` model to a dedicated module for better
+  separation of concerns.
+* Makes tracking optional, modular, and easier to maintain.
+* Existing mail functionality remains unaffected.
+* Reduces database size for systems that do not require tracking.
+
+task-5260614
+
+Part-of: odoo/odoo#235719
+Related: odoo/enterprise#99500
+Related: odoo/upgrade#9225
+Signed-off-by: Thibault Delavallee (tde) <tde@openerp.com>
+
+================================= pseudo patch: =================================
+
+--- a/addons/mail/models/__init__.py
++++ b/addons/mail/models/__init__.py
+@@ -44,7 +44,6 @@ from . import mail_presence
+ from . import mail_push
+ from . import mail_push_device
+ from . import mail_scheduled_message
+-from . import mail_tracking_value
+ from . import mail_template
+ 
+ # discuss
+
+--- a/addons/mail/models/mail_message.py
++++ b/addons/mail/models/mail_message.py
+@@ -270,13 +270,6 @@ class MailMessage(models.Model):
+         search="_search_is_bookmarked",
+         help="Current user has bookmarked this message",
+     )
+-    # tracking
+-    tracking_value_ids = fields.One2many(
+-        'mail.tracking.value', 'mail_message_id',
+-        string='Tracking values',
+-        groups="base.group_system",
+-        help='Tracked values are stored in a separate model. This field allow to reconstruct '
+-             'the tracking and to generate statistics on the model.')
+     # polls
+     ended_poll_ids = fields.One2many('mail.poll', 'end_message_id')
+     started_poll_ids = fields.One2many('mail.poll', 'start_message_id')
+@@ -722,7 +715,6 @@ class MailMessage(models.Model):
+ 
+     @api.model_create_multi
+     def create(self, vals_list):
+-        tracking_values_list = []
+         for values in vals_list:
+             if not (self.env.su or self.env.user.has_group('base.group_user')):
+                 values.pop('author_id', None)
+@@ -767,9 +759,6 @@ class MailMessage(models.Model):
+                     return f'{data_to_url[key][0]}{match.group(3)} alt="{data_to_url[key][1]}" data-attachment-id="{data_to_url[key][2]}"'
+                 values['body'] = _image_dataurl.sub(base64_to_boundary, values['body'] or '')
+ 
+-            # delegate creation of tracking after the create as sudo to avoid access rights issues
+-            tracking_values_list.append(values.pop('tracking_value_ids', False))
+-
+         messages = super().create(vals_list)
+ 
+         # link back attachments to records, to filter out attachments linked to
+@@ -810,31 +799,10 @@ class MailMessage(models.Model):
+         if attachments_tocheck:
+             attachments_tocheck.check_access('read')
+ 
+-        # from tracking commands, create relevant tracking information (protected model)
+-        messages._create_tracking_data(tracking_values_list)
+-
+         messages.filtered(lambda msg: msg._is_thread_message() and msg.message_type != 'user_notification')._invalidate_documents()
+ 
+         return messages
+ 
+-    def _create_tracking_data(self, tracking_values_ids_list):
+-        for message, tracking_values_cmd in zip(self, tracking_values_ids_list):
+-            if not tracking_values_cmd:
+-                continue
+-            track_vals_lst = []
+-            for cmd in tracking_values_cmd:
+-                if len(cmd) == 3 and cmd[0] == 0:
+-                    track_values = dict(cmd[2])  # copy to avoid altering original dict
+-                    for key in (k for k in ('field_name', 'field_type', 'new_value', 'old_value') if k in cmd[2]):
+-                        track_values.pop(key)
+-                    track_values['mail_message_id'] = message.id
+-                    track_vals_lst.append(track_values)
+-            other_cmd = [cmd for cmd in tracking_values_cmd if len(cmd) != 3 or cmd[0] != 0]
+-            if track_vals_lst:
+-                self.env['mail.tracking.value'].sudo().create(track_vals_lst)
+-            if other_cmd:
+-                message.sudo().write({'tracking_value_ids': tracking_values_cmd})
+-
+     def write(self, vals):
+         if not (self.env.su or self.env.user.has_group('base.group_user')):
+             vals.pop('author_id', None)
+@@ -1294,15 +1262,6 @@ class MailMessage(models.Model):
+ 
+             res.attr("needaction", needaction)
+ 
+-            def tracking_values(message):
+-                # sudo: mail.message - filtering allowed tracking values
+-                trackings = message.sudo().tracking_value_ids._filter_has_field_access(message.env)
+-                record = record_by_message.get(message)
+-                if record and hasattr(record, "_track_filter_for_display"):
+-                    trackings = record._track_filter_for_display(trackings)
+-                return message._message_tracking_value_format(trackings)
+-
+-            res.attr("trackingValues", tracking_values)
+         # Add extras at the end to guarantee order in result. In particular, the parent message
+         # needs to be after the current message (client code assuming the first received message is
+         # the one just posted for example, and not the message being replied to).
+@@ -1426,10 +1385,6 @@ class MailMessage(models.Model):
+             (not self.body or tools.is_html_empty(self.body))
+             and (not self.subtype_id or not self.subtype_id.description)
+             and not self.attachment_ids
+-            and not (
+-                self.has_field_access(self._fields["tracking_value_ids"], "read")
+-                and self.tracking_value_ids
+-            )
+             and not self.has_poll
+         )
+ 
+
+--- a/addons/mail/models/mail_thread.py
++++ b/addons/mail/models/mail_thread.py
+@@ -527,7 +527,7 @@ class MailThread(models.AbstractModel):
+           * if no tracking;
+           * only for user generated content;
+         """
+-        if messages.tracking_value_ids:
++        if any(message.message_type == 'tracking' for message in messages):
+             raise exceptions.UserError(_("Messages with tracking values cannot be modified"))
+         if any(message.message_type != 'comment' for message in messages):
+             raise exceptions.UserError(_("Only messages type comment can have their content updated"))
+@@ -2883,7 +2883,7 @@ class MailThread(models.AbstractModel):
+             self._process_attachments_for_post(attachments, attachment_ids, msg_values)
+         )  # attachement_ids, body
+ 
+-        new_message = self._message_create([msg_values], message_tracking_values)
++        new_message = self._message_create([msg_values])
+         self._fallback_lang()._notify_thread(new_message, msg_values, **notif_kwargs)
+         return new_message
+ 
+@@ -2978,7 +2978,6 @@ class MailThread(models.AbstractModel):
+             'is_internal': True,
+             'subject': subject,
+             'subtype_id': self.env['ir.model.data']._xmlid_to_res_id('mail.mt_note'),
+-            'tracking_value_ids': tracking_value_ids,
+             # recipients
+             'email_add_signature': False,  # False as no notification -> no need to compute signature
+             'message_id': generate_tracking_message_id('message-notify'),  # why? this is all but a notify
+@@ -3187,7 +3186,6 @@ class MailThread(models.AbstractModel):
+             'res_id',
+             'subject',
+             'subtype_id',
+-            'tracking_value_ids',
+         }
+ 
+     def _get_message_create_ignore_field_names(self):
+
+--- a/addons/mail/models/mail_track_mixin.py
++++ b/addons/mail/models/mail_track_mixin.py
+@@ -458,7 +458,7 @@ class MailTrackMixin(models.AbstractModel):
+         values = {
+             'field_id': field.id,
+             'field_name': col_name,
+-            'field_label': col_info['string'],
++            'field_label': col_info.get('string'),
+             'field_type': col_info['type'],
+             'old_value': initial_value,
+             'new_value': new_value,
+@@ -476,14 +476,17 @@ class MailTrackMixin(models.AbstractModel):
+             values.update({
+                 f'old_value_{col_info["type"]}': initial_value,
+                 f'new_value_{col_info["type"]}': new_value,
+-                'old_value': formatLang(self.env, initial_value),
+-                'new_value': formatLang(self.env, new_value),
+             })
+-            if col_info['type'] == 'char':
++            if col_info['type'] in {'char', 'text'}:
+                 values.update({
+                     'old_value': initial_value or 'None',
+                     'new_value': new_value or 'None',
+                 })
++            else:
++                values.update({
++                    'old_value': formatLang(self.env, initial_value or 0),
++                    'new_value': formatLang(self.env, new_value or 0),
++                })
+ 
+         elif col_info['type'] == 'monetary':
+             currency_id = col_info.get('currency_id')
+
+--- a/addons/mail/models/mail_tracking_value.py
++++ b/None
+@@ -1,58 +0,0 @@
+-# -*- coding: utf-8 -*-
+-from odoo import fields, models
+-
+-
+-class MailTrackingValue(models.Model):
+-    _name = 'mail.tracking.value'
+-    _description = 'Mail Tracking Value'
+-    _rec_name = 'field_id'
+-    _order = 'id DESC'
+-
+-    field_id = fields.Many2one(
+-        'ir.model.fields', required=False, readonly=True,
+-        index=True, ondelete='set null')
+-    field_info = fields.Json('Removed field information')
+-
+-    old_value_integer = fields.Integer('Old Value Integer', readonly=True)
+-    old_value_float = fields.Float('Old Value Float', readonly=True)
+-    old_value_char = fields.Char('Old Value Char', readonly=True)
+-    old_value_text = fields.Text('Old Value Text', readonly=True)
+-    old_value_datetime = fields.Datetime('Old Value DateTime', readonly=True)
+-
+-    new_value_integer = fields.Integer('New Value Integer', readonly=True)
+-    new_value_float = fields.Float('New Value Float', readonly=True)
+-    new_value_char = fields.Char('New Value Char', readonly=True)
+-    new_value_text = fields.Text('New Value Text', readonly=True)
+-    new_value_datetime = fields.Datetime('New Value Datetime', readonly=True)
+-
+-    mail_message_id = fields.Many2one('mail.message', 'Message ID', required=True, index=True, ondelete='cascade')
+-
+-    def _filter_has_field_access(self, env):
+-        """ Return the subset of self for which the user in env has access. As
+-        this model is admin-only, it is generally accessed as sudo and we need
+-        to distinguish context environment from tracking values environment.
+-
+-        If tracking is linked to a field, user should have access to the field.
+-        Otherwise only members of "base.group_system" can access it. """
+-
+-        def has_field_access(tracking):
+-            if not tracking.field_id:
+-                return env.is_system()
+-            model = env[tracking.field_id.model]
+-            model_field = model._fields.get(tracking.field_id.name)
+-            return model.has_field_access(model_field, 'read') if model_field else False
+-
+-        return self.filtered(has_field_access)
+-
+-    def _filter_free_field_access(self):
+-        """ Return the subset of self which is available for all users: trackings
+-        linked to an existing field without access group. It is used notably
+-        when sending tracking summary through notifications. """
+-
+-        def has_free_access(tracking):
+-            if not tracking.field_id:
+-                return False
+-            model_field = self.env[tracking.field_id.model]._fields.get(tracking.field_id.name)
+-            return model_field and not model_field.groups
+-
+-        return self.filtered(has_free_access)

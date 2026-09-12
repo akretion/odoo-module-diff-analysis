@@ -1,0 +1,258 @@
+PR: https://github.com/odoo/odoo/pull/241368
+
+From: 6a56bd10cec73eabd78b3ab7ba09fe4ab3789243
+From: Youssef (abyo)
+Date: 2026-04-19 08:57:09
+
+Breaking data model changes scores: del:1 + add:0, change matches:
+-    _inherit = 'stock.picking'
+
+Total Changes: 141
+
+[IMP] point_of_sale: use POS without stock module
+
+Point of sale module depends on the stock module, where
+most complex operations take place. Some small businesses don't need
+complex operations like batch picking, tracking products, etc..
+They need simple operations that increases and decreases the product's
+quantities in their inventory.
+
+This commit seperates stock and POS, and adds a bridge
+module pos_stock that will override the simple stock operations
+(increase/decrease inventory) in the POS with the
+actual complex stock operations in the stock module.
+
+All stock operations currently in PoS will be moved to
+pos_stock.
+
+Following the same rationale, we allow pos_sale to be used solely
+without the need of the stock module.
+Not every business needs to create a picking/delivery
+or track its products.
+
+All stock operations currently in pos_sale will be
+moved to pos_sale_stock.
+
+closes odoo/odoo#241368
+
+Task: 5418116
+Related: odoo/enterprise#106117
+Related: odoo/upgrade#9418
+Signed-off-by: William André (wan) <wan@odoo.com>
+
+================================= pseudo patch: =================================
+
+--- a/addons/pos_sale/models/__init__.py
++++ b/addons/pos_sale/models/__init__.py
+@@ -10,6 +10,5 @@ from . import product_template
+ from . import crm_team
+ from . import pos_session
+ from . import sale_order
+-from . import stock_picking
+ from . import res_config_settings
+ from . import res_partner
+
+--- a/addons/pos_sale/models/pos_order.py
++++ b/addons/pos_sale/models/pos_order.py
+@@ -91,49 +91,6 @@ class PosOrder(models.Model):
+             if pos_order.state != 'draft':
+                 for sale_order in sale_orders.filtered(lambda so: so.state in ['draft', 'sent']):
+                     sale_order.action_confirm()
+-
+-            # update the demand qty in the stock moves related to the sale order line
+-            # flush the qty_delivered to make sure the updated qty_delivered is used when
+-            # updating the demand value
+-            so_lines.flush_recordset(['qty_delivered'])
+-            # track the waiting pickings
+-            waiting_picking_ids = set()
+-            for so_line in so_lines:
+-                so_line_stock_move_ids = so_line.move_ids.reference_ids.move_ids
+-                for stock_move in so_line.move_ids:
+-                    picking = stock_move.picking_id
+-                    if not picking.state in ['waiting', 'confirmed', 'assigned']:
+-                        continue
+-
+-                    def get_expected_qty_to_ship_later():
+-                        pos_pickings = so_line.pos_order_line_ids.order_id.picking_ids
+-                        if pos_pickings and all(pos_picking.state in ['confirmed', 'assigned'] for pos_picking in pos_pickings):
+-                            return sum((so_line._convert_qty(so_line, pos_line.qty, 'p2s') for pos_line in
+-                                        so_line.pos_order_line_ids if so_line.product_id.type != 'service'), 0)
+-                        return 0
+-
+-                    qty_delivered = max(so_line.qty_delivered, get_expected_qty_to_ship_later())
+-                    new_qty = so_line.product_uom_qty - qty_delivered
+-                    if stock_move.uom_id.compare(new_qty, 0) <= 0:
+-                        new_qty = 0
+-                    stock_move.product_uom_qty = so_line.compute_uom_qty(new_qty, stock_move, False)
+-                    # If the product is delivered with more than one step, we need to update the quantity of the other steps
+-                    for move in so_line_stock_move_ids.filtered(lambda m: m.state in ['waiting', 'confirmed', 'assigned'] and m.product_id == stock_move.product_id):
+-                        move.product_uom_qty = stock_move.product_uom_qty
+-                        waiting_picking_ids.add(move.picking_id.id)
+-                    waiting_picking_ids.add(picking.id)
+-
+-            def is_product_uom_qty_zero(move):
+-                return move.uom_id.is_zero(move.product_uom_qty)
+-
+-            # cancel the waiting pickings if each product_uom_qty of move is zero
+-            for picking in self.env['stock.picking'].browse(waiting_picking_ids):
+-                if all(is_product_uom_qty_zero(move) for move in picking.move_ids):
+-                    picking.action_cancel()
+-                else:
+-                    # We make sure that the original picking still has the correct quantity reserved
+-                    picking.action_assign()
+-
+         return data
+ 
+     def action_view_sale_order(self):
+@@ -167,7 +124,3 @@ class PosOrder(models.Model):
+         if 'crm_team_id' in vals:
+             vals['crm_team_id'] = vals['crm_team_id'] if vals.get('crm_team_id') else self.session_id.crm_team_id.id
+         return super().write(vals)
+-
+-    def _force_create_picking_real_time(self):
+-        result = super()._force_create_picking_real_time()
+-        return result or any(self.lines.mapped('sale_order_origin_id'))
+
+--- a/addons/pos_sale/models/pos_order_line.py
++++ b/addons/pos_sale/models/pos_order_line.py
+@@ -14,41 +14,16 @@ class PosOrderLine(models.Model):
+         compute='_compute_qty_delivered',
+         store=True, readonly=False, copy=False)
+ 
+-    @api.depends('order_id.state', 'order_id.picking_ids', 'order_id.picking_ids.state', 'order_id.picking_ids.move_ids.quantity')
++    @api.depends('order_id.state')
+     def _compute_qty_delivered(self):
+-        product_qty_left_to_assign = {}
+         for order_line in self:
+             if order_line.order_id.state in ['paid', 'done']:
+-                outgoing_pickings = order_line.order_id.picking_ids.filtered(
+-                    lambda pick: pick.state == 'done' and pick.picking_type_code == 'outgoing'
+-                )
+-
+-                if outgoing_pickings and order_line.order_id.shipping_date:
+-                    moves = outgoing_pickings.move_ids.filtered(
+-                        lambda m: m.state == 'done' and m.product_id == order_line.product_id
+-                    )
+-                    qty_left = product_qty_left_to_assign.get(order_line.product_id.id, False)
+-                    if (qty_left):
+-                        order_line.qty_delivered = min(order_line.qty, qty_left)
+-                        product_qty_left_to_assign[order_line.product_id.id] -= order_line.qty_delivered
+-                    else:
+-                        order_line.qty_delivered = min(order_line.qty, sum(moves.mapped('quantity')))
+-                        product_qty_left_to_assign[order_line.product_id.id] = sum(moves.mapped('quantity')) - order_line.qty_delivered
+-
+-                elif outgoing_pickings:
+-                    # If the order is not delivered later, and in a "paid", "done" or "invoiced" state, it fully delivered
+-                    order_line.qty_delivered = order_line.qty
+-                else:
+-                    order_line.qty_delivered = 0
++                order_line.qty_delivered = order_line.qty
++            else:
++                order_line.qty_delivered = 0
+ 
+     @api.model
+     def _load_pos_data_fields(self, config):
+         params = super()._load_pos_data_fields(config)
+         params += ['sale_order_origin_id', 'sale_order_line_id', 'down_payment_details']
+         return params
+-
+-    def _launch_stock_rule_from_pos_order_lines(self):
+-        orders = self.mapped('order_id')
+-        for order in orders:
+-            self.env['stock.move'].browse(order.lines.sale_order_line_id.move_ids._rollup_move_origs()).filtered(lambda ml: ml.state not in ['cancel', 'done'])._action_cancel()
+-        return super()._launch_stock_rule_from_pos_order_lines()
+
+--- a/addons/pos_sale/models/sale_order.py
++++ b/addons/pos_sale/models/sale_order.py
+@@ -26,7 +26,7 @@ class SaleOrder(models.Model):
+     @api.model
+     def _load_pos_data_fields(self, config):
+         return ['name', 'state', 'user_id', 'order_line', 'partner_id', 'pricelist_id', 'fiscal_position_id', 'amount_total', 'amount_untaxed', 'amount_unpaid',
+-            'picking_ids', 'partner_shipping_id', 'partner_invoice_id', 'date_order', 'write_date', 'amount_paid']
++            'partner_shipping_id', 'partner_invoice_id', 'date_order', 'write_date', 'amount_paid']
+ 
+     def load_sale_order_from_pos(self, config_id):
+         product_ids = self.order_line.product_id.ids
+@@ -130,33 +130,6 @@ class SaleOrderLine(models.Model):
+             'write_date', 'product_custom_attribute_value_ids', 'order_id',
+         ]
+ 
+-    @api.depends('pos_order_line_ids.qty', 'pos_order_line_ids.order_id.picking_ids', 'pos_order_line_ids.order_id.picking_ids.state', 'pos_order_line_ids.refund_orderline_ids.order_id.picking_ids.state')
+-    def _compute_qty_delivered(self):
+-        super()._compute_qty_delivered()
+-
+-    def _prepare_qty_delivered(self):
+-        delivered_qties = super()._prepare_qty_delivered()
+-
+-        def _get_pos_delivered_qty(sale_line, pos_lines):
+-            if all(picking.state == "done" for picking in pos_lines.order_id.picking_ids):
+-                # Sum converted quantities from POS to sale order UoM
+-                return sum(self._convert_qty(sale_line, pos_line.qty, "p2s") for pos_line in pos_lines)
+-            return 0
+-
+-        def line_filter(line):
+-            return line.order_id.state not in ["cancel", "draft"]
+-
+-        for sale_line in self.filtered(lambda line: line.product_id.type != "service"):
+-            pos_line_ids = sale_line.sudo().pos_order_line_ids
+-            pos_qty = _get_pos_delivered_qty(sale_line, pos_line_ids.filtered(line_filter))
+-            if pos_qty != 0:
+-                delivered_qties[sale_line] += pos_qty
+-
+-            refund_qty = _get_pos_delivered_qty(sale_line, pos_line_ids.refund_orderline_ids.filtered(line_filter))
+-            if refund_qty != 0:
+-                delivered_qties[sale_line] += refund_qty
+-        return delivered_qties
+-
+     @api.depends('pos_order_line_ids.qty', 'pos_order_line_ids.order_id.state')
+     def _compute_qty_invoiced(self):
+         super()._compute_qty_invoiced()
+@@ -181,13 +154,8 @@ class SaleOrderLine(models.Model):
+                 product_uom = sale_line.product_id.uom_id
+                 sale_line_uom = sale_line.product_uom_id
+                 item = sale_line.read(field_names, load=False)[0]
+-                if sale_line.product_id.tracking in ['lot', 'serial']:
+-                    move_lines = sale_line.move_ids.move_line_ids.filtered(lambda ml: ml.product_id.id == sale_line.product_id.id)
+-                    item['lot_names'] = move_lines.lot_id.mapped('name')
+-                    lot_qty_by_name = {}
+-                    for line in move_lines:
+-                        lot_qty_by_name[line.lot_id.name] = lot_qty_by_name.get(line.lot_id.name, 0.0) + line.quantity
+-                    item['lot_qty_by_name'] = lot_qty_by_name
++                extra_items = self._get_read_converted_extra_items(sale_line)
++                item.update(extra_items)
+                 if product_uom == sale_line_uom:
+                     results.append(item)
+                     continue
+@@ -208,6 +176,9 @@ class SaleOrderLine(models.Model):
+ 
+         return results
+ 
++    def _get_read_converted_extra_items(self, sale_line):
++        return {}
++
+     @api.model
+     def _convert_qty(self, sale_line, qty, direction):
+         """Converts the given QTY based on the given SALE_LINE and DIR.
+
+--- a/addons/pos_sale/models/stock_picking.py
++++ b/None
+@@ -1,19 +0,0 @@
+-# -*- coding: utf-8 -*-
+-# Part of Odoo. See LICENSE file for full copyright and licensing details.
+-
+-from odoo import models
+-
+-
+-class StockPicking(models.Model):
+-    _inherit = 'stock.picking'
+-
+-    def _create_move_from_pos_order_lines(self, lines):
+-        lines_to_unreserve = self.env['pos.order.line']
+-        for line in lines:
+-            if line.order_id.shipping_date:
+-                continue
+-            if any(wh != line.order_id.config_id.warehouse_id for wh in line.sale_order_line_id.move_ids.location_id.warehouse_id):
+-                continue
+-            lines_to_unreserve |= line
+-        lines_to_unreserve.sale_order_line_id.move_ids.filtered(lambda ml: ml.state not in ['cancel', 'done'])._do_unreserve()
+-        return super()._create_move_from_pos_order_lines(lines)

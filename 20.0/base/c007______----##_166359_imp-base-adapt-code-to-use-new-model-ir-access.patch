@@ -1,0 +1,871 @@
+PR: https://github.com/odoo/odoo/pull/166359
+
+From: 26cc6ac18fe9e29e034d8ccf34b63c4ad650307e
+From: Raphael Collet
+Date: 2026-06-17 06:35:10
+
+Breaking data model changes scores: del:28 + add:0, change matches:
+-    model_access_ids = fields.One2many('ir.model.access', 'model_id', string='Model Access')
+-    rule_ids = fields.One2many('ir.rule', 'model_id', string='Record Rules')
+-    name = fields.Char(required=True, index=True)
+-    active = fields.Boolean(default=True, help='If you uncheck the active field, it will disable the ACL without deleting it (if you delete a native ACL, it will be re-created when you reload the module).')
+-    model_id = fields.Many2one('ir.model', string='Model', required=True, index=True, ondelete='cascade')
+-    group_id = fields.Many2one('res.groups', string='Group', ondelete='restrict', index=True)
+-    perm_read = fields.Boolean(string='Read Access')
+-    perm_write = fields.Boolean(string='Write Access')
+-    perm_create = fields.Boolean(string='Create Access')
+-    perm_unlink = fields.Boolean(string='Delete Access')
+-    name = fields.Char()
+-    active = fields.Boolean(default=True, help="If you uncheck the active field, it will disable the record rule without deleting it (if you delete a native record rule, it may be re-created when you reload the module).")
+-    model_id = fields.Many2one('ir.model', string='Model', index=True, required=True, ondelete="cascade")
+-    model_name = fields.Char(related='model_id.model', string='Model Name')
+-    groups = fields.Many2many('res.groups', 'rule_group_rel', 'rule_group_id', 'group_id', ondelete='restrict')
+-    domain_force = fields.Text(string='Domain')
+-    perm_read = fields.Boolean(string='Read', default=True)
+-    perm_write = fields.Boolean(string='Write', default=True)
+-    perm_create = fields.Boolean(string='Create', default=True)
+-    perm_unlink = fields.Boolean(string='Delete', default=True)
+-    model_access = fields.One2many('ir.model.access', 'group_id', string='Access Controls', copy=True)
+-    rule_groups = fields.Many2many('ir.rule', 'rule_group_rel',
+-    rules_count = fields.Integer('# Record Rules', help='Number of record rules that apply to the current user',
+
+Total Changes: 627
+
+[IMP] base: adapt code to use new model ir.access
+
+Part-of: odoo/odoo#166359
+Related: odoo/enterprise#120158
+Related: odoo/upgrade#10466
+Related: odoo/upgrade-util#442
+Signed-off-by: Christophe Monniez (moc) <moc@odoo.com>
+Co-authored-by: Adrien Dieudonné <adr@odoo.com>
+
+================================= pseudo patch: =================================
+
+--- a/odoo/addons/base/models/__init__.py
++++ b/odoo/addons/base/models/__init__.py
+@@ -18,7 +18,6 @@ from . import ir_cron
+ from . import ir_filters
+ from . import ir_default
+ from . import ir_exports
+-from . import ir_rule
+ from . import ir_config_parameter
+ from . import ir_autovacuum
+ from . import ir_mail_server
+
+--- a/odoo/addons/base/models/ir_access.py
++++ b/odoo/addons/base/models/ir_access.py
+@@ -328,6 +328,42 @@ class IrAccess(models.Model):
+ 
+         return Domain.OR(permissions) & Domain.AND(restrictions)
+ 
++    #
++    # TODO: remove this method, which returns a "restrictions only" domain; both
++    # models that use it should use specific code instead
++    #
++    @api.ormcache('self.env.uid', 'model_name', 'operation', 'include_inherits', 'tuple(self._get_access_context())')
++    def _get_restriction_domain_for(self, model_name: str, operation: str, *, include_inherits=True) -> Domain:
++        """ Return the domain that combines the restrictions to perform
++        ``operation`` on the records of ``model_name``.
++        """
++        assert operation in IN_SELECTION, f"Invalid access operation {operation!r} (expected {", ".join(map(repr, IN_SELECTION))}"
++        operations = IN_SELECTION[operation]
++
++        # collect restrictions only
++        restrictions = []
++
++        # add access for parent models as restrictions
++        if include_inherits:
++            for parent_model_name, parent_field_name in self.env[model_name]._inherits.items():
++                domain = self._get_domain_for(parent_model_name, operation)
++                if domain.is_false():
++                    return Domain.FALSE
++                restrictions.append(Domain(parent_field_name, 'any', domain))
++
++        # some domains have been pre-evaluated, evaluate only if needed
++        eval_context = None
++        for access in self._get_all_access().get(model_name, ()):
++            if access.operation in operations and not access.group_id:
++                domain = access.domain
++                if not isinstance(domain, Domain):
++                    if eval_context is None:
++                        eval_context = self._eval_context()
++                    domain = Domain(safe_eval(domain, eval_context))
++                restrictions.append(domain)
++
++        return Domain.AND(restrictions)
++
+     def _get_access_context(self) -> Iterator:
+         """ Return the context values that the evaluation of the access domain depends on. """
+         yield tuple(self.env.context.get('allowed_company_ids', ()))
+
+--- a/odoo/addons/base/models/ir_actions.py
++++ b/odoo/addons/base/models/ir_actions.py
+@@ -835,10 +835,9 @@ class IrActionsServer(models.Model):
+ 
+     @api.depends('state')
+     def _compute_available_model_ids(self):
+-        allowed_models = self.env['ir.model'].search(
+-            [('model', 'in', list(self.env['ir.model.access']._get_allowed_models()))]
+-        )
+-        self.available_model_ids = allowed_models.ids
++        model_names = [model._name for model in self.env.values() if model.has_access('read')]
++        models = self.env['ir.model'].sudo().search([('model', 'in', model_names)])
++        self.available_model_ids = models
+ 
+     @api.depends('model_id', 'update_path', 'state')
+     def _compute_crud_relations(self):
+
+--- a/odoo/addons/base/models/ir_model.py
++++ b/odoo/addons/base/models/ir_model.py
+@@ -17,7 +17,6 @@ from odoo import api, fields, models, tools
+ from odoo.exceptions import AccessError, UserError, ValidationError
+ from odoo.fields import Command, Domain
+ from odoo.tools import BinaryBytes, frozendict, reset_cached_properties, split_every, sql, unique, OrderedSet, SQL
+-from odoo.tools.func import deprecated
+ from odoo.tools.safe_eval import expr_eval, safe_eval, datetime, dateutil, time
+ from odoo.tools.translate import FIELD_TRANSLATE, LazyTranslate, _
+ 
+@@ -234,8 +233,6 @@ class IrModel(models.Model):
+                                            help="The list of models that extends the current model.")
+     state = fields.Selection([('manual', 'Custom'), ('base', 'Base')], string='Type', default='manual', readonly=True)
+     access_ids = fields.One2many('ir.access', 'model_id', string='Access')
+-    model_access_ids = fields.One2many('ir.model.access', 'model_id', string='Model Access')
+-    rule_ids = fields.One2many('ir.rule', 'model_id', string='Record Rules')
+     abstract = fields.Boolean(string="Abstract Model")
+     transient = fields.Boolean(string="Transient Model")
+     modules = fields.Char(compute='_in_modules', string='In Apps', help='List of modules in which the object is defined or inherited')
+@@ -436,7 +433,7 @@ class IrModel(models.Model):
+             # incremental setup will reload custom models
+             self.pool._setup_models__(self.env.cr, [])
+         if 'rule_ids' in vals or 'access_ids' in vals:
+-            # for env['ir.model.access']._get_all_access_groups
++            # for env['ir.access']._get_all_access
+             self.env.transaction.invalidate_ormcache('stable')
+         return res
+ 
+@@ -454,7 +451,7 @@ class IrModel(models.Model):
+             # update database schema
+             self.pool.init_models(self.env.cr, manual_models, dict(self.env.context, update_custom_fields=True))
+         if res:
+-            # for env['ir.model.access']._get_all_access_groups
++            # for env['ir.access']._get_all_access
+             self.env.transaction.invalidate_ormcache('stable')
+         return res
+ 
+@@ -2145,151 +2142,6 @@ class IrModelRelation(models.Model):
+             cr.execute(query, (table, self.env.uid, self.env.uid, module, model._name))
+ 
+ 
+-class IrModelAccess(models.Model):
+-    _name = 'ir.model.access'
+-    _description = 'Model Access'
+-    _order = 'model_id,group_id,name,id'
+-    _allow_sudo_commands = False
+-
+-    name = fields.Char(required=True, index=True)
+-    active = fields.Boolean(default=True, help='If you uncheck the active field, it will disable the ACL without deleting it (if you delete a native ACL, it will be re-created when you reload the module).')
+-    model_id = fields.Many2one('ir.model', string='Model', required=True, index=True, ondelete='cascade')
+-    group_id = fields.Many2one('res.groups', string='Group', ondelete='restrict', index=True)
+-    perm_read = fields.Boolean(string='Read Access')
+-    perm_write = fields.Boolean(string='Write Access')
+-    perm_create = fields.Boolean(string='Create Access')
+-    perm_unlink = fields.Boolean(string='Delete Access')
+-
+-    @api.model
+-    @api.ormcache(cache='stable')
+-    def _get_all_access_groups(self):
+-        """ Return all active access permissions.
+-
+-        :return: Dict {mode: {model_name: [group_ids]}}
+-        """
+-        modes = ('read', 'write', 'create', 'unlink')
+-        self.flush_model()
+-        all_access = self.env.execute_query_dict(SQL(
+-            """
+-            SELECT m.model, a.group_id, a.perm_read, a.perm_write, a.perm_create, a.perm_unlink
+-            FROM ir_model_access a
+-            LEFT JOIN ir_model m
+-            ON m.id = a.model_id
+-            WHERE a.active IS TRUE
+-            """
+-        ))
+-        access_by_mode = {
+-            mode: tools.groupby((a for a in all_access if a[f'perm_{mode}']), itemgetter('model'))
+-            for mode in modes
+-        }
+-        return frozendict({
+-            mode: frozendict({
+-                model: frozenset(a['group_id'] or False for a in model_access)
+-                for model, model_access in mode_access
+-            })
+-            for mode, mode_access in access_by_mode.items()
+-        })
+-
+-    # The context parameter is useful when the method translates error messages.
+-    # But as the method raises an exception in that case,  the key 'lang' might
+-    # not be really necessary as a cache key, unless the `ormcache`
+-    # decorator catches the exception (it does not at the moment.)
+-
+-    @api.ormcache('self.env.uid', 'mode')
+-    def _get_allowed_models(self, mode='read'):
+-        access_by_model = self._get_all_access_groups().get(mode)
+-        if not access_by_model:
+-            return frozenset()
+-        # include False to catch global access rules
+-        user_group_ids = {*self.env.user._get_group_ids(), False}
+-        return frozenset(
+-            model
+-            for model, accesses in access_by_model.items()
+-            if not user_group_ids.isdisjoint(accesses)
+-        )
+-
+-    @api.model
+-    @deprecated("Since 20.0, use Model.has_access")
+-    def check(self, model, mode='read', raise_exception=True):
+-        if self.env.su:
+-            # User root have all accesses
+-            return True
+-
+-        assert isinstance(model, str), 'Not a model name: %s' % (model,)
+-
+-        if model not in self.env:
+-            _logger.error('Missing model %s', model)
+-
+-        has_access = model in self._get_allowed_models(mode)
+-        if not has_access and raise_exception:
+-            raise self._make_access_error(model, mode) from None
+-        return has_access
+-
+-    def _make_access_error(self, model: str, mode: str):
+-        """ Return the exception corresponding to an access error. """
+-        _logger.info('Access Denied by ACLs for operation: %s, uid: %s, model: %s', mode, self.env.uid, model)
+-
+-        operation_error = str(ACCESS_ERROR_HEADER[mode]) % {
+-            'document_kind': self.env['ir.model']._get(model).name or model,
+-            'document_model': model,
+-        }
+-
+-        lang = self.env.lang or 'en_US'
+-        self.env.cr.execute(f"""
+-            SELECT COALESCE(COALESCE(c.name->>%s, c.name->>'en_US') || '/', '') || COALESCE(g.name->>%s, g.name->>'en_US')
+-              FROM ir_model_access a
+-              JOIN ir_model m ON (a.model_id = m.id)
+-              JOIN res_groups g ON (a.group_id = g.id)
+-         LEFT JOIN res_groups_privilege c ON (c.id = g.privilege_id)
+-             WHERE m.model = %s
+-               AND a.active = TRUE
+-               AND a.perm_{mode} = TRUE
+-          ORDER BY c.name, g.name NULLS LAST
+-        """, [lang, lang, model])
+-        rows = self.env.cr.fetchall()
+-        groups = "\n".join(f"\t- {g}" for (g,) in rows)
+-        if groups:
+-            group_info = str(ACCESS_ERROR_GROUPS) % {'groups_list': groups}
+-        else:
+-            group_info = str(ACCESS_ERROR_NOGROUP)
+-
+-        resolution_info = str(ACCESS_ERROR_RESOLUTION)
+-
+-        return AccessError(operation_error + "\n\n" + group_info + "\n\n" + resolution_info)
+-
+-    @api.model
+-    def call_cache_clearing_methods(self):
+-        self.env.invalidate_all()
+-        # for this model caches and implies _get_allowed_models (default) too
+-        self.env.transaction.invalidate_ormcache('stable')
+-
+-    #
+-    # Check rights on actions
+-    #
+-    @api.model_create_multi
+-    def create(self, vals_list):
+-        self.call_cache_clearing_methods()
+-        for ima in vals_list:
+-            if "group_id" in ima and not ima["group_id"] and any([
+-                    ima.get("perm_read"),
+-                    ima.get("perm_write"),
+-                    ima.get("perm_create"),
+-                    ima.get("perm_unlink")]):
+-                _logger.warning("Rule %s has no group, this is a deprecated feature. Every access-granting rule should specify a group.", ima['name'])
+-        return super().create(vals_list)
+-
+-    def write(self, vals):
+-        if any(self._ids):
+-            self.call_cache_clearing_methods()
+-        return super().write(vals)
+-
+-    def unlink(self):
+-        res = super().unlink()
+-        if self:
+-            self.call_cache_clearing_methods()
+-        return res
+-
+-
+ class IrModelData(models.Model):
+     """Holds external identifier keys for records in the database.
+        This has two main uses:
+
+--- a/odoo/addons/base/models/ir_rule.py
++++ b/None
+@@ -1,317 +0,0 @@
+-# Part of Odoo. See LICENSE file for full copyright and licensing details.
+-import ast
+-import logging
+-import typing
+-
+-from odoo import _, api, fields, models, tools
+-from odoo.exceptions import AccessError, ValidationError
+-from odoo.fields import Domain
+-from odoo.tools import config, frozendict
+-from odoo.tools.safe_eval import safe_eval
+-
+-
+-_logger = logging.getLogger(__name__)
+-
+-
+-class RuleInfo(typing.NamedTuple):
+-    rule_id: int
+-    group_id: int
+-    mode: str
+-    domain: Domain | str
+-
+-
+-class IrRule(models.Model):
+-    _name = 'ir.rule'
+-    _description = 'Record Rule'
+-    _order = 'model_id DESC,id'
+-    _MODES = ('read', 'write', 'create', 'unlink')
+-    _allow_sudo_commands = False
+-    _clear_cache_name = 'stable'
+-
+-    name = fields.Char()
+-    active = fields.Boolean(default=True, help="If you uncheck the active field, it will disable the record rule without deleting it (if you delete a native record rule, it may be re-created when you reload the module).")
+-    model_id = fields.Many2one('ir.model', string='Model', index=True, required=True, ondelete="cascade")
+-    model_name = fields.Char(related='model_id.model', string='Model Name')
+-    groups = fields.Many2many('res.groups', 'rule_group_rel', 'rule_group_id', 'group_id', ondelete='restrict')
+-    domain_force = fields.Text(string='Domain')
+-    perm_read = fields.Boolean(string='Read', default=True)
+-    perm_write = fields.Boolean(string='Write', default=True)
+-    perm_create = fields.Boolean(string='Create', default=True)
+-    perm_unlink = fields.Boolean(string='Delete', default=True)
+-
+-    _no_access_rights = models.Constraint(
+-        'CHECK (perm_read!=False or perm_write!=False or perm_create!=False or perm_unlink!=False)',
+-        "Rule must have at least one checked access right!",
+-    )
+-
+-    @api.model
+-    def _eval_context(self):
+-        """Returns a dictionary to use as evaluation context for
+-           ir.rule domains.
+-           Note: company_ids contains the ids of the activated companies
+-           by the user with the switch company menu. These companies are
+-           filtered and trusted.
+-        """
+-        # use an empty context for 'user' to make the domain evaluation
+-        # independent from the context
+-        return {
+-            'user': self.env.user.with_context({}),
+-            'company_ids': self.env.companies.ids,
+-            'company_id': self.env.company.id,
+-        }
+-
+-    @api.depends('groups')
+-    def _compute_global(self):
+-        for rule in self:
+-            rule['global'] = not rule.groups
+-
+-    @api.constrains('model_id')
+-    def _check_model_name(self):
+-        # Don't allow rules on rules records (this model).
+-        if any(rule.model_id.model == self._name for rule in self):
+-            raise ValidationError(_('Rules can not be applied on the Record Rules model.'))
+-
+-    @api.constrains('active', 'domain_force', 'model_id')
+-    def _check_domain(self):
+-        eval_context = self._eval_context()
+-        for rule in self:
+-            if rule.active and rule.domain_force:
+-                try:
+-                    domain = safe_eval(rule.domain_force, eval_context)
+-                    model = self.env[rule.model_id.model].sudo()
+-                    Domain(domain).validate(model)
+-                except Exception as e:  # noqa: BLE001
+-                    raise ValidationError(_('Invalid domain %(domain)s: %(error)s', domain=rule.domain_force, error=e))
+-
+-    def _compute_domain_keys(self):
+-        """ Return the list of context keys to use for caching ``_compute_domain``. """
+-        return ['allowed_company_ids']
+-
+-    def _get_failing(self, for_records, mode='read'):
+-        """ Returns the rules for the mode for the current user which fail on
+-        the specified records.
+-
+-        Can return any global rule and/or all local rules (since local rules
+-        are OR-ed together, the entire group succeeds or fails, while global
+-        rules get AND-ed and can each fail)
+-        """
+-        # disable active_test so rule evaluation considers inactive records
+-        # otherwise failing rules may be incorrectly reported
+-        Model = for_records.browse(()).sudo().with_context(active_test=False)
+-        record_ids = for_records.ids
+-        eval_context = self._eval_context()
+-        failing_ids = set()
+-        rules = [r for r in self._get_all_rules().get(Model._name, ()) if r.mode == mode]
+-
+-        # first check if the group rules fail for any record (aka if
+-        # searching on (records, group_rules) filters out some of the records)
+-        user_group_ids = set(self.env.user._get_group_ids())
+-        group_domains = Domain.OR(
+-            r.domain if isinstance(r.domain, Domain) else Domain(safe_eval(r.domain, eval_context))
+-            for r in rules
+-            if r.group_id in user_group_ids
+-        )
+-
+-        # if all records get returned, the group rules are not failing
+-        if Model.search_count(group_domains & Domain('id', 'in', record_ids)) < len(record_ids):
+-            failing_ids.update(r.rule_id for r in rules if r.group_id in user_group_ids)
+-
+-        # check failing global rules
+-        for r in rules:
+-            if r.group_id:
+-                continue
+-            dom = r.domain if isinstance(r.domain, Domain) else Domain(safe_eval(r.domain, eval_context))
+-            if Model.search_count(dom & Domain('id', 'in', record_ids)) < len(record_ids):
+-                failing_ids.add(r.rule_id)
+-
+-        # re-filter to keep the order from rules
+-        return self.browse(id_ for r in rules if (id_ := r.rule_id) in failing_ids)
+-
+-    @api.model
+-    @api.ormcache(cache='stable')
+-    def _get_all_rules(self) -> dict[str, tuple[RuleInfo, ...]]:
+-        """ Returns all the active record rules for models in the registry.
+-
+-        :return: Dict {model_name: [RuleInfo]}
+-        """
+-        all_rules = self.sudo().search_fetch(
+-            [('active', '=', True)],
+-            ['model_name', 'groups', 'domain_force', *(f'perm_{mode}' for mode in self._MODES)],
+-            order='id',
+-        )
+-        # pre-evaluate domains if possible (once per rule)
+-        domains = {}
+-        env = self.env(su=True)
+-        for rule in all_rules:
+-            if rule.model_name not in env:
+-                continue
+-            domain = (rule.domain_force or '').strip()
+-            try:
+-                domain = ast.literal_eval(domain) if domain else Domain.TRUE
+-            except ValueError:
+-                domains[rule] = domain
+-            else:
+-                domains[rule] = Domain(domain).optimize(env[rule.model_name])
+-
+-        return frozendict({
+-            model_name: tuple(
+-                RuleInfo(rule.id, group.id, mode, domains[rule])
+-                for rule in model_rules
+-                for mode in self._MODES
+-                if rule[f'perm_{mode}']
+-                # iterate over all groups, or just once with an empty group (for global rules)
+-                for group in rule.groups or (rule.groups,)
+-            )
+-            for model_name, model_rules in all_rules.grouped('model_name').items()
+-            if model_name in env
+-        })
+-
+-    @api.model
+-    @tools.conditional(
+-        'xml' not in config['dev_mode'],
+-        api.ormcache(
+-            'self.env.uid', 'self.env.su', 'model_name', 'mode', 'include_inherits',
+-            'tuple(self._compute_domain_context_values())'),
+-    )
+-    def _compute_domain(self, model_name: str, mode: str = "read", *, include_inherits=True) -> Domain:
+-        model = self.sudo().env[model_name]
+-        if self.env.su:
+-            return Domain.TRUE
+-
+-        # add rules for parent models
+-        global_domains: list[Domain] = []
+-        if include_inherits:
+-            for parent_model_name, parent_field_name in model._inherits.items():
+-                if domain := self._compute_domain(parent_model_name, mode):
+-                    global_domains.append(Domain(parent_field_name, 'any', domain))
+-
+-        # fetch the model's rules
+-        rules = self._get_all_rules().get(model_name, ())
+-        group_domains: list[Domain] = []
+-        if rules:
+-            # include False to catch global rules
+-            user_group_ids = {*self.env.user._get_group_ids(), False}
+-            # some domains have been pre-evaluated, evaluate only if needed
+-            eval_context = None
+-            for rule in rules:
+-                if rule.mode != mode or rule.group_id not in user_group_ids:
+-                    continue
+-                domain = rule.domain
+-                if not isinstance(domain, Domain):
+-                    if eval_context is None:
+-                        eval_context = self._eval_context()
+-                    domain = Domain(safe_eval(domain, eval_context))
+-                if rule.group_id:
+-                    group_domains.append(domain)
+-                else:
+-                    global_domains.append(domain)
+-
+-        # combine global domains and group domains
+-        if group_domains:
+-            global_domains.append(Domain.OR(group_domains))
+-        return Domain.AND(global_domains).optimize(model)
+-
+-    def _compute_domain_context_values(self):
+-        for k in self._compute_domain_keys():
+-            v = self.env.context.get(k)
+-            if isinstance(v, list):
+-                # currently this could be a frozenset (to avoid depending on
+-                # the order of allowed_company_ids) but it seems safer if
+-                # possibly slightly more miss-y to use a tuple
+-                v = tuple(v)
+-            yield v
+-
+-    def unlink(self):
+-        res = super().unlink()
+-        self.env.transaction.invalidate_access_cache()
+-        return res
+-
+-    @api.model_create_multi
+-    def create(self, vals_list):
+-        self.env.flush_all()
+-        res = super().create(vals_list)
+-        self.env.transaction.invalidate_access_cache()
+-        return res
+-
+-    def write(self, vals):
+-        # DLE P33: tests for cached values
+-        # - odoo/addons/test_access_rights/tests/test_feedback.py
+-        # - odoo/addons/test_access_rights/tests/test_ir_rules.py
+-        # - odoo/addons/base/tests/test_orm.py (/home/dle/src/odoo/master-nochange-fp/odoo/addons/base/tests/test_orm.py)
+-        self.env.flush_all()
+-        res = super().write(vals)
+-        self.env.transaction.invalidate_access_cache()
+-        return res
+-
+-    def _make_access_error(self, operation, records):
+-        _logger.info('Access Denied by record rules for operation: %s on record ids: %r, uid: %s, model: %s', operation, records.ids[:6], self.env.uid, records._name)
+-        self = self.with_context(self.env.user.context_get())
+-
+-        model = records._name
+-        description = self.env['ir.model']._get(model).name or model
+-        operations = {
+-            'read':  _("read"),
+-            'write': _("write"),
+-            'create': _("create"),
+-            'unlink': _("unlink"),
+-        }
+-        user_description = f"{self.env.user.name} (id={self.env.user.id})"
+-        operation_error = _("Uh-oh! Looks like you have stumbled upon some top-secret records.\n\n" \
+-            "Sorry, %(user)s doesn't have '%(operation)s' access to:", user=user_description, operation=operations[operation])
+-        failing_model = _("- %(description)s (%(model)s)", description=description, model=model)
+-
+-        resolution_info = _("If you really, really need access, perhaps you can win over your friendly administrator with a batch of freshly baked cookies.")
+-
+-        # Note that by default, public and portal users do not have
+-        # the group "base.group_no_one", even if debug mode is enabled,
+-        # so it is relatively safe here to include the list of rules and record names.
+-        rules = self._get_failing(records, mode=operation).sudo()
+-
+-        display_records = records[:6].sudo()
+-        company_related = any('company_id' in (r.domain_force or '') for r in rules)
+-
+-        def get_record_description(rec):
+-            # If the user has access to the company of the record, add this
+-            # information in the description to help them to change company
+-            if company_related and 'company_id' in rec and rec.company_id in self.env.user.company_ids:
+-                return f'{description}, {rec.display_name} ({model}: {rec.id}, company={rec.company_id.display_name})'
+-            return f'{description}, {rec.display_name} ({model}: {rec.id})'
+-
+-        context = None
+-        if company_related:
+-            suggested_companies = display_records._get_redirect_suggested_company()
+-            if suggested_companies and len(suggested_companies) != 1:
+-                resolution_info += _('\n\nNote: this might be a multi-company issue. Switching company may help - in Odoo, not in real life!')
+-            elif suggested_companies and suggested_companies in self.env.user.company_ids:
+-                context = {'suggested_company': {'id': suggested_companies.id, 'display_name': suggested_companies.display_name}}
+-                resolution_info += _('\n\nThis seems to be a multi-company issue, you might be able to access the record by switching to the company: %s.', suggested_companies.display_name)
+-            elif suggested_companies:
+-                resolution_info += _('\n\nThis seems to be a multi-company issue, but you do not have access to the proper company to access the record anyhow.')
+-
+-        if not self.env.user.has_group('base.group_no_one') or not self.env.user._is_internal():
+-            msg = f"{operation_error}\n{failing_model}\n\n{resolution_info}"
+-        else:
+-            # This extended AccessError is only displayed in debug mode.
+-            failing_records = '\n'.join(f'- {get_record_description(rec)}' for rec in display_records)
+-            rules_description = '\n'.join(f'- {rule.name}' for rule in rules)
+-            failing_rules = _("Blame the following rules:\n%s", rules_description)
+-            msg = f"{operation_error}\n{failing_records}\n\n{failing_rules}\n\n{resolution_info}"
+-
+-        # clean up the cache of records because of filtered_domain to check ir.rule + display_name above
+-        records.invalidate_recordset()
+-
+-        exception = AccessError(msg)
+-        if context:
+-            exception.context = context
+-        return exception
+-
+-
+-#
+-# Hack for field 'global': this field cannot be defined like others, because
+-# 'global' is a Python keyword. Therefore, we add it to the class by assignment.
+-# Note that the attribute '_module' is normally added by the class' metaclass.
+-#
+-global_ = fields.Boolean(compute='_compute_global', store=True,
+-                         help="If no group is specified the rule is global and applied to everyone")
+-setattr(IrRule, 'global', global_)
+-global_.__set_name__(IrRule, 'global')
+
+--- a/odoo/addons/base/models/ir_ui_view.py
++++ b/odoo/addons/base/models/ir_ui_view.py
+@@ -28,6 +28,8 @@ from odoo.tools.template_inheritance import apply_inheritance_specs, locate_node
+ from odoo.tools.translate import xml_translate, TRANSLATED_ATTRS
+ from odoo.tools.view_validation import valid_view, get_domain_value_names, get_expression_field_names, get_dict_asts
+ 
++from . import ir_access
++
+ _logger = logging.getLogger(__name__)
+ 
+ MOVABLE_BRANDING = ['data-oe-model', 'data-oe-id', 'data-oe-field', 'data-oe-xpath', 'data-oe-source-id']
+@@ -1530,12 +1532,16 @@ actual arch.
+         return name_manager
+ 
+     def _get_access_groups(self, group_definitions, model_name):
+-        group_list = self.env['ir.model.access']._get_all_access_groups()['read'].get(model_name, ())
+-        if not group_list:
+-            return group_definitions.empty
+-        if False in group_list:  # there is some global access
+-            return group_definitions.universe
+-        return group_definitions.from_ids(group_list)
++        """ Return the group expression object that represents the users who
++        can perform ``operation`` on model ``model_name``.
++        """
++        accesses = self.env['ir.access']._get_all_access().get(model_name, ())
++        operations = ir_access.IN_SELECTION['read']
++        return group_definitions.from_ids(
++            access.group_id
++            for access in accesses
++            if access.group_id and access.operation in operations
++        )
+ 
+     def _add_missing_fields(self, node, name_manager):
+         """ Add the fields required for evaluating expressions in the view given by ``node``. """
+
+--- a/odoo/addons/base/models/res_groups.py
++++ b/odoo/addons/base/models/res_groups.py
+@@ -1,6 +1,6 @@
+ # Part of Odoo. See LICENSE file for full copyright and licensing details.
+ 
+-from odoo import api, fields, models
++from odoo import _, api, fields, models
+ from odoo.exceptions import UserError, ValidationError
+ from odoo.fields import Command, Domain
+ from odoo.tools import SetDefinitions
+@@ -23,20 +23,21 @@ class ResGroups(models.Model):
+     all_users_count = fields.Integer('# Users', help='Number of users having this group (implicitly or explicitly)',
+         compute='_compute_all_users_count', compute_sudo=True)
+ 
+-    model_access = fields.One2many('ir.model.access', 'group_id', string='Access Controls', copy=True)
+-    rule_groups = fields.Many2many('ir.rule', 'rule_group_rel',
+-        'group_id', 'rule_group_id', string='Rules', domain="[('global', '=', False)]")
+     access_ids = fields.One2many('ir.access', 'group_id', string="Access Rules", copy=True)
++    access_count = fields.Integer(
++        compute="_compute_access_count"
++    )
+     menu_access = fields.Many2many('ir.ui.menu', 'ir_ui_menu_group_rel', 'gid', 'menu_id', string='Access Menu')
+     view_access = fields.Many2many('ir.ui.view', 'ir_ui_view_group_rel', 'group_id', 'view_id', string='Views')
+-    comment = fields.Text(translate=True)
++    comment = fields.Text(string='Notes', translate=True)
+     full_name = fields.Char(compute='_compute_full_name', string='Group Name', search='_search_full_name')
+-    share = fields.Boolean(string='Share Group', help="Group created to set access rights for sharing data with some users.")
++    share = fields.Boolean(string='Share Group',
++        help="Indicates that the group is used external data sharing prupose (e.g., portal access to specific records)")
+     api_key_duration = fields.Float(string='API Keys maximum duration days',
+         help="Determines the maximum duration of an api key created by a user belonging to this group.")
+ 
+     sequence = fields.Integer(string='Sequence')
+-    privilege_id = fields.Many2one('res.groups.privilege', string='Privilege', index=True)
++    privilege_id = fields.Many2one('res.groups.privilege', string='Scope', index=True)
+     view_group_hierarchy = fields.Json(string='Technical field for default group setting', compute='_compute_view_group_hierarchy')
+ 
+     _check_api_key_duration = models.Constraint(
+@@ -68,16 +69,19 @@ class ResGroups(models.Model):
+       therefore have all the rights of these groups in addition to their own access rights.
+     """
+     implied_ids = fields.Many2many('res.groups', 'res_groups_implied_rel', 'gid', 'hid',
+-        string='Implied Groups', help='Users of this group are also implicitly part of those groups')
++        string='Implied Groups', help='Users in the current group are implicitly part of the implied groups')
++    implied_count = fields.Integer(compute="_compute_implied_count"
++    )
+     all_implied_ids = fields.Many2many('res.groups', string='Transitively Implied Groups', recursive=True,
+         compute='_compute_all_implied_ids', compute_sudo=True, search='_search_all_implied_ids',
+         help="The group itself with all its implied groups.")
+     implied_by_ids = fields.Many2many('res.groups', 'res_groups_implied_rel', 'hid', 'gid',
+-        string='Implying Groups', help="Users in those groups are implicitly part of this group.")
++        string='Implying Groups', help="Users in implying groups are implicitly part of the current group")
++    implied_by_count = fields.Integer(compute="_compute_implied_by_count")
+     all_implied_by_ids = fields.Many2many('res.groups', string='Transitively Implying Groups', recursive=True,
+         compute='_compute_all_implied_by_ids', compute_sudo=True, search='_search_all_implied_by_ids')
+     disjoint_ids = fields.Many2many('res.groups', string='Disjoint Groups',
+-        help="A user may not belong to this group and one of those.  For instance, users may not be portal users and internal users.",
++        help="Users in the current group cannot be added in disjoint groups. For example, a user cannot be in the \"Internal\" and \"Portal\" groups at the same time.",
+         compute='_compute_disjoint_ids')
+ 
+     @api.constrains('implied_ids', 'implied_by_ids')
+@@ -229,14 +233,14 @@ class ResGroups(models.Model):
+         # field 'share' depends on method has_group()
+         # DLE P139
+         if any(self._ids):
+-            self.env['ir.model.access'].call_cache_clearing_methods()
++            self.env['ir.access']._clear_caches()
+ 
+         res = super().write(vals)
+ 
+         # invalidate caches after the write (if not su) because we check access
+         # when writing
+         if any(self._ids) and not self.env.su:
+-            self.env['ir.model.access'].call_cache_clearing_methods()
++            self.env['ir.access']._clear_caches()
+         return res
+ 
+     def _ensure_xml_id(self):
+@@ -281,6 +285,11 @@ class ResGroups(models.Model):
+     def _search_all_user_ids(self, operator, value):
+         return [('all_implied_by_ids.user_ids', operator, value)]
+ 
++    @api.depends('implied_ids')
++    def _compute_implied_count(self):
++        for group in self:
++            group.implied_count = len(group.implied_ids)
++
+     @api.depends('implied_ids.all_implied_ids')
+     def _compute_all_implied_ids(self):
+         """ Compute the reflexive transitive closure of implied_ids. """
+@@ -296,6 +305,11 @@ class ResGroups(models.Model):
+         ids = [*value, *group_definitions.get_subset_ids(value)]
+         return [('id', operator, ids)]
+ 
++    @api.depends('implied_by_ids')
++    def _compute_implied_by_count(self):
++        for group in self:
++            group.implied_by_count = len(group.implied_by_ids)
++
+     @api.depends('implied_by_ids.all_implied_by_ids')
+     def _compute_all_implied_by_ids(self):
+         """ Compute the reflexive transitive closure of implied_by_ids. """
+@@ -413,6 +427,11 @@ class ResGroups(models.Model):
+         for group in self:
+             group.all_users_count = len(group.all_user_ids)
+ 
++    @api.depends('access_ids')
++    def _compute_access_count(self):
++        for group in self:
++            group.access_count = len(group.access_ids)
++
+     def action_show_all_users(self):
+         self.ensure_one()
+         return {
+@@ -424,3 +443,33 @@ class ResGroups(models.Model):
+             'domain': [('all_group_ids', 'in', self.ids)],
+             'target': 'current',
+         }
++
++    def action_view_implied_ids(self):
++        self.ensure_one()
++        return {
++            'type': 'ir.actions.act_window',
++            'name': _("Implying Groups"),
++            'res_model': 'res.groups',
++            'views': [[False, 'list'], [False, 'form']],
++            'domain': [('implied_by_ids', 'in', self.ids)],
++        }
++
++    def action_view_implied_by_ids(self):
++        self.ensure_one()
++        return {
++            'type': 'ir.actions.act_window',
++            'name': _("Implied Groups"),
++            'res_model': 'res.groups',
++            'views': [[False, 'list'], [False, 'form']],
++            'domain': [('implied_ids', 'in', self.ids)],
++        }
++
++    def action_view_access_ids(self):
++        self.ensure_one()
++        return {
++            'type': 'ir.actions.act_window',
++            'name': _("Access Rules"),
++            'res_model': 'ir.access',
++            'views': [[False, 'list'], [False, 'kanban'], [False, 'form']],
++            'domain': [('group_id', 'in', self.ids)],
++        }
+
+--- a/odoo/addons/base/models/res_groups_privilege.py
++++ b/odoo/addons/base/models/res_groups_privilege.py
+@@ -8,7 +8,7 @@ class ResGroupsPrivilege(models.Model):
+ 
+     name = fields.Char(string='Name', required=True, translate=True)
+     description = fields.Text(string='Description')
+-    placeholder = fields.Char(string='Placeholder', default="No", help="Text that is displayed as placeholder in the selection field of the user form.")
++    placeholder = fields.Char(string='No group label', default="No", help="Label displayed when the user does not belong of any group of that scope.")
+     sequence = fields.Integer(string='Sequence', default=100)
+     category_id = fields.Many2one('ir.module.category', string='Category', index=True)
+     group_ids = fields.One2many('res.groups', 'privilege_id', string='Groups')
+
+--- a/odoo/addons/base/models/res_users.py
++++ b/odoo/addons/base/models/res_users.py
+@@ -251,8 +251,6 @@ class ResUsers(models.Model):
+ 
+     accesses_count = fields.Integer('# Access Rights', help='Number of access rights that apply to the current user',
+                                     compute='_compute_accesses_count', compute_sudo=True)
+-    rules_count = fields.Integer('# Record Rules', help='Number of record rules that apply to the current user',
+-                                 compute='_compute_accesses_count', compute_sudo=True)
+     groups_count = fields.Integer('# Groups', help='Number of groups that apply to the current user',
+                                   compute='_compute_accesses_count', compute_sudo=True)
+ 
+@@ -476,8 +474,7 @@ class ResUsers(models.Model):
+     def _compute_accesses_count(self):
+         for user in self:
+             groups = user.all_group_ids
+-            user.accesses_count = len(groups.model_access)
+-            user.rules_count = len(groups.rule_groups)
++            user.accesses_count = len(groups.access_ids)
+             user.groups_count = len(groups)
+ 
+     @api.depends('res_users_settings_ids')
+@@ -1148,22 +1145,10 @@ class ResUsers(models.Model):
+         return {
+             'name': _('Access Rights'),
+             'view_mode': 'list,form',
+-            'res_model': 'ir.model.access',
++            'res_model': 'ir.access',
+             'type': 'ir.actions.act_window',
+             'context': {'create': False, 'delete': False},
+-            'domain': [('id', 'in', self.all_group_ids.model_access.ids)],
+-            'target': 'current',
+-        }
+-
+-    def action_show_rules(self):
+-        self.ensure_one()
+-        return {
+-            'name': _('Record Rules'),
+-            'view_mode': 'list,form',
+-            'res_model': 'ir.rule',
+-            'type': 'ir.actions.act_window',
+-            'context': {'create': False, 'delete': False},
+-            'domain': [('id', 'in', self.all_group_ids.rule_groups.ids)],
++            'domain': [('group_id', 'in', self.all_group_ids.ids)],
+             'target': 'current',
+         }
+ 

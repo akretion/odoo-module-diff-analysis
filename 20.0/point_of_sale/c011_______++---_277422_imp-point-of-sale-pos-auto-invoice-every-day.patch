@@ -1,0 +1,374 @@
+PR: https://github.com/odoo/odoo/pull/277422
+
+From: 02eecc4e8267a5b4f975c2427645d1eabd26dae4
+From: David Monnom (moda)
+Date: 2026-08-25 09:01:48
+
+Breaking data model changes scores: del:8.4 + add:3, change matches:
+-    pos_session_ids = fields.One2many("pos.session", compute="_compute_pos_sessions", search="_search_pos_sessions", string="POS Sessions")
+-    pos_session_from_sales_ids = fields.One2many("pos.session", "sales_move_id", "POS Sessions from Sales")
+-    pos_session_from_refunds_ids = fields.One2many("pos.session", "refunds_move_id", "POS Sessions from Refunds")
++    pos_session_ids = fields.One2many(
+-    sales_move_id = fields.Many2one(
++    sale_move_ids = fields.One2many(
+-    refunds_move_id = fields.Many2one(
++    refund_move_ids = fields.One2many(
+-    correction_move_ids = fields.Many2many(
++    correction_move_ids = fields.One2many(
+
+Total Changes: 162
+
+[IMP] point_of_sale, pos_*: auto invoice every day
+
+Users do not necessarily close the session once a day. If a client close
+the session once a week, we currently have one combined payment/invoice,
+which is difficult for the user to then reconcile the payments.
+
+So a new option is added to automatically create an invoice every day,
+even if the session is still open. This will allow the user to reconcile
+the payments more easily.
+
+closes odoo/odoo#277422
+
+Taskid: 6388266
+Related: odoo/enterprise#124946
+Related: odoo/upgrade#10824
+Signed-off-by: David Monnom (moda) <moda@odoo.com>
+
+================================= pseudo patch: =================================
+
+--- a/addons/point_of_sale/models/account_move.py
++++ b/addons/point_of_sale/models/account_move.py
+@@ -12,22 +12,42 @@ class AccountMove(models.Model):
+     reversed_pos_order_id = fields.Many2one('pos.order', string="Reversed POS Order",
+         index='btree_not_null',
+         help="The pos order that was reverted after closing the session to create an invoice for it.")
+-    pos_session_ids = fields.One2many("pos.session", compute="_compute_pos_sessions", search="_search_pos_sessions", string="POS Sessions")
+-    pos_session_from_sales_ids = fields.One2many("pos.session", "sales_move_id", "POS Sessions from Sales")
+-    pos_session_from_refunds_ids = fields.One2many("pos.session", "refunds_move_id", "POS Sessions from Refunds")
+     pos_order_count = fields.Integer(compute="_compute_origin_pos_count", string='POS Order Count')
++    pos_session_ids = fields.One2many(
++        "pos.session",
++        compute="_compute_pos_sessions",
++        search="_search_pos_sessions",
++        string="POS Sessions",
++    )
++    pos_session_sales_id = fields.Many2one(
++        "pos.session",
++        string="POS Sessions from Sales",
++        index='btree_not_null',
++    )
++    pos_session_refunds_id = fields.Many2one(
++        "pos.session",
++        string="POS Sessions from Refunds",
++        index='btree_not_null',
++    )
++    pos_session_correction_id = fields.Many2one(
++        "pos.session",
++        string="POS Sessions from Corrections",
++        index='btree_not_null',
++    )
+ 
+-    @api.depends('pos_session_from_sales_ids', 'pos_session_from_refunds_ids')
++    @api.depends('pos_session_sales_id', 'pos_session_refunds_id', 'pos_session_correction_id')
+     def _compute_pos_sessions(self):
+         for move in self:
+-            move.pos_session_ids = move.pos_session_from_sales_ids | move.pos_session_from_refunds_ids
++            move.pos_session_ids = move.pos_session_sales_id | move.pos_session_refunds_id | move.pos_session_correction_id
+ 
+     def _search_pos_sessions(self, operator, value):
+         sessions = self.env['pos.session'].sudo().search([('id', operator, value)])
+         return [
+             '|',
+-            ('pos_session_from_sales_ids', 'in', sessions.ids),
+-            ('pos_session_from_refunds_ids', 'in', sessions.ids),
++            '|',
++            ('pos_session_sales_id', 'in', sessions.ids),
++            ('pos_session_refunds_id', 'in', sessions.ids),
++            ('pos_session_correction_id', 'in', sessions.ids),
+         ]
+ 
+     @api.depends('pos_order_ids')
+
+--- a/addons/point_of_sale/models/pos_config.py
++++ b/addons/point_of_sale/models/pos_config.py
+@@ -10,9 +10,9 @@ from babel.dates import format_date
+ import odoo.release
+ from odoo import SUPERUSER_ID, Command, _, api, fields, models, tools
+ from odoo.exceptions import AccessError, UserError, ValidationError
++from odoo.fields import Domain
+ from odoo.http import request
+ from odoo.tools import SQL, convert
+-from odoo.fields import Domain
+ from odoo.tools.misc import get_lang
+ from odoo.tools.translate import mark_as_copy
+ 
+@@ -88,6 +88,17 @@ class PosConfig(models.Model):
+         required=True,
+         default=_default_partner,
+         check_company=True)
++    session_closing_mode = fields.Selection(
++        [('daily', 'Daily'), ('closing', 'At closing')],
++        string='Closing Mode',
++        default='daily',
++        readonly=True,
++    )
++    session_closing_daily_hour = fields.Float(
++        string='Daily Closing Hour',
++        default=4.0,
++        help="The hour at which the session will be automatically closed when the closing mode is set to 'Daily'.",
++    )
+     currency_id = fields.Many2one('res.currency', compute='_compute_currency', store=True, compute_sudo=True, string="Currency")
+     order_seq_id = fields.Many2one('ir.sequence', string='Order Sequence', readonly=True, copy=False)
+     order_backend_seq_id = fields.Many2one('ir.sequence', string='Order Backend Sequence', readonly=True, copy=False)
+
+--- a/addons/point_of_sale/models/pos_order.py
++++ b/addons/point_of_sale/models/pos_order.py
+@@ -935,7 +935,7 @@ class PosOrder(models.Model):
+ 
+     def read_pos_data(self, data, config):
+         # If the previous session is closed, the order will get a new session_id due to _get_valid_session in _process_order
+-        account_moves = self.sudo().account_move | self.sudo().payment_ids.account_move_id | self.session_id.sales_move_id | self.session_id.refunds_move_id
++        account_moves = self.sudo().account_move | self.sudo().payment_ids.account_move_id | self.session_id.sale_move_ids | self.session_id.refund_move_ids
+         return {
+             'pos.order': self._load_pos_data_read(self, config) if config else [],
+             'pos.session': [],
+@@ -1687,11 +1687,14 @@ class PosOrder(models.Model):
+ 
+     def action_pos_order_invoice(self):
+         self.ensure_one()
++        account_move = self.account_move
++        globally = self.is_globally_invoiced
++        singly = self.is_singly_invoiced
+ 
+-        if self.invoice_status == 'invoiced':
++        if singly and account_move:
+             # Already has a real customer invoice (account_move is not a session closing entry).
+             move = self.account_move
+-        elif self.session_id and self.session_id.state == 'closed':
++        elif (self.session_id and self.session_id.state == 'closed') or (globally and account_move):
+             # Session is closed: reverse the closing entry and create a proper invoice.
+             move = self._generate_invoice_after_session_closing()
+         else:
+@@ -1718,13 +1721,14 @@ class PosOrder(models.Model):
+         of the session closing.
+         """
+         self.ensure_one()
+-        if not self.session_id or self.session_id.state != "closed":
++        if self.session_id.state != "closed" and not self.is_globally_invoiced:
+             return self._generate_pos_order_invoice()
+ 
+         session = self.session_id
+-        refund_move = session.refunds_move_id
+-        sale_move = session.sales_move_id
++        refund_move = self.account_move if self.is_globally_invoiced or not session.refund_move_ids else session.refund_move_ids[-1]
++        sale_move = self.account_move if self.is_globally_invoiced or not session.sale_move_ids else session.sale_move_ids[-1]
+         global_move = refund_move if self.is_refund_or_negative() else sale_move
++
+         if not global_move or global_move.state != "posted":
+             return self.env['account.move']
+ 
+
+--- a/addons/point_of_sale/models/pos_session.py
++++ b/addons/point_of_sale/models/pos_session.py
+@@ -86,18 +86,29 @@ class PosSession(models.Model):
+         string='Closing Difference',
+         compute='_compute_closing_difference',
+     )
+-    sales_move_id = fields.Many2one(
++    sale_move_count = fields.Integer(
++        string='Number of related sales journal entries',
++        compute='_compute_account_move_count',
++    )
++    refund_move_count = fields.Integer(
++        string='Number of related refunds journal entries',
++        compute='_compute_account_move_count',
++    )
++    sale_move_ids = fields.One2many(
+         'account.move',
++        'pos_session_sales_id',
+         string='Sales Entry',
+         index=True,
+     )
+-    refunds_move_id = fields.Many2one(
++    refund_move_ids = fields.One2many(
+         'account.move',
++        'pos_session_refunds_id',
+         string='Refunds Entry',
+         index=True,
+     )
+-    correction_move_ids = fields.Many2many(
++    correction_move_ids = fields.One2many(
+         'account.move',
++        'pos_session_correction_id',
+         string='Correction Entries',
+         index=True,
+     )
+@@ -111,7 +122,6 @@ class PosSession(models.Model):
+         string='Number of related journal entries',
+         compute='_compute_account_move_count',
+     )
+-
+     order_ids = fields.One2many('pos.order', 'session_id', string='Orders')
+     order_count = fields.Integer(compute='_compute_order_count')
+     rescue = fields.Boolean(
+@@ -306,14 +316,14 @@ class PosSession(models.Model):
+         moves = self.env['account.move'].search([('id', operator, value)])
+         return [
+             '|',
+-            ('sales_move_id', 'in', moves.ids),
+-            ('refunds_move_id', 'in', moves.ids),
++            ('sale_move_ids', 'in', moves.ids),
++            ('refund_move_ids', 'in', moves.ids),
+         ]
+ 
+-    @api.depends('sales_move_id', 'refunds_move_id')
++    @api.depends('sale_move_ids', 'refund_move_ids')
+     def _compute_move_ids(self):
+         for session in self:
+-            session.move_ids = session.sales_move_id | session.refunds_move_id
++            session.move_ids = session.sale_move_ids | session.refund_move_ids
+ 
+     def _compute_order_count(self):
+         orders_data = self.env['pos.order']._read_group([('session_id', 'in', self.ids)], ['session_id'], ['__count'])
+@@ -385,6 +395,53 @@ class PosSession(models.Model):
+             orders_by_preset[order.preset_id.id]['count'] += 1
+         return list(orders_by_preset.values())
+ 
++    @api.model
++    def _launch_cron_generate_invoice_period(self, additional_domain=[]):
++        domain = [
++            ('state', '!=', 'closed'),
++            ('order_ids', '!=', False),
++            ('config_id.session_closing_mode', '=', 'daily'),
++        ]
++        domain += additional_domain
++        sessions = self.search(domain)
++        for session in sessions:
++            try:
++                session.with_company(session.company_id)._validate_session_accounting()
++            except Exception as e:  # noqa: BLE001
++                # We don't block the cron if one session fails to validate, we log the error and continue with the next session
++                _logger.error("Failed to validate session accounting for session %s: %s", session.id, e)
++
++    @api.model
++    def _cron_generate_invoice_period(self):
++        """
++        The cron runs every 10 minutes. A session matches only if its
++        configured closing hour falls within the (now - 10min, now]
++        window, so each session is processed at most once per day.
++        """
++        now = fields.Datetime.now()
++        window_start_dt = now - timedelta(minutes=10)
++
++        # float hours, 21:30 => 21.5
++        window_end = now.hour + now.minute / 60.0 + now.second / 3600.0
++        window_start = (window_start_dt.hour + window_start_dt.minute / 60.0 + window_start_dt.second / 3600.0)
++        domain = []
++
++        if window_start <= window_end:
++            # normal case, (14.33, 14.5)
++            domain += [
++                ('config_id.session_closing_daily_hour', '>', window_start),
++                ('config_id.session_closing_daily_hour', '<=', window_end),
++            ]
++        else:
++            # window wraps midnight, (23.83, 0.0) => match > 23.83 or <= 0.0
++            domain += [
++                '|',
++                ('config_id.session_closing_daily_hour', '>', window_start),
++                ('config_id.session_closing_daily_hour', '<=', window_end),
++            ]
++
++        self._launch_cron_generate_invoice_period(domain)
++
+     def close_session_from_ui(self, payment_method_closing={}):
+         """
+         Main entry point for closing a session from the UI. It will
+@@ -535,12 +592,15 @@ class PosSession(models.Model):
+             ],
+         }
+ 
++    @api.depends('sale_move_ids', 'refund_move_ids')
+     def _compute_account_move_count(self):
+         for record in self:
+             record.account_move_count = len(record._get_session_and_order_account_moves())
++            record.sale_move_count = len(record.sale_move_ids)
++            record.refund_move_count = len(record.refund_move_ids)
+ 
+     def _get_session_and_order_account_moves(self):
+-        return self.sales_move_id | self.refunds_move_id | self.order_ids.mapped('account_move')
++        return self.sale_move_ids | self.refund_move_ids | self.order_ids.mapped('account_move')
+ 
+     def _get_related_account_moves(self):
+         invoices = self._get_session_and_order_account_moves()
+@@ -860,20 +920,25 @@ class PosSession(models.Model):
+         non_invoiced_orders, invoiced_orders = self._get_invoiced_and_non_invoiced_orders()
+         self._check_invoiced_orders_are_posted(invoiced_orders)
+ 
++        # Zero quantity orders are not considered for accounting, as they have no financial impact
++        zero_quantity_orders = non_invoiced_orders.filtered(lambda order: all(line.qty == 0 for line in order.lines))
++        non_invoiced_orders -= zero_quantity_orders
++
+         # Build the out_receipt lines. Returns pm_data_list so we can
+         # create the matching account.payment / statement line records after posting.
+         sale_orders = non_invoiced_orders.filtered(
+-            lambda order: not order.is_refund_or_negative() and order.amount_total > 0,
++            lambda order: not order.is_refund_or_negative() and order.amount_total >= 0,
+         )
+         refund_orders = non_invoiced_orders - sale_orders
+         sales_move = self._create_session_account_move(sale_orders)
+         refunds_move = self._create_session_account_move(refund_orders)
+-        self.sales_move_id = sales_move
+-        self.refunds_move_id = refunds_move
++        self.sudo().sale_move_ids |= sales_move
++        self.sudo().refund_move_ids |= refunds_move
+ 
+         # Ensure tracking of pos orders in the account moves
+         sale_orders.account_move = sales_move
+         refund_orders.account_move = refunds_move
++        non_invoiced_orders.write({'state': 'done'})
+ 
+     def _prepare_session_closing_extra_line_commands(self, orders, refund, payments=[]):
+         """ Inherited in pos_stock """
+@@ -1042,7 +1107,7 @@ class PosSession(models.Model):
+         """ Return the paid orders of the session that are not invoiced. """
+         self.ensure_one()
+         orders = self._get_order_for_session_closing()
+-        invoiced_orders = orders.filtered(lambda o: o.is_singly_invoiced)
++        invoiced_orders = orders.filtered(lambda o: o.is_singly_invoiced or o.is_globally_invoiced)
+         non_invoiced_orders = orders - invoiced_orders
+         return non_invoiced_orders, invoiced_orders
+ 
+@@ -1089,7 +1154,8 @@ class PosSession(models.Model):
+ 
+         reverse_move_lines = []
+         invoice_to_reverse = order.account_move
+-        original_move = self.refunds_move_id if order.is_refund_or_negative() else self.sales_move_id
++        is_refund = order.is_refund_or_negative()
++        original_move = order.account_move if order.is_globally_invoiced else self.refund_move_ids[-1] if is_refund else self.sale_move_ids[-1]
+         reverse_move_lines += self._prepare_account_move_line_commands_for_reversal(
+             order,
+             invoice_to_reverse,
+
+--- a/addons/point_of_sale/models/res_config_settings.py
++++ b/addons/point_of_sale/models/res_config_settings.py
+@@ -45,6 +45,8 @@ class ResConfigSettings(models.TransientModel):
+     pos_customer_display_bg_img_name = fields.Char(related='pos_config_id.customer_display_bg_img_name', readonly=False)
+ 
+     # pos.config fields
++    pos_session_closing_mode = fields.Selection(related='pos_config_id.session_closing_mode', readonly=False)
++    pos_session_closing_daily_hour = fields.Float(related='pos_config_id.session_closing_daily_hour', readonly=False)
+     pos_use_presets = fields.Boolean(related='pos_config_id.use_presets', readonly=False)
+     pos_default_preset_id = fields.Many2one('pos.preset', related='pos_config_id.default_preset_id', readonly=False)
+     pos_available_preset_ids = fields.Many2many('pos.preset', related='pos_config_id.available_preset_ids', readonly=False)
+@@ -126,6 +128,9 @@ class ResConfigSettings(models.TransientModel):
+     pos_iface_printbill = fields.Boolean(related='pos_config_id.iface_printbill', readonly=False)
+     pos_use_download_invoice = fields.Boolean(related='pos_config_id.use_download_invoice', readonly=False)
+ 
++    def action_launch_cron_generate_invoice_period(self):
++        self.env['pos.session']._launch_cron_generate_invoice_period()
++
+     def open_payment_method_form(self):
+         bank_journal = self.env['account.journal'].search([('type', '=', 'bank'), ('company_id', 'in', self.env.company.parent_ids.ids)], limit=1)
+         return {

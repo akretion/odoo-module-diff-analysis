@@ -1,0 +1,386 @@
+PR: https://github.com/odoo/odoo/pull/271273
+
+From: d71d7b954ce3fa49b5c9d33129499b4deb0fc30a
+From: Victor Feyens
+Date: 2026-07-08 22:32:06
+
+Breaking data model changes scores: del:1 + add:0, change matches:
+-    _inherit = ['analytic.mixin', 'res.currency.rate.consolidation.mixin']
+
+Total Changes: 248
+
+[REF] product,account,*: simplify catalog logic
+
+The catalog was historically developed for the `sale.order` (and `sale.order.line`)
+models.
+
+It was later on re-used for account moves and purchase orders, then
+for stock models (mrp productions and work orders, ...).
+
+In 19.0, it was enhanced to handle sections update (SO, PO, AM).
+
+...
+
+All those changes accumulated some inconsistencies and technical complexity.
+
+This commit factorizes the logic duplicated in the different models as much as
+possible, it also introduces a clean `product.catalog.line.mixin` that now
+formalizes the methods expected on the 'line' model, and factorizes the default
+behavior.
+
+Note that the current commit (and PR) only focuses on the backend logic of the
+catalog, the client side logic will require more work and will (hopefully) be done
+in the near future.
+
+Part-of: odoo/odoo#271273
+Related: odoo/enterprise#121320
+Related: odoo/upgrade#10572
+Signed-off-by: Victor Feyens (vfe) <vfe@odoo.com>
+
+================================= pseudo patch: =================================
+
+--- a/addons/purchase/models/purchase_order.py
++++ b/addons/purchase/models/purchase_order.py
+@@ -1266,63 +1266,63 @@ class PurchaseOrder(models.Model):
+             ('receipt_reminder_email', '=', True)
+         ]).filtered(lambda p: p.mapped('order_line.product_id.product_tmpl_id.type') != ['service'])
+ 
+-    def _default_order_line_values(self, child_field=False):
+-        default_data = super()._default_order_line_values(child_field)
+-        new_default_data = self.env['purchase.order.line']._get_product_catalog_lines_data()
+-        return {**default_data, **new_default_data}
++    # -------------------------------------------------------------------------
++    # CATALOG
++    # -------------------------------------------------------------------------
+ 
+     def action_add_from_catalog(self):
+         res = super().action_add_from_catalog()
+         kanban_view_id = self.env.ref('purchase.product_view_kanban_catalog_purchase_only').id
+         res['views'][0] = (kanban_view_id, 'kanban')
+         res['search_view_id'] = [self.env.ref('purchase.product_view_search_catalog').id, 'search']
+-        res['context']['partner_id'] = self.partner_id.id
+         return res
+ 
+     def _get_action_add_from_catalog_extra_context(self):
+         return {
+             **super()._get_action_add_from_catalog_extra_context(),
+             'precision': self.env['decimal.precision'].precision_get('Product Unit'),
+-            'product_catalog_currency_id': self.currency_id.id,
+             'product_catalog_digits': self.order_line._fields['price_unit'].get_digits(self.env),
+             'search_default_seller_ids': self.partner_id.name,
+-            'show_sections': bool(self.id),
++            'partner_id': self.partner_id.id,
+         }
+ 
++    def _get_catalog_currency(self):
++        return self.currency_id or super()._get_catalog_currency()
++
+     def _get_product_catalog_domain(self):
+         return super()._get_product_catalog_domain() & Domain('purchase_ok', '=', True)
+ 
+-    def _get_product_catalog_product_data(self, product, **kwargs):
+-        product_data = super()._get_product_catalog_product_data(product)
+-        seller_data = self._get_product_catalog_seller_data(product)
+-        product_data.update(seller_data)
++    def _is_readonly(self) -> bool:
++        """ Return whether the purchase order is read-only or not based on the state.
++        A purchase order is considered read-only if its state is 'cancel'.
++
++        :return: Whether the purchase order is read-only or not.
++        """
++        return super()._is_readonly() or self.state == 'cancel'
++
++    def _get_product_price_type(self) -> str:
++        return 'standard_price'
++
++    def _get_product_catalog_product_data(self, product, **kwargs) -> dict:
++        return {
++            **super()._get_product_catalog_product_data(product, **kwargs),
++            **self._get_product_catalog_seller_data(product, **kwargs),
++        }
++
++    def _get_product_catalog_uom_data(self, product, *args, **kwargs) -> dict:
++        res = super()._get_product_catalog_uom_data(product, *args, **kwargs)
++        if 'availableUoms' not in res:  # UoM not enabled
++            return res
++
+         available_uoms = product._get_available_uoms() | product.seller_ids.uom_id
+-        product_data['availableUoms'] = available_uoms.read(['name', 'factor'])
+-        return product_data
+-
+-    def _get_product_catalog_record_lines(self, product_ids, *, section_id=None, **kwargs):
+-        grouped_lines = defaultdict(lambda: self.env['purchase.order.line'])
+-        if section_id is None:
+-            section_id = (
+-                self.order_line[:1].id
+-                if self.order_line[:1].display_type == 'line_section'
+-                else False
+-            )
+-        for line in self.order_line:
+-            if (
+-                line.display_type
+-                or line.product_id.id not in product_ids
+-                or line.get_parent_section_line().id != section_id
+-            ):
+-                continue
+-            grouped_lines[line.product_id] |= line
+-        return grouped_lines
++        res['availableUoms'] = available_uoms.read(["name", "factor"])
++        return res
+ 
+-    def _get_product_catalog_seller_data(self, product, **kwargs):
+-        """ This function will return a dict containing the price of the product,
+-        UoM display name , and the seller's data if found.
++    def _get_product_catalog_seller_data(self, product, *, uom=None, **kwargs):
++        """Return a dict containing the updated product data according to the seller (if found).
+ 
+         :param object product: Recordset of `product.product`.
++        :param recordset uom: Recordset of `uom.uom`.
+         :rtype: dict
+         :return: A dict with the following structure:
+             {
+@@ -1336,36 +1336,49 @@ class PurchaseOrder(models.Model):
+         """
+         self.ensure_one()
+         product.ensure_one()
+-        uom_id = kwargs.get('uom_id', False)
+-        product_infos = {
+-            'price':  product.standard_price,
+-            **self._get_product_catalog_uom_data(product, uom_id or product.uom_id),
+-        }
++        product_infos = {}
+         # Check if there is a price and a minimum quantity for the order's vendor.
+         if self.partner_id:
+             seller = product._select_seller(
+                 partner_id=self.partner_id,
+                 quantity=None,
++                uom_id=uom,
+                 date=fields.Date.context_today(self, timestamp=self.date_order),
+-                uom_id=uom_id,
+                 ordered_by='min_qty',
+                 params={'order_id': self, 'force_uom': kwargs.get('force_uom', False)}
+             )
+             if seller:
+                 seller_price = seller.currency_id._convert(
+                     from_amount=seller.price_discounted,
+-                    to_currency=product.currency_id,
+-                    company=product.company_id,
++                    to_currency=self.currency_id,
+                     round=False
+                 )
++                target_uom = uom or seller.uom_id
+                 product_infos.update(
+-                    self._get_product_catalog_uom_data(product, seller.uom_id),
+-                    price=product.uom_id._compute_price(seller_price, seller.uom_id),
++                    self._get_product_catalog_uom_data(product, target_uom, **kwargs),
++                    price=product.uom_id._compute_price(seller_price, target_uom),
+                     min_qty=seller.min_qty,
+                     sellerUomFactor=seller.uom_id.factor / product.uom_id.factor,
+                 )
+         return product_infos
+ 
++    def _catalog_create_new_line(self, child_field, product, quantity, uom, **kwargs):
++        line = super()._catalog_create_new_line(child_field, product, quantity, uom, **kwargs)
++
++        # Trigger seller computation
++        line.uom_id = uom
++
++        return line
++
++    def _get_product_catalog_default_unit_price(self, product, uom, **kwargs) -> float:
++        seller_data = self._get_product_catalog_seller_data(product, uom=uom, **kwargs)
++        return seller_data.get('price') or super()._get_product_catalog_default_unit_price(
++            product, uom, **kwargs
++        )
++
++    def _has_sections(self) -> bool:
++        return True
++
+     def get_acknowledge_url(self):
+         return self.get_portal_url(query_string='&acknowledge=True')
+ 
+@@ -1428,65 +1441,6 @@ class PurchaseOrder(models.Model):
+         for line, date in updated_dates:
+             line._update_date_planned(date)
+ 
+-    def _update_order_line_info(
+-        self, product, quantity, uom, *, section_id=False, child_field='order_line', **kwargs
+-    ):
+-        """ Update purchase order line information for a given product or create
+-        a new one if none exists yet.
+-        :param record product_id: The product, as a `product.product` record.
+-        :param int quantity: The quantity selected in the catalog.
+-        :param int section_id: The id of section selected in the catalog.
+-        :param record uom_id: The UoM selected in the catalog, as a `uom.uom` record.
+-        :return: The unit price of the product, based on the pricelist of the
+-                 purchase order and the quantity selected.
+-        :rtype: float
+-        """
+-        self.ensure_one()
+-        pol = self.order_line.filtered(
+-            lambda l: l.product_id.id == product.id
+-            and l.get_parent_section_line().id == section_id
+-        )
+-        if pol:
+-            if uom and pol.uom_id != uom:
+-                old_uom = pol.uom_id
+-                pol.uom_id = uom.id
+-                # For real records, _origin == self, so the compute method's
+-                # _origin check always passes and skips price recomputation
+-                # when there's no vendor pricelist. Convert the price manually.
+-                if not pol.selected_seller_id:
+-                    pol.price_unit = pol.technical_price_unit = old_uom._compute_price(
+-                        pol.price_unit, pol.uom_id
+-                    )
+-            if quantity != 0:
+-                pol.product_qty = quantity
+-            elif self.state in ['draft', 'sent']:
+-                price_unit = pol.price_unit_discounted
+-                pol.unlink()
+-                return price_unit
+-            else:
+-                pol.product_qty = 0
+-        elif quantity > 0:
+-            pol = self.env['purchase.order.line'].create({
+-                'order_id': self.id,
+-                'product_id': product.id,
+-                'product_qty': quantity,
+-                'sequence': self._get_new_line_sequence(child_field, section_id),
+-            })
+-            pol.uom_id = uom  # Trigger seller computation
+-        return pol.price_unit_discounted
+-
+-    def _get_default_create_section_values(self):
+-        """ Return the default values for creating a section line in the purchase order through
+-        catalog.
+-
+-        :return: A dictionary with default values for creating a new section.
+-        :rtype: dict
+-        """
+-        return {'product_qty': 0}
+-
+-    def _get_parent_field_on_child_model(self):
+-        return 'order_id'
+-
+     def _create_update_date_activity(self, updated_dates):
+         note = Markup('<p>%s</p>\n') % _('%s modified receipt dates for the following products:', self.partner_id.name)
+         for line, date in updated_dates:
+@@ -1516,16 +1470,6 @@ class PurchaseOrder(models.Model):
+                 new_receipt_date=date.date()
+             )
+ 
+-    def _is_readonly(self):
+-        """ Return whether the purchase order is read-only or not based on the state.
+-        A purchase order is considered read-only if its state is 'cancel'.
+-
+-        :return: Whether the purchase order is read-only or not.
+-        :rtype: bool
+-        """
+-        self.ensure_one()
+-        return self.state == 'cancel'
+-
+     @api.model
+     def get_import_templates(self):
+         return [{
+
+--- a/addons/purchase/models/purchase_order_line.py
++++ b/addons/purchase/models/purchase_order_line.py
+@@ -11,7 +11,11 @@ from odoo.tools.float_utils import float_compare, float_round
+ 
+ class PurchaseOrderLine(models.Model):
+     _name = 'purchase.order.line'
+-    _inherit = ['analytic.mixin', 'res.currency.rate.consolidation.mixin']
++    _inherit = [
++        'analytic.mixin',
++        'res.currency.rate.consolidation.mixin',
++        'product.catalog.line.mixin',
++    ]
+     _description = 'Purchase Order Line'
+     _order = 'order_id, sequence, id'
+ 
+@@ -596,6 +600,32 @@ class PurchaseOrderLine(models.Model):
+         order = self.env['purchase.order'].browse(self.env.context.get('order_id'))
+         return order.with_context(child_field='order_line').action_add_from_catalog()
+ 
++    def _get_quantity_field(self) -> str:
++        return "product_qty"
++
++    def _get_product_uom_field(self) -> str:
++        return "uom_id"
++
++    def _get_catalog_unit_price(self, *args, **kwargs) -> float:  # noqa: ARG002
++        return self[0].price_unit_discounted
++
++    def _can_be_unlinked_from_catalog(self):
++        return super()._can_be_unlinked_from_catalog() and self.state in {'draft', 'sent'}
++
++    def _update_catalog_quantity(self, quantity, uom, **kwargs) -> float:
++        if uom and self.uom_id != uom:
++            old_uom = self.uom_id
++            self.uom_id = uom.id
++            # For real records, _origin == self, so the compute method's
++            # _origin check always passes and skips price recomputation
++            # when there's no vendor pricelist. Convert the price manually.
++            if not self.selected_seller_id:
++                self.price_unit = self.technical_price_unit = old_uom._compute_price(
++                    self.price_unit, self.uom_id
++                )
++
++        super()._update_catalog_quantity(quantity, uom, **kwargs)
++
+     def action_open_invoices(self):
+         self.ensure_one()
+         invoice_ids = self.invoice_lines.move_id.ids
+@@ -634,52 +664,6 @@ class PurchaseOrderLine(models.Model):
+         else:
+             self.product_qty = 1.0
+ 
+-    def _get_product_catalog_lines_data(self, **kwargs):
+-        """ Return information about purchase order lines in `self`.
+-
+-        If `self` is empty, this method returns only the default value(s) needed for the product
+-        catalog. In this case, the quantity that equals 0.
+-
+-        Otherwise, it returns a quantity and a price based on the product of the POL(s) and whether
+-        the product is read-only or not.
+-
+-        A product is considered read-only if the order is considered read-only (see
+-        ``PurchaseOrder._is_readonly`` for more details) or if `self` contains multiple records.
+-
+-        Note: This method cannot be called with multiple records that have different products linked.
+-
+-        :raise odoo.exceptions.ValueError: ``len(self.product_id) != 1``
+-        :rtype: dict
+-        :return: A dict with the following structure:
+-            {
+-                'quantity': float,
+-                'price': float,
+-                'readOnly': bool,
+-                'uomDisplayName': String,
+-                'uomId': int,
+-                'productUomFactor': float (optional),
+-                'productUomDisplayName': string (optional),
+-                'packaging': dict,
+-                'warning': String,
+-            }
+-        """
+-        if self:
+-            self.product_id.ensure_one()
+-            catalog_info = self[0].order_id._get_product_catalog_seller_data(self.product_id)
+-            available_uoms = self.product_id._get_available_uoms() | self.product_id.seller_ids.uom_id
+-            catalog_info.update(
+-                quantity=self[0].product_qty,
+-                price=self[0].price_unit_discounted,
+-                readOnly=self[0].order_id._is_readonly() or len(self) > 1,
+-                availableUoms=[
+-                    {'id': uom.id, 'name': uom.display_name, 'factor': uom.factor}
+-                    for uom in available_uoms
+-                ],
+-                **self[0].order_id._get_product_catalog_uom_data(self.product_id, self[0].uom_id),
+-            )
+-            return catalog_info
+-        return {'quantity': 0}
+-
+     def _get_product_purchase_description(self, product_lang):
+         self.ensure_one()
+         name = product_lang.display_name

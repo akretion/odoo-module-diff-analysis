@@ -1,0 +1,278 @@
+PR: https://github.com/odoo/odoo/pull/283020
+
+From: 326acc2988086994e4efd4def39a7722b24fdb1d
+From: Hesham Saleh
+Date: 2026-08-21 22:19:53
+
+Breaking data model changes scores: del:1 + add:3, change matches:
+-    rounding_method = fields.Selection(string='Rounding Method', required=True,
++    currency_ids = fields.Many2many(comodel_name='res.currency', string="Currency")
++    partner_category_ids = fields.Many2many(comodel_name='res.partner.category', string="Partner Category")
++    payment_method_line_ids = fields.Many2many(comodel_name='account.payment.method.line', string="Payment Method")
+
+Total Changes: 175
+
+[IMP] account: Improve sales rounding
+
+This commit improves rounding methods usage on sales moves
+
+The improvements are the following:
+1) Allow users to manage and adjust rounding directly from the main invoice form view
+(instead of the "Other Info" tab) and enable inline editing on the rounding list view.
+2) Restrict automatic rounding calculations strictly to active sales/invoicing flows.
+Passive incoming flows must respect received values without recomputation.
+3) Introduce configurable conditions directly on rounding methods so they apply automatically
+only when specific criteria are met (e.g., currency-specific rules).
+4) Ensure rounding automatically applies to invoices generated from Sales Orders
+(when conditions are met) without requiring structural changes to the Sales App or
+forcing the original SO to be rounded.
+
+task-6479888
+
+closes odoo/odoo#283020
+
+Related: odoo/upgrade#11103
+Signed-off-by: William André (wan) <wan@odoo.com>
+
+================================= pseudo patch: =================================
+
+--- a/addons/account/models/account_cash_rounding.py
++++ b/addons/account/models/account_cash_rounding.py
+@@ -1,7 +1,7 @@
+ # -*- coding: utf-8 -*-
+ 
+ from odoo import models, fields, api, _
+-from odoo.tools import float_round
++from odoo.tools import SQL, float_round
+ from odoo.exceptions import ValidationError
+ 
+ 
+@@ -14,32 +14,104 @@ class AccountCashRounding(models.Model):
+     """
+     _name = 'account.cash.rounding'
+     _description = 'Account Cash Rounding'
++    _order = 'sequence, id'
+     _check_company_auto = True
++    _check_company_domain = models.check_company_domain_parent_of
+ 
+-    name = fields.Char(string='Name', translate=True, required=True)
+-    rounding = fields.Float(string='Rounding Precision', required=True, default=0.01,
+-        help='Represent the non-zero value smallest coinage (for example, 0.05).')
+-    strategy = fields.Selection([('biggest_tax', 'Modify tax amount'), ('add_invoice_line', 'Add a rounding line')],
+-        string='Rounding Strategy', default='add_invoice_line', required=True,
+-        help='Specify which way will be used to round the invoice amount to the rounding precision')
+-    company_id = fields.Many2one('res.company', string='Company', required=True, readonly=True, default=lambda self: self.env.company, ondelete='cascade')
++    name = fields.Char(string="Name", translate=True, required=True)
++    sequence = fields.Integer(required=True, default=10)
++
++    # Rounding fields
++    rounding = fields.Float(
++        string="Precision",
++        required=True,
++        default=1.0,
++        help="The smallest value used to round the total amount (e.g., 0.05 or 100).",
++    )
++    rounding_method = fields.Selection(
++        string="Method",
++        selection=[
++            ('UP', 'Up'),
++            ('DOWN', 'Down'),
++            ('HALF-UP', 'Nearest'),
++        ],
++        required=True,
++        default='HALF-UP',
++        help="The computation rule used to round values (e.g., UP, DOWN, or HALF-UP).",
++    )
++    strategy = fields.Selection(
++        string="Strategy",
++        selection=[
++            ('biggest_tax', 'Modify tax amount'),
++            ('add_invoice_line', 'Add a rounding line'),
++        ],
++        required=True,
++        default='add_invoice_line',
++        help="Specify how the rounding difference is applied: add a rounding line or adjust the highest tax amount.",
++    )
+     profit_account_id = fields.Many2one(
+         'account.account',
+-        string='Profit Account',
+-        check_company=True,
+-        domain="[('account_type', 'not in', ('asset_receivable', 'liability_payable'))]",
++        string="Profit Account",
++        compute='_compute_profit_account_id',
++        store=True,
++        readonly=False,
++        company_dependent=True,
++        domain="[('account_type', 'not in', ('asset_receivable', 'liability_payable', 'off_balance'))]",
+         ondelete='restrict',
+     )
+     loss_account_id = fields.Many2one(
+         'account.account',
+-        string='Loss Account',
+-        check_company=True,
+-        domain="[('account_type', 'not in', ('asset_receivable', 'liability_payable'))]",
++        string="Loss Account",
++        compute='_compute_loss_account_id',
++        store=True,
++        readonly=False,
++        company_dependent=True,
++        domain="[('account_type', 'not in', ('asset_receivable', 'liability_payable', 'off_balance'))]",
+         ondelete='restrict',
+     )
+-    rounding_method = fields.Selection(string='Rounding Method', required=True,
+-        selection=[('UP', 'Up'), ('DOWN', 'Down'), ('HALF-UP', 'Nearest')],
+-        default='HALF-UP', help='The tie-breaking rule used for float rounding operations')
++
++    # Conditions fields
++    currency_ids = fields.Many2many(comodel_name='res.currency', string="Currency")
++    partner_category_ids = fields.Many2many(comodel_name='res.partner.category', string="Partner Category")
++    payment_method_line_ids = fields.Many2many(comodel_name='account.payment.method.line', string="Payment Method")
++    company_id = fields.Many2one('res.company', string="Company", ondelete='cascade')
++
++    def _get_default_accounts(self, internal_group):
++        return {
++            self.env['res.company'].browse(company_id): account_id
++            for company_id, account_id in
++            self.env.execute_query(SQL(
++                """
++                SELECT DISTINCT ON (company.id) company.id, account.id
++                  FROM res_company company
++                  JOIN account_account_res_company_rel rel
++                    ON rel.res_company_id = ANY(STRING_TO_ARRAY(RTRIM(company.parent_path, '/'), '/')::int[])
++                  JOIN account_account account
++                    ON rel.account_account_id = account.id
++                 WHERE account.active
++                   AND SPLIT_PART(account.account_type, '_', 1) = %(internal_group)s
++                """,
++                internal_group=internal_group,
++            ))
++        }
++
++    @api.depends('strategy', 'company_id')
++    def _compute_profit_account_id(self):
++        default_accounts = self._get_default_accounts('income')
++        need_profit_account = self.filtered(lambda r: r.strategy == 'add_invoice_line' and not r.profit_account_id)
++        for record in need_profit_account:
++            for company, account_id in default_accounts.items():
++                if not record.company_id or record.company_id in company.parent_ids:
++                    record.with_company(company).profit_account_id = account_id
++
++    @api.depends('strategy', 'company_id')
++    def _compute_loss_account_id(self):
++        default_accounts = self._get_default_accounts('expense')
++        need_loss_account = self.filtered(lambda r: r.strategy == 'add_invoice_line' and not r.loss_account_id)
++        for record in need_loss_account:
++            for company, account_id in default_accounts.items():
++                if not record.company_id or record.company_id in company.parent_ids:
++                    record.with_company(company).loss_account_id = account_id
+ 
+     @api.constrains('rounding')
+     def validate_rounding(self):
+
+--- a/addons/account/models/account_move.py
++++ b/addons/account/models/account_move.py
+@@ -745,7 +745,10 @@ class AccountMove(models.Model):
+         comodel_name='account.cash.rounding',
+         string='Cash Rounding Method',
+         help='Defines the smallest coinage of the currency that can be used to pay by cash.',
++        compute='_compute_invoice_cash_rounding_id',
++        store=True, readonly=False, index=True,
+     )
++    has_biggest_tax_cash_rounding_line = fields.Boolean(compute='_compute_has_biggest_tax_cash_rounding_line')
+     sending_data = fields.Json(copy=False)
+     invoice_pdf_report_id = fields.Many2one(
+         comodel_name='ir.attachment',
+@@ -1888,6 +1891,7 @@ class AccountMove(models.Model):
+         'invoice_line_ids.price_total',
+         'invoice_line_ids.price_subtotal',
+         'invoice_payment_term_id',
++        'invoice_cash_rounding_id',
+         'partner_id',
+         'currency_id',
+         'document_tax_mode',
+@@ -2533,6 +2537,36 @@ class AccountMove(models.Model):
+                 company = move.company_id or self.env.company
+                 move.document_tax_mode = company.account_price_include
+ 
++    @api.depends('currency_id', 'partner_id.category_id', 'preferred_payment_method_line_id')
++    def _compute_invoice_cash_rounding_id(self):
++        sale_moves = self.filtered(lambda move: move.is_sale_document(include_receipts=True) and move.state == 'draft')
++        if not sale_moves:
++            return
++        CashRounding = self.env['account.cash.rounding']
++        cash_roundings = CashRounding.search([
++            *CashRounding._check_company_domain(sale_moves.company_id),
++            '|', '|',
++            ('currency_ids', 'in', sale_moves.currency_id.ids),
++            ('partner_category_ids', 'in', sale_moves.partner_id.category_id.ids),
++            ('payment_method_line_ids', 'in', sale_moves.preferred_payment_method_line_id.ids),
++        ])
++        if not cash_roundings:
++            return
++        for move in sale_moves:
++            move.invoice_cash_rounding_id = next((
++                cash_rounding
++                for cash_rounding in cash_roundings
++                if (not cash_rounding.company_id or cash_rounding.company_id == move.company_id)
++                and (not cash_rounding.currency_ids or move.currency_id in cash_rounding.currency_ids)
++                and (not cash_rounding.partner_category_ids or move.partner_id.category_id & cash_rounding.partner_category_ids)
++                and (not cash_rounding.payment_method_line_ids or move.preferred_payment_method_line_id in cash_rounding.payment_method_line_ids)
++            ), False)
++
++    @api.depends('invoice_cash_rounding_id.strategy', 'line_ids')
++    def _compute_has_biggest_tax_cash_rounding_line(self):
++        for move in self:
++            move.has_biggest_tax_cash_rounding_line = move.invoice_cash_rounding_id.strategy == 'biggest_tax' and any(line.display_type == 'rounding' for line in move.line_ids)
++
+     # -------------------------------------------------------------------------
+     # ALERTS
+     # -------------------------------------------------------------------------
+@@ -8011,3 +8045,36 @@ class AccountMove(models.Model):
+         with the Documents app.
+         """
+         return self.message_main_attachment_id
++
++    def get_cash_roundings(self, limit=5):
++        """
++        returns the most relevant rounding methods to the current invoice (or active company if invoice not saved yet).
++        """
++
++        # should be called only on one invoice (saved or not)
++        if len(self) > 1:
++            return
++
++        CashRounding = self.env['account.cash.rounding']
++
++        query = CashRounding._search(
++            domain=CashRounding._check_company_domain(self.company_id or self.env.company),
++            order=CashRounding._order,
++            limit=limit,
++        )
++        if self.invoice_cash_rounding_id:
++            query.order = SQL(
++                "(%s = %s) DESC, %s",
++                query.table.id,
++                self.invoice_cash_rounding_id.id,
++                query.order,
++            )
++        rows = self.env.execute_query(query.select(
++            query.table.id,
++            query.table.name,
++            SQL("COUNT(*) OVER ()"),
++        ))
++        return {
++            'total_length': rows[0][2] if rows else 0,
++            'records': [{'id': rounding_method_id, 'display_name': name} for rounding_method_id, name, _count in rows],
++        }
+
+--- a/addons/account/models/res_config_settings.py
++++ b/addons/account/models/res_config_settings.py
+@@ -81,7 +81,7 @@ class ResConfigSettings(models.TransientModel):
+         help="Intermediary account used when moving from a liquidity account to another.")
+     transfer_account_active = fields.Boolean(related='transfer_account_id.active', string="Internal Transfer Account Active")
+     module_account_accountant = fields.Boolean(string='Accounting')
+-    group_cash_rounding = fields.Boolean(string="Cash Rounding", implied_group='account.group_cash_rounding')
++    group_cash_rounding = fields.Boolean(string="Total Rounding", implied_group='account.group_cash_rounding')
+     show_sale_receipts = fields.Boolean(string='Sale Receipt', config_parameter='account.show_sale_receipts')
+     module_account_budget = fields.Boolean(string='Budget Management')
+     module_account_payment = fields.Boolean(string='Invoice Online Payment')
