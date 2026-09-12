@@ -37,6 +37,21 @@ You can browse each directory to dig into the detail of these changes.
 28. [google_calendar](https://github.com/akretion/odoo-module-diff-analysis/blob/main/15.0/google_calendar) - 16K (1 commit)
 29. [hr_fleet](https://github.com/akretion/odoo-module-diff-analysis/blob/main/15.0/hr_fleet) - 14K (1 commit)
 30. [payment_payumoney](https://github.com/akretion/odoo-module-diff-analysis/blob/main/15.0/payment_payumoney) - 14K (1 commit)
+31. [pos_adyen](https://github.com/akretion/odoo-module-diff-analysis/blob/main/15.0/pos_adyen) - 13K (1 commit)
+32. [payment_transfer](https://github.com/akretion/odoo-module-diff-analysis/blob/main/15.0/payment_transfer) - 12K (1 commit)
+33. [product](https://github.com/akretion/odoo-module-diff-analysis/blob/main/15.0/product) - 12K (1 commit)
+34. [gift_card](https://github.com/akretion/odoo-module-diff-analysis/blob/main/15.0/gift_card) - 8.9K (1 commit)
+35. [auth_totp](https://github.com/akretion/odoo-module-diff-analysis/blob/main/15.0/auth_totp) - 8.3K (1 commit)
+36. [calendar](https://github.com/akretion/odoo-module-diff-analysis/blob/main/15.0/calendar) - 7.9K (1 commit)
+37. [project_timesheet_holidays](https://github.com/akretion/odoo-module-diff-analysis/blob/main/15.0/project_timesheet_holidays) - 7.7K (1 commit)
+38. [mrp](https://github.com/akretion/odoo-module-diff-analysis/blob/main/15.0/mrp) - 6.9K (1 commit)
+39. [event_sms](https://github.com/akretion/odoo-module-diff-analysis/blob/main/15.0/event_sms) - 6.1K (1 commit)
+40. [sale_project](https://github.com/akretion/odoo-module-diff-analysis/blob/main/15.0/sale_project) - 6.0K (1 commit)
+41. [stock_account](https://github.com/akretion/odoo-module-diff-analysis/blob/main/15.0/stock_account) - 5.6K (1 commit)
+42. [delivery](https://github.com/akretion/odoo-module-diff-analysis/blob/main/15.0/delivery) - 5.6K (1 commit)
+43. [hr_expense](https://github.com/akretion/odoo-module-diff-analysis/blob/main/15.0/hr_expense) - 5.0K (1 commit)
+44. [pad](https://github.com/akretion/odoo-module-diff-analysis/blob/main/15.0/pad) - 4.3K (1 commit)
+45. [phone_validation](https://github.com/akretion/odoo-module-diff-analysis/blob/main/15.0/phone_validation) - 3.9K (1 commit)
 
 In total: 45 addons, 85 data model
 impacting commits, 1.8M of pseudo patches.

@@ -37,6 +37,12 @@ You can browse each directory to dig into the detail of these changes.
 28. [sale_management](https://github.com/akretion/odoo-module-diff-analysis/blob/main/14.0/sale_management) - 9.0K (1 commit)
 29. [hr](https://github.com/akretion/odoo-module-diff-analysis/blob/main/14.0/hr) - 8.3K (1 commit)
 30. [mail](https://github.com/akretion/odoo-module-diff-analysis/blob/main/14.0/mail) - 6.7K (1 commit)
+31. [hr_recruitment](https://github.com/akretion/odoo-module-diff-analysis/blob/main/14.0/hr_recruitment) - 6.4K (1 commit)
+32. [stock_dropshipping](https://github.com/akretion/odoo-module-diff-analysis/blob/main/14.0/stock_dropshipping) - 5.1K (1 commit)
+33. [mass_mailing_crm](https://github.com/akretion/odoo-module-diff-analysis/blob/main/14.0/mass_mailing_crm) - 4.7K (1 commit)
+34. [sale](https://github.com/akretion/odoo-module-diff-analysis/blob/main/14.0/sale) - 4.2K (1 commit)
+35. [uom](https://github.com/akretion/odoo-module-diff-analysis/blob/main/14.0/uom) - 3.8K (1 commit)
+36. [hr_presence](https://github.com/akretion/odoo-module-diff-analysis/blob/main/14.0/hr_presence) - 2.0K (1 commit)
 
 In total: 36 addons, 88 data model
 impacting commits, 2.0M of pseudo patches.
