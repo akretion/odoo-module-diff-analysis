@@ -1,34 +1,37 @@
 # hr migration guide (18.0 -> 19.0)
 
+The `hr` app has been deeply reshaped in 19.0: the contract model disappears in favour of a versioned employee, and bank account handling becomes multi-account. This guide summarises what a functional user and a project owner need to know.
+
 ## What's new for users
 
-The official 19.0 release notes do not describe the core `hr` app (the Payroll, Planning, Expenses and Documents sections cover other apps, mostly Enterprise-only packages). Everything below comes from the 19.0 code of `hr`.
+- **Contract history on the employee form.** The separate contract concept is merged into the employee as "versions". A timeline in the employee form lets you see the succession of versions over time, and you can create past or future versions manually.
+- **Protected payroll history.** Editing a version that is already covered by a done or paid payslip no longer silently rewrites history: Odoo creates a new version, flags the affected payslips and schedules an activity for the HR responsible. A version can only be deleted when no payslip refers to it.
+- **Multiple bank accounts per employee.** An employee can now hold several bank accounts. A wizard lets HR distribute the salary across them (fixed amount or percentage of the remainder) and reorder them by priority; the first one is the primary account used for expense receipts and payments. Invoices/bills for the employee use that primary account.
+- **Leaner user profile form.** The preferences and user form no longer expose a long list of HR fields (birthday, marital status, identification numbers, education, presence, manager, coach, home-work distance, etc.). Those values are now managed from the employee record.
 
-- **Multiple bank accounts per employee.** The single "Bank Account" field becomes a list. A new *Bank Account Allocation* wizard lets HR split the salary across accounts, as a fixed amount or as a percentage of the remainder, and reorder accounts to set priority: the first one is the primary account, used for expense receipts and payments. A dedicated widget shows each account's allocation.
-- **Contracts become employee versions.** Wage, dates, working schedule and salary structure now live on the employee as dated versions. New indicators show whether a version is current, future or past, and a version list view is reachable from the employee form.
-- **Clearer work location data.** Work location name and type (Home / Office / Other) are now computed on the employee, so the presence icon tooltip and user profiles show meaningful values instead of raw location names.
-- **Smaller improvements:** public birth-date string, bulk user creation from the Employees list, automatic phone number formatting, clearer address/state selection, avatar card data in multi-company.
-- **User profiles.** Many employee fields (birthdate, marital status, ID, permit and visa numbers, studies, presence, home-work distance, language…) are no longer related on `res.users`; that data is now managed from the employee record.
+Note: the official 19.0 release notes selected for this addon mostly describe Enterprise payroll, localization, Planning, Documents and industry packages, not the Community `hr` app. Nothing in them can be safely attributed to this module, so all of the above comes from the code changes.
 
 ## Technical data model changes
 
-- `hr.employee.bank_account_id` (Many2one) → `bank_account_ids` (Many2many via `employee_bank_account_rel`). New fields: `primary_bank_account_id`, `is_trusted_bank_account`, `has_multiple_bank_accounts`, and stored JSON `salary_distribution` (percentage allocations must total 100%).
-- `res.partner.bank.employee_id` becomes Many2many (with `_search_employee_id`), plus `employee_salary_amount`, `employee_salary_amount_is_percentage`, `currency_symbol`, `employee_has_multiple_bank_accounts`.
-- `res.users`: `employee_bank_account_id` / `bank_account_id` → `employee_bank_account_ids` / `bank_account_ids`; many related employee fields removed (department, address, parent, coach, birthday, marital, sex, IDs, visa, permit, certificate, studies, presence/activity, employee type…). `_compute_can_edit` removed; `_compute_is_hr_user`, `action_related_contact`, `get_formview_action` added.
-- `hr.version` carries the contract data now: wage, dates, structure, flexible schedule, with new computes (`_compute_is_current`, `_compute_is_future`, `_compute_is_past`, `_compute_contract_wage`, `_compute_job_title`…), `create`, `write`, `action_open_version`, `check_contract_finished`, `_unlink_except_last_version`. `work_location_name` / `work_location_type` are removed from `hr.version` and computed on `hr.employee` (related on `hr.employee.public`).
-- `hr.employee`: new `_compute_current_version_id`, presence/newly-hired computes, `create_version`, `create_contract`, `check_no_existing_contract`, `action_archive` / `action_unarchive` (replacing the deprecated `toggle_active`), `_cron_update_current_version_id`. Removed: `_check_ssnid`, `_cron_check_work_permit_validity`, `_get_marital_status_selection`.
-- `hr.department`: new `_search_complete_name` search method.
-- ORM signature updates: `_search(..., bypass_access=False)`, `fetch()` / `search_fetch()` with optional `field_names`, `_field_to_sql(alias, field_expr, query=None)`.
+- **New model `hr.version`.** `hr.employee` now uses `_inherits` on it through `version_id`, so version fields stay readable/writable from the employee. New fields: `version_ids` (One2many), `current_version_id`, `current_date_version`, `versions_count`, plus helpers `create_version()`, `_get_version(date)`, `_is_in_contract(date)`.
+- **Dates.** `date_start` / `date_end` are replaced by a mandatory `date_version` and the `contract_date_start` / `contract_date_end` pair. On versions, `date_start` / `date_end` are now computed and non-stored.
+- **States removed.** Contract states (`open`, `close`, ...) and `kanban_state` are gone; use the computed helpers (`is_current`, `is_past`, `_is_in_contract`).
+- **Fields moved to `hr.version`:** department, job, company, address, work contact/user/resource links, working schedule, marital status, spouse and children, identification numbers (SSN/SIN/passport), gender, home-work distance, departure reason/date/description, work location.
+- **Bank accounts.** `bank_account_id` (Many2one) becomes `bank_account_ids` (Many2many) on `hr.employee`, with `primary_bank_account_id`, `is_trusted_bank_account`, `has_multiple_bank_accounts` and a stored JSON `salary_distribution`. `res.partner.bank.employee_id` becomes a Many2many with a custom search; `res.users.employee_bank_account_ids` follows.
+- **`res.users` cleanup.** Dozens of related HR fields and their entries in `HR_READABLE_FIELDS` / `HR_WRITABLE_FIELDS` were removed, and the HR-specific simple user form view was merged away.
+- **Work location.** `work_location_name` / `work_location_type` move from `hr.version` to `hr.employee` as computed fields; `hr.employee.public` now relates to them.
+- **Misc.** `hr_icon_display` selection is now extensible; the bank allocation wizard model was added. Reporting/SQL that read version fields must join `hr.version`.
 
 ## How your habits should change
 
-- Stop looking for a separate Contract object: open the employee and use the contract/version actions. Existing contracts are migrated into versions, and the "new contract" button warns when a version already covers the date.
-- Manage payroll bank details through the allocation wizard instead of one field, and keep percentage allocations totalling 100% — Odoo refuses invalid distributions.
-- Edit personal data (birthday, family situation, IDs, permits) on the employee, not on the user's profile.
-- Archive employees through the archive/unarchive actions, which also work on several employees at once.
+- Stop managing "a contract per employee": manage versions on the employee, and use the timeline to navigate history.
+- Expect a new version (and payslip warnings) instead of an in-place edit when touching a version already paid.
+- Salary rules and localizations must read `version` from `localdict` instead of `contract`, and custom domains based on `date_start` / `state` must be rewritten.
+- For payouts, select accounts with the multi-account field and open the allocation wizard to set amounts/percentages; keep the order meaningful, as it defines the primary account.
+- Manage personal/HR data on the employee form, not on the user form.
+- Review custom reports, SQL queries and integrations touching `hr.contract`, `date_start`, `state` or `bank_account_id`.
 
 ## What you gain by migrating
 
-- One source of truth per employee: identity, contract history and payroll data in a single versioned record.
-- Genuine salary splitting across several bank accounts, with a primary account for payments and a controlled allocation total.
-- Fewer inconsistencies between employee, user and contact records, cleaner profile permissions, and an up-to-date ORM surface for your customizations built on `hr`.
+- A single source of truth for employee data with a real, auditable contract history.
+- Safer payroll: modifications on already-paid periods are detected and turned into new versions with traceability.

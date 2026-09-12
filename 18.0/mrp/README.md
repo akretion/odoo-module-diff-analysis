@@ -1,50 +1,41 @@
 # mrp migration guide (17.0 -> 18.0)
-
 ## What's new for users
-
-The 18.0 release notes extract available to us covers eCommerce only and says nothing about Manufacturing. The items below therefore come from the code changes and apply to the Community edition — no Enterprise-only feature is presented as included.
-
-- **Product catalog in BoMs and MOs** — add components and byproducts to a manufacturing order, and components to a bill of materials, from the same catalog side panel used in Sales and Purchase, with filters (product used in a BoM/MO, kit).
-- **Manual consumption is now a choice** — tracked (lot/serial) components are no longer forced to manual consumption; you decide per BoM line.
-- **Late manufacturing orders** — delayed indicator, filter and coloured list rows highlight MOs behind schedule.
-- **Mass produce serials** — batch production of serialised products is one "Mass Produce" action instead of a wizard.
-- **Work centre planning** — backward scheduling, planning simulation in the BoM overview, and a clickable weekly load graph on the work centre overview.
-- **Costs** — the MO overview shows real operation cost and WIP accounting now takes the date into account.
-- **Documents** — production documents become product documents and appear in the BoM and MO chatters.
-- **Smaller wins** — start/pause a MO or many work orders at once, reshuffle operations, cancellation warnings, BoM shown in replenishment, smart button from a transfer to its MOs, rebuilt scrap and unbuild forms.
+The official 18.0 release notes extract provided covers eCommerce, not MRP. No relevant MRP-only release note is available here, so this guide is based on the 17.0→18.0 module diff.
+- Manual consumption is now a real choice: you can enable or disable it per BoM line, even for tracked components. It is no longer forced by lot/serial tracking or by an operation.
+- Operation dependencies: new "Operation Dependencies" option on BoMs lets you declare which operations must finish before another can start.
+- Documents are unified: the separate MRP document model disappears. Files are managed as product documents and can be flagged "Bill of Materials" to appear on BoMs and manufacturing orders.
+- BoM lead times: manufacturing lead time and days to prepare the MO are now documented on the BoM.
+- Variant support extends to operations and by-products, not only BoM lines.
+- Work centers gain tags and product capacities.
+- Manufacturing orders gain unbuild links.
+- BoM safety: cycle detection blocks a product from containing itself through sub-BoMs; kit BoMs cannot be created for products with reordering rules; by-product cost shares are validated (positive, total ≤ 100).
 
 ## Technical data model changes
-
-**Model removed:** `mrp.document` — merged into `product.document`.
-
-**Fields removed:** `mrp.bom.line.manual_consumption_readonly`; `stock.picking.type.use_auto_consume_components_lots` and its related field on `mrp.production`.
-
-**Fields added:** `product.document.attached_on_mrp` (Hidden / Bill of Materials); `mrp.production.is_delayed` (computed and searchable); `stock.picking.mrp_production_ids`; BoM support on `stock.replenish.mixin`; computed/searched `product_is_in_bom`, `product_is_in_mo` and `is_kits` on products.
-
-**Behaviour changes:**
-- `mrp.bom.line.manual_consumption` is a plain stored boolean, no longer computed from tracking or operation.
-- Manual consumption of a stock move now derives only from its BoM line.
-- A document added on a BoM is re-pointed to the product/template with `attached_on_mrp = 'bom'`.
-- `mrp.unbuild` and `stock.scrap` onchanges became computed fields — integrations relying on onchange triggers must be reviewed.
-- `mrp.document.copy`/`unlink` and `mrp.routing.workcenter._get_comparison_values` are gone.
-
-**Method signature changes** (only matters if you have custom code):
-- `mrp.bom.explode(..., never_attribute_values=False)`
-- `mrp.bom.line._skip_bom_line(product, never_attribute_values=False)`
-- `mrp.production._get_move_raw_values(product, ...)` (was `product_id`)
-- `mrp.production._set_qty_producing(pick_manual_consumption_moves=True)`
-- `mrp.workorder.button_start(raise_on_invalid_state=False)` and `_cal_cost(date=False)`
-- `mrp.workcenter._get_first_available_slot(start, duration, forward=True, leaves_to_ignore=False, extra_leaves_slots=[])`
-- `mrp.workorder._read_group_workcenter_id(workcenters, domain)` — `order` argument dropped
+- Removed model: mrp.document. Replaced by product.document plus attached_on_mrp selection (Hidden / Bill of Materials).
+- stock.production.lot renamed to stock.lot; MRP imports and relations updated.
+- mrp.bom: added possible_product_template_attribute_value_ids, allow_operation_dependencies, produce_delay, days_to_prepare_mo; product_tmpl_id/product_id now stored/indexed; product_qty uses "Product Unit of Measure"; ready_to_produce default is all_available; inherits product.catalog.mixin; _order = sequence, id; display name uses _compute_display_name; _rec_names_search replaces custom _name_search.
+- mrp.routing.workcenter: added blocked_by_operation_ids / needed_by_operation_ids and variant attribute value fields.
+- mrp.workorder: added blocked_by_workorder_ids / needed_by_workorder_ids; next_work_order_id removed.
+- mrp.workcenter: added tag_ids and capacity_ids.
+- mrp.production: added unbuild_ids; removed use_auto_consume_components_lots; date fields adjusted.
+- mrp.bom.line: manual_consumption is no longer computed; manual_consumption_readonly removed.
+- stock.picking.type: use_auto_consume_components_lots removed.
+- Removed fields include module_mrp_workorder, group_locked_by_default, allowed_product_ids, allowed_mo_ids, order_finished_lot_ids.
+- Method changes: _bom_find now takes a product recordset and returns a BoM per product; _bom_find_domain takes products; _set_qty_producing has a pick_manual_consumption_moves argument; _determine_is_manual_consumption is based only on the BoM line.
+- BoM copy now remaps operation dependencies; BOM explode uses the new finder and cycle checks.
 
 ## How your habits should change
-
-- **BoM lines:** the Manual Consumption checkbox is unlocked for tracked components. Review your BoMs: tick it where operators must register consumption by hand, leave it clear to speed up validation.
-- **Picking types:** "Consume Reserved Lots/Serial Numbers automatically" is gone; that behaviour is now set per BoM line.
-- **Documents:** file drawings and specifications on the product, choosing "MRP: Visible at = Bill of Materials", instead of uploading them on the MO or BoM.
-- **Serials:** use the Mass Produce action instead of the old serial wizard.
-- **Scrap/unbuild:** these forms now fill in automatically; no manual touch is needed to get default locations, BoM or lot.
+- Review every BoM line with tracked components: manual consumption is no longer automatic. If you relied on scanning lots/serials for each tracked component, tick "Manual Consumption"; if you want speed, leave it off and let reserved lots/serials be consumed.
+- Check BoM readiness settings: new BoMs default to "When all components are available" instead of "When components for 1st operation are available".
+- Stop using standalone MRP documents. Upload files on the product and mark them visible on BoMs; they will show in the BoM/MO chatter.
+- Use operation dependencies only when operations must be sequenced; otherwise leave them off for simultaneous scheduling.
+- Update reports, imports, and integrations that reference mrp.document, stock.production.lot, use_auto_consume_components_lots, manual_consumption_readonly, or next_work_order_id.
+- Expect validation messages for BoM cycles, kit orderpoints, and by-product cost shares.
 
 ## What you gain by migrating
-
-Moving to 18.0 gives your production team a faster daily flow (catalog picking, mass actions, automatic form defaults), better visibility (delayed MOs, work centre load graph, interactive overview graphs, real costs, WIP by date) and a cleaner data model (one document model instead of two, manual consumption under your control). Customisations are lighter too: several onchange-driven flows became computed fields, which are easier to extend. Because `mrp.document` and two picking-type fields disappear and several method signatures change, plan the upgrade with a test pass on your BoMs, tracked components and any custom module touching MRP.
+- More accurate consumption: decide per component whether operators must scan lots/serials.
+- Better planning: lead times and operation dependencies improve scheduling of multi-level BoMs.
+- Cleaner document management: one product document repository, visible where production users need it.
+- Stronger BoM control: variant-specific operations/by-products, cycle prevention, and cost-share checks reduce data errors.
+- Richer work centers: tags and capacities support more precise routing and planning.
+- Clearer traceability: unbuilds linked to manufacturing orders.

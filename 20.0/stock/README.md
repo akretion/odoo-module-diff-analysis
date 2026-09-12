@@ -2,41 +2,38 @@
 
 ## What's new for users
 
-Odoo's official 20.0 release notes do not cover this addon; the changes below come from the 19.0 → 20.0 code diff of the `stock` module itself.
+The official 20.0 release notes contain no section dedicated to this addon, so everything below is derived from the 20.0 code changes themselves.
 
-- **Scrap is now a stock move.** The dedicated Scrap document is gone. The Scrap menu lists the scrap moves themselves, with the fields you know (product, quantity, lot/serial, source and scrap location, reason tags, replenish). You can also scrap a lot/serial number directly from its form.
-- **Scrap reason tags** and **Should Replenish** are now options carried by the move.
-- **Allocation report replaces the Reception Report.** There is no global setting left: display, auto-print and label options are configured per operation type (never for outgoing ones).
-- **Returns and exchanges are actions on the transfer** (return all, return a selection, exchange) instead of a separate wizard.
-- **Put in Pack from Detailed Operations**, including splitting lines by package capacity.
-- **Reordering rules**: a new wizard mass-updates the demand basis and factor, recomputing daily demand, min and max.
-- **Inventory adjustments can be backdated** when the date is editable.
-- **Settings clean-up**: individual shipping-connector checkboxes disappeared; delivery methods are opened from a single "Delivery Methods" view.
+- **Scrapping is now a normal stock move.** The dedicated *Scrap* order model (`stock.scrap`) is gone. The Scrap menu shows a list of stock moves flagged as scrap; a record created there is a draft move that becomes done when confirmed. Scrap reason tags and the "Replenish Quantities" option are still available, now on the move itself.
+- **Scrap straight from a lot/serial number.** The lot/serial form has a *Scrap* button that opens a pre-filled scrap move, plus a button listing that lot's scrap moves.
+- **Kits can no longer be scrapped** (limitation of the move-based approach).
+- **Batch, Wave & Cluster Transfers are now part of Inventory.** The separate `stock_picking_batch` app disappears; the feature is switched on with a simple setting instead of installing an extra module.
+- **Allocation / Reception Report becomes an option per operation type.** Instead of one global setting, each operation type carries its own "Show Allocation" and auto-print options, so receipts and internal transfers can behave differently.
+- **Reordering rules get a suggest wizard** to recompute in bulk the demand period, the factor, the daily demand and the min/max quantities.
 
 ## Technical data model changes
 
-- **Removed model**: `stock.scrap`, plus `scrap_id` on `stock.move` and `stock.move.line`.
-- **`stock.move`**: added `is_scrap`, `scrap_reason_tag_ids`, `should_replenish_scrapped`; `reference` is now writable; `lot_ids` restricted to the move's product. `stock.lot` gains `is_scrap`.
-- **`res.company`**: added `scrap_location_id`, `default_stock_location_id`.
-- **Moved to `product`**: `virtual_available`, `incoming_qty`, `outgoing_qty`.
-- **Renamed**: orderpoint `based_on` → `min_max_based_on`, `percent_factor` → `min_max_based_on_factor`; UoM logistic fields (`product_uom` → `uom_id`).
-- **Removed fields**: `show_operations` (picking, operation type, move), `package_type_sequence_id`, and the `group_stock_reception_report` setting.
-- **Picking batch** now lives in `stock` (`stock.picking.batch`), with batch/wave merging and automatic batch/wave creation options on operation types.
-- **Signatures to audit in custom modules**: `stock.rule._get_push_rule(move, location_dest_id, route_ids, warehouse_id, extra_domain)` (`_run_push` removed), `_get_stock_move_values(..., uom_id, ...)`, `_get_lead_days(..., bypass_delay_description=...)`, `stock.quant.action_apply_inventory(date=None)`, `stock.picking._create_backorder(..., from_manual_backorder=False)`, `stock.move.line.action_put_in_pack(..., package_capacity=None)`, `stock.warehouse.orderpoint.action_replenish()` (no more `force_to_max`).
+- Removed model `stock.scrap`; added `stock.scrap.reason.tag`. The batch/wave/cluster models and views moved from `stock_picking_batch` into `stock`.
+- `stock.move`: `scrap_id` removed; `is_scrap`, `scrap_reason_tag_ids` and `should_replenish_scrapped` added; `reference` is now editable; `lot_ids` is domain-filtered by product.
+- `stock.move.line`: `scrap_id` removed; `is_scrap` and `batch_id` (related) added.
+- `stock.lot`: new `is_scrap` flag.
+- `res.company`: computed `scrap_location_id` and `default_stock_location_id`; a scrap move now defaults from the company stock location to the scrap location.
+- `stock.picking`: `move_ids` excludes scrap moves; `has_scrap_move` and `action_see_move_scrap` now key on `is_scrap`.
+- `stock.picking.type`: `auto_show_reception_report` now gates allocation reports; the global `group_stock_reception_report` is removed. The label "Operation Category" is renamed "Type of Operation".
+- Renames: `stock.move.product_uom` → `uom_id`; `stock.move.line.product_uom_id` → `uom_id`; `stock.lot.product_uom_id` → `uom_id`; orderpoint `based_on` → `min_max_based_on` and `percent_factor` → `min_max_based_on_factor`.
+- Settings: `module_stock_picking_batch` replaced by `group_stock_picking_batch`; `group_stock_reception_report` and the per-carrier `module_delivery_*` toggles are removed from Inventory (connectors are reached from a single Delivery Methods view).
+- `virtual_available`, `incoming_qty` and `outgoing_qty` moved to the base `product` module (no impact when Inventory is installed).
+- Methods: `stock.move.action_scrap()`, `_action_scrap()`, `check_available_qty()`, `_action_replenish()`, `_prepare_scrap_move_vals()`, `action_print_reception_report()`; `stock.lot.action_scrap()` and `action_open_scrap_moves()`; `stock.picking.button_scrap()` → `action_scrap()`; `stock.move.line.action_revert_inventory()` → `action_revert()`; batch/wave helpers added on `stock.move.line`. Dead code removed (`show_operations`).
 
 ## How your habits should change
 
-- Scrapping happens in the Scrap list of stock moves, or from a transfer/lot; there is no scrap order to consult afterwards. Scrapping a kit is no longer possible.
-- If you relied on the global Reception Report setting or company-level auto-print flags, re-enable them per operation type.
-- Returns and exchanges are buttons on the transfer; no return wizard to fill in.
-- Reports, filters or imports based on `stock.scrap`, or on the stock-owned `virtual_available`, must be adapted.
-- Customisations using `show_operations`, `based_on`, `percent_factor`, `product_uom`/`product_uom_id` or the reception-report group need updating.
+- Scrap operations are no longer separate documents: look for them in the Scrap menu, in the move list, or from the picking's *Scraps* button. Reports or filters based on `stock.scrap` must be rebuilt on scrap moves.
+- If you scrapped kits, define an alternative process (scrap the components or use inventory adjustments).
+- Batch/wave behaviour is now a setting, not an installed app; check that it is enabled after migration.
+- Review each operation type to set "Show Allocation" and the automatic report/label printing, since the previous global setting no longer applies.
+- Custom code, exports or server actions using `product_uom` on moves, or `product_uom_id` on move lines/lots, must use `uom_id`; orderpoint fields renamed likewise.
+- Customizations on shipping connectors should use the new unified Delivery Methods view.
 
 ## What you gain by migrating
 
-- One consistent document — the stock move — for scrap, inventory and transfers: fewer records, full traceability.
-- Scrap, returns and put-in-pack available where the work happens, with fewer dialogs.
-- Allocation and label behaviour configurable per operation type instead of a single company-wide switch.
-- On hand, incoming, outgoing and forecasted quantities available at product level, preparing lighter inventory setups.
-- Easier reordering-rule tuning thanks to the demand suggestion wizard.
-- A supported release whose data model converges with upcoming versions, lowering the cost of future upgrades.
+A simpler, more consistent stock engine: one model for both transfers and scrapping, fewer modules to install and maintain for batching and waves, allocation reports tuned per operation type, a bulk wizard for reordering rules, and a unified unit-of-measure naming that makes customizations and integrations easier to write and less error-prone.

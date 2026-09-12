@@ -2,38 +2,45 @@
 
 ## What's new for users
 
-- **Automatic account hierarchy.** The chart of accounts now groups itself from the account codes: you no longer have to fill in the parent group or the group on each account (still overridable for exceptions).
-- **Choose your numbering.** You can pick the numbering sequence you want when posting your first customer invoice or vendor bill, and the entry number is now directly editable.
-- **Reconciliation models with several lines.** Write-off/suggestion lines are no longer limited to two.
-- **Better audit trail** on the entry number and on tax-grid tags.
-- **Payments through outstanding accounts**: customer and vendor payments are posted to outstanding accounts and only reach the bank account when the bank statement is imported.
+- **Payments go through outstanding accounts.** Customer and vendor payments are posted on "Outstanding Receipts/Payments" accounts configured on the journal; the money reaches the bank account only at bank reconciliation. Manual journal entries can be reconciled on these accounts too.
+- **Better payment tracking.** Payment status (printed, cancelled, date of the action) is now traced, and an invoice/bill can be marked as partially paid when the amount received is lower than the balance.
+- **Editable document numbering.** Choose the numbering sequence directly when posting your first invoice or bill, instead of going through technical sequence settings.
+- **"To check" flag** on invoices/bills to follow up on documents that need review.
+- **Smarter reconciliation models:** they can match on customer/vendor and also look into the note and reference, not only the label.
+- **Chart of accounts:** the account hierarchy is now built automatically from the account code.
+- **Cash rounding:** separate accounts for rounding gains and losses.
+- **Bank accounts:** SEPA BIC is no longer mandatory.
 
-Note: several accounting items mentioned in the 14.0 release notes are Enterprise-only and are **not** included in the Community edition (fiscal years, aged partner balance, reconciliation widget).
+Note: the bank reconciliation widget, aged partner balance, ledger/financial reports, unrealized gains & losses report and multi tax reports belong to Odoo Enterprise and are not part of this Community addon.
 
 ## Technical data model changes
 
-**account.group / account.account** — `code_prefix` is replaced by `code_prefix_start` + `code_prefix_end` (equal length enforced, no overlap between groups of the same granularity); `company_id` becomes required and `parent_id` is read-only. `account.account.group_id` becomes a stored computed field and the old `onchange_code` heuristic disappears. New model `account.group.template`; groups are generated from the chart template.
+Removed or renamed:
+- `account.journal.post_at` removed (the Payment Validation / Bank Reconciliation posting choice is gone).
+- Journal `default_debit_account_id` / `default_credit_account_id` replaced by a single `default_account_id`.
+- Journal `sequence_id`, `refund_sequence_id`, `sequence_number_next`, `refund_sequence_number_next` removed. `account.move.name` becomes a stored, editable computed field (with `highest_name`), plus `sequence_override_regex` on journals.
+- `account.move.line.tag_ids` renamed `tax_tag_ids` (SQL tables unchanged).
+- `account.fiscal.year` model removed from Community (moved to Enterprise); the `account_fiscal_country_*` config parameters are replaced by `account_tax_fiscal_country_id` on `res.company`.
+- `account.bank.statement.line` loses its direct links to statements, accounts and partner bank accounts; the reconciliation model `second_*` write-off fields are dropped.
 
-**account.reconcile.model / .line** — new models `account.reconcile.model.line` and `account.reconcile.model.line.template`. All `second_*` fields, `has_second_line` and `amount_from_label_regex` are removed and replaced by `line_ids` (One2many) with `amount_type`/`amount_string`, `tax_ids` and `analytic_tag_ids`.
-
-**account.move / account.journal** — `name` is now stored, editable and computed. New fields `posted_before`, `highest_name`, `show_name_warning`, and `sequence_override_regex` on the journal. Removed from the journal: `sequence_id`, `refund_sequence_id`, `sequence_number_next`, `refund_sequence_number_next`; from the move: `invoice_sequence_number_next(_prefix)`. New abstract model `sequence.mixin`, also used by bank statements.
-
-**account.move.line** — `tag_ids` is renamed `tax_tag_ids` (same table and columns, so existing reports keep working).
-
-**Signatures and removals** — `_get_taxes_move_lines_dict` is now an instance method (`ensure_one`); `_get_write_off_move_lines_dict` gained a `residual_balance` argument. `account.fiscal.year` and `res.company.compute_fiscalyear_dates()` are gone from Community.
+Added:
+- Journal: `payment_debit_account_id`, `payment_credit_account_id`, `suspense_account_id`.
+- New models `account.reconcile.model.line` (and its template), `account.group.template`; `account.partial.reconcile` and `account.full.reconcile` moved to dedicated files, with per-currency amounts stored on each partial.
+- `account.group`: `code_prefix_start`/`code_prefix_end`, `company_id`; `account.account.group_id` is now computed from the account code.
+- Company level: `income_currency_exchange_account_id`, `expense_currency_exchange_account_id` and the cash-basis base account.
 
 ## How your habits should change
 
-- Check your account codes first: groups and their parents are now derived from the codes, not from what you typed manually.
-- Forget the journal "Next Number" fields; numbering is handled on the entry itself.
-- Because numbers are editable, the prefix matters: renaming mid-period can make the next number reuse an existing prefix. A per-journal regex can enforce a strict format (advisor only).
-- Rebuild your reconcile models as line lists instead of first/second line.
-- Replace any customisation or report using `tag_ids` on move lines with `tax_tag_ids`.
-- Fiscal-year records are no longer available in Community.
+- Do not look for "Next number" on journals anymore: set or edit the entry number on the document itself.
+- Reconciliation models: add as many write-off lines as needed instead of the old fixed "second line".
+- One "Default Account" now covers both debit and credit sides of a journal.
+- Bank statements no longer use a reconciliation threshold; statements lines create entries immediately on the suspense account.
+- An invoice is "paid" only when reconciled with an entry on the journal's liquidity account; with outstanding accounts, an intermediate "in payment" state is expected.
+- Account groups: create accounts and let Odoo assign the group; adjust only for exceptions.
 
 ## What you gain by migrating
 
-- Less manual setup, and an account hierarchy that stays consistent.
-- User-editable numbering, without going through `ir.sequence` settings.
-- Reconciliation models that go beyond two lines and are much easier to maintain.
-- A supported, modern base with a clear upgrade path prepared by Akretion.
+- A clearer, auditable payment lifecycle: outstanding accounts make the gap between payment and bank statement explicit.
+- Less configuration and fewer technical screens: numbering, default accounts, account groups and reconciliation models are all simpler and more flexible.
+- More reliable multi-currency reconciliation, thanks to per-currency amounts stored on each partial reconciliation.
+- Better day-to-day visibility with the "To check" flag, payment status tracking and automatic account hierarchy.

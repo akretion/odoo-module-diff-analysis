@@ -1,35 +1,41 @@
 # mrp migration guide (19.0 -> 20.0)
 
+Migration guide for the Manufacturing (`mrp`) addon, Odoo 19.0 → 20.0, Community edition. No official release notes covered this addon: the points below come from the actual 20.0 code changes.
+
 ## What's new for users
 
-No official release-note extract covers this addon for 20.0, so the points below are derived from the code changes actually shipped in the `mrp` module.
-
-- **Scrap is no longer a separate document.** The `stock.scrap` model is removed; scrapping a component, a finished product or a by-product now creates a stock move flagged as a scrap. The Scrap menu, the *Scrap* button on a manufacturing order and on a work order all open this new list/form. Functionally the flow is unchanged (product, quantity, reason, replenishment). One regression to know about: **kits can no longer be scrapped**.
-- You can now scrap a lot/serial number directly from its own form view.
-- **Work-order planning** gained explicit "planning issues" and "conflicts" information, plus plan / unplan actions and a "select MO to plan" action.
-- **Unbuild** orders can cover several serial numbers at once, with a "clear lots" action.
-- The **consumption warning** field is dropped from BoMs and the manual-consumption detection helpers are gone; component replacement across BoMs is faster.
-- **Subcontracting**: order-level "finished lot ids" fields removed. **Product documents** are no longer shown on the BoM form (they remain on products). The **allocation report** is now driven by a setting per picking type.
+- Work order planning: the hover popover warnings become two filterable flags, *Has planning issues* and *Has conflicts* (conflicts now also count in-progress work orders). The work order list colours late dates red and today orange, kanban cards show units, and you can search by manufacturing order references.
+- Scrapping: the `stock.scrap` model disappears but the feature stays — a scrap is now a stock move flagged as scrap. You can scrap a lot/serial number from its form, record scrap reason tags and ask to replenish scrapped goods. Kits can no longer be scrapped.
+- Unbuilding: one unbuild order can now reverse several serial numbers. Lot-tracked products still take one lot, with a button to clear the selection. The small unbuild dialog is replaced by the standard unbuild form.
+- BoM maintenance: from a product's "used in BoMs" list you can multi-edit BoM lines and replace a component in several BoMs at once.
+- Cleaner BoM forms: product documents are no longer managed from the BoM (they stay on the product form).
+- Consumption: the BoM "Flexible Consumption" option (Allowed / Allowed with warning / Blocked) is removed; "allowed with warning" is now always the behaviour.
+- Allocation report: the "Allocation Report for Manufacturing Orders" setting moves from General Settings to an option on each operation type.
 
 ## Technical data model changes
 
-- Removed: `stock.scrap` (file `mrp/models/stock_scrap.py`), `mrp.production.scrap_ids`, `mrp.workorder.scrap_ids` and `mrp.workorder.scrap_count`. `mrp.production.scrap_count` remains but is computed from scrap moves (`is_scrap = True`) on components and finished products.
-- `stock.move`: new `is_scrap`, `scrap_reason_tag_ids`, `should_replenish_scrapped`; new helpers `_prepare_scrap_move_vals`, `_action_replenish`, `_get_production_assignation_domain`, `action_add_from_catalog_wo`.
-- **UoM renames**: `product_uom_id` -> `uom_id` on `mrp.bom`, `mrp.bom.line`, `mrp.bom.byproduct`, `mrp.production`, `mrp.unbuild`, `mrp.workcenter.capacity`; `mrp.workorder.uom_id` is now related to `production_id.uom_id`; on MO moves `product_uom` -> `uom_id`. `_compute_product_uom_id` -> `_compute_uom_id`, `_get_default_product_uom_id` -> `_default_uom_id`.
-- **Signatures**: `mrp.production.button_plan(as_soon_as_possible=True)`, `_plan_workorders()` (no `replan`), `_split_productions(...)` (no `skip_procurement`), `_set_qty_producing(mark_moves_picked=True)`, `_autoprint_generated_lots(lot_ids)`, `button_scrap` -> `action_scrap`. `mrp.workorder._set_duration(employee_id=None, employee_duration=None)`, `_calculate_date_finished(..., compute_leaves=False)`, `_get_current_theorical_operation_cost` -> `_get_current_theoretical_operation_cost`. `mrp.bom._set_outdated_bom_in_productions(skip_bom_outdated_unmark=False)`.
-- **New MO fields/actions**: `packages_count`, `remaining_time`, `all_child_count`, `note`, `active_workcenter_ids`; `action_view_packages`, `action_view_allocation_report`, `action_detailed_operations`, `action_view_mrp_production_all_childs`. New BoM helpers: `action_copy_existing_operations`, `action_open_exploded_bom_lines`, `_compute_component_count`, `_compute_subassembly_count`, `_get_exploded_bom_data`.
+- UoM fields renamed: `product_uom_id` → `uom_id` on `mrp.bom`, `mrp.bom.line`, `mrp.bom.byproduct` and `mrp.production`; `product_uom` → `uom_id` on MRP `stock.move`. Helper `_get_default_product_uom_id` → `_default_uom_id`.
+- `stock.scrap` removed: `mrp.production.scrap_ids`, `mrp.workorder.scrap_ids` / `scrap_count` and the MRP inherit of `stock.scrap` disappear. `button_scrap()` → `action_scrap()`; `action_see_move_scrap()` now targets `stock.move` with `is_scrap = True`.
+- `stock.move.manual_consumption` removed; `_set_qty_producing(pick_manual_consumption_moves=True)` → `_set_qty_producing(mark_moves_picked=True)`; context key `force_manual_consumption` → `force_move_picked`.
+- `mrp.workorder`: `json_popover` / `show_json_popover` replaced by `has_conflicts`, `has_planning_issues` (searchable) and `decoration_dates`; `production_reference_ids` added.
+- `consumption` removed from `mrp.bom`, `mrp.production` and `mrp.workorder`.
+- `mrp.unbuild.lot_id` → `lot_ids` (many2many); `product_qty` follows the selected serials; `action_clear_lots()` added.
+- `mrp.bom.line`: `attachments_count`, `action_see_attachments()`, `bom_product_id`, `bom_product_qty` and `bom_product_uom_id` removed; `write()` now re-checks BoM cycles and flags outdated BoMs on running productions.
+- Removed: `product.document.attached_on_mrp` (and its `ir.attachment` override), `mrp.workorder.finished_lot_ids`, `stock.move.order_finished_lot_ids`, `res.config.settings.group_mrp_reception_report`.
+- Added: `stock.move.action_open_allocation_report()`; allocation reporting is driven by operation types (`auto_show_reception_report`).
 
 ## How your habits should change
 
-- Stop thinking in "scrap orders": the Scrap menu now lists stock moves (existing scrap data is handled by the upgrade).
-- Scrapping a kit is no longer possible; scrap the components instead.
-- Any data import/export, saved filter, custom report or Studio/OCA customization using `product_uom_id` (BoM, BoM line, by-product, MO, unbuild, work-center capacity) or `product_uom` on MO moves must switch to `uom_id`.
-- Custom code calling `button_scrap`, `_get_default_product_uom_id`, `_get_current_theorical_operation_cost`, `_plan_workorders(replan=...)` or `_split_productions(skip_procurement=...)` needs updating.
-- Component consumption is registered through stock moves only; the older manual-consumption flags/helpers no longer exist. Customizations relying on BoM consumption warnings must be dropped.
+- Imports, exports, integrations and reports using `product_uom_id` / `product_uom` on BoMs, MOs or their moves must use `uom_id`.
+- Scrap orders become stock moves: use the Scrap menu; kits can no longer be scrapped.
+- Consumption is no longer auto-updated once a move is picked: changing the produced quantity only follows unpicked moves. The "Blocked"/"Allowed" BoM modes are gone (warning only); `skip_consumption` in context still bypasses the check.
+- Enable reception/allocation report display and auto-printing per operation type, not through a user group.
+- Rebuild work order filters/dashboards on the new boolean flags.
 
 ## What you gain by migrating
 
-- One single object (the stock move) for every stock outflow: scrap quantities, valuation, traceability and replenishment then follow your normal logistics rules.
-- A consistent `uom_id` naming across logistic models, making imports, exports and integrations simpler and less error-prone.
-- Better visibility on work-order planning conflicts, with explicit plan/unplan actions.
-- More flexible unbuilds (several serials in one order) and faster BoM component replacement on large bills of materials.
+- Planning issues and conflicts are visible and filterable at a glance.
+- Scraps, moves and valuation share one model, keeping stock data consistent.
+- Replace a component across many BoMs in one action.
+- Unbuild several serials in a single order.
+- Uniform UoM naming across logistic modules: simpler imports and customizations.

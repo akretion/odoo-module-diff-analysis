@@ -1,37 +1,49 @@
 # stock migration guide (12.0 -> 13.0)
 
+This addon covers inventory, transfers, locations and putaway. Here is what changes for a functional user moving from 12.0 to 13.0.
+
 ## What's new for users
 
-**Putaway rules, rebuilt for usability.** Instead of creating a "Put Away Strategy" record and attaching it to a location, you now define putaway rules directly on locations: each rule targets a product *or* a product category, states where the product arrives, and where it must be stored. Rules are reachable from the product and product category forms (stat buttons) and from a new Product configuration menu entry.
+- **Inventory adjustments**: counting stock is simpler — no more "filter" selection, and you can adjust a product quantity without building a full inventory adjustment.
+- **Putaway rules**: the old "Put Away Strategy" is replaced by readable rules attached to products, product categories and locations.
+- **Rescheduling**: choose per stock rule whether a scheduled-date change is propagated to the next operations, and from which delay. The old company-wide setting is gone.
+- **Route renamed**: "Make to Order" is now "Replenish on Order" (the product is not always manufactured).
+- **Product description on transfers**: shown on transfer lines and adaptable per transfer type (receipt, delivery, internal).
+- **Forecasted inventory**: the forecast is available in graph and grid views.
 
-**Inventory adjustments, simplified.** The "Inventory of..." filter is gone. Create an adjustment, optionally restrict it to one or more locations and/or one or more products — or leave both empty to count all your stock. Lines now live in their own list view, with a colour legend (outdated quantities in red, differences in blue, newly added lines in bold), a Difference column and "Counted Quantity" wording. You can refresh lines whose on-hand quantity became outdated, and validated adjustments expose their accounting moves through a stat button.
-
-**Rescheduling propagation is now per rule.** The "No Rescheduling Propagation" setting disappeared from Inventory settings. Whether a date change is pushed to the next move — and the minimum delta above which it is pushed — is now defined on each operation rule and copied to the moves it generates.
-
-**Reserved quantities are always visible.** The "Show Reserved" option on operation types is removed: detailed operations always display reserved lines (lot/serial, source location, package).
-
-Other user-visible points: the Make To Order route is renamed **Replenish on Order**; product descriptions on transfers can differ per transfer type (receipt, delivery, internal); stock move lines carry a company (multi-company); reordering-rule counters on products are computed per company.
+Other release-note items (valuation layers, landed costs on vendor bills, carrier return labels, lot/serial on invoices, picking assignment) belong to other addons or to Enterprise — check them separately.
 
 ## Technical data model changes
 
-- **Removed:** `stock.picking.type.show_reserved`, `stock.move.move_line_nosuggest_ids` (and `_get_move_lines`), plus the `view_stock_move_nosuggest_operations` view.
-- **Putaway:** models `product.putaway` and `stock.fixed.putaway.strat` are removed, replaced by `stock.putaway.rule` (product_id, category_id, location_in_id, location_out_id, sequence). `stock.location.putaway_strategy_id` becomes `putaway_rule_ids`; `get_putaway_strategy()` is renamed `_get_putaway_strategy()`. New `putaway_rule_ids` on product (variant), product category and location.
-- **Rescheduling:** `res.company.propagation_minimum_delta`, `res.config.settings.propagation_minimum_delta` and `use_propagation_minimum_delta` are removed. Added `propagate_date` and `propagate_date_minimum_delta` on `stock.rule` (default 1) and `stock.move`.
-- **Inventory adjustment:** `stock.inventory` loses `location_id`, `product_id`, `package_id`, `partner_id`, `lot_id`, `category_id`, `filter`, `exhausted`, `total_qty`, `inventory_location_id`; it gains `location_ids` and `product_ids` (many2many) and `start_empty`. `stock.inventory.line` loses `product_uom_category_id`, `theoretical_qty` is no longer stored, and `difference_qty`, `inventory_date`, `outdated`, `is_editable` are added; "Checked Quantity" becomes "Counted Quantity". New methods: `action_open_inventory_lines`, `action_view_related_move_lines`, `action_refresh_quantity`. Validation now requires the Stock Manager group.
-- **Reordering counters:** `nbr_reordering_rules`, `reordering_min_qty` and `reordering_max_qty` (product and product template) are computed per company (`compute_sudo=False`).
+**Inventory adjustment (`stock.inventory`)**
+- Removed: `filter`, `total_qty`, `category_id`, `exhausted`, `inventory_location_id`, and the single-value `location_id`, `product_id`, `package_id`, `partner_id`, `lot_id`.
+- Added: `location_ids` and `product_ids` (many2many), `start_empty`; defaults now depend on `company_id`.
+- Lines: new `difference_qty`, `inventory_date`, `outdated`, `is_editable`; `theoretical_qty` is no longer stored; "Checked Quantity" becomes "Counted Quantity"; `product_uom_id` is readonly.
+- Duplicate-line check now applies only inside the same adjustment; `_action_done` drops its `cancel_backorder` argument; `action_inventory_line_tree` becomes `action_open_inventory_lines`; new `action_view_related_move_lines`.
+
+**Putaway**
+- Models `product.putaway` and `stock.fixed.putaway.strat` are removed; new model `stock.putaway.rule` (`product_id`, `category_id`, `location_in_id`, `location_out_id`, `sequence`, `company_id`).
+- `stock.location.putaway_strategy_id` becomes `putaway_rule_ids`; `get_putaway_strategy` becomes `_get_putaway_strategy`.
+
+**Rescheduling / picking**
+- `res.company.propagation_minimum_delta` and its settings are removed.
+- `stock.move` and `stock.rule` gain `propagate_date` and `propagate_date_minimum_delta`.
+- `stock.move.move_line_nosuggest_ids` and `stock.picking.type.show_reserved` are removed (one Detailed Operations view).
+
+**Multi-company**
+- `check_company` is enforced on many relations (moves, locations, routes, putaway rules, inventory lines...).
+- `stock.move.line.company_id` is no longer related; `company_id` added to package levels, putaway rules and lots; `stock.picking.type.company_id` is required and pickings follow their type.
+- Changing the company of a location or putaway rule is forbidden.
+- Reordering-rule counters on products are computed per active company.
 
 ## How your habits should change
 
-- Operation types: nothing to tick anymore — detailed operations always show reserved quantities.
-- Putaway: re-create your old strategies as location putaway rules; the sequence keeps category priority.
-- Inventory adjustments: no more filters. Select locations/products or count everything, edit only counted quantities, refresh outdated lines, and remember that only a Stock Manager can validate. Cancelled adjustments keep their lines instead of regenerating them.
-- Rescheduling: set propagation behaviour on each rule rather than once in settings.
+- **Inventory adjustment**: pick one or several locations and/or products; leave both empty to count everything. Lines open in their own view — red = quantity outdated, blue = counted differs from on hand, bold = new line. Existing lines can only be edited on the counted quantity; select outdated lines to refresh the on-hand quantity. Only stock managers can validate. Cancelling keeps the lines, so re-starting no longer regenerates them.
+- **Putaway**: configure rules from the product, product category or location form instead of choosing a strategy on the location; product rules win over category rules, then priority decides.
+- **Rescheduling**: set propagation and minimum delta on the stock rule rather than in Settings.
+- **Transfers**: the "Show Reserved" option on operation types is gone.
+- **Multi-company**: choose the company when creating a location or a rule; it cannot be changed afterwards.
 
 ## What you gain by migrating
 
-- Putaway rules that match real warehouse practice and are visible where products are configured.
-- Much faster, safer inventory counting, with difference and outdated feedback instead of blind entry.
-- Per-rule rescheduling control, so MTO chains no longer shift dates for trivial changes.
-- Consistent multi-company visibility, correct reordering counters, clearer transfer descriptions and a simplified detailed-operations screen.
-
-*Note: one large multi-company patch was outside the review budget, so this list may not be exhaustive.*
+A cleaner inventory process: fewer fields to fill, adjustment lines that show at a glance what is outdated or different, and validation restricted to stock managers. Putaway becomes explicit and maintainable per product or category, rescheduling is tuned where it matters (per rule) instead of globally, and multi-company data — moves, counters, rules — is properly isolated, so the information you rely on for replenishment decisions is more trustworthy in 13.0.

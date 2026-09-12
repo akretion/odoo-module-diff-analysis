@@ -1,49 +1,47 @@
 # survey migration guide (13.0 -> 14.0)
 
+Community-edition summary of the `survey` addon changes between Odoo 13.0 and 14.0; release-notes items not confirmed by the code are omitted.
+
 ## What's new for users
 
-**Conditional questions.** A question can now be shown only if a specific answer was selected in an earlier question (Question B appears only if "Choice 1" was picked in Question A). Answers to questions that were never displayed are cleared, so scores and printed reports stay correct. The mechanism is ignored for randomized question selection and inside live sessions.
-
-**Live sessions.** The survey app gains a live session mode, with an improved host interface showing charts, questions and a live leaderboard of participants.
-
-**Design.** Pictures and videos can be used as backgrounds or to illustrate questions, and new layouts are available.
-
-**Building and sharing.** A description and sections can be added directly from the frontend form; the share link is optimised and customisable; transitions are loaded in AJAX (no full page reload) and the website header, footer and live chat are hidden while answering.
+- **Live sessions.** Run a survey with an audience: the host starts a session, shares a join link and controls the pace, one question at a time, pushed to every attendee screen.
+- **Live settings.** "Reward quick answers" (speed-based scoring) and a per-question time limit.
+- **Host screens.** Current question, timer, number of answers received, live results for the question and, on scored surveys, the attendee ranking.
+- **Attendee experience.** Waiting screen, automatic jump to the current question, countdown, and confirmation before the next question.
+- **Nicknames.** A text question flagged "Save as user nickname" identifies attendees in rankings (otherwise "Anonymous").
+- **Conditional questions.** Question B appears only if a chosen answer to question A was selected; answers to hidden questions are cleared and excluded from scoring. Ignored during live sessions and with randomized selection.
+- **Sharing.** Short survey link based on the first 6 characters of the token, plus a code-entry page.
 
 ## Technical data model changes
 
-Two kinds of changes: a large naming/cleanup refactor, and the new conditional-display fields.
+Renames (the ORM migrates data, but filters, exports, templates, server actions and custom code must be updated):
 
-Removed:
-- `survey.question.question` (redundant related on `title`; `_rec_name` is now `title`).
-- `survey.survey.category` and `survey.survey.public_url` (URLs are now returned by the new `get_start_url()` / `get_print_url()` methods).
-- `survey.user_input.input_type` (manual vs. invitation) and the `do_clean_emptys` autovacuum job that deleted empty manual answers.
-- `action_start_survey()` / `action_print_survey()` now accept an `answer` argument.
+- model `survey.label` -> `survey.question.answer`
+- `survey.question`: `labels_ids` -> `suggested_answer_ids`, `labels_ids_2` -> `matrix_row_ids`; `question_id_2` -> `matrix_question_id` on the answer model
+- `survey.survey`: `thank_you_message` -> `description_done`, `certificate` -> `certification`, `passing_score` -> `scoring_success_min`
+- `survey.user_input`: `quizz_score` -> `scoring_percentage`, `quizz_passed` -> `scoring_success`, `token` -> `access_token`, `attempt_number` -> `attempts_number`, `is_time_limit_reached` -> `survey_time_limit_reached`, `question_ids` -> `predefined_question_ids`
+- `survey.user_input.line`: `value_suggested` -> `suggested_answer_id`, `value_suggested_row` -> `matrix_row_id`
+- Question types `free_text` -> `text_box`, `textbox` -> `char_box`; answer types `text` -> `char_box`, `number` -> `numerical_box`, `free_text` -> `text_box`; stored values `value_text` -> `value_char_box`, `value_number` -> `value_numerical_box`, `value_free_text` -> `value_text_box`
 
-Renamed model: `survey.label` → `survey.question.answer`.
+New fields:
 
-Renamed fields:
-- survey.survey: `thank_you_message` → `description_done`, `certificate` → `certification`, `passing_score` → `scoring_success_min` ("Success %", no longer required).
-- survey.question: `labels_ids` → `suggested_answer_ids`, `labels_ids_2` → `matrix_row_ids`; question types `free_text` / `textbox` → `text_box` / `char_box`.
-- survey.question.answer: `question_id_2` → `matrix_question_id`.
-- survey.user_input: `quizz_score` → `scoring_percentage`, `quizz_passed` → `scoring_success`, `token` → `access_token`, `attempt_number` → `attempts_number`.
-- survey.user_input.line: `value_suggested` → `suggested_answer_id`, `value_suggested_row` → `matrix_row_id`, `value_text` → `value_char_box`, `value_number` → `value_numerical_box`, `value_free_text` → `value_text_box`; answer types aligned (`char_box`, `numerical_box`, `text_box`).
+- `survey.survey`: `session_state`, `session_question_id`, `session_question_start_time`, `session_question_answer_count`, `session_show_ranking`, `session_speed_rating`, `has_conditional_questions`; `is_attempts_limited` is now computed/stored and forced off for public surveys without login and for surveys with conditional questions.
+- `survey.question`: `save_as_nickname`, `is_time_limited`, `time_limit`, `is_conditional`, `triggering_question_id`, `triggering_answer_id`.
+- `survey.user_input`: `nickname`, `is_session_answer`, `question_time_limit_reached`, `scoring_total` (raw total score, next to the percentage).
 
-Added (conditional display): `survey.question.is_conditional`, `triggering_question_id`, `triggering_answer_id`; `survey.survey.has_conditional_questions`; `is_attempts_limited` is now stored/computed.
+Removed: `survey.survey.category`, the `public_url` field, the redundant `question` related field; `survey.user_input.input_type` and the empty-answers autovacuum cron; `survey.question.question`.
+
+Behaviour changes: answer scores are now computed on create/write through `_get_answer_score`, which applies the live-session speed rating; navigation is rewritten as `_get_next_page_or_question`, handling conditional questions and back navigation; new session actions (`action_start_session`, `action_end_session`) and short routes `/s`, `/s/<6 chars>`.
 
 ## How your habits should change
 
-- Reporting, filters, exports, e-mail templates and custom code using the old names (`quizz_score`, `labels_ids`, `passing_score`, `public_url`, `value_text`…) must be updated to the new names.
-- The Manual/Invitation distinction is gone; use `invite_token` to identify answers created from an invitation.
-- To share a survey, use its share/start link (`get_start_url()`) instead of the removed `public_url` field.
-- Question and answer types are renamed: imports or XML data your teams maintain must be aligned.
-- Conditional questions are configured on the question itself; enabling them disables the limited-number-of-attempts option, and they do not apply to randomized selection or live sessions.
-- Empty manual answers are no longer purged automatically: clean them up yourself if needed.
+- To animate a live quiz, prepare the survey first (quick-answer reward, per-question time limits, nickname question), then start the session from the survey form and share the short link. The layout switches to one question per page; one session per survey; ending it marks attendee answers as done.
+- Configure conditional display per question. It is ignored in live sessions and with randomized selection, and deselecting the triggering answer clears the answers of the question it displayed.
+- Update every place using old technical names (saved filters, exports, automated actions, email templates, custom modules); business screens are unchanged, but old names no longer resolve.
+- Options based on `category`, `input_type`, the public-URL field or empty-answer clean-up are gone; use access/invite tokens and the URL methods instead.
 
 ## What you gain by migrating
 
-- Surveys that adapt to answers: shorter, more relevant forms and better completion rates.
-- Live sessions with leaderboard: run quizzes and training sessions interactively.
-- A more modern look and smoother, AJAX-based navigation.
-- A cleaner, more consistent data model (`survey.question.answer`, `scoring_*` fields): easier to customise, report on, and to carry forward to future versions.
-- Everything above ships with the Community `survey` app; no Enterprise licence is required.
+- A built-in live quiz mode (timer, speed scoring, live ranking) for webinars, events and training, with no extra module.
+- Conditional questions, so respondents only see relevant questions, with correct scoring.
+- A cleaner, self-explanatory data model, easier to extend, report and integrate.

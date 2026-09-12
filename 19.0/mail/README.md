@@ -1,39 +1,37 @@
 # mail migration guide (18.0 -> 19.0)
 
-This guide covers the `mail` addon (Discuss, chatter, activities, email gateway, templates). It is written for functional users and for customers planning an 18.0 → 19.0 upgrade on the **Community** edition.
-
 ## What's new for users
 
-The official 19.0 release notes we have cover Accounting, AI, eCommerce, Sales, CRM, Project, Documents and Sign. **None of them describes this addon**: the only chatter-related items (AI drafting of emails/chatter summaries, AI prompts in mail templates) are Enterprise AI features and are therefore *not* part of the Community scope of this document. So the useful functional news below comes from the code changes shipped in `mail` itself:
+The provided release notes extract does not list Community-specific changes for the `mail` addon; most listed features belong to other apps (Accounting, eCommerce, AI, Sign, Sales, etc.). The user-visible changes below come from the 18.0 -> 19.0 code changes for `mail`.
 
-- **Activities**: a revamped activity UI with one-click reschedule actions (Today, Tomorrow, Next Week) and better plan summaries showing the next activities of a plan.
-- **Archiving no longer deletes activities**: archiving a record keeps its planned activities; they are now only removed when the record is actually deleted.
-- **Deleted messages stay visible**: a deleted message no longer disappears from the thread, its content is removed instead.
-- **Chatter search filters**: you can filter messages in the chatter (notifications only, etc.) instead of scrolling.
-- **Attachments**: PDF files now get a preview thumbnail, and voice/audio notes carry playback metadata.
-- **Link previews** are reused per URL instead of being generated again for every message.
-- **Discuss / live chat**: channel invitations can be sent by email, member history is tracked, and the chat window state is stored in the browser.
-- **Email servers**: a user can now configure a *personal* outgoing mail server, with a usage limit; using another user's server is blocked. Out-of-office can be configured on the user and is applied when posting.
-- **Fetchmail**: mail retrieval runs as a cron with visible progress and a batch limit (50 per run), and the old IMAP timeout workaround is gone.
+- **Done activities are always kept.** Marking an activity as done now archives it, so completed activities remain available for views/reporting. The per-activity-type “Keep Done” option is removed.
+- **Link previews are shared by URL.** A URL preview is fetched and stored once, then reused by any message containing that URL. Hiding a preview is now per message.
+- **Chat window state is browser-local.** Open/folded/closed chat windows are no longer stored on the server per member; they are kept in the browser.
+- **Scheduled-message composer cleanup.** Obsolete BCC-related composer fields are removed.
 
 ## Technical data model changes
 
-- `mail.scheduled.message`: **removed fields** `notified_bcc` and `show_notified_bcc` (obsolete composer/scheduler fields) and their compute method.
-- `mail.message`: **`record_name` field removed** (now a computed `_compute_record_name`); `is_thread_message` replaced by `_is_thread_message` / `_is_thread_message_visible`; `_message_fetch` now takes `thread`, `is_notification`; `_to_store(store, fields, ...)` signature changed; `_author_to_store` and `_cleanup_side_records` removed; `fetch(field_names=None)`.
-- `mail.presence`: **new model**; presence logic moved out of `bus` (`bus.presence`, `ir.websocket` presence methods removed) into `mail`.
-- Recipients: `_message_get_default_recipients(with_cc=False, all_tos=False)`, new `_message_add_default_recipients`, `_partner_find_from_emails`, and **batch-enabled suggested recipients** (`_message_get_suggested_recipients_batch`, moved to `BaseModel`, new `no_create` / `primary_email` / `reply_discussion` options).
-- Notifications: `_notify_get_reply_to(..., author_id=False)`, reply-to uses the real author name, `msg_vals=False` defaults, `force_record_name` parameters, new out-of-office helpers.
-- `mail.activity.mixin`: `activity_reschedule`, `activity_feedback`, `activity_search`, `activity_unlink` gain `only_automated=True`; new `action_reschedule_today/tomorrow/nextweek`; `toggle_active()` deprecated.
-- `mail.tracking.duration.mixin`: new "rotting" fields and search/domain helpers.
-- Attachments: limited-access ownership tokens (`_get_ownership_token`, `_has_attachments_ownership`) for deleting files, and mention tokens.
-- `fetchmail.server`: `_fetch_mail(batch_limit=50)`, `fetch_mail()` (no more `raise_exception`), IMAP/POP3 helpers privatized.
-- `mail.template`: `_generate_template(..., recipients_allow_suggested=...)`, new render/validation helpers, delete-confirmation modal removed.
-- `res.partner`: `_find_or_create_from_emails` extended (`ban_emails`, `filter_found`, `no_create`, sorting); `_to_store` removed on `res.partner`.
-- Globally: 72 signatures modified, 196 added, 91 removed.
+- **New model `mail.message.link.preview`** links messages and link previews. Fields: `message_id`, `link_preview_id`, `sequence`, `is_hidden`, related `author_id`. Unique constraint on (`message_id`, `link_preview_id`).
+- **`mail.link.preview`**: removed `message_id` and `is_hidden`; added `message_link_preview_ids`; `source_url` is now unique.
+- **`mail.message`**: `link_preview_ids` replaced by `message_link_preview_ids` (One2many to `mail.message.link.preview`).
+- **`mail.activity.type`**: removed `keep_done`.
+- **`mail.activity`**: `_action_done` now always archives done activities instead of unlinking or conditionally archiving. `activity_unlink` still unlinks; `activity_feedback` archives.
+- **`discuss.channel`**: added computed sudo fields `self_member_id` and `invited_member_ids`; `is_member` is now also `compute_sudo`.
+- **`discuss.channel.member`**: removed `fold_state`; removed `_channel_fold`; `_get_or_create_chat` no longer accepts `force_open`.
+- **`mail.scheduled.message`**: removed `notified_bcc` and `show_notified_bcc`.
+- **ORM cleanup**: many `mail` models now declare an explicit `_name`; some `_inherit` lists were changed to strings. No user-facing model rename.
+- **Internal Store API refactor**: `_to_store` handling now uses `Store.One` / `Store.Many` classes, can be optional, and receives a `fields` argument.
 
 ## How your habits should change
 
-- Stop expecting archiving to remove activities; delete records instead.
-- Use the new chatter filters and reschedule shortcuts rather than editing dates by hand.
-- Do not build views, exports or reports on `notified_bcc`, `show_notified_bcc` or `mail.message.record_name`: they no longer exist.
-- Custom integrations calling `channel_create`, `channel_get`, `create_group` or `add_members` must adapt — these are now private/internal (`_create_channel`, `_get_or_create_chat`, `_add_members`).
+- **Activity cleanup:** completed activities are no longer deleted by default and are not controlled by a “Keep Done” flag. Expect a longer activity history. Use `activity_unlink` only when you truly want to delete activities.
+- **Link previews:** hiding a link preview now affects that message only. Other messages using the same URL still show the shared preview.
+- **Discuss:** do not expect the same open/folded/closed chat windows to follow you across browsers, devices or sessions. They are local to the browser.
+- **Scheduled messages:** old BCC display fields no longer exist; rely on standard recipient/follower behaviour.
+
+## What you gain by migrating
+
+- **Better activity history and reporting**, because done activities are preserved instead of being deleted.
+- **Less database duplication and fewer external requests for link previews**, since each URL is cached once and reused.
+- **Simpler Discuss state management**, with chat window state handled locally in the browser.
+- **A codebase aligned with Odoo 19 ORM conventions**, making future maintenance and Community/OCA module compatibility easier.

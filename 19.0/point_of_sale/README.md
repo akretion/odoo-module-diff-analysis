@@ -1,44 +1,32 @@
 # point_of_sale migration guide (18.0 -> 19.0)
 
 ## What's new for users
-
-Items from the Odoo 19.0 release notes that really concern this addon:
-
-- Group products by parent and child categories in the POS terminal.
-- Product info is opened by long press/click on the product card, or from the action button.
-- PoS presets: predefined presets apply a mode and a schedule to an order (delivery, pickup, ...). Scheduling is now based on working calendars: working periods per weekday plus an interval, instead of opening/closing hours.
-- Localizations touching the POS: Brazil (batch NFC-e, XML export), Kenya (eTIMS), Malaysia (e-invoice from the session and consolidated invoices), Peru (SUNAT thermal printing), Saudi Arabia (ZATCA Phase 2 QR on receipts), Hong Kong (QFPay terminal).
-
-Restaurant courses/allergens, preparation display, default ZPL formats, global invoices and employee-rights profiles belong to other, mostly Enterprise, apps; check your subscription before relying on them.
+- **Group products** by parent and child categories in the terminal: a POS limited to a parent category now also loads its sub-categories.
+- **Product info**: long press/click a product card, or use the product action button, to display product information.
+- **One-click payment validation**: validate a payment with a single click.
+- **Presets**: predefined presets apply order modes and schedules quickly (delivery, pick-up, ...). They now use a weekly working schedule, can require identification (none / address / name), can run in return mode, can carry an image, and expose capacity and slot intervals for the next 7 days.
+- **Localizations** (separate modules, check availability): Peru SUNAT thermal printing, Kenya eTIMS, Malaysia consolidated e-invoices, Brazil NFC-e batches, Saudi ZATCA Phase 2 QR on receipts.
+- The official 19.0 notes list few other Community POS items; most POS features there are Enterprise or localization modules.
 
 ## Technical data model changes
-
-- POS product cards now load `product.template` (with `product.product`, attributes and pricelists as complements) instead of `product.product` only. Limited-product loading now runs on templates.
-- `product.packaging` is removed from POS and replaced by `product.uom` (barcode, product_id, uom_id): packagings are merged into Units of Measure.
-- `pos.order` amounts (amount_difference, amount_tax, amount_total, amount_paid, amount_return, tip_amount) and `pos.order.line` price_subtotal/price_subtotal_incl become Monetary fields, rounded on the session currency.
-- `pos.order.pos_reference` now follows YYLL-SSS-FOOOO; `tracking_number` becomes a stored, readonly field (no longer computed nor searched through the reference); `sequence_number` is negative when the order was created offline.
-- `pos.session`: `sequence_number` and `login_number` are removed, replaced by `order_seq_id` and `login_number_seq_id` (ir.sequence records created per session and deleted with it).
-- `pos.order.session_id` is no longer required; `config_id` is now computed from the session (still stored).
-- `pos.order.procurement_group_id` is replaced by `stock_reference_ids`: procurement.group is replaced by stock.reference in Inventory, and stock moves/pickings link to orders through references.
-- `pos.preset`: hour_opening, hour_closing, capacity_per_x_minutes, x_minutes, preparation_time_minute and address_on_ticket are removed; identification, is_return, image_128, resource_calendar_id, attendance_ids, slots_per_interval, interval_time, count_linked_orders and count_linked_config are added, with resource.calendar.attendance loaded in POS.
-- `pos.config`: orderlines_sequence_in_cart_by_category is removed, and the Preparation Display toggle left the POS settings.
-- POS pricelist items are now filtered on their validity dates (date_start/date_end).
-- Helpers `_get_available_categories`, `_get_available_product_domain` and `get_limited_products_loading` are removed.
+- **Product cards**: POS loads `product.template` as the product model (previously `product.product`); variants, attributes and pricelists are handled on the template. `pos.config._get_available_categories`, `_get_available_product_domain` and `get_limited_products_loading` are removed; pricelists loaded in the POS are filtered on their start/end dates.
+- **Packagings**: `product.packaging` no longer exists (merged into units of measure). The POS loads `product.uom` (barcode, product_id, uom_id); barcode scanning returns `product.uom`.
+- **Sequences / receipt numbers**: `pos_reference` becomes `YY-POSID-SEQUENCE` (e.g. `000-0-000000`); `tracking_number` is a stored Char (no computed value, no custom search); `sequence_number` can be negative for offline orders. Sequences move from session to config: new `order_seq_id`, `order_backend_seq_id`, `order_line_seq_id`, `device_seq_id`. Removed: `pos.config.sequence_id` / `sequence_line_id`, `pos.session.order_seq_id` / `login_number_seq_id`; `login_number` is replaced by a device identifier.
+- **Orders**: `session_id` is no longer required, `config_id` is a stored computed field derived from the session, and a new `source` field is added. Future-dated preset orders can no longer be cancelled.
+- **Presets**: added `identification`, `is_return`, `image_128`, `resource_calendar_id`, `attendance_ids`, `slots_per_interval`, `interval_time` and linked-count fields; removed `address_on_ticket`, `hour_opening`, `hour_closing`, `capacity_per_x_minutes`, `x_minutes`, `preparation_time_minute`. `resource.calendar.attendance` is now loaded in the POS.
+- **Amounts**: order and order-line amounts (`amount_total`, `amount_tax`, `amount_paid`, `amount_return`, `amount_difference`, `tip_amount`, `price_subtotal`, `price_subtotal_incl`) are now Monetary (currency-aware) instead of plain floats.
+- **Stock**: `procurement.group` is replaced by `stock.reference`; `pos.order.procurement_group_id` becomes `stock_reference_ids` (many2many), with `stock.reference.pos_order_ids`.
+- **Loading API**: hooks become `_load_pos_data_search_read(data, config)`, `_load_pos_data_read(records, config)`, `_load_pos_data_domain(data, config)`, `_load_pos_data_fields(config)` and `_unrelevant_records(config)`; `_load_pos_data`, `_post_read_pos_data` and `_read_pos_record` are removed. Session-level values (server version, base URL, permissions) are now read from `pos.config`. `orderlines_sequence_in_cart_by_category` and its setting are removed.
+- Invoicing an order now requires an invoice journal on the POS configuration, otherwise an error is raised.
 
 ## How your habits should change
-
-- Packagings are now Units of Measure: create a UoM with the right name and ratio and add it to the product's units; existing packaging records must be migrated.
-- Order numbers look different: year + device + session + sequence. Offline orders are marked F=1 with a negative sequence number, which is expected.
-- Presets: replace opening/closing hours with calendar working periods and an interval; slots are generated for the next 7 days.
-- A preset order scheduled in the future cannot be cancelled from the backend: it is detached from its session instead.
-- If you limit categories on a POS config, products of child categories now appear automatically.
-- Amounts now display with your currency rounding everywhere (lists, exports, receipts).
+- Use long press/click or the product action button for product info instead of a separate information screen.
+- Validate payments in one click.
+- Rely on parent/child categories to display and group products.
+- Treat presets as schedules: opening hours are weekly attendances, slots cover the next 7 days.
 
 ## What you gain by migrating
-
-- Better performance and no more variant/pricelist workarounds in POS, thanks to template-based product loading.
-- Reliable per-session sequential order numbering, with device identification and explicit marking of offline orders; session counters become sequences, avoiding concurrent-update errors.
-- Correct currency rounding on all POS amounts.
-- One single unit concept (Units of Measure) shared with Sales, Purchase and Inventory.
-- Calendar-based presets for cleaner pickup/delivery slots.
-- Up-to-date POS e-invoicing compliance for several localizations.
+- A lighter, faster POS: product cards come from the template, and all data loading goes through one consistent API.
+- A data model aligned with the rest of Odoo: UoM instead of packagings, `stock.reference` instead of procurement groups, currency-aware amounts.
+- Cleaner order numbering: per-POS sequences with separate counters for backend orders, order lines and devices.
+- More capable presets for delivery/pick-up flows, plus a quicker checkout (one-click payment, quick product info, category grouping).

@@ -2,39 +2,51 @@
 
 ## What's new for users
 
-- **Expense reports are removed.** Most reports contained a single expense, so the extra grouping step has been dropped.
-- **Batch actions from the list view.** Submit, approve, post and pay several expenses at once by selecting several lines.
-- **Grouped accounting for employee-paid expenses.** Posting several employee-paid expenses at once generates a single accounting document per employee.
-- **One expense, one payment.** Company-paid expenses are settled by their own payment entry, making the expense/payment link explicit.
-- **Faster attachment handling** on expenses with many receipts.
+**Expense reports are gone.** Odoo 19 aligns Expenses with the way people actually work: most "reports" only ever contained a single expense. Each expense is now a standalone record you submit, approve, post and pay on its own. When you do need to process several at once, select them in the list view and use the submit / approve / post actions in bulk. For employee-paid expenses, posting several at once still generates **one single vendor bill per employee**.
 
-The 19.0 Expenses notes also announce physical expense cards (Mastercard / Stripe Issuing). That is Enterprise-only and is not part of the Community addon described here.
+**Simpler approval.** Submitting an expense now also approves it automatically when the employee has no expense manager configured — no pointless validation step for small teams.
+
+**A clearer lifecycle, per expense.** The statuses are now: Draft → Submitted → Approved → Posted → In Payment → Paid (plus Refused). The old "To Report" / "To Submit" / "Done" wording disappears. Approval is tracked separately with an Approval State and an Approval Date stored on the expense itself.
+
+**The accounting trail is visible on the expense.** Each expense shows the journal entry it generated, and payment method fields are set directly on the expense for company-paid expenses.
 
 ## Technical data model changes
 
-- `hr.expense.sheet` is removed, with its ~70 methods (approval, posting, payment, activity update). All workflow logic now lives on `hr.expense`.
-- `hr.expense` gains `action_submit/approve/refuse/reset/post/pay`, `action_open_account_move`, `action_open_split_expense`, and computes `can_approve`, `can_reset`, `payment_method_line_id`, `selectable_payment_method_line_ids`. Payment becomes one-to-one (`_check_o2o_payment`, `_create_company_paid_moves`).
-- `res.company` / `res.config.settings`: `expense_outstanding_account_id` is removed. The outstanding account now comes from the chart template and is created automatically if missing; an archived account raises a warning with a link to it.
-- `hr.department`: `_compute_expense_sheets_to_approve` becomes `_compute_expenses_to_approve_count`.
-- `account.move`: `action_open_expense`, `_check_expense_ids`, `_compute_nb_expenses` replace the report-oriented helpers.
-- `hr.employee`: `_search_filter_for_expense` moves from `hr.employee.base` to `hr.employee` / `hr.employee.public` (contracts merged into the employee model).
-- Accounting engine: new tax computation hooks on `account.tax` / `account.move.line`, and `_compute_outstanding_account_id` on `account.payment`. Internal, but custom modules using the old hooks must be adapted.
-- `ir.attachment` create/unlink overrides are replaced by `_get_attachment_by_record` (performance).
+**Models**
+- `hr.expense.sheet` is **removed** (~49 fields and relations dropped); its remaining logic moves into `hr.expense`.
+- The `ir.attachment` extension of the module is removed.
+
+**`hr.expense`**
+- Added: `account_move_id`, `department_id`, `manager_id`, `approval_state`, `approval_date`, `total_amount`, `untaxed_amount`, `amount_residual`, `journal_id`, `payment_method_line_id`, `selectable_payment_method_line_ids`, `can_reset`, `can_approve`, and `former_sheet_id` (integer, keeps the former report id).
+- Removed: `sheet_id`, `approved_by`, `approved_on`, `accounting_date` (was related to the sheet) and the report-level totals.
+- `state` selection rewritten: `draft`, `submitted`, `approved`, `posted`, `in_payment`, `paid`, `refused`. `reported` and `done` no longer exist. New constraint: only draft expenses may have a zero total.
+- `is_editable` / `can_approve` / `can_reset` are now computed from user groups and the manager hierarchy instead of the report.
+
+**`account.move`**
+- `expense_sheet_id` → `expense_ids` (One2many on `account_move_id`) plus `nb_expenses`. `show_commercial_partner_warning` removed.
+- `action_open_expense_report` → `action_open_expense`.
+- New constraint: each company-paid expense must have its own dedicated journal entry.
+
+**`account.payment`**: `expense_sheet_id` → `expense_ids` (related to `move_id.expense_ids`); the "linked to an expense report" guard now speaks about expenses.
+
+**`hr.department`**: `expense_sheets_to_approve_count` → `expenses_to_approve_count`, counting expenses in state `submitted`.
+
+**`hr.employee`**: the expense manager now defaults to the parent manager's user without requiring the approver group, and the selection domain follows the parent hierarchy.
+
+**`res.company` / `res.config.settings`**: `expense_outstanding_account_id` is removed. The outstanding account comes from the payment method line, otherwise from the chart of accounts' default outstanding account (created automatically if missing). Nothing to set in Settings any more.
 
 ## How your habits should change
 
-- Forget "expense reports": no sheet to create, name, fill and submit — you act directly on expenses.
-- To send several expenses for approval, select them in the list and use Submit; approvers approve from the same list.
-- The approval reason and "can I approve" flags are shown per expense, not per report.
-- Expenses are now analysed by status, employee and dates on the expense list rather than through report records.
-- In Settings, the expense Outstanding Account field is gone. Check your expense journal and payment methods; Odoo uses (and creates if needed) the default outstanding account of your chart of accounts.
-- Ask your integrator for a data migration plan: historical reports and their approval trail must be reviewed.
+- Stop creating expense reports: capture the expense, submit it, done.
+- Bulk work now happens through list-view selection, not through a report form.
+- One company-paid expense = one journal entry. Employee-paid expenses posted together still produce one bill per employee, so keep grouping them when you want a single reimbursement document.
+- Replace any filter, saved view, automated action or spreadsheet that referenced `hr.expense.sheet` or `sheet_id` with expense-level criteria (employee, department, status).
+- Rename your old status filters ("To Report", "Done" no longer exist).
+- Check your chart of accounts before go-live: the default outstanding accounts must exist (they are created on demand) and be active.
+- Review who is an expense manager: with none configured, submission equals approval.
 
 ## What you gain by migrating
 
-- A simpler daily flow: one object, fewer clicks, no report to build before submitting.
-- Batch submit/approve/post/pay on many expenses in a single action.
-- A clear one-to-one link between expense, journal entry and payment, simplifying reconciliation and audit.
-- Less setup: the outstanding account no longer has to be configured manually.
-- Better performance on expenses with many attachments.
-- A codebase aligned with 19.0 accounting, a safer base for future upgrades and custom developments.
+Fewer clicks per expense, no artificial report to maintain, batch processing that matches real usage, a single unambiguous status per expense, a direct link to the generated journal entry, approval rules driven by the HR hierarchy, and one less accounting setting to configure. Existing expense data is migrated, with the former report reference preserved on each expense.
+
+*Note: the release notes also mention disallowed-expense percentage changes and physical expense cards; those belong to other / Enterprise addons and are not part of this Community module's changes.*

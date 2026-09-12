@@ -1,48 +1,48 @@
 # point_of_sale migration guide (12.0 -> 13.0)
 
-13.0 reworks POS cash control, plugs the POS into the merged accounting engine, and shares pricelist settings with Sales. Here is what changes for Community users moving from 12.0.
-
 ## What's new for users
+* **One accounting entry per session** - closing a PoS session now creates a single journal entry instead of one entry per order.
+* **Cash control** - set a default cash opening/closing and track any cash difference at session start and end.
+* **Multiple employees per session** - several employees can sell simultaneously in the same session.
+* **Keypad** - use the keypad on the PoS frontend to manage orders.
+* **Usability** - new stat button to reach order details, reordered menus, onboarding with default picking types.
+* **Alerts** - a next activity warns you when a session should be closed and reopened.
+* **Reporting** - PoS sales are counted in product sales, and PoS reporting supports multiple currencies.
+* The accounting "engine" merge (customer invoices and journal entries now share one model) is visible in PoS when invoicing an order.
 
-- **Cash Control.** A cashbox is now a reusable *template*, shareable by several POS configurations. At session opening the counted content comes from the last closed session, like a real cashbox; you can reload the default cashbox at start, and cash differences are tracked.
-- **Session closing.** A single accounting entry is created when the session closes, improving performance and making the session's payment history clearer.
-- **Reporting.** POS sales now count into product sales, and POS reporting handles multi-currency.
-- **Employees.** One session can be shared by several employees connected at the same time.
-- **Usability.** A stat button on the POS config lists the session's orders, menus were reordered, default picking types ease on-boarding, the frontend has a keypad, and a next-activity alert reminds you to close/reopen the session.
-
-*Note: payment-terminal integrations (SIX, Adyen) and other Enterprise items of the 13.0 release notes are not part of this Community addon.*
+Terminal integrations (SIX, Adyen) and IoT ticket printers are not part of the Community edition; confirm them with your integrator.
 
 ## Technical data model changes
+New models
+* `pos.payment.method` and `pos.payment` replace `account.journal` (and `account.bank.statement` / `account.bank.statement.line`) as payment methods and payments.
+* `pos.payment.method` carries `receivable_account_id`, `is_cash_count`, `cash_journal_id`, `company_id`, `config_ids`, `open_session_ids`. A default Cash and Bank method are auto-created per company using the new `res.company.account_default_pos_receivable_account_id`.
 
-Cashbox:
-- `account.cashbox.line` loses `default_pos_id`; its POS inheritance is removed.
-- `account.bank.statement.cashbox` gains `pos_config_ids`, `is_a_template` and a `currency_id` computed from the POS config.
-- `pos.config.default_cashbox_lines_ids` → `default_cashbox_id` (Many2one on `account.bank.statement.cashbox`).
-- New computed `last_session_closing_cashbox`; `last_session_closing_cash` is 0 when the last session had no cash register.
-- `cash_control` can no longer be changed while a session is open (new constraint).
-- `pos.session.open_cashbox()` renamed `open_cashbox_pos()`; new `set_default_cashbox()` and `_validate_cashbox()` (moves `new_session` to `opening_control`).
+Changed fields
+* `account.journal`: `journal_user` removed, `pos_payment_method_ids` added.
+* `pos.config`: `journal_ids` -> `payment_method_ids`; `group_by` removed; `default_cashbox_lines_ids` -> `default_cashbox_id` (cashbox template); `last_session_closing_cashbox` added; writing a config with an open session now raises a UserError.
+* `pos.session`: `statement_ids` -> `payment_method_ids` (related to the config).
+* `pos.order`: `payment_ids` added; `invoice_id` removed, `account_move` now holds the invoice/journal entry, since `account.invoice` was merged into `account.move`.
+* `pos.category`: `image` / `image_64` / `image_128` -> a single `image_128`.
+* `res.config.settings`: `pos_sales_price` and `pos_pricelist_setting` removed (pricelists now share the Sales configuration).
 
-Accounting merge:
-- `account.invoice[.line/.tax]`, `account.voucher[.line]` and the `account_voucher` module are gone: everything is `account.move` / `account.move.line`.
-- `pos.order.invoice_id` is removed; the invoice is now an `account.move` on `account_move`, and the invoice action opens `account.move` (`out_invoice`/`out_refund`).
-- `_prepare_invoice()` and `_action_create_invoice_line()` become `_prepare_invoice_line(order_line)`; `_prepare_analytic_account()` disappears, so analytic accounts are no longer set on POS journal items by that hook.
-- `_reconcile_payments()` no longer includes invoice move lines; anglo-saxon pricing uses `_stock_account_get_anglo_saxon_price_unit()`; tax groups use `flatten_taxes_hierarchy()`.
-
-Other:
-- `pos.category`: `image` and `image_64` removed, `image_128` becomes a real `fields.Image` (128x128).
-- `res.config.settings`: `pos_sales_price` and `pos_pricelist_setting` removed — pricelists are now configured with Sales.
+Methods
+* `_payment_fields(ui_paymentline)` -> `_payment_fields(order, ui_paymentline)`.
+* `_match_payment_to_invoice` removed.
+* Per-order account move creation removed from `pos.order`: the entry is produced once per session at closing.
+* `action_pos_order_invoice` builds an `account.move` with `invoice_line_ids` (no `account.invoice`), and posts it.
 
 ## How your habits should change
-
-- POS "invoices" are journal entries: the menus and reports that listed invoices now show journal entries (merged Accounting engine).
-- Expect one journal entry per session at closing instead of per-payment entries.
-- Review your POS configurations: old default balance lines are replaced by a default cashbox template.
-- Configure pricelists once, for Sales and POS, in the shared pricelist settings.
+* Configure payment methods under Point of Sale > Payment Methods, not on journals. The "Use in Point of Sale" checkbox on journals is gone.
+* Each payment method owns its receivable account; this is what allows the single session entry. Cash lines are reconciled automatically, non-cash receivable lines are combined per method and can be reconciled with the reconciliation widget.
+* "Group Journal Items" is gone.
+* Cash control uses reusable cashbox templates: a session starts with the content of the last closed session, and you can reset it to the config default. You cannot change the cash control setting or the config while a session is open.
+* Invoices issued from the PoS are journal entries; open them from `account.move`.
+* Pricelists are configured once for Sales and PoS.
+* Product categories keep only one image field.
 
 ## What you gain by migrating
-
-- Cheaper, clearer session closing with a single auditable accounting entry.
-- Cash handling that matches reality (templates, carry-over, tracked differences).
-- Reliable POS turnover in product sales reporting, multi-currency included.
-- Several employees per session, keypad entry, faster on-boarding.
-- A POS aligned with the modern accounting engine, easier to reconcile and extend.
+* Far faster closing of sessions with thousands of orders, because journal entries are no longer created order by order.
+* Cleaner, easier-to-audit accounting: one entry per session, cash automatically reconciled, and other payments grouped by payment method in a single receivable line.
+* A real payment history: payments are dedicated records, fully searchable and reportable.
+* Better cash management with default cashboxes and cash difference tracking.
+* You stay on a supported version, with the accounting improvements of 13.0 (invoice/journal entry unification, reconciliation, reporting).

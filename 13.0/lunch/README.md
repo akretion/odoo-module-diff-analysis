@@ -1,52 +1,61 @@
 # lunch migration guide (12.0 -> 13.0)
 
 ## What's new for users
+The 13.0 release notes list four lunch changes. Three are relevant to this Community addon:
 
-The Odoo 13.0 release notes for Lunch highlight three user-facing changes that this addon really implements:
+- **Vendor availability management** — you can define when each vendor can be ordered from, and the app only offers products that are really orderable at that moment.
+- **A revamped ordering interface** — ordering was reworked into a friendlier, "document-like" flow instead of the old order + order-lines form.
+- **Email ordering** — the order of the day can be prepared and sent to the vendor by email directly from Odoo.
 
-- **Vendor availability management.** Availability is now defined per vendor (one specific day, or recurrent weekdays, with a from/to time range and a timezone) instead of free-text "lunch alerts". It tells users what can be ordered on a given day.
-- **A revamped ordering interface.** Ordering is simplified with a new kanban-style screen ("à la Documents"): you pick products, extras (toppings) and quantities instead of typing order lines, with product images.
-- **Emails to the vendor.** The order of the day can be sent by email directly to the vendor – automatically at a configured hour, or manually.
-
-The release note about a notification "in the chatter or in the app" is too generic and not specific to this addon; it is not detailed here.
+The note about notifying users "in the chatter or in the app" has no counterpart here (the lunch order model is not a chatter model), so don't count on it after migrating.
 
 ## Technical data model changes
 
-**New model – `lunch.supplier`** (Lunch Supplier): linked `res.partner` with related contact/image fields, `send_by` (Phone/Email), `automatic_email_send` + `automatic_email_time`, `tz`, and availability fields (`recurrency`, `recurrency_from`/`_to`, `recurrency_date`, weekday booleans, `available_today` computed and searchable). A cron (`_auto_email_send`) emails pending orders to suppliers.
+**Added models**
+- `lunch.location` (`name`, `address`): replaces `res.partner` as the availability perimeter.
+- `lunch.supplier`: linked partner, contact fields, `automatic_email_send` / `automatic_email_time`, `recurrency*`, `available_today`.
+- `lunch.topping`: name, price, category, `topping_category`.
+- `lunch.cashmove.report` (SQL report) used to compute wallet balances.
 
-**Removed model – `lunch.alert`**, together with the `alerts` field on `lunch.order`. Vendor availability replaces it.
+**Removed / merged**
+- `lunch.order.line` disappears; its fields are merged into `lunch.order` (one record = one product, with `quantity`).
+
+**`lunch.alert` reworked**
+- Removed `display`, `alert_type`, `specific_day`, `monday`..`sunday`, `start_hour`, `end_hour`, `partner_id`.
+- Added `until`, `recurrency_monday`..`recurrency_sunday`, `location_ids`, and a computed/searchable `available_today`; `message` is now HTML.
+
+**`lunch.cashmove`**
+- `order_id` and `state` removed; `currency_id` added; ordered by date.
+- `get_wallet_balance(user)` becomes `get_wallet_balance(user, include_config=True)`.
 
 **`lunch.product`**
-- `supplier` (res.partner) becomes `supplier_id` (lunch.supplier, required); `price` becomes required; `category_id` is no longer required; label "Product" → "Name".
-- `available` (computed/searchable) is removed.
-- Added: `is_topping` ("extra garniture"), `already_ordered`, `new_until`, `favorite_user_ids`, `company_id`, `currency_id` and images via `image.mixin` (`image`, `image_128`, `image_64`).
+- `supplier` (res.partner) becomes `supplier_id` (lunch.supplier); supplier, price and category are now required.
+- `available` is computed from vendor availability.
+- New `new_until`, `favorite_user_ids`, `available_location_ids`.
+- Now inherits `image.mixin`: the explicit `image` / `image_128` / `image_64` fields and their resize hooks are gone.
 
-**`lunch.order`**
-- `state` is no longer computed from the order lines: it defaults to New, gains an **Ordered** step and keeps Received / Cancelled.
-- Added: `mail_sent`, `supplier_ids` (computed, stored). Removed: `alerts`, `previous_order_ids`, `previous_order_widget`.
-- New methods: `action_order()`, `action_confirm(supplier=None)`, `action_cancel()`.
+**`lunch.product.category`**
+- New topping configuration: `topping_label_1/2/3`, `topping_ids_1/2/3`, `topping_quantity_1/2/3` (None or More / One or More / Only One), plus `company_id` and `currency_id`.
 
-**`lunch.order.line`**
-- `product_id` is filtered on `is_topping = False`; `supplier` becomes `supplier_id`.
-- `price` is now a stored computed value: quantity × (product price + toppings), instead of the related product price.
-- Added: `quantity` (default 1) and `topping_ids`; `cashmove` is now linked through `order_line_id`.
-- New: `update_quantity(increment)` (checks the user's wallet balance), `action_confirm()`, `action_cancel()`; the old `order()`, `confirm()`, `cancel()` and create/write availability checks are removed.
+**Settings**
+- `res.company` gains the wallet overdraft threshold (`lunch_minimum_threshold`), exposed in `res.config.settings`.
 
-**`lunch.cashmove`**: `order_id` is renamed `order_line_id`; new `get_wallet_balance(user)`.
-
-No method signature changes were detected for this addon.
+**Method signature changes**
+- `order()`, `confirm()`, `cancel()` (order lines) disappear; `lunch.order` now exposes `action_order()`, `action_confirm()`, `action_cancel()`, `update_quantity(increment)` and `_check_wallet()`.
+- `lunch.order` loses `order_line_ids`, `total`, `alerts`, `previous_order_widget` and gains `topping_ids_1/2/3`, `display_toppings`, `quantity`, `active` plus an `ordered` state.
 
 ## How your habits should change
-
-- **Vendors instead of alerts:** create a Lunch Supplier per vendor (partner, availability recurrence, email settings) rather than alert records – availability is now a property of the supplier.
-- **Wallet timing:** the wallet is debited when the order is placed (one cash move per ordered line), not when the manager marks it as received. Changing a quantity updates the cash move; cancelling a line removes it.
-- **Ordering:** use the new order screen with quantities and toppings; the app refuses any change exceeding the wallet balance.
-- **Sending to vendors:** orders are grouped per supplier; send them by email manually, or let the cron do it for suppliers configured for automatic sending.
+- Ordering happens in the new interface: you no longer build an order with several lines on a form.
+- Vendors must be set up with their availability window, otherwise their products simply won't be offered.
+- Alerts are no longer tied to a vendor/day/hour rule; they are now attached to locations and weekday recurrency.
+- Vendors can be emailed the order of the day from Odoo, so the "call the restaurant" step goes away.
+- Managers can allow a negative wallet (overdraft) from the settings instead of topping up manually each time.
 
 ## What you gain by migrating
+- A faster, less error-prone ordering experience for every employee.
+- Vendor availability enforced automatically: fewer orders placed with a closed vendor.
+- Less manual work: the vendor email is generated by Odoo, and wallet balances are computed from a dedicated report instead of being reconciled by hand.
+- Richer configuration: suppliers, delivery locations, topping categories with quantities, favourite products, "new until" flags.
+- Cleaner product images through `image.mixin`.
 
-- Vendors are properly modelled (contact, availability, timezone, email) instead of being loose partners plus a separate alert list.
-- Fewer mistakes: availability, quantities, toppings and wallet controls are enforced by the app, not by the manager's memory.
-- Faster daily handling: automatic vendor emails replace the manual composer step.
-- A richer catalogue: product images, toppings and favourites make ordering clearer for employees.
-- You move to a supported version and to the 13.0 data model that later versions build upon.
+**Migration caution:** this is a deep rework, not a cosmetic update. Vendors must be converted to `lunch.supplier` / `lunch.location`, existing order lines merged into orders, and alert records rebuilt. Plan a data migration step and a short user-training session — Akretion can script and validate both.

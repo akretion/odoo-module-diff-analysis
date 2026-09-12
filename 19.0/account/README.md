@@ -1,43 +1,22 @@
 # account migration guide (18.0 -> 19.0)
 
-Applies to the Community `account` addon. Enterprise-only items from the 19.0 Accounting release notes (full bank reconciliation widget, accounting/follow-up reports, OCR digitisation, tax returns, asset templates) are not covered here.
+What changes in the `account` addon when moving from Odoo 18.0 to 19.0.
 
 ## What's new for users
 
-**Receipts become first-class documents.** Purchase receipts are always available: switch between Bill and Receipt directly on the vendor bill form. Sales receipts are enabled once in Settings (no security group needed), get list-view filters, and companies can define default sale/purchase receipt taxes applied before product or account taxes. The "Professional" percentage (partially deductible bills) now also works on purchase receipts.
-
-**Better account selection.** Accounts can carry a description explaining when to use them. On invoices income accounts are proposed first; on bills, expenses and fixed assets. Default taxes on accounts now apply only to invoices and bills, not to miscellaneous entries.
-
-**Fiscal positions reworked.** Tax mappings are removed: a tax declares which fiscal positions it applies to and which taxes it replaces (e.g. a 0% export tax replaces domestic sale taxes). Fiscal positions are always chosen by sequence with applicability filters; replaced taxes are hidden by default and remain reachable via "Search More".
-
-**Tax reports.** The + / - signs have been removed from tax tags; inversions are now handled on report lines.
-
-**Blocking warnings removed.** Partner "Invoice" warning fields and their setting are gone; warnings from Purchase/Sale are informational only and no longer block or reset the partner.
-
-**Also improved:** light audit trail enabled by default; duplicate-bill warnings remain visible after posting; resetting an invoice to draft detaches the generated file; deferred miscellaneous entries get start/end dates; a taxable supply date is activated where legally required; clearer payment communication formats; improved default recipient bank account on invoices; cleaned-up reconciliation model forms and dashboard links; renamed menu actions for readable URLs.
+- **Bank reconciliation redesigned**: a simpler view replaces the old widget, automatic models recognize transactions better, and keyboard shortcuts are available.
+- **Fiscal positions without tax mappings**: each tax declares on its own form which fiscal position it applies to and which taxes it replaces.
+- **Partial deductibility**: on bills and purchase receipts, set a "Professional percentage" per line; the private part is booked on the journal's dedicated account.
+- **Receipts merged with invoices and bills**: switch type on the vendor bill form; sale receipts are enabled in settings.
+- **Light audit trail enabled by default**, with an optional restrictive mode that localizations can force.
+- **Cleaner forms and menus**: revamped journal and reconciliation model views, a new journal creation wizard, a dashboard link to draft miscellaneous entries.
+- **Default taxes on accounts** now apply only to invoices and bills, never to miscellaneous entries; income accounts are suggested first on customer invoices, expenses on bills.
+- **Easier daily work**: duplicate-bill warnings, PDF preview of documents linked to bank transactions, follow-up exclusions, better recipient bank account selection, report annotations in the chatter.
 
 ## Technical data model changes
 
-Removed: `res.partner.invoice_warn` / `invoice_warn_msg`; `res.config.settings.group_warning_account`; `group_show_sale_receipts` / `group_show_purchase_receipts` (replaced by the `account.show_sale_receipts` config parameter); the three `module_account_bank_statement_import_*` settings toggles (OFX/CSV/CAMT are no longer shown).
-
-Added: `res.company.account_sale_receipt_tax_id` and `account_purchase_receipt_tax_id`; `account.move.is_receipt()`; the `kpi.provider` model (`get_account_kpi_summary`); account placeholder-code search.
-
-Changed behaviour:
-- `account.move.line.parent_id` is now computed, not stored; section logic moved to `_get_section_lines` / `get_parent_section_line`.
-- Tax tags: the invert mechanism is removed (`_compute_tax_tag_invert` deleted, `_translate_tax_tags` added), matching the report change.
-- Writing on `account.code` now creates `code.mapping` records (`account.code.mapping` compute/create overrides).
-- Audit trail: `mail.message` flags renamed (`account_audit_log_activated` → `account_audit_log_restricted`, plus a preview flag); new company checks for restrictive audit trails.
-- Analytic lines are kept synchronised with journal items (new create/write/unlink overrides, `_update_analytic_distribution`).
-
-Method signatures: 40 modified, 284 added, 81 removed. Integrators should note `default_get(fields)`, `write(vals)`, `name_search(..., domain=...)`, `read_group()` replaced by `formatted_read_group()`, `_field_to_sql(alias, field_expr, query=None)`, `_get_default_amls_matching_domain(allow_draft=False)`, `chart.template.try_loading(..., force_create=True)`, `_get_invoice_report_filename(extension, report=None)`, `is_sale_document/is_purchase_document(..., move_type=False)`, `_autopost_draft_entries(batch_size)`, and many new tax-computation helpers (`_prepare_base_line_for_taxes_computation`, `_add_tax_details_in_base_lines`, `_round_base_lines_tax_details`).
-
-## How your habits should change
-
-- Ignore partner invoice warnings; messages from Purchase/Sale are informative only.
-- Configure tax applicability and replacement on taxes, and ordering on fiscal positions, instead of tax mappings.
-- Enable sale receipts once in Settings; purchase receipts need no setting.
-- Read tax reports without +/- tag signs; use "Search More" to add back a replaced tax.
-
-## What you gain by migrating
-
-Cleaner accounting screens, flexible receipts, fiscal positions and tax reports that are easier to justify to auditors, an audit trail active without configuration, and a modernised ORM API that keeps your customisations maintainable.
+- New abstract model `account.document.import.mixin`, inherited by `account.move`: `_to_files_data`/`_unwrap_attachments` build an intermediate `files_data` format, `_extend_with_attachments` takes `files_data`, `_get_edi_decoder` is replaced by `_decode_attachment`, and one file can generate several records.
+- `account.move.line`: added `deductible_amount` and `reconciled_lines_ids`; `parent_id` is no longer stored, `child_ids` removed; `tax_key`, `compute_all_tax`, `compute_all_tax_dirty`, `total_tax_factor` and `tax_tag_invert` removed; new non-deductible display types. Tax totals keys were renamed (`amount_total` -> `total_amount_currency`) and global rounding is recomputed tax by tax.
+- `account.reconcile.model`: `auto_reconcile` becomes `trigger` (Manual/Automated), `to_check` becomes `next_activity_type_id`. Removed: `rule_type`, `matching_order`, `match_note`, `match_transaction_details`, `match_text_location_*`, `match_same_currency`, `match_partner*`, `past_months_limit`, `decimal_separator`, `partner_mapping_line_ids`, `allow_payment_tolerance`, `payment_tolerance_*`, `counterpart_type`, `journal_id`, `number_entries`; added `can_be_proposed`, `mapped_partner_id` and, on lines, `partner_id`.
+- Models removed: `account.reconcile.model.partner.mapping`, `account.fiscal.position.tax`. `account.fiscal.position.tax_ids` is now a many2many to `account.tax`; `account.tax` gains `fiscal_position_ids`, `original_tax_ids` and `is_domestic`.
+- `res.company`: `check_account_audit_trail` renamed `restrictive_audit_trail`, plus new `force_restrict

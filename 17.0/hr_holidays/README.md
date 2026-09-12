@@ -1,62 +1,62 @@
 # hr_holidays migration guide (16.0 -> 17.0)
 
-This document summarizes what changes for the **Time Off** application (`hr_holidays`, Community edition) when moving from Odoo 16.0 to 17.0.
-
-> **About the official 17.0 release notes:** the extract available for this addon covers only *Industries / data modules* and Odoo Experience videos — **nothing relevant to Time Off**. Everything described below therefore comes from the actual code changes shipped in 17.0, not from marketing material.
-
 ## What's new for users
 
-**Stress Days are now called Mandatory Days.** The whole concept has been renamed in the menu, in the calendar configuration and in error messages ("You are not allowed to request a time off on a Mandatory Day").
+The provided Odoo 17 release notes extract only covers "Industries" and Odoo Experience topics — nothing about Time Off. The user-visible changes below therefore come from the hr_holidays commits themselves, and all apply to the Community edition.
 
-**Cleaner menus and lists**
-- The *Approval* menu is renamed **Management**.
-- *My Allocations*: the "Employee" group-by is removed, and the `Current Year` filter is replaced by **Currently Valid**.
-- *My Time Off*: the Employees column is removed from list and kanban views.
-
-**Better time-off dashboard**
-- Opening a time off from the dashboard now shows its state directly.
-- The two legends *Public Holiday* and *Mandatory Day* are removed.
-
-**Improved allocation request form (employee side)**
-- The allocation name is now computed automatically (time-off type, duration and unit).
-- The **Allocation Type** field is hidden when no active accrual plan exists in the database.
-
-**Accrual plans**
-- Plans can now be **archived** from the action menu.
-- An **Employees** button is available on the plan form.
+- **See future allocations**: on allocation screens, pick a future date to see what accrual plans will grant, what will expire, and what is not yet available. The selector appears only for employees with accrual allocations.
+- **Simpler allocations**: the "To Submit" and "Cancelled" states are gone; allocations are created directly in "To Approve".
+- **Richer accrual plans**: choose credit at the *start* or *end* of the accrual period, a custom carry-over date (start of year, allocation date, or any month/day), an accrued-time cap, and a carry-over policy (nothing, everything, or a maximum).
+- **Accrual simulation**: changing the start date or accrual plan instantly shows what the employee would receive — no more dummy allocations.
+- **"Stress Days" renamed "Mandatory Days"** everywhere.
+- **Accrual plans can be archived**, and concerned employees are listed from the plan form.
+- **UX clean-up**: "Approval" menu renamed "Management"; "Current Year" filter replaced by "Currently Valid"; employee column removed from My Time Off lists; redundant dashboard legends removed.
 
 ## Technical data model changes
 
-**Renames / removals**
-- Model `hr.leave.stress.day` → `hr.leave.mandatory.day` (data migration of existing records expected).
-- `has_stress_day` → `has_mandatory_day`; `_compute_has_stress_day` → `_compute_has_mandatory_day`; `_check_stress_day` → `_check_mandatory_day`; `get_stress_days` / `_get_stress_days` → `get_mandatory_days` / `_get_mandatory_days` (and the related `get_*_days_data` helpers). No public method signature change beyond these renames.
-- `hr.leave.accrual.level`: **`parent_id` (Previous Level) removed**; `is_based_on_worked_time` **moved to the plan**; `level_ids` is now labelled *Milestone* and `transition_mode` *Milestone Transition*.
+**Renamed model**: `hr.leave.stress.day` → `hr.leave.mandatory.day` (same fields). Requires a data migration.
 
-**Accrual level behaviour**
-- `added_value_type` values change from `days`/`hours` to `day`/`hour`, and the field is now computed (new `can_modify_value_type`); `added_value` defaults to 1.
-- `maximum_leave` is now computed and driven by the new `cap_accrued_time` boolean (default: on).
-- `action_with_unused_accruals` values change from `postponed`/`lost` to `lost` / `all` / `maximum`, with `all` as default; `postpone_max_days` semantics follow.
+**hr.leave**
+- `holiday_allocation_id` removed: a leave is no longer attached to one specific allocation.
+- `has_stress_day` → `has_mandatory_day`.
+- Constraint `_check_holidays` replaced by `_check_validity`, based on `get_allocation_data`.
+- New cron `_cancel_invalid_leaves`: leaves in the next 31 days that exceed accruals are cancelled automatically.
 
-**Accrual plan (new fields)**
-- `active` (archiving), `accrued_gain_time` (`start`/`end`, default `end`), `is_based_on_worked_time`, `added_value_type`, and a custom carry-over date: `carryover_date` (`year_start` / `allocation` / `other`), `carryover_month`, `carryover_day`.
+**hr.leave.allocation**
+- Removed: `can_reset`, `taken_leave_ids`.
+- `state`: `draft` and `cancel` removed, default is now `confirm`.
+- Added: `already_accrued`, `has_accrual_plan`.
+- `type_request_unit` is computed instead of related; `allocation_type` is now readonly.
+- `_compute_leaves` no longer depends on taken leaves; new helpers `_get_carryover_date`, `_add_days_to_allocation`.
 
-**Allocation**
-- `allocation_type` becomes read-only; `type_request_unit` is now computed instead of related; `number_of_days_display` becomes writable.
-- New `has_accrual_plan` and `already_accrued` fields.
-- New onchange simulation: changing `date_from` or `accrual_plan_id` previews the days the plan would grant.
-- Internal method `_end_of_year_accrual` removed; `_update_accrual` simplified (year-end logic is now handled through the carry-over date).
+**hr.leave.accrual.plan**
+- Added: `is_based_on_worked_time` (moved down from the level), `accrued_gain_time`, `carryover_date`, `carryover_day`, `carryover_day_display`, `carryover_month`, `added_value_type`, `active` (archive).
+- Labels: "Level Transition" → "Milestone Transition"; levels are now "Milestone".
 
-A third change set (future-allocations refactoring, PR 108148) also lands in 17.0; it is not detailed here.
+**hr.leave.accrual.level**
+- Removed: `is_based_on_worked_time`, `parent_id` ("Previous Level").
+- `added_value_type` is computed and its values became `day` / `hour` (was `days` / `hours`).
+- `action_with_unused_accruals` options replaced: `postponed` → `all` / `maximum` / `lost`.
+- `maximum_leave` is computed and gated by new `cap_accrued_time`; `added_value` defaults to 1; deleting a plan cascades to its levels.
+
+**hr.employee**
+- New `_get_consumed_leaves(leave_types, target_date, ignore_future)` returns per-allocation consumption and excess-day warnings.
+- `_get_contextual_employee` is now `@api.model` and also reads `default_employee_id`.
+- `get_stress_days*` renamed `get_mandatory_days*`.
 
 ## How your habits should change
 
-- Update your vocabulary and any saved filters/reports: **Stress Day → Mandatory Day**, **Approval → Management**, **Current Year → Currently Valid**.
-- Existing mandatory-day records must be migrated to the new model; check your time-off calendar before go-live.
-- **Re-review every accrual plan**: the previous `parent_id` level chaining is gone, and "At the end of the calendar year, unused accruals will be..." is replaced by a *Carry over* choice. Old behaviour ("Transferred to the next year") maps to *All accrued time carried over*; "Lost" maps to *None. Accrued time reset to 0*.
-- Decide per plan whether time is granted **at the start** or **at the end** of the accrual period, and whether accrual follows worked time or calendar days.
-- Set the carry-over date explicitly (year start, allocation date, or a custom day/month) — you are no longer forced onto 1 January.
-- You no longer need to create "fake allocations" to see what a plan would give: open an accrual allocation and change the start date to simulate.
+- Allocations are no longer submitted: they are created straight in "To Approve".
+- A leave is no longer tied to one allocation: consumption is re-matched across all valid allocations.
+- Configure accruals at plan level (worked time, carry-over date, start/end crediting), not at level level.
+- Old carry-over settings map as follows: "Transferred to the next year" → "All accrued time carried over"; "Lost" → "None. Accrued time reset to 0".
+- Update procedures, reports and imports that mention stress days.
+- Check future leaves regularly: they can now be cancelled automatically when accruals are insufficient.
 
 ## What you gain by migrating
 
-- A clearer, less cluttered Time Off UX for employees and managers (renamed menus, simplified list/kanban views, state visible from the dashboard).
+- **Visibility**: employees and managers see future balances and upcoming expirations before they happen.
+- **Better accrual rules**: custom carry-over dates, start/end crediting, caps and simulation.
+- **Less rework**: fewer allocation states, clearer forms, auto-cancellation of over-accrued leaves.
+- **Cleaner daily use**: menus, filters and reports that match real usage.
+- **A maintained codebase**: this refactoring defines the 17.0 line; staying on 16.0 freezes behaviour.

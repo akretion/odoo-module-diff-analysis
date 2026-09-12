@@ -1,47 +1,50 @@
 # product migration guide (15.0 -> 16.0)
 
-Scope: the `product` addon only (the base module for products, variants, pricelists and units of measure). Applications built on top of it are covered by their own guides.
+This guide covers the `product` addon (the base product catalog module) between Odoo 15.0 and 16.0. It is written for functional users and for a customer planning a 15.0 to 16.0 upgrade on the Community edition.
 
 ## What's new for users
 
-The 16.0 release notes are mostly about the applications that *use* products (eCommerce, Sales, Inventory, Purchase, Website). Only one product-centred item really belongs to this addon:
+The 16.0 release notes mostly highlight other apps (eCommerce, Sales, Inventory, Manufacturing, Website, Spreadsheet, Project...). For the `product` addon itself, the extract contains very little: the module is a foundation layer, and most product-related novelties appear in the apps built on top of it.
 
-- **Product tags** – classify products with tags and filter them easily, in the backend and on the website.
+What actually concerns this addon:
 
-Everything else you may read about products in the release notes (Shop page redesign, product pictures grid/carousel, default sorting, coupons and loyalty cards, back-in-stock notifications, B2B "hide prices", product comparison prices) is delivered by other addons such as Website/eCommerce, Sales or Loyalty, and some of it is Enterprise-only. Nothing else in `product` changes noticeably for day-to-day users: creating products, variants, attributes, pricelists and units of measure works the same way as in 15.0.
+- **Country of Origin**: a *Country of Origin* is now available on the product form, and is reused by shipping documents such as commercial invoices for international deliveries.
+- **Product tags**: filtering products by tags is smoother, both in backend product lists and in the website shop.
+
+Everything else in the extract (Amazon connector, coupons and loyalty, rental, MES, allocations, shipping carriers, accounting-style spreadsheet functions, etc.) belongs to other apps — and several of those items are Enterprise-only. Do not assume they come with a Community 16.0 upgrade.
 
 ## Technical data model changes
 
-From the 15.0 → 16.0 code diff:
+**Code reorganisation (no data impact)**
+`product.py` was split into dedicated files: `product_product.py`, `product_category.py`, `product_packaging.py`, `product_supplierinfo.py`, with the module imports updated accordingly. The models and tables are the same. The `_inherits = {'product.template': ...}` and `mail.thread` declarations on `product.product` are unchanged: they only appear in the diff because the code moved between files.
 
-**Removed fields**
-- `product.template.price` – computed Float "Price", context dependent (pricelist, partner, quantity, uom, date).
-- `product.template.pricelist_id` – non-stored Many2one, technical field used only for searching on pricelists.
-- `product.product.price` – same context-dependent computed Float, on the variant.
+Any custom module that patches file paths, overrides these models by file, or relies on `product.py` must update its references.
 
-They were removed because they were unused, did not behave correctly, and duplicated what pricelist rules already compute. The inverse methods that wrote their value back into `list_price` are gone as well.
+**Removed fields on `product.template`**
+- `price` (float, context-dependent price computed from pricelist, quantity, uom, date), together with its methods `_compute_template_price`, `_compute_template_price_no_inverse` and `_set_template_price`.
+- `pricelist_id` (non-stored technical field, used to search products by pricelist).
 
-**Unchanged**
-- `list_price` ("Sales Price") on the template remains the user-defined catalogue price; standard pricelist computation is untouched.
+**Removed fields on `product.product`**
+- `price` (same contextual price on the variant), with `_compute_product_price` and `_set_product_price`.
 
-**Added**
-- `_get_contextual_price()` on both `product.template` and `product.product`. It returns `0.0` when no `pricelist` is present in the context; otherwise it reads `quantity`, `uom` and `date` from the context and returns the price computed by the pricelist. Unlike the old `price` field, it is read-only: it never writes to `list_price`.
+**Added methods**
+- `_get_contextual_price()` on both `product.template` and `product.product`: returns the price for the context pricelist (context key `pricelist`), quantity, uom and date. It returns `0.0` when no pricelist is set in the context.
 
-**Code structure**
-- The model files were reorganised (`product.py` split into `product_product.py` / `product_template.py`). No data impact, but custom code that patches file paths must be updated.
+**Unchanged behaviour**: `list_price` (Sales Price), `price_extra` (variant extra), `standard_price`, `barcode`, `default_code`, images, packagings, vendor pricelists (`seller_ids`), categories and tags behave as before.
 
 ## How your habits should change
 
-- Any custom export, import, list view, filter, server action or report referencing `price` or `pricelist_id` on products must be rewritten: those fields no longer exist.
-- To know the price of a product for a given customer, quantity, unit of measure and date, use the pricelist price report (Pricelists, or the "Product Price" report) or a pricelist rule, instead of the old contextual "Price" column.
-- Developers: replace `product.with_context(pricelist=..., quantity=...).price` with `product._get_contextual_price()` or, preferably, with the pricelist's price computation method. Remember that no value is written back to Sales Price anymore.
-- Day-to-day sales, purchases, eCommerce and POS behaviour is unchanged: prices still come from pricelists, so quotations, sales orders and carts are not affected.
-- If you adopt product tags, tag your catalogue to benefit from the new filters and website filtering.
+- The contextual **Price** and **Pricelist** columns disappear from product views. To get a customer- or quantity-specific price, use the price rules of the pricelist, or the product price list report.
+- Saved filters, exports, automated actions, spreadsheet formulas or custom reports built on product `price` or `pricelist_id` will return nothing or fail. Review them before migrating and switch to pricelist data or `_get_contextual_price`.
+- The old habit of typing a price through the contextual `price` field is gone: keep using **Sales Price** on the template and the variant extra prices.
+- Any integration (website, connector, external tool) that wrote a price through `price` must be adapted.
 
 ## What you gain by migrating
 
-- **One single source of truth for prices**: pricelist rules. The old context-dependent "Price" field could return different values depending on context and could silently overwrite your Sales Price – that risk is gone.
-- **Fewer surprises in customisations**: no ghost non-stored field that ends up by mistake in list views, exports or reports.
-- **A cleaner, better maintained code base** (models split per file), which makes future customisations and upgrades cheaper and safer.
-- **Product tags** to organise and filter a large catalogue, plus all 16.0 improvements brought by the modules that build on `product`.
-- Staying on an up-to-date, supported Odoo version, with the fixes and new features delivered by the dependent apps.
+- **Clearer product data**: pricing now always comes from pricelists and their rules, instead of a computed field that was context-dependent, often unused, and could show misleading values in lists and exports.
+- **Fewer dead technical fields**: the non-stored `pricelist_id` search field is gone, which removes a common source of confusing search results.
+- **Safer customisation**: the module is split into focused files, making your specific developments easier to review, patch and upgrade.
+- **Preserved catalog**: products, variants, attributes, vendor prices, packagings, categories and tags migrate as-is; the changes are structural, not a re-modelling of your data.
+- **Same functional flows, supported version**: you move to a maintained release while your sales, purchase, inventory and eCommerce flows keep relying on the same product foundation.
+
+Plan a short audit of your customisations and reports that touch `price` / `pricelist_id`, then the upgrade itself is low risk for this addon.

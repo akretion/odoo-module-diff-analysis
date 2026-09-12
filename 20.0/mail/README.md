@@ -1,40 +1,34 @@
 # mail migration guide (19.0 -> 20.0)
 
-Scope: the `mail` addon (Discuss, Chatter, activities, tracking) from Odoo 19.0 to 20.0. No 20.0 release-note extract was available for this addon, so the functional points below come from the code changes shipped in this version.
-
 ## What's new for users
+No official release-note extract covers the `mail` addon, so this guide is based on the code changes actually shipped in 20.0.
 
-- **Polls in Discuss.** Any channel or chat can host a poll with predefined answers, optional multiple choice, live result percentages and an optional end date. Guests can vote, and expired polls close and post their result automatically.
-- **Pin messages everywhere.** Pinning was limited to Discuss channels; it now works in every record's Chatter, so key messages can be pinned and retrieved later without scrolling.
-- **Simpler "Seen" marks.** The intermediate "delivered/fetched" step is gone. One grey check = at least one member has seen the message; double purple checks = seen by all members.
-- **Starred becomes Bookmark.** Message starring is renamed to bookmarking, backed by a bookmark box.
-- **Simpler activity chaining.** "Trigger Next Activity" and the recommended-activities list are removed. An activity type now suggests a single next activity, and "Done & Schedule Next" opens the standard Schedule Activity popup (activity plans included).
+- **Cc recipients**: in the composer you now choose, per recipient, whether the message is sent in "To" or in "Cc". The notification popover shows which one was used, incoming Cc are processed, and mail templates gain a "Cc (Partners)" field next to "To (Partners)".
+- **Polls in Discuss channels**: users and guests can vote on predefined answers; single or multiple choice, percentage computation, and an "end poll" message.
+- **Pin messages in the Chatter**: pinning is no longer restricted to Discuss channels; it now works on any thread.
+- **Simpler scheduled activities**: "Trigger Next Activity" and the recommended-activities list are removed. Each activity type defines a single "Suggest Next Activity", and "Done & Schedule Next" now always opens the activity scheduler wizard.
+- **Server actions**: "Send Email" becomes "Send Message", a new "Log Note" action posts an internal note, and the "Send Email As" selector disappears.
+- **Terminology**: "Starred" becomes "Bookmarked"; the "fetched" message indicator is removed, leaving a simpler seen state (one grey check: seen by some, two purple: seen by all).
 
 ## Technical data model changes
+**Added models**: `mail.poll`, `mail.poll.option`, `mail.poll.vote` (Discuss polls, with one-vote-per-user/guest constraints), `mail.call.artifact` (post-call recording/transcript metadata; one attachment per artifact, non-overlapping segments), `bus.sync.mixin` (generic bus synchronisation) and `mail.track.mixin` (values tracking extracted from `mail.thread`).
 
-New models: `mail.poll`, `mail.poll.option`, `mail.poll.vote` (question, options, votes per user or guest, unique vote per option); `bus.sync.mixin` (generic bus synchronisation, used by discuss channel/member/category); `mail.track.mixin` (value tracking extracted from `mail.thread`, which now inherits `bus.listener.mixin` + `mail.track.mixin`); `res.role`.
+**Added fields**: `mail.message.partner_cc_ids`, `mail.mail.recipient_cc_ids`, `mail.template.partner_cc`, `mail.scheduled.message.partner_cc_ids` (plus composer wizard fields), `mail.message.started_poll_ids` / `ended_poll_ids` / `has_poll`, `discuss.call.history.artifact_ids`, `ir.actions.server.log_note_note`, and `mail.message.is_bookmarked` / `bookmarked_partner_ids` (renamed from `starred` / `starred_partner_ids`).
 
-Field changes:
-- `mail.message`: `starred_partner_ids` -> `bookmarked_partner_ids`, `starred` -> `is_bookmarked`; new `has_poll`, `started_poll_ids`, `ended_poll_ids`, `mark_as_unread`. The `mail_poll` message type was added then dropped: polls are ordinary comments carrying a `has_poll` flag.
-- `discuss.channel.pinned_message_ids` and `discuss.channel.member.fetched_message_id` removed; pinning now goes through `mail.thread.set_message_pin()`, and Chatter exposes `has_pinned_messages` / `pinned_messages`.
-- `mail.activity`: `recommended_activity_type_id`, `previous_activity_type_id`, `has_recommended_activities` and `chaining_type` removed.
-- `mail.activity.type`: `triggered_next_type_id`, `chaining_type` and the `suggested_next_type_ids` many2many become a single `suggested_next_type_id`, also added on activity plan templates (replacing `next_activity_ids`).
+**Removed or relocated**: `mail.tracking.value` moves out of `mail` into a dedicated `mail_tracking` module, and `tracking_value_ids` disappears from `mail.message`; `discuss.channel.member.fetched_message_id` and `channel_fetched()`; `discuss.channel.pinned_message_ids` (replaced by `mail.thread.set_message_pin`); `mail.activity.recommended_activity_type_id`, `previous_activity_type_id`, `has_recommended_activities`, `chaining_type`; `mail.activity.type.triggered_next_type_id`, `chaining_type` and `suggested_next_type_ids` (now a single `suggested_next_type_id`); `mail.activity.plan.template.next_activity_ids`; `res.users.settings.push_to_talk_key`, `use_push_to_talk`, `voice_active_duration`; `ir.actions.server.mail_post_method`.
 
-API / signature changes: `message_post()` accepts `partner_cc_ids` (CC recipients) and `tracking_values`; `activity_schedule()` accepts `activity_user_id_fname`; the `_notify_*` and `_track_*` helpers lose their `msg_vals` argument and are renamed (`_track_log`, `_track_post_template`, ...); the `_to_store` API is replaced by `_store_*_fields(res)` helpers; `ir.config_parameter.set_param()` is replaced by `set_bool` / `set_str` / `create` / `write`; `mail.template._parse_partner_to` -> `_parse_partner_list_ids`; `discuss.channel._create_group(partners_to -> users_to)` and `_broadcast(partner_ids -> users)`. Existing overrides must be reviewed.
+**Behaviour and signatures**: the `mail_poll` message type was dropped — polls post as normal `comment` messages flagged by `has_poll`. `_track_execute` / `_track_post_template` now handle logging; `_action_done` and `action_feedback` no longer return the next activities; user settings are read through the settings record and synchronised by `bus.sync.mixin`; outgoing emails also resolve `recipient_cc_ids`, which adds a few queries when preparing mails.
 
 ## How your habits should change
-
-- Create polls from the Discuss composer; expect them to close on their own at the end date.
-- Pin/unpin from the message action menu on any record, not only in channels.
-- Stop waiting for the "delivered" tick: only "seen" states remain.
-- Rename your vocabulary: starred messages are now bookmarks (data moved by the standard upgrade scripts).
-- Review every activity type that used "Trigger Next Activity" or several suggested activities: only one suggestion survives, and the next activity is no longer created automatically - users go through the scheduler popup.
-- If you maintain custom modules, budget time for the method renames above.
+- Recreate "trigger" activity chains as a single "Suggest Next Activity" per activity type: the next activity is no longer created automatically, the scheduler popup is always used.
+- Recreate server actions that used "Send Email As: Note" as "Log Note"; "Message" ones become "Send Message".
+- Adapt filters, reports or automations referring to `mail_poll` message types, `tracking_value_ids`, `fetched_message_id`, `pinned_message_ids` or the removed starred fields.
+- If you rely on field tracking in the chatter, make sure the new `mail_tracking` module is installed and updated.
+- Push-to-talk and voice-activity preferences are now per device (browser storage) instead of shared server-side.
 
 ## What you gain by migrating
-
-- Higher engagement: polls turn Discuss into a lightweight decision tool.
-- Faster information retrieval: pinning in Chatter plus the bookmark box.
-- A consistent, easier-to-teach activity flow: one suggestion, one scheduling popup, plans usable everywhere.
-- Cleaner internals for your customisations: `bus.sync.mixin` and `mail.track.mixin` remove hand-written glue code, and access-rights/search helpers were unified - lower risk and cheaper maintenance on the long run.
-- A supported version: 19.0 still receives fixes, but new features and long-term security coverage happen on 20.0.
+- Full Cc support across composer, templates, gateway and notifications.
+- Native polls for quick decisions inside Discuss, including guest participation.
+- Pinning available in every chatter, plus a leaner and more reliable "seen" indicator.
+- A lighter core: tracking is optional (`mail_tracking`), and reusable mixins (`mail.track.mixin`, `bus.sync.mixin`) simplify the custom modules you maintain.
+- Fewer confusing options for end users in activities and server actions.

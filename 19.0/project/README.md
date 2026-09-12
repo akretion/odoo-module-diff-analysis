@@ -1,50 +1,37 @@
 # project migration guide (18.0 -> 19.0)
 
-This guide summarises what changes in the **project** addon (Community edition) when moving from 18.0 to 19.0.
-
 ## What's new for users
-- **Project templates**: create a project from a template with pre-filled details and roles defined on template tasks, choosing which user fills each role at creation. Task planning follows the template.
-- **Task templates**: convert a task into a reusable template and create new tasks from it.
-- **Assignees from email**: when a task is created from an incoming email, internal users found in the "To" field are set as assignees.
-- **Tasks in the calendar**: tasks to plan appear in the calendar side panel and can be scheduled by drag & drop.
-- **Customer ratings per stage**: rating requests are configured on the task stage instead of the project.
-- **Project privacy**: an additional privacy level lets you share private projects with portal users.
+
+From the official 19.0 release notes, the points that concern the Community `project` app:
+
+- **Task templates** – reusable task templates that standardise recurring setups.
+- **Project templates** – create a project from a template with pre-filled details, assign roles to the template tasks, then pick at creation time which employee fills each role.
+- **Drag & drop in the calendar view** – reschedule existing tasks by moving them in the calendar.
+
+Not included in Community (Enterprise only): Gantt view for tasks on the portal, auto-planning on flexible schedules. Task templates for service products belong to `sale_project`.
+
+Note: the refactoring that moved task templates into a dedicated model was reverted before the release. A task template is still a task flagged as a template, so nothing changes for you there.
 
 ## Technical data model changes
 
-**project.project**
-- Added: `allow_recurring_tasks`.
-- Removed: `rating_active`, `rating_status`, `rating_status_period`, `rating_request_deadline` (moved to `project.task.type`).
-- `allow_task_dependencies` / `allow_milestones` no longer get a default from user groups and gain inverse methods.
-- New helpers: `_check_project_group_with_field`, `check_features_enabled`, `_get_project_features_mapping`, and template methods (`action_create_template_from_project`, `action_toggle_project_template_mode`, `action_create_from_template`, `action_undo_convert_to_template`, `get_template_tasks`).
-
-**project.task.type**
-- Added: `rating_active`, `rating_status`, `rating_status_period`, `rating_request_deadline`, `_send_rating_all`.
-- Removed: `disabled_rating_warning`.
-
-**project.task**
-- `rating_active` is now related to `stage_id.rating_active`; `allow_recurring_tasks` is related to the project.
-- `display_in_project` is computed only (depends on `project_id`, `parent_id`), no longer editable; `show_display_in_project` is removed.
-- Subtasks are hidden by default: `_where_calc` drops the `display_in_project` leaf when the `show_subtasks` context key is set.
-- Portal lists renamed `SELF_*_FIELDS` -> `TASK_PORTAL_READABLE_FIELDS` / `TASK_PORTAL_WRITABLE_FIELDS`; custom portal field-access checks removed.
-- Template additions: `action_convert_to_template`, `_compute_has_template_ancestor`, `get_import_templates`, `plan_task_in_calendar`.
-- `partner_phone` moved into this module.
-
-**Others**
-- `project.milestone`: `project_allow_milestones` added.
-- `project.role`: colour default and `copy_data`.
-- `res.config.settings`: `group_project_rating`, `group_project_recurring_tasks`, `group_project_task_dependencies`, `group_project_milestone` and `_get_basic_project_domain` removed.
-- Core refactors: `read_group` -> `formatted_read_group` / `_read_group`, `name_search(args=)` -> `domain=`, `toggle_active` deprecated in favour of `action_unarchive`, mail overrides aligned (`msg_dict`, `msg_vals=False`, `_notify_get_reply_to(..., author_id)`).
+- **Task templates**: the new `project.task.template` model and `project.task.task_template_id` were dropped again by the revert. Templates remain in `project.task` (`is_template`, `has_template_ancestor`); project counters and views keep filtering on those flags.
+- **Customer ratings moved to stages**: `project.task.type` now owns `rating_active`, `rating_status`, `rating_status_period` and `rating_request_deadline`, and the daily scheduler runs per stage. The same fields were removed from `project.project`, and `disabled_rating_warning` was removed from the stage.
+- `project.task.rating_active` is now related to `stage_id.rating_active` (previously `project_id.rating_active`).
+- **New project toggle** `project.project.allow_recurring_tasks`, alongside `allow_task_dependencies` and `allow_milestones`; all three now default to off and drive group membership (new helpers `_check_project_group_with_field`, `check_features_enabled`).
+- **Global settings removed**: `group_project_rating`, `group_project_recurring_tasks`, `group_project_task_dependencies` and `group_project_milestone` are gone from `res.config.settings`.
+- **Subtasks**: `project.task.show_display_in_project` removed; `display_in_project` is now computed only, with no manual override.
+- `project.milestone.project_allow_milestones` added (computed, searchable).
 
 ## How your habits should change
-- **Project options are per project.** Task Dependencies, Milestones and Recurring Tasks are no longer global settings; enable them in the project form. The related user group is granted automatically as soon as one project uses the option and revoked when no project does. New projects start with the three options disabled.
-- **Ratings are per stage.** Configure "Send a customer rating request" on the task stage. Ratings are always visible in views and reporting, so there is no global switch anymore.
-- **Subtasks.** The per-subtask eye icon is gone: subtasks are hidden by default, use the "Show Sub-tasks" filter (not available in My Tasks).
-- **Consistency.** Disabling Recurring Tasks or Task Dependencies on a project resets the recurring flag / waiting state of its tasks.
+
+- Enable Task Dependencies, Recurring Tasks and Milestones **on each project** (project form), not in Settings. A brand new project starts with all of them off.
+- Configure customer ratings **on task stages**, not on the project: tick "Send a customer rating request", choose when it is sent (when reaching this stage, or periodically) and the email template.
+- Feature groups are now maintained automatically: enabling a feature in a project gives access to it; disabling it in the last project using it removes it again. Turning off dependencies resets waiting tasks, turning off recurrence clears the recurrent flag.
+- Sub-tasks no longer show up by default in task lists: use the new **"Show Sub-tasks" filter** instead of the removed per-task eye icon.
 
 ## What you gain by migrating
-- Templates and roles remove repetitive project setup and standardise delivery.
-- Email-based task creation fills assignees automatically.
-- Per-stage rating configuration is far more flexible than a project-wide setting.
-- Fewer global settings: options live where they apply, with less hidden configuration.
-- A cleaner data model (deprecated APIs replaced, simplified fields) makes future versions and custom developments easier.
+
+- Feature-by-feature, project-by-project configuration: no global switch imposing task dependencies, recurrence or milestones on every project.
+- Ratings that fit your process: feedback is requested by stage, so different stages and projects can behave differently.
+- Calmer task views: sub-tasks stay out of the way until you ask for them.
+- You move onto the current series, where fixes and new features land.

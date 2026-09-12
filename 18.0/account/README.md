@@ -1,51 +1,49 @@
 # account migration guide (17.0 -> 18.0)
 
-This guide summarizes what changes in the `account` addon between Odoo 17.0 and 18.0, for functional users. It describes the Community edition.
+Odoo 18.0 reshapes the Invoicing core: payments, lock dates, shared accounts and Send & Print. Here is what changes for users and for your data.
 
 ## What's new for users
 
-- **Reworked lock dates.** Locking is now done by journal type (sales, purchases, taxes), with a new hard lock date and an exceptions mechanism (grant a temporary unlock to a user, with an audit trail). A warning explains what is blocked and why.
-- **Shared accounts between companies.** The same account can now belong to several companies of your database; the code is computed per company, and accounts can be merged and un-merged.
-- **Payments without accounting entries.** A payment no longer creates a journal entry unless the payment method has an outstanding account defined. Payments now have their own state and validate/reject actions.
-- **Register payments on draft invoices and bills**, and pay in installments based on the payment terms; the portal shows what is already paid.
-- **Preferred payment method per partner** (incoming and outgoing), used by default when creating payments.
-- **Better duplicate detection on vendor bills**: draft and posted documents are searched, with smart links to the potential duplicates.
-- **New credit card journal type** to record credit card payments, upload statements and reconcile them.
-- **Reconciliation models can generate a customer invoice or vendor bill** directly from a bank transaction.
-- **Sales taxes price included/excluded** are driven by a company setting, and can be overridden on individual taxes.
-- **Legal notes on taxes**, displayed on documents when the tax is used.
-- **Analytic distribution models** can be sequenced and combined across plans.
-- **Email aliases on miscellaneous journals**: incoming emails with attachments create journal entries automatically.
-- **Exchange rate is stored on invoices** and displayed.
-- **Annual/fiscal-year journal sequences** support staggered fiscal years; matching numbers are simplified and color-coded.
-- **Audit trail improvements** (GoBD-oriented): changes on journal items are tracked.
+- **Payments without accounting entries**: a payment only creates a journal entry if an outstanding account is set on its payment method. Recording a payment is now mainly about avoiding duplicates and preparing bank files.
+- **New payment states**: Draft, In Process (previously Posted), Paid, Canceled, Rejected.
+- **Block Payment** action on invoices prevents registering a payment.
+- **Register payments on draft invoices**; installment amounts from payment terms are proposed.
+- **Preferred payment method per partner** (incoming/outgoing), used by default and usable as a filter.
+- **Preferred invoicing method and e-invoice format per contact**, driving a simplified Send & Print: one channel by default instead of ticking everything each time.
+- **Lock dates**: sales and purchases now lock separately, plus a Hard Lock Date. (The lock-date wizard itself is Enterprise.)
+- **Shared accounts between companies**: one chart of accounts for several companies, with merge/de-merge tools.
+- **Credit card journals**, check layout selection, QR codes in the bills payment wizard, editable reconciliation amount.
+- **Invoicing dashboard/onboarding** refreshed for Invoicing-only users.
+- Also: duplicate bill detection, autopost bills, abnormal invoice alerts, journal email aliases, invoice line catalogue view, exchange rate stored on invoices.
 
 ## Technical data model changes
 
-Removed fields and methods:
-- `account.journal`: `sale_activity_type_id`, `sale_activity_user_id`, `sale_activity_note` (customer payments follow-up on sale journals was removed).
-- `res.partner`: `has_unreconciled_entries`, `last_time_entries_checked` and `mark_as_reconciled()` were removed (unused).
-
-Notable changes:
-- `account.account`: company-shared account codes (`_compute_code`, `_ensure_code_is_unique`, `_search_code`), new account unmerge tool (`action_unmerge`), `_search_new_account_code(start_code, cache=None)`, `_constrains_code` removed.
-- `account.lock_exception`: reworked with one lock date per exception, new state, revoke action and audit-trail view.
-- `account.payment`: new state/validation flow (`action_validate`, `action_reject`, `_generate_journal_entry`); the move synchronisation methods were removed.
-- `account.move.send`: large new model supporting the Send & Print flow.
-- `account.tax`, `account.move`, `account.move.line`: tax computation API reworked (`_compute_taxes(base_lines, company, …)`, `compute_all(..., rounding_method=…)`), `_get_accounting_date(..., lock_dates=None)`, `account.payment.term._compute_terms(..., cash_rounding=None)`.
-- `account.bank.statement`, `account.bank.statement.line`, `account.payment`: new `init()` (denormalised journal/company).
+- account.payment no longer inherits account.move: move_id is optional; new name, date, state, memo, is_sent fields; journal_id/company_id are computed; destination_journal_id and is_internal_transfer removed.
+- New many2many invoice_ids / matched_payment_ids link payments and invoices without reconciliation.
+- account.move.payment_id renamed origin_payment_id; new matched_payment_ids, payment_count and the 'blocked' payment_state.
+- Company-level outstanding accounts (account_journal_payment_debit/credit_account_id) and all fallbacks to them were removed.
+- account.account: company_id replaced by company_ids; code is company-dependent (one code per company); group_id/root_id are no longer stored.
+- res.company: period_lock_date removed, replaced by sale_lock_date and purchase_lock_date; new hard_lock_date and user_* fields; max_tax_lock_date removed. New model account.lock_exception; the account_lock module is gone.
+- res.partner: has_unreconciled_entries, last_time_entries_checked and mark_as_reconciled() removed; receivable/payable account fields now use ondelete='restrict'.
+- account.journal: sale_activity_type_id / user_id / note removed.
+- account.move: send_and_print_values renamed sending_data; Send & Print split into account.move.send.wizard (single) and account.move.send.batch.wizard (batch).
+- Methods renamed: _check_fiscalyear_lock_date → _check_fiscal_lock_dates; _get_accounting_date takes a lock_dates argument.
+- Core: company-dependent fields (e.g. account code) are now stored as jsonb, so they can be searched and reported on.
 
 ## How your habits should change
 
-- Use the new lock-date screen: select journal types, set a hard lock, and grant exceptions instead of a single fiscal-year lock.
-- Do not expect a journal entry for every payment: it depends on the outstanding account set on the payment method.
-- Configure price-included/excluded once at company level rather than tax by tax.
-- Accounts are no longer strictly company-specific: check sharing rules when creating or merging accounts.
-- Old sale-journal "payment follow-up activity" settings are gone; schedule activities manually if needed.
+- Do not expect a journal entry for every payment. Set an outstanding account on the payment method line only if you want one.
+- Bank reconciliation becomes the reference: match bank transactions to invoices, and handle transfers between your own journals as a write-off instead of an Internal Transfer payment.
+- Use Canceled / Rejected instead of deleting payments that never reached the bank.
+- Payments without entries no longer count in the invoice paid amount; they show as In Process.
+- Create accounts with the company context, then set a code for each company before adding more companies.
+- Review lock dates: split sales/purchase locks replace the old period lock date, and the Hard Lock Date cannot be undone.
+- In Send & Print, set each partner's preferred channel once instead of choosing options at every send.
 
 ## What you gain by migrating
 
-- Stronger, more granular period locking and a real audit trail (GoBD).
-- Simpler multi-company accounting: shared accounts, no duplicated charts, merge/unmerge tools.
-- A cleaner payment flow: draft payments, installments, preferred payment methods, fewer useless entries.
-- Less manual work on bank reconciliation and vendor-bill duplicates.
-- A maintained release: 17.0 is reaching end of life, 18.0 keeps you on a supported, updated version.
+- Cleaner receivable/payable balances and easier bank reconciliation, with fewer duplicate payments.
+- One shared chart of accounts for multi-company setups.
+- Finer period control through per-journal locks and a defensible hard lock.
+- Faster reconciliation (batched queries) and better structured company-dependent data (jsonb).
+- A Send & Print flow that scales to batch sending and e-invoicing.

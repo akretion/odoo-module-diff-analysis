@@ -1,54 +1,47 @@
 # mail migration guide (14.0 -> 15.0)
 
-What changes in the `mail` addon (Discuss, chatter, activities) when moving from Odoo 14.0 to 15.0.
-
 ## What's new for users
 
-Odoo 15 release notes, Discuss section:
+In 15.0 mail channels are purely chat-oriented. The "mailing list" behaviour of a channel — sending its messages by email and moderating them — was removed from channels and re-implemented in a separate module. A channel is now a chat, a group chat or a private discussion.
 
-- **Channels**: invite people as channel members; channel notifications have been simplified. Channels can no longer be followers, and mailing-list style mail channels are gone.
-- **Chat members**: the list of members of a channel is now displayed.
-- **Sidebar and usability**: channels, chats and direct messages are easier to find, with avatars in the DM / group DM section.
-- **Direct messages**: create a group from an existing direct message.
-- **Messages**: edit or delete a message, or add a smiley reaction.
-- **Shortcut**: start a chat from the command palette (Ctrl+K).
-
-The release notes say nothing else specific to this addon; everything below comes from the code changes.
+- Invite people as members of a channel; the member list is visible in Discuss.
+- Simplified channel notifications and a reworked sidebar: channels, chats and group DMs are easier to find, with avatars in the DM section.
+- Start a chat from the command palette (Ctrl+K); create a group from a direct message.
+- Edit or delete a message, and react to it with a smiley.
+- Channels are no longer followers: only partners (people) can follow a record.
+- Email templates are QWeb-based and edited in their final rendering, so you customise them without touching code.
+- A new Settings option restricts template writing to members of the "Mail Template Editor" group.
+- Activity types: clearer configuration, and non-administrators can access the Activity Types menu again.
 
 ## Technical data model changes
 
-**Activities (mail.activity.type / mail.activity)**
-- `force_next` removed; replaced by `chaining_type` — "Suggest Next Activity" or "Trigger Next Activity" — also available on activities.
-- `default_next_type_id` → `triggered_next_type_id`; `next_type_ids` → `suggested_next_type_ids`; the two are mutually exclusive.
-- `default_description` → `default_note`.
-- Labels: "Scheduled Date" → "Schedule"; "after validation date" → "after completion date"; "Action to Perform" → "Action".
+Removed model: mail.moderation.
 
-**Followers (mail.followers)**
-- `channel_id` removed and `partner_id` is now required: only partners can follow a document. `name`, `email` and `is_active` become related fields on the partner, and the channel-related SQL constraints are dropped.
-- Helper methods lost their channel arguments: `_get_recipient_data`, `_get_subscription_data`, `_insert_followers`, `_add_default_followers`, `_add_followers`.
+mail.channel — removed: moderation, moderator_ids, is_moderator, moderation_ids, moderation_count, moderation_notify, moderation_notify_msg, moderation_guidelines, moderation_guidelines_msg, email_send, channel_message_ids.
 
-**Messages and channels**
-- `mail.message.channel_ids` removed: a message now belongs to a single document (`model` / `res_id`), channels included, which use `message_ids`.
-- `mail.channel.channel_message_ids` removed.
-- `mail.channel.email_send` removed: channels are chat only.
+mail.message — removed: moderation_status, moderator_id, need_moderation, channel_ids. A message now belongs to exactly one thread (model + res_id); the "listener channel" mechanism is gone and the related access-rule exceptions were simplified.
 
-**Moderation removed**
-- Model `mail.moderation` deleted.
-- `mail.channel`: `moderation`, `moderator_ids`, `is_moderator`, `moderation_ids`, `moderation_count`, `moderation_notify`, `moderation_notify_msg`, `moderation_guidelines`, `moderation_guidelines_msg`.
-- `mail.message`: `moderation_status`, `moderator_id`, `need_moderation`; `message_fetch` no longer takes `moderated_channel_ids`; the moderation API is gone.
-- `res.users`: `moderation_channel_ids`, `is_moderator`, `moderation_counter`.
+mail.followers — removed: channel_id; partner_id is now required; name/email/is_active are related fields on partner_id. The channel uniqueness / XOR SQL constraints were dropped, and internal helpers (_insert_followers, _add_followers, _get_recipient_data, _get_subscription_data) no longer take channel arguments.
+
+mail.activity.type — force_next replaced by chaining_type (suggest / trigger); default_next_type_id → triggered_next_type_id; next_type_ids → suggested_next_type_ids; default_description → default_note; res_model_id (many2one ir.model) → res_model (selection computed in sudo, so no ir.model read access is needed); initial_res_model_id → initial_res_model. Labels changed too: "Scheduled Date" → "Schedule", "after validation date" → "after completion date", "Action to Perform" → "Action". On mail.activity, force_next is replaced by the related chaining_type.
+
+mail.composer.mixin — new is_mail_template_editor field; can_edit_body is False when a template is selected and the user is not a template editor; _render_field adapted.
+
+mail.render.mixin — new _unrestricted_rendering attribute; rendering a dynamic template without the template-editor group raises AccessError, and static content is returned as-is.
+
+New group mail.group_mail_template_editor and parameter mail.restrict.template.rendering (IrConfigParameter.set_param toggles it on base.group_user). Deleting an ir.model now also deletes its activity types.
 
 ## How your habits should change
 
-- Discuss channels are chats: they no longer send messages by email and cannot be moderated. Mailing lists and moderated email channels have to move to the separate module that replaces them.
-- Only partners follow documents; you can no longer add a channel as a follower.
-- No more moderation queue, "pending moderation" status, moderators or email allow/ban lists in Discuss.
-- For activity types, pick the Chaining Type: "Suggest Next Activity" (types proposed to the user when the activity is closed) or "Trigger Next Activity" (the next activity is created automatically). Only one of the two lists applies.
-- On activity types, "Default Description" is now "Default Note".
+- Stop using channels as mailing lists. Moderation queues, "Check messages" in Discuss, guidelines emails, the channel subject and email sending are gone; mailing-list features now live in a separate module.
+- You can no longer follow a document with a channel — add the people instead. Conversely, a message is displayed in a single chatter.
+- Configure activity types with "Chaining Type": Trigger (the next activity is scheduled automatically when you complete the current one) or Suggest (the next activity is proposed). The old "Trigger Next Activity" checkbox is gone.
+- If template restriction is enabled, request the Mail Template Editor group before editing dynamic templates; otherwise the body is read-only once a template is selected.
 
 ## What you gain by migrating
 
-- A clearer Discuss: chat channels chat, documents get followers, and every message is attached to one record.
-- Simpler, more predictable notifications, without channel self-following or email side effects inside chats.
-- Explicit activity chaining through one setting instead of two overlapping fields.
-- A supported version, with upgrade scripts that migrate the removed models/fields and renamed fields for you.
+- A leaner data model: channels are chats, followers are people — fewer surprises in notifications and access rights.
+- Mailing-list features are cleanly separated instead of being squeezed into the channel model.
+- Fine-grained control over who writes email templates, with safer rendering of dynamic Jinja content.
+- Better activities: clearer chaining, a default note, and Activity Types accessible to all users, not only administrators.
+- A modernised Discuss (members, sidebar, editing/reactions) and QWeb email templates edited in their final rendering.
