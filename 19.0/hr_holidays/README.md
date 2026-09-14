@@ -1,29 +1,33 @@
 # hr_holidays migration guide (18.0 -> 19.0)
 
 ## What's new for users
-The official 19.0 release notes contain almost no core Time Off items. The only Time Off-related note is for the Indian localization: Flexi Leave is now fully supported with Optional Holidays, so employees using that leave type can only select eligible optional holiday days. No other Time Off feature is announced. The changes described below therefore come from the technical diff.
+
+The official 19.0 release notes contain no entry about the Community `hr_holidays` module — the published extract covers localizations, accounting and payroll. The only Time Off item (India Flexi Leave with Optional Holidays) belongs to the Indian localization, outside a Community deployment, so it is not claimed here. All user-visible changes in 19.0 come from the refactors described below.
 
 ## Technical data model changes
-- **Employee/contract merge**: Odoo 19 introduces `hr.version`, a versioned employee model replacing `hr.contract`. Payroll-impacting fields now live on `hr.version`, inherited by `hr.employee`. Time Off reads the working calendar from the employee version. Contract states (`open`, `close`, `kanban_state`) are removed. Salary rules now receive `version` in the localdict instead of `contract`.
-- **Models/files**: `hr.employee.base` is removed; its fields move into `hr.employee`. A new `hr.employee.public` extension and `hr_version.py` are added.
-- **`hr.employee`**: `leave_manager_id`, `current_leave_state`, `leave_date_from`, `leave_date_to`, `allocation_count`, `allocations_count`, `show_leaves`, `is_absent`, `allocation_display`, `allocation_remaining_display` and `hr_icon_display` are now defined directly on `hr.employee`.
-- **Removed employee fields**: `remaining_leaves` and `leaves_count` (unused, buggy compute).
-- **`hr.leave`**: removed `can_reset`. Added `can_approve`, `can_validate`, `can_refuse`, `can_cancel`, `holiday_status_requires_allocation`, `max_leaves`, `virtual_remaining_leaves`, `dashboard_warning_message`. `leave_type_increases_duration` changed from Boolean to Char (carries an explanatory message). Labels: `request_unit_half` "Half Day" -> "Half-Day"; `request_unit_hours` "Custom Hours" -> "Specific Time"; `duration_display` "Requested (Days/Hours)" -> "Requested".
-- **Methods**: `action_reset_confirm` removed. `action_validate` becomes private `_action_validate`. `action_approve` is now the only public approve/validate entry point and chooses first vs final approval. `_action_user_cancel` and `_force_cancel` accept `reason=None`.
-- **`hr.leave.type`**: `show_on_dashboard` inverted/renamed to `hide_on_dashboard`. `requires_allocation` and `employee_requests` changed from Selection to Boolean. Labels: "No Validation" -> "None needed"; "Notified Time Off Officer" -> "Notify HR"; "Public Holiday Included" -> "Ignore Public Holidays".
-- **Accrual plan/level**: `carryover_day`, `first_day`, `second_day`, `first_month_day`, `second_month_day`, `yearly_day` changed from Integer to Selection (1-31). Months/weekdays now use numeric strings (`1`-`12`, `0`-`6`) instead of `jan`/`mon`. Day pickers show only days available in the selected month, and the "last day" value is gone. The SQL date constraint is replaced by a Python constraint.
-- **`hr.leave.allocation`**: carryover/settlement date now uses `monthrange`, avoiding invalid dates such as Feb 31.
-- **`res.users`**: removed related fields `leave_manager_id`, `show_leaves`, `is_absent`, `allocation_remaining_display`, `allocation_display`, `hr_icon_display`; also removed from self-readable/self-writable fields. `leave_date_to` remains.
-- **Conflict check**: overlapping leaves now build a `dashboard_warning_message`; saving still raises it as a validation error.
+
+**Contracts become employee versions.** `hr.contract` is merged into a new versioned employee model (`hr.version`), which `hr_holidays` now extends. Employee leave fields move from the deleted `hr.employee.base` abstract model to `hr.employee`, and a new `hr.employee.public` extension is added. Contract states (`open`, `close`, `kanban_state`) disappear, and payroll data now lives on the version: time-off code and salary rules that read contract fields must read version fields.
+
+**Leave types.** `requires_allocation` and `employee_requests` switch from `'yes'/'no'` selections to Booleans (old domains such as `('requires_allocation', '=', 'yes')` no longer match). `show_on_dashboard` is replaced by `hide_on_dashboard`, with inverted meaning. Labels change: "No Validation" becomes "None needed", "Half Day" becomes "Half-Day", "Notified Time Off Officer" becomes "Notify HR".
+
+**Leave requests.** `can_reset` and `action_reset_confirm` are removed; `leave_type_increases_duration` becomes an explanatory text instead of a Boolean. New fields appear: `max_leaves`, `virtual_remaining_leaves`, `dashboard_warning_message`, `can_validate`, `can_refuse`. `action_validate` becomes the private `_action_validate`, and automatic (no validation) leaves now go through `action_approve`.
+
+**Employees.** `remaining_leaves` and `leaves_count` are removed. New computed fields (`leave_date_from/to`, `current_leave_state`, `allocation_display`, `is_absent`, `show_leaves`) drive the absence icons "On leave" / "Present but on leave".
+
+**User preferences.** The related fields `leave_manager_id`, `show_leaves`, `is_absent`, `allocation_remaining_display`, `allocation_display` and `hr_icon_display` are removed from `res.users`: they can no longer be read or written from the user profile.
+
+**Accrual plans.** Day parameters (`first_day`, `second_day`, `carryover_day`, `yearly_day`, ...) move from integers plus a display field to a single stored selection of days 1–31; `week_day` becomes 0–6 and month keys change from `jan`/`feb` to `1`/`2`. Existing data must be converted. Days are capped to the month length (31 February becomes 28/29), and 30 October is now selectable.
 
 ## How your habits should change
-The release notes announce no core Time Off habit changes for 19.0. The only behavior note is India-specific: Flexi Leave now restricts selection to eligible optional holidays. Everything else follows the data model changes above; expect renamed fields, the new approve/validate buttons, and numeric day/month pickers in accrual plans.
+
+- **Approve vs Validate.** "Approve" only appears when a second approval is required; "Validate" appears when you have the rights to approve fully. With enough rights, a "both" request is validated in one click.
+- **Overlaps.** Double bookings now show a warning message on the request form, and the same message blocks saving.
+- **Deletion.** Only Time Off Administrators can delete approved requests; employees keep the right to cancel their own.
+- **Leave types.** Settings are plain checkboxes: "Requires allocation", "Allow Employee Requests", "Hide On Dashboard".
+- **Accrual plans.** Pick a day from the list instead of typing a number; the list follows the selected month.
+- **Working schedule.** Changing an employee's calendar updates future time off, and is refused if allocations no longer cover it.
+- **Profile.** Your Time Off approver is no longer editable from your own preferences; an HR user sets it on the employee form.
 
 ## What you gain by migrating
-- One versioned employee model replaces separate contracts, so HR, payroll and Time Off share a single timeline with historical versions.
-- Cleaner approval flow: one approve action, separate approve/validate/refuse buttons, and automatic validation uses the same path.
-- Better overlapping-leave handling: conflicts are explained in a dashboard warning before saving.
-- More accurate accruals: day pickers accept real calendar days, adapt to the selected month, and avoid the old "last day" shortcut. Carryover dates are computed safely.
-- Simpler leave type setup with boolean toggles for "Requires allocation", "Allow Employee Requests" and "Hide On Dashboard".
-- Removal of unused employee balance fields reduces confusion on employee forms.
-- Ready for payroll localization updates, since salary rules now read the employee `version`.
+
+A single source of truth for HR data: employee history is versioned instead of duplicated between employee and contract, making past and future states auditable. Approvals become simpler and more predictable — the right button for the right person, clearer overlap warnings, stricter deletion rules for compliance. Accrual plans are easier to configure and no longer break on short months, and the employee and user screens are trimmed to what is actually used.

@@ -2,38 +2,44 @@
 
 ## What's new for users
 
-**Talent pool replaces candidates.** The Candidate record is gone: applications now hold the person's details, and the new **Talent Pool** replaces it. Any application can be turned into a "talent", grouped into pools, and reused to create applications for other job positions — simpler for SMEs, while headhunting-style reuse remains possible.
+- **Talent pool replaces candidates.** The candidate system has been replaced by a talent pool system: you can turn an existing application into a reusable "talent", group talents into talent pools, and use them to create applications for other job positions. Simple hiring flows stay simple, while head-hunting style re-engagement becomes possible again.
+- **Job matching.** The skills redesign adds a job position matching indicator showing how suitable an applicant is for a role, based on their skills and their degrees, compared with what the job position expects.
+- **Campaign tracking.** Applicants can still be tracked by campaign.
 
-**Skills-based job matching.** Job positions define expected skills and an expected degree; degrees now have a score (0–100%) and the applicant shows how well they match a position, with matching positions browsable.
-
-**Job position dashboard.** The job kanban is a clearer vertical list with "New applications" / "In progress" counters, one activity counter, an employees smart button and the company name on cards.
-
-**Campaign/source tracking.** Applications stay tracked by source, now linked from the job position.
+The release notes say nothing else specific to this addon (the remaining recruitment/Documents entries concern other apps or Enterprise-only features and are not part of this Community addon).
 
 ## Technical data model changes
 
-* **Model `hr.candidate` removed** (also `res.company.candidate_properties_definition`, `calendar.event.candidate_id`); `hr.employee.candidate_id` becomes `applicant_ids`.
-* **`hr.applicant`** now owns the person data: `partner_id`, `partner_name`, `email_from/normalized`, `partner_phone(_sanitized)`, `linkedin_profile`, `type_id`, `availability`, `color`, `employee_id/name`, `categ_ids` (plain many2many), and inherits `mail.thread.blacklist` + `mail.thread.phone`.
-* **New applicant fields:** `talent_pool_ids`, `pool_applicant_id`, `is_pool_applicant`, `is_applicant_in_pool` (searchable), `talent_pool_count`, `application_count` (replaces `other_applications_count`), plus "rotting" helpers for stale applications.
-* **New model `hr.talent.pool`:** name, company, pool manager, description, color, tags, `talent_ids` (applicants), `no_of_talents`.
-* **`hr.job`:** added `job_source_ids`, `expected_degree`, `employee_count`, `open_application_count`, `activity_count` (replaces `activities_overdue`/`activities_today`), `action_open_employees`. Removed: `user_id` (Recruiter), `currency_id`/`compensation`, `date_from`/`date_to`.
-* **`hr.recruitment.degree`:** new `score` (0–1, constrained). **`hr.recruitment.source`:** new `create_and_get_alias()`.
-* **Method signatures:** `message_new(msg_dict, ...)`, `_notify_get_reply_to(default=None, author_id=False)`, `toggle_active()` → `action_archive()`/`action_unarchive()`, applicant `copy_data()`.
-* **New SQL indexes** on applicant email/phone and attachment content (performance).
+**Removed**
+- The whole `hr.candidate` model.
+- On `hr.applicant`: `candidate_id` and the related fields it carried (`email_from`, `email_normalized`, `partner_phone`, `partner_phone_sanitized`, `linkedin_profile`, `type_id`, `availability`, `color`, `employee_id`, `emp_is_active`, `employee_name` are now plain fields on the applicant); `other_applications_count` and its compute are replaced by `application_count`; the tag compute `_compute_categ_ids` is gone.
+- On `calendar.event`: `candidate_id` (and its compute, plus `default_candidate_id` context handling).
+- On `hr.job`: mission dates `date_from` / `date_to`, `user_id` (Recruiter), `currency_id` / `compensation`, `activities_overdue` / `activities_today`; the `action_open_late_activities`, `action_open_today_activities` and `action_job_board_modules` actions; the automatic creation of a LinkedIn source when a job position is created.
+
+**Added**
+- `hr.talent.pool` model.
+- On `hr.applicant`: `talent_pool_ids`, `pool_applicant_id`, `is_pool_applicant`, `is_applicant_in_pool`, `talent_pool_count`, plus `application_count`, and the `mail.thread.blacklist` / `mail.thread.phone` mixins.
+- On `hr.job`: `job_source_ids`, `expected_degree`, `activity_count` (single activity counter).
+- On `hr.recruitment.degree`: `score` (0 to 1, constrained).
+- On `hr.recruitment.source`: `create_and_get_alias()`.
+
+**Behaviour changes**
+- Applicant identity data now lives on the applicant. Email and phone are computed from the contact and write back to it, creating the contact automatically (a contact name is required when one is created).
+- Duplicate detection is based on shared email, sanitized phone or LinkedIn profile, excludes talents, and is scoped per company.
+- Tags are no longer inherited from a candidate, and CV/attachments are no longer copied from candidate to applicant at creation.
+- Availability is no longer auto-updated from job position dates.
 
 ## How your habits should change
 
-* Stop creating Candidates: contact info, tags, CV, meetings and employee creation all happen on the application.
-* Duplicates ("other applications") are found automatically by matching email, phone or LinkedIn.
-* The Recruiter field on the job position is gone; recruiters/interviewers are set on applications or as job interviewers.
-* Mission dates (`date_from`/`date_to`) are no longer on job positions (the job-board integration app adds them back) and availability is no longer auto-updated from the mission end date.
-* Refusing uses the new action button (cog menu entry removed); the refuse wizard uses the standard email composer and lists duplicates as tags.
-* Attachments/CVs live on the application; job "Trackers" is now a page in the job form.
+- **Candidates are gone.** Keep creating applications as usual; to keep someone on file, promote the application to a talent and place it in a talent pool.
+- **Refusing** an applicant no longer uses a cog menu: a visible action button replaces it, the wizard uses the standard email composer, and duplicate applications are shown as tags (also when refusing several applicants at once).
+- **Job positions**: trackers are now a page rather than a stat button; key actions are reachable directly from the job position view.
+- **Skills**: define expected skills and the expected degree on the job position to benefit from the matching indicator.
 
 ## What you gain by migrating
 
-* A simpler, less redundant data model: no Candidate/Application duplication, fewer records to maintain.
-* Talent pools: build a reusable pool of profiles and generate applications for new openings in a few clicks.
-* Faster shortlisting thanks to expected skills/degrees and applicant-position matching.
-* Cleaner job dashboards (in-progress applications, activities, employees) and a more discoverable refuse flow.
-* Stronger communication on applications (phone/email blacklist, bounce handling) and performance work on applicant search and attachments.
+- A lighter recruitment flow: no candidate record to maintain, fewer clicks for occasional hiring.
+- Talent pools restore re-engagement and multi-position sourcing for teams that need it.
+- Skills-based matching with degree scoring helps shortlist candidates faster.
+- Cleaner screens and a more approachable refusal/duplicate experience.
+- A supported, upgrade-safe data model, since candidate data is migrated onto applications and talents.

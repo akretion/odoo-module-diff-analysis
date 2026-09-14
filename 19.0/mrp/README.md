@@ -2,45 +2,36 @@
 
 ## What's new for users
 
-The release notes we received for 19.0 cover localizations only — they contain no Manufacturing (mrp) chapter. Everything below comes from the addon's own commits.
+The Odoo 19.0 release notes we received cover Localizations (country accounting, payroll, e-invoicing) only. Nothing there concerns Manufacturing (mrp), so no release-note feature is highlighted here; the user-visible changes below come from the addon's own history.
 
-**One MO, many serial numbers.** A manufacturing order is no longer limited to one finished lot/serial. Lot-tracked products keep a single lot (selected or auto-generated, shown directly on the MO). Serial-tracked products generate their serials through a dedicated wizard, with a smart button showing the count and a Clear button to reset. On Shop Floor you are redirected to that wizard.
-
-**Free choice of units of measure.** Unit categories are gone. BoM lines, by-products and MOs can use any unit (buy in pieces, sell in kilograms). Selection is filtered by a new "allowed units" field built from the product's unit, its packagings and its vendors' units.
-
-**Simpler operation documents.** Worksheet type, description, PDF and Google Slide fields are removed from operations and work orders. Keep instructions (text) and one PDF at quality-check-point level.
-
-**Manufacturing security lead time removed** from settings. Use the BoM's "days to prepare MO", vendor lead times and company "days to purchase".
-
-**Planning and costing.** Work center capacities reworked, operation durations computed more consistently, operation cost estimation, blocked work centers visible in the Gantt view, and "Plan Orders" now lists work orders from alternative work centers.
-
-**Also:** standard batch size on BoMs, more reliable by-product quantities, the final product can be used as a component, replenishment rules can use the BOM or pricelist unit as ordering multiple, and a redesigned product catalog.
+- **Several serials per Manufacturing Order.** A MO can now produce more than one serial number instead of exactly one. Serials are generated from the MO (a wizard when several are needed) and listed behind a "Serial Numbers" smart button; on the shop floor the operator is taken to that wizard. For lot-tracked products you still set one lot, shown on the MO, with a Clear button. The single-MO "Mass Produce" flow is gone.
+- **Simpler operation documents.** Worksheet types and Google Slide URLs are gone from operations; documentation is now a description plus one PDF, handled at the quality point level.
+- **Manufacturing Security Lead Time removed.** The company-level lead time and its setting disappear.
+- **Free choice of units of measure.** Any unit allowed on the product (its own unit, its packagings, its vendors' units) can be used on MOs and BoMs.
+- **References instead of procurement groups.** MOs, moves and pickings are linked through reference documents and a production group that keeps child, parent and backorder MOs together.
 
 ## Technical data model changes
 
-- **mrp.production**: `lot_producing_id` → `lot_producing_ids` (many2many); added `serial_numbers_count`, `allowed_uom_ids`, `production_group_id`, `reference_ids`; removed `product_uom_category_id` and `procurement_group_id`; `action_mass_produce` removed, `action_generate_serial(workorder=)` plus new `action_view_serial_numbers` / `action_clear_lot_producing_ids`.
-- **mrp.workorder**: `finished_lot_id` → `finished_lot_ids`; worksheet fields and `_update_finished_move` removed.
-- **stock.move**: `order_finished_lot_id` → `order_finished_lot_ids`; added `production_group_id`; `is_done` removed.
-- **mrp.bom / mrp.bom.line / mrp.bom.byproduct**: UoM category fields and `onchange_product_uom_id` removed, `allowed_uom_ids` added; batch-size validation added.
-- **mrp.routing.workcenter**: worksheet fields and `note` removed; capacity/duration methods reworked around `_compute_cost`.
-- **mrp.unbuild**: `lot_id` is no longer computed from the MO.
-- **New models**: `mrp.production.group` (name, productions, child/parent groups) and `stock.reference`, which replaces `procurement.group`; work center capacities become their own records.
-- **res.company / res.config.settings**: `manufacturing_lead` and `use_manufacturing_lead` removed.
-- **Signatures**: `create(vals_list)`, `write(vals)`, `_action_confirm(create_proc=)`, `_split_productions(skip_procurement=)`, `_get_capacity(product, unit, default_capacity=)`; `toggle_active` replaced by `action_archive`/`action_unarchive`.
+- `procurement.group` is replaced by `stock.reference`; `mrp.production.procurement_group_id` becomes `reference_ids` (Many2many), as does `stock.move.group_id`.
+- New model `mrp.production.group` (`name`, `production_ids`, `child_ids`, `parent_ids`) and new `mrp.production.production_group_id` / `stock.move.production_group_id` fields. Child, source and backorder counts, picking links and backorder numbering use it. `stock.picking.production_ids` becomes a related One2many with a related `production_group_id`.
+- `mrp.production.lot_producing_id` becomes `lot_producing_ids` (Many2many) with a new `serial_numbers_count`. `mrp.workorder.finished_lot_id` → `finished_lot_ids`; `stock.move.order_finished_lot_id` → `order_finished_lot_ids`. `mrp.unbuild.lot_id` is no longer computed from the MO and is restricted by a related `lot_producing_ids`.
+- Removed from `mrp.routing.workcenter`: `worksheet_type`, `note`, `worksheet`, `worksheet_google_slide`; the related worksheet fields and `operation_note` go from `mrp.workorder`.
+- Removed: `res.company.manufacturing_lead` and the `use_manufacturing_lead` setting.
+- Removed `product_uom_category_id` on `mrp.bom`, `mrp.bom.line`, `mrp.bom.byproduct` and `mrp.production`; new computed `allowed_uom_ids` fields drive unit domains.
+- API: `_can_produce_serial_number` → `_can_produce_serial_numbers`; `_is_finished_sn_already_produced` → `_are_finished_serials_already_produced`; `_prepare_procurement_values` loses its `group` argument. Removed: `_prepare_procurement_group_vals`, `_set_lot_producing`, `action_mass_produce`, `MrpWorkorder._update_finished_move`. `action_generate_serial` accepts a `workorder`.
 
 ## How your habits should change
 
-- Produce serials through the wizard and review them via the smart button; do not expect a single serial per MO.
-- Ignore the old UoM-category warning — it no longer exists; pick any unit offered in the filtered list.
-- Attach instructions/PDF to the quality check point, not to the operation.
-- Remove security lead time from your planning; use BoM "days to prepare MO" and vendor delays.
-- Backorders and child MOs are grouped by production group/references instead of a procurement group on the MO.
-- Producing several units of a serial product in one work order is now allowed.
+- Do not expect one serial per MO: generate serials before marking a serial-tracked MO done. One lot per MO is still enforced.
+- Procurement groups are gone from MOs, moves and pickings. Trace a make-to-order sale to its MO, sub-MOs and backorders via references and the production group.
+- Merging moves into existing pickings is no longer group-driven: use batch/wave transfers, and the partner setting grouping RFQs by scheduled date.
+- Plan with BoM manufacturing lead time and "days to prepare MO" rather than a company security lead time.
+- Prepare operation documentation as a description plus one PDF.
+- Units of measure no longer need a shared category; product packagings and vendor units now define what is selectable.
 
 ## What you gain by migrating
 
-- Serial traceability at the scale of your real production runs: several serials per MO, one wizard, one smart button.
-- Real UoM flexibility (pieces vs kilograms) without category constraints or workarounds.
-- Cleaner operation documentation: one instruction text and one PDF where it matters.
-- Simpler lead-time model and better planning/costing visibility (capacities, durations, operation cost, alternative and blocked work centers).
-- A modernized data model (references, production groups) that keeps future 19.0 features in scope.
+- Serialised production in fewer documents: one MO covers a whole series of serial numbers.
+- Clearer genealogy: one production group connects a sale, its MO and all parent, child and backorder MOs.
+- References give a flexible, document-agnostic link between Inventory and MRP documents.
+- Lighter configuration: fewer worksheet options, no security lead time, and simpler unit-of-measure rules that allow buying and selling a product in genuinely different units.
