@@ -1,52 +1,39 @@
 # point_of_sale migration guide (17.0 -> 18.0)
 
-Summary of what changes in the Point of Sale app between Odoo 17.0 and 18.0, for users and for the underlying data model.
-
 ## What's new for users
 
-- **Redesigned POS screen**: the front end has been rebuilt with a simpler, more touch-friendly layout.
-- **Customer display without an IoT box**: the checkout screen is now a standalone app that can run on any remote device. Settings offer a single "Customer Facing Display" choice (same device / another device / IoT-connected screen) plus a background image.
-- **Editable payments**: payment methods can be corrected before the receipt is printed.
-- **QR code payments**: a QR payment method lets customers pay from their banking application.
-- **Cash difference logging**: opening and closing cash counts, expected amount, difference and notes are always recorded on the session.
-- **Create products in PoS**: products can be created and edited directly from the POS interface.
-- **One order at a time for refunds**: products from a single order only can be refunded in one refund.
-
-(The 18.0 release notes also list restaurant novelties such as predefined internal notes and table merge; those belong to the separate `pos_restaurant` app, not to this module.)
+- **Redesigned PoS interface**: the front end has been fully reworked for simplicity and speed.
+- **Create products in PoS**: create and edit products and their variants directly from the Point of Sale app.
+- **Customer display without an IoT box**: the display is now a standalone app that runs on any remote device on the network (tablet, PC). Setup is a single "Customer Facing Display" option — None / Same device / Another device / IoT-connected screen — plus a background image.
+- **QR code payments**: customers can pay by scanning the QR code with their bank application.
+- **Editable payments**: payments can be adjusted before the receipt is printed.
+- **Cash difference logging**: opening and closing cash counts are always recorded on the PoS session.
+- **Localization addons** (separate modules): JoFotara receipts (Jordan), on-demand ZATCA PDF (Saudi Arabia), TicketBAI (Spain), SInvoice e-invoices (Vietnam), QRIS status (Indonesia), EDI with POS orders (Peru).
 
 ## Technical data model changes
 
-**pos.order**
-- Removed: `is_refunded`, `refunded_order_ids` (Many2many), `refunded_orders_count`.
-- Added: `refunded_order_id` (Many2one) — "Order from which items were refunded in this order"; `refund_orders_count` now counts refund orders.
-- `create_from_ui()` → `sync_from_ui()`; `_process_order(order, draft, existing_order)` → `_process_order(order, existing_order)`.
-- `action_receipt_to_customer()` → `action_send_receipt(email, ticket_image, basic_image)`; `action_view_refunded_orders()` → `action_view_refunded_order()` (form) plus `action_view_refund_orders()`.
-- New tracking helpers for order control and payment changes (`_compute_is_edited`, `_create_pm_change_log`, `_post_chatter_message`).
-
-**pos.config**
-- Removed: `iface_customer_facing_display`, `..._via_proxy`, `..._local`, `..._background_image_1920`.
-- Added: `customer_display_type` (none / local / remote / proxy), `customer_display_bg_img`, `customer_display_bg_img_name`.
-- New: `update_customer_display(order, access_token)`, `_get_customer_display_data()`, `_get_display_device_ip()`, `set_opening_control()`, `delete_opening_control_session()`, `post_close_register_message()`.
-
-**New mixins**
-- `pos.bus.mixin`: brings `access_token` and `_notify()` to `pos.config`, `pos.session` and `pos.order`; the old `access_token` field and `_get_bus_channel_name()` on sessions disappear.
-- `pos.load.mixin`: standardises POS data loading with `_load_pos_data`, `_load_pos_data_fields`, `_load_pos_data_domain`, `_load_pos_data_models`, `_load_pos_data_relations`. It replaces the `_loader_params_*` / `_get_pos_ui_*` methods removed from `pos.session`, and is implemented on many standard models (products, partners, taxes, fiscal positions, journals, UoMs, picking types, …).
-
-**Other models**
-- `pos.payment`: `_create_payment_moves(is_reverse=False)`, `_check_amount()`.
-- `pos.payment.method`: QR support (`_compute_qr`, `_compute_hide_qr_code_method`, `get_qr_code()`, `_onchange_payment_method_type()`).
-- `pos.order.line`: `_get_discount_amount()`, `_prepare_tax_base_line_values()`, `get_existing_lots()`, `unlink()`.
-- `pos.session`: `find_product_by_barcode(barcode, config_id)`, `_get_sale_vals(key, sale_vals)`, `_post_cash_details_message(state, expected, difference, notes)`, `load_data(models_to_load, only_data)`.
-- Combo logic moved to the product module (`product.combo`, `product.combo.item`); matching `pos.combo` methods were removed.
-- Token-based access to product images for the customer display (`ir.binary`); product-level journal entries at session closing; amounts adjusted for reversed POS orders.
+- **New `pos.load.mixin`**: data sent to the PoS client is now declared per model through `_load_pos_data_domain()`, `_load_pos_data_fields()` and `_load_pos_data()`. `pos.session._load_data_params()` was removed and replaced by `_load_pos_data_models()`, which lists the loaded models. Nearly all POS models now inherit the mixin (pos.order and lines, payments and payment methods, printers, categories, bills, notes, taxes, cash rounding, fiscal positions, UoM, partners/companies/currencies/countries/languages, products, picking types, views). Custom server values can be sent using keys prefixed with `_`.
+- **New `pos.bus.mixin`** (`access_token` field, `_notify()` method), inherited by pos.config, pos.session and pos.order. The token field left `pos.session`; `_ensure_access_token()` and `_get_bus_channel_name()` were removed.
+- **Customer display fields replaced** on `pos.config`: `iface_customer_facing_display` (and its local / via-proxy / background-image variants) removed; added `customer_display_type`, `customer_display_bg_img`, `customer_display_bg_img_name`, plus `update_customer_display()` and `_get_customer_display_data()`.
+- **Combos moved to the Product module**: `pos.combo` becomes `product.combo`, `pos.combo.line` becomes `product.combo.item`, `combo_line_ids` becomes `combo_item_ids`, `pos.order.line.combo_line_id` becomes `combo_item_id`, and the extra-price field is renamed `extra_price`.
+- **Refund fields simplified**: `is_refunded`, `refunded_order_ids` and `refunded_orders_count` removed; `refunded_order_id` (single order) added. Actions renamed to `action_view_refunded_order` / `action_view_refund_orders`.
+- **Start Category removed**: `pos.config.iface_start_categ_id` and `start_category` deleted, together with their settings fields and constraint.
+- **Amounts are Monetary now**: `amount_total`, `amount_tax`, `amount_paid`, `amount_return`, `amount_difference`, `tip_amount` on orders, and `price_subtotal` / `price_subtotal_incl` on order lines. Decimals follow the session currency.
 
 ## How your habits should change
 
-- **Customer display setup**: forget the two checkboxes of 17.0 — pick one display type and upload the background image. Remote screens no longer need an IoT box, but each screen is opened separately.
-- **Refunds**: you no longer mix lines from several orders in one refund. The refund points to a single source order through `refunded_order_id`, and the smart button opens that order.
-- **Start category**: the "start category" configuration was removed; the POS opens on the available categories (use "Available PoS Product Categories" to restrict the list).
-- **Cash counts**: opening and closing differences are systematically logged on the session, so expect a trace even when counts match.
-- **Payments**: review the payment screen before printing — you can now fix or add payment lines at that stage.
+- Start Category is gone: use Restrict Categories to choose which categories appear in PoS.
+- Refund one order at a time: lines from several orders can no longer be grouped in a single refund; each refund is linked to one original order.
+- Combos are configured on the product (type "Combo") and shared with Sales and eCommerce; "Combo Lines" are now "Combo Items".
+- Customer display setup: pick a device type instead of ticking separate proxy/local options.
+- Custom developments must move from `_load_data_params` to the new `pos.load.mixin` hooks, and use `pos.bus.mixin` for tokens and bus notifications.
+- Amount fields keep their names but are currency-aware: review any integration that assumed fixed zero decimals.
 
 ## What you gain by migrating
 
+- A modern, faster till interface with fewer clicks for cashiers.
+- Customer displays on ordinary devices, with no IoT box to buy or maintain.
+- Combos usable consistently in Sales, eCommerce and the Point of Sale.
+- Refunds that follow accounting logic: one source order, one refund, correct reverse invoices.
+- In-store product creation, QR payments and broader fiscal compliance for POS orders.
+- A cleaner, per-model data-loading API, making future customizations easier to maintain.
