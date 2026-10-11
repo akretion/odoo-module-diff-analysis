@@ -1,46 +1,46 @@
 # pos_self_order migration guide (18.0 -> 19.0)
 
-_Scope: the Community addon `pos_self_order` (QR menu, QR ordering, Kiosk)._
-
 ## What's new for users
 
-The 19.0 release notes cover Point of Sale at a high level; only these points really touch self-ordering:
+- **Presets in self-ordering.** The "Self Takeaway" checkbox is gone. Self-order now uses Point of Sale *presets*: each preset states whether it is available in self-order and how the order is served (Pickup zone, Table or Delivery). This matches the 19.0 "PoS presets" release note — customers pick a schedule/mode instead of a binary takeaway flag.
+- **Products come from product templates.** The self-order catalog is built from `product.template` instead of `product.product`. Variants, attributes and pricelists are handled natively, removing a long-standing performance/limit issue on product cards.
+- **More reliable loading and receipts.** Self-order and the POS terminal now share one data-loading pipeline; session data (base URL, self-order marker) is attached consistently, fixing cases where receipts failed to print when the session object was missing in self-order.
 
-- **PoS presets** — create predefined presets that apply an order schedule and service mode at once (delivery, pick-up, and more). In self-order, presets are what replaces the old "Self Takeaway" flag: the guest chooses *how and where* the order is served instead of ticking a takeaway box.
-- **Allergen management for self-orders** is mentioned in the Restaurant part of the notes. It belongs to the Restaurant flow, so confirm availability in your edition before advertising it.
-
-The remaining release note items (ZPL formats, global invoice, product grouping, minimal rights profile, GoFood/GrabFood, one-click payment, due accounts, etc.) concern the cashier POS or are Enterprise-only and are **not** part of this addon. Most of the real work on `pos_self_order` shipped as quality fixes without dedicated release notes: kiosk layout and images, language selection, payment safety, receipt by email, QR codes.
+Note: self-order items in the release notes about restaurants (allergens, courses, preparation-time report) are Enterprise features, not part of this Community addon.
 
 ## Technical data model changes
 
-**Removed**
+Removed: `account.fiscal.position` no longer inherits the self-order loading mixin in this addon (its file is deleted).
 
-- `pos.config.self_ordering_takeaway` ("Self Takeaway") and `res.config.settings.pos_self_ordering_takeaway`: takeaway is now expressed through presets.
-- The dedicated self-order loader on `account.fiscal.position` (now handled by the shared POS loader).
-- `pos.order.sync_from_ui()` override (no longer needed once takeaway lives on presets).
-- `pos.session.create()` / `_create_pos_self_sessions_sequence()` overrides (order reference reworked in `point_of_sale`).
+Removed fields:
+- `pos.config.self_ordering_takeaway` ("Self Takeaway")
+- `res.config.settings.pos_self_ordering_takeaway` (related)
 
-**Added / changed**
+Added fields on `pos.preset`: `available_in_self` (Boolean, default False) and `service_at` (Selection: counter / table / delivery, default counter, required).
 
-- `pos.preset`: new `available_in_self` (boolean) and `service_at` (Pickup zone / Table / Delivery), plus `mail_template_id`; only presets flagged for self-order (and the default preset) are sent to kiosk/QR.
-- `pos.config`: `_prepare_self_order_splash_screen(vals_list, is_new=False)`, plus new helpers `_ensure_public_attachments()`, `_generate_single_qr_code(url)`, `get_pos_qr_order_data()`, `has_valid_self_payment_method()`, `_supported_kiosk_payment_terminal()`.
-- `pos.order`: new `action_pos_order_cancel()`, `action_send_self_order_receipt(email, mail_template_id, ticket_image, basic_image)`, `_send_payment_result(payment_result)`; `_process_saved_order(draft)` override dropped.
-- `product.template`: `_compute_self_order_visible()` (hides the self-order field when irrelevant), `_process_pos_self_ui_products()`; `product.template` / `product.product` also expose `_can_return_content()`.
-- **Unified loading API**: `_load_pos_self_data_domain(data, config)` and `_load_pos_self_data_fields(config)` now take the config *record*; new hooks `_load_pos_self_data_search_read()`, `_load_pos_self_data_read()`, `_load_pos_data_read()`, `_load_pos_data_models()` replace the old `_load_pos_self_data()` / `_post_read_pos_self_data()` pattern. Custom or OCA modules overriding the old methods must be ported.
-- `ir.http.get_nearest_lang()` (language selection), `res.config.settings._generate_excel(rows, headers)` (table URLs to XLSX).
-- Odoo-wide: `write()` now takes `vals` instead of `vals_list`.
+Loading API reworked on all models:
+- `_load_pos_self_data_domain(self, data)` → `_load_pos_self_data_domain(self, data, config)`
+- `_load_pos_self_data_fields(self, config_id)` → `_load_pos_self_data_fields(self, config)`
+- `_load_pos_self_data()` and `_post_read_pos_self_data()` are replaced by `_load_pos_self_data_read(self, records, config)` and the new `_load_pos_self_data_search_read(self, data, config)`.
+- `config` is now a `pos.config` record, not an id or `data['pos.config'][0]`; domains read the config directly (e.g. `config.floor_ids.ids`, `config.default_preset_id.id`).
+
+Other models:
+- `pos.session`: `_post_read_pos_data` / `_post_read_pos_self_data` replaced by `_load_pos_data_read`; `_base_url` and `_self_order_pos` are no longer set on the session payload.
+- `pos.order`: the `sync_from_ui` override (takeaway preservation) is removed.
+- `product.product`: loading fields, onchange and write hooks move to `product.template`; the product card model is `product.template`.
+- `res.partner`: self-order domain returns `False` (no partner data loaded).
+- `mail.template`, `product.tag`, `pos.payment.method`, `restaurant.floor`, `restaurant.table`, `pos_self_order.custom_link` were updated to the new signatures.
 
 ## How your habits should change
 
-- **Retire the Self Takeaway setting.** Configure presets instead (service at = counter / table / delivery) and flag those available in self-order; the default preset is applied automatically.
-- The Self Ordering settings block keeps mode, service mode and default language — only the takeaway toggle disappears.
-- Re-test kiosk and QR devices end to end: splash/background images, kiosk layout, language selection and payment flows were all reworked.
-- Have your integrator review any custom code that extended the self-order data loading or `product.product`/`product.template` write methods.
+- Stop configuring the "Self Takeaway" option in POS settings: it no longer exists. Create presets instead, enable "Available in Self" on the ones to expose, and set "Service at" (Pickup zone, Table, Delivery).
+- Review every preset (schedule, mail template, service location): order mode is now chosen per preset, not globally.
+- Product availability in self-order still uses `self_order_available` / `public_description`, now stored and loaded on `product.template`; unchecking "Available in POS" still clears self-order availability.
+- Custom developments must adopt the new `(data, config)` signatures and `_load_pos_self_data_read`; the old `_post_read_pos_self_data` hook no longer exists.
 
 ## What you gain by migrating
 
-- **One loading pipeline for POS and self-order**, removing the "works in the cashier, fails in the kiosk" class of bugs; receipts print reliably because session data is loaded consistently.
-- Correct catalogue: unavailable products are not pushed to guests, archived variants are handled.
-- Safer payments: orders are not sent to preparation when payment fails; payment results are reported back.
-- Better guest experience: improved kiosk responsiveness and image loading, working language selection, receipt by email from self-order, QR code generation for tables, XLSX export of table URLs.
-- Smaller technical debt: fewer duplicated overrides to maintain across upgrades.
+- Real service-mode choices for customers (pickup, table, delivery) instead of one takeaway flag.
+- Attributes, variants and pricelists usable in the self-order catalog, with better performance on large catalogs.
+- One loading pipeline shared with the POS terminal: fewer edge cases, reliable session/base-URL data and printing.
+- Less dead code (fiscal-position shim, takeaway overrides) and simpler customizations.

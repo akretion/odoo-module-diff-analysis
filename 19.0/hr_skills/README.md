@@ -2,50 +2,43 @@
 
 ## What's new for users
 
-- **Skills and certifications are now cleanly separated.** Certifications get a dedicated menu item and their own tab on the Employee form. A skill type can be flagged as a certification; certified skill types are shown with a medal marker.
-- **Validity periods.** Skills and certifications carry *Validity Start* / *Validity Stop* dates. The Employee form exposes a "current skills" view that only shows what is still valid today, while expired certifications remain visible for history.
-- **Faster skill entry.** Adding or updating a skill on an employee opens a dedicated dialog that is pre-filled, so you no longer juggle skill type / skill / level dropdowns on the employee form itself.
-- **Resume improvements.** Resume lines gained an external URL and colour handling, so external trainings and courses can be linked from the employee resume (part of the broader resume / LMS rework).
+- **Certifications are now a first-class concept.** A skill type can be flagged as a certification. Certifications get their own menu entry and a dedicated tab on the Employee form, separate from regular skills.
+- **Skill management has been reworked.** Employee skill lines now carry a *Validity Start* / *Validity Stop* period, so a skill can have a history (e.g. "English A2 from January to June", then "English B1").
+- **No more "Skills History" screen.** History is no longer stored in a separate log; it is reconstructed from the validity dates on the skill lines themselves.
+- **Improved creation dialog.** Adding a skill or a certification from an employee is done through a dedicated, simplified pop-up with a quick "Save" action.
+- **Clearer validation.** Odoo blocks overlapping periods, an end date before the start date, or a skill that does not belong to the selected skill type.
+
+Only these items relate to `hr_skills`; the rest of the 19.0 release notes concerns other apps.
 
 ## Technical data model changes
 
-**Models**
-- New abstract model `hr.individual.skill.mixin`, shared by `hr.employee.skill` and `hr.job.skill`. Field definitions and constraints were moved here.
-- **`hr.employee.skill.log` is removed** (file deleted). There is no longer a separate, department-scoped skills history model.
+**New model**
+- `hr.individual.skill.mixin` (abstract): shared logic for skill/certification lines. Fields: `skill_id`, `skill_level_id`, `skill_type_id`, `level_progress`, `color`, `valid_from` (default today), `valid_to`, `levels_count`, `certification_skill_type_count`, `is_certification` (related to `hr.skill.type.is_certification`), `display_warning_message`. Constraints: `_check_not_overlapping_regular_skill`, `_check_date`, `_check_skill_type`, `_check_skill_level`.
 
-**Fields added**
-- `hr.employee`: `current_employee_skill_ids`, `certification_ids` (computed, writable).
-- `hr.employee.public`: same two fields (related, read-only).
-- `hr.skill.type`: `sequence`, `levels_count`, `is_certification`.
-- `hr.employee.skill` / `hr.job.skill` (via mixin): `valid_from`, `valid_to`, `levels_count`, `certification_skill_type_count`, `is_certification` (related), `display_warning_message`.
-- `hr.job`: `current_job_skill_ids`, `skill_ids`.
-- `hr.resume.line`: `color`, `external_url`.
+**Removed model**
+- `hr.employee.skill.log` ("Skills History") is deleted, along with `_create_logs()` and every automatic log creation in `hr.employee.skill` and `hr.employee.write()`.
 
-**Field behaviour changes**
-- `hr.skill.level` ordering changed from `level_progress desc` to `level_progress`.
-- `hr.skill.type` ordering changed from `name` to `sequence, name`.
-- `hr.skill.level._compute_display_name` (the "name (x%)" dropdown label) was removed.
-- Writing skill fields on `hr.employee` is now transformed into archive/create commands; the old department-driven log creation is gone.
-
-**Method changes**
-- Removed from `hr.employee.skill`: `create`, `write`, `_create_logs`, `_compute_skill_id`, `_compute_skill_level_id`, `_compute_display_name`, `_check_skill_type`, `_check_skill_level` (logic moved to the mixin).
-- Added on the mixin: `_create_individual_skills`, `_write_individual_skills`, `_expire_individual_skills`, `_get_transformed_commands`, `_get_overlapping_individual_skill`, `_check_date`, `_check_not_overlapping_regular_skill`, `_onchange_valid_date`, `_can_edit_certification_validity_period`, `_linked_field_name`.
-- Added on skills: `open_hr_employee_skill_modal`, `action_save`, `get_current_skills_by_employee`.
-- Added on `hr.employee`: `_compute_certification_ids`, `_compute_current_employee_skill_ids`.
-- **`res.users` fields removed**: hr_skills no longer extends `res.users`; skills and resume lines are no longer available on the user preferences / profile form.
+**Changed**
+- `hr.employee.skill` now `_inherit = 'hr.individual.skill.mixin'`; gains `valid_from`, `valid_to`, `is_certification`. The SQL constraint `unique (employee_id, skill_id)` is dropped and replaced by overlap checks (one active line per skill, several certifications allowed if their periods differ).
+- `level_progress` is no longer stored or aggregated (previously stored with the `avg` aggregator).
+- `hr.employee`: new `current_employee_skill_ids` and `certification_ids` (computed, writable; `create()`/`write()` fold them into transformed `employee_skill_ids` commands). `write()` no longer creates log entries when `department_id` changes.
+- `hr.employee.public`: added related `current_employee_skill_ids` and `certification_ids` (read-only).
+- `hr.employee.skill`: new `_linked_field_name()`, `get_current_skills_by_employee()`, `open_hr_employee_skill_modal()`, `action_save()`, plus inherited `_create_individual_skills()` / `_expire_individual_skills()`.
+- `res.users`: the whole `hr_skills` extension is removed (`resume_line_ids`, `employee_skill_ids`, `current_employee_skill_ids`, `certification_ids`, `SELF_READABLE_FIELDS` / `SELF_WRITEABLE_FIELDS`); view `hr.res_users_view_form_simple_modif` removed.
 
 ## How your habits should change
 
-- **Do not look for the old "Skills History" log.** History is now the list of skill and certification records themselves, each with a validity period.
-- **Editing is not overwriting.** Changing a level archives the previous record (`valid_to` = yesterday) and creates a new one. This is intentional: it preserves traceability. Consequently records can only be truly deleted when created within the last 24 hours or already expired; otherwise they are archived.
-- **Constraints are stricter.** One active skill per skill is allowed for an employee; several certifications with the same skill and level are allowed only if their date ranges differ. Overlaps and duplicates are rejected with an error listing the conflicting records, and a stop date earlier than the start date is blocked.
-- **Certifications are managed from their tab/menu**, not from the generic skills list.
-- **Skills are no longer self-editable from Preferences**; they are maintained on the employee record (by HR or the employee form).
-- **Job position skills** do not expose the certification validity period: validity dates apply to employee records.
+- Stop looking for the Skills History log: read history from the validity dates on the skill lines.
+- Editing a skill does not overwrite it. Odoo archives the previous line and creates a new one.
+- Removing a current skill effectively archives it (validity stop set to yesterday); only very recent lines are truly deleted. Certifications, however, can be deleted at any time.
+- Skills self-service from the Preferences/Profile form is gone: manage skills from the Employee form.
+- Flag the relevant skill types as certifications to get the dedicated menu and tab.
+- Existing 18.0 data is handled by the upgrade scripts shipped with the migration.
 
 ## What you gain by migrating
 
-- Auditability without a side table: every level change is a dated record, so you can see what an employee knew and when.
-- Certifications tracked with real validity windows — expiries are visible instead of being tacit knowledge.
-- Consistent rules for employees and job positions thanks to the shared mixin, with clearer error messages on overlaps.
-- Cleaner data entry through the dedicated skill dialog on the employee form.
+- Proper certification tracking: expiry dates, a dedicated tab and menu, and explicit warnings instead of silent overwrites.
+- A reliable, audit-friendly skill history without an extra log model, so past skill levels stay consistent in reports.
+- Cleaner employee records (archiving instead of deleting) and fewer data-entry errors thanks to overlap and date validation.
+- A simpler, faster skill-creation dialog for HR users.
+- Skills are managed in one place — the employee — while user preferences stay focused on user settings.

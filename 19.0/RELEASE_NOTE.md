@@ -1,5 +1,4 @@
-# 
- Odoo 19
+# Odoo 19
 
 ## Release Notes
 September 2025

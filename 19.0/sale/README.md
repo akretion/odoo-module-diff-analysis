@@ -1,52 +1,25 @@
 # sale migration guide (18.0 -> 19.0)
 
-What changes in the **Sales** app (`sale`) between Odoo 18.0 and 19.0, for functional users and for teams preparing the upgrade.
+The Sales addon changes mostly under the hood in 19.0, but several field names and a few day-to-day behaviours change. Here is what users will see and what to review before migrating.
 
 ## What's new for users
 
-- **Catalog sections**: build quotations section by section from the product catalog, with search/tags.
-- **Optional sections**: a section or sub-section of a quotation can be marked optional; portal customers can choose quantities on those lines. (Optional *products* are replaced by optional sections.)
-- **Hide section prices or composition**: a (sub)section can show only its total, hiding line prices or the lines themselves, in reports and in the portal.
-- **Combos**: quantities and choices are easier to edit from the backend, and combo line totals now appear in the backend and in reports.
-- **Print and mark as sent**: a button prints the quotation and flags it as sent, without emailing it.
-- **Delivery date**: only Goods products are considered (services no longer push the expected date).
-- **Packagings are merged into Units of Measure**; packaging definitions are now UoM records.
-- **Down payment account** is set once per company in Accounting settings instead of per product category.
+- **Packagings merged with units of measure.** Product packagings are no longer a separate concept: define an extra unit of measure on the product and select it on the order line. Extra units are also selectable on the eCommerce product page.
+- **Catalog sections.** Create and manage order sections directly in the catalog, and search products by tags.
+- **Hide section prices and composition.** (Sub)section lines can hide their prices (showing only the total) or hide their whole content, in reports and in the portal.
+- **Optional sections in the portal.** Sections and subsections of a quotation can be flagged as optional, and portal users can set the quantity of those lines themselves.
+- **Combo products.** Combo quantities and choices can now be modified from the backend.
+- **Expected delivery date.** It is now computed from Goods products only; services no longer push the delivery date.
+- **Print a quotation without sending it.** A button lets you print and mark a quotation as sent without sending the email.
+- **Down payment account.** The Down payment Account is no longer set per product category; it is a company-level setting in Accounting settings.
 
 ## Technical data model changes
 
-Renamed fields (check imports, exports, EDI and custom code):
-`sale.order.line.product_uom` -> `product_uom_id`, `sale.order.line.tax_id` -> `tax_ids`, `product.pricelist.item.product_uom` -> `product_uom_name`.
+**sale.order.line**
+- `product_uom` renamed `product_uom_id` (also purchase.order.line, sale.report, product.supplierinfo); compute `_compute_product_uom` → `_compute_product_uom_id`.
+- `tax_id` renamed `tax_ids`, compute `_compute_tax_id` → `_compute_tax_ids`, aligning with account.move.line.
+- `product_packaging_id` and `product_packaging_qty` removed, with their computes and onchange; the `product.packaging` model and its `sales` field are gone.
+- `parent_id` (parent section) is no longer stored and the `child_ids` One2many is removed; totals now rely on `_get_section_lines` / `_is_line_in_section`. `collapse_prices` and `collapse_composition` now default to False.
 
-Removed:
-- model `product.packaging` (with its Sales flag) and the sale order line fields `product_packaging_id` / `product_packaging_qty`;
-- blocking warnings: `res.partner.sale_warn`, `product.template.sale_line_warn` (the message fields remain, shown in warning boxes);
-- CRM team statistics `quotations_count`, `quotations_amount`, `sales_to_invoice_count`;
-- `product.category.property_account_downpayment_categ_id` (replaced by `res.company.downpayment_account_id`);
-- `sale.order.line.child_ids`; `parent_id` is no longer stored.
-
-Added:
-- `sale.order.preferred_payment_method_line_id`;
-- quotation import template support (`get_import_templates`).
-
-Behaviour changes:
-- `sale_async_emails` is merged into `sale`: order emails can be queued and sent by a cron.
-- `sale.order` inherits `account.document.import.mixin`; `_create_order_from_attachment`, `_extend_with_attachments` and `_get_order_edi_decoder` give way to the generic `_decode_attachment` flow.
-- Section logic is reworked around `_get_section_lines`, `_is_line_in_section`, `get_parent_section_line`, `_get_section_totals`.
-
-Method signature changes for custom modules: `_get_product_catalog_record_lines(product_ids, *, section_id=None)`, `_update_order_line_info(product_id, quantity, *, section_id=False, child_field='order_line')`, `_prepare_procurement_values()` (no more `group_id`), `_send_order_notification_mail(mail_template, allow_deferred_sending=True)`, `payment.transaction._compute_reference_prefix(separator, **values)`.
-
-## How your habits should change
-
-- Warnings no longer block. Partner and product sales warnings appear in a warning box and the "block" behaviour is gone: you can always add the line or confirm the order.
-- There is no Packaging field on order lines anymore. Create the matching Unit of Measure on the product and select it on the line.
-- Configure the Downpayment Account once, on the company (Accounting settings), rather than per product category.
-- Sales team kanban no longer shows quotations or amounts to invoice; use list/pivot views with grouping instead.
-- On quotations, the new collapse/hide options directly change what the customer sees in the portal and on the PDF.
-
-## What you gain by migrating
-
-- A simpler configuration: packagings folded into units of measure, a single down payment account per company, non-blocking warnings.
-- Better quotations: catalog sections, optional sections customers can fill in, hidden prices, combo totals, print-and-send.
-- Cleaner data and performance: fewer stored computed fields, no unused team statistics, asynchronous email sending, and a shared document-import engine for orders and invoices.
-- Staying on a maintained version, with sales aligned on the 19.0 accounting, UoM and fiscal engines.
+**Warnings**
+- `res.partner.sale_warn` and `product.template.sale_line_warn` are removed; the message fields `sale_warn_msg` / `sale_line_warn_msg` remain. The blocking warning

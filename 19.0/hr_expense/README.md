@@ -2,48 +2,43 @@
 
 ## What's new for users
 
-**Expense reports are gone.** Expense reports were removed because most reports contained a single expense, and forcing a report added unnecessary steps. You now create one expense and submit it directly.
+**Expense reports are gone.** In 18.0 you had to create an expense report (`hr.expense.sheet`) to group expenses before submitting, approving and posting them. In 19.0 the report object no longer exists: an expense is now its own document, which matches the common usage where a report usually contained a single expense.
 
-**Batch submission, approval and posting from the list view.** Select several expenses in the Expenses list and submit, approve or post them together: the old report-by-report flow is replaced by standard multi-select actions.
+To keep the batch workflow, select several expenses in the list view and use the action buttons to submit, approve or post them all at once.
 
-**Consolidated reimbursements.** For employee-paid ("to reimburse") expenses, posting several expenses at once generates a single vendor bill per employee.
+- Employee-paid (to reimburse) expenses selected together still generate **a single vendor bill per employee**.
+- Company-paid (paid by company) expenses must be posted individually: each one gets its own dedicated journal entry.
 
-The 19.0 release notes for Expenses are short. The physical expense card features (Stripe / Mastercard Issuing) and the Belgian disallowed-expense percentage change belong to Enterprise or localization addons, not to this Community addon. Everything else below comes from the actual code changes.
+**Approval is simplified.** A new approval state (Submitted / Approved / Refused) lives on the expense itself, with an approval date. When an employee has no expense manager, submitting an expense also approves it automatically, so no unnecessary validation step blocks the flow.
+
+**Disallowed expenses** now use an allowed percentage instead of a disallowed percentage, so deductibility above 100% (e.g. Belgium) can be expressed; the report shows both amounts in that case (report availability depends on your Accounting apps).
+
+Note: physical expense cards (Mastercard / Stripe Issuing) mentioned in the 19.0 release notes rely on Enterprise-only modules and are not part of a Community deployment.
 
 ## Technical data model changes
 
-Model removed
-* `hr.expense.sheet` (including its `ir.attachment` override) is deleted; its remaining logic moved to `hr.expense`.
+Removed model: `hr.expense.sheet`.
 
-`hr.expense`
-* Removed: `sheet_id`, `approved_by`, `approved_on`, `accounting_date`.
-* Added: `department_id`, `manager_id` (stored computes), `approval_state`, `approval_date`, `account_move_id`, `journal_id`, `payment_method_line_id`, `selectable_payment_method_line_ids`, `untaxed_amount`, `amount_residual`, `can_reset`, `can_approve`, and `former_sheet_id` (integer, keeps the old report grouping for data migration).
-* `state` selection reworked: `draft`, `submitted`, `approved`, `posted`, `in_payment`, `paid`, `refused`. The old `draft` / `reported` / `done` values are gone; `approval_state` tracks submitted / approved / refused separately.
-* New constraints: a total of 0 is allowed only in draft; one expense per payment; each company-paid expense needs its own journal entry.
-* Behaviour: submitting an expense also approves it when no expense manager is set for the employee.
-
-`account.move`
-* `expense_sheet_id` → `expense_ids` (One2many), `nb_expenses` added, `show_commercial_partner_warning` removed, `action_open_expense_report` → `action_open_expense`.
-* A move can only hold several expenses when none is paid by the company.
-
-`account.payment`: `expense_sheet_id` → `expense_ids`; `action_open_expense_report` → `action_open_expense`.
-
-`account.move.line`: filters on `expense_id.payment_mode` instead of the sheet.
-
-`hr.department`: `expense_sheets_to_approve_count` → `expenses_to_approve_count` (counts submitted expenses).
-
-`hr.employee`: `expense_manager_id` is now taken from the employee's parent/manager without requiring the expense group.
-
-`res.company` / `res.config.settings`: `expense_outstanding_account_id` removed; the outstanding account now comes from the chart of accounts (created automatically if missing), while a per-payment-method account is still honoured.
+- `hr.expense`: removed `sheet_id`, `approved_by`, `approved_on`, `accounting_date`. Added `account_move_id`, `journal_id` (related to the payment method line), `payment_method_line_id` with `selectable_payment_method_line_ids`, `amount_residual`, `untaxed_amount`, `department_id`, `manager_id`, `approval_state`, `approval_date`, `can_reset`, `can_approve`, and `former_sheet_id` (integer preserving the old report grouping during migration).
+- `hr.expense.state` reworked: `draft, submitted, approved, posted, in_payment, paid, refused` (`reported` and `done` are gone).
+- `account.move`: `expense_sheet_id` replaced by an `expense_ids` One2many plus `nb_expenses`; `action_open_expense_report` becomes `action_open_expense`; a new constraint forbids several company-paid expenses on one entry; the "all entries must be deleted together" guard is removed.
+- `account.payment`: `expense_sheet_id` becomes `expense_ids`; `action_open_expense_report` becomes `action_open_expense`; the same deletion guard is removed.
+- `hr.department`: `expense_sheets_to_approve_count` becomes `expenses_to_approve_count` (counts submitted expenses).
+- `hr.employee`: the expense manager is now derived from the parent hierarchy without requiring the expense approver group.
+- `res.company` / `res.config.settings`: `expense_outstanding_account_id` is removed; the outstanding account now comes from the payment method's payment account or the chart of accounts default (created automatically if missing).
 
 ## How your habits should change
 
-* Stop creating reports: create expenses and submit them individually or by multi-selection.
-* Use multi-select plus the Actions menu to submit, approve and post in one go.
-* Company-paid expenses: one expense = one journal entry, so group only employee-paid expenses (they merge into a single bill per employee).
-* Review employee managers, since approval routing no longer requires the expense group.
-* Accounting: configure outstanding accounts in the chart of accounts rather than in the Expenses settings.
+- Stop creating and validating expense reports: create expenses, then select them in the list view.
+- Use multi-selection to submit, approve or post in batch, and check the Journal Entry smart button on the expense.
+- Company-paid expenses: one expense = one entry. Expect separate postings instead of a single grouped entry.
+- Remove the outstanding account setting from Accounting settings; if the default account is archived, activate it or the flow will warn you.
+- Since approval can be automatic, make sure expense managers are configured for employees who still need a real validation.
 
 ## What you gain by migrating
 
-Fewer clicks end to end, with no report to create or forget; faster approval for employees who have no expense manager (auto-approval on submit); batch handling of many expenses; consolidated per-employee bills for reimbursements; a leaner data model with no intermediate report object; and less configuration, since the outstanding account follows the standard chart of accounts. The upgrade path keeps the legacy report grouping in `former_sheet_id`, so historical data stays readable.
+- Fewer clicks: no report to create for a single expense.
+- Consolidated posting for employee reimbursements, individual accuracy for company-paid expenses.
+- Clearer statuses (draft, submitted, approved, posted, paid) tracked directly on the expense.
+- One less configuration field to maintain for company-paid expenses.
+- A supported upgrade path: history is preserved and old reports are collapsed into expenses.

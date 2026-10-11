@@ -1,50 +1,41 @@
 # fleet migration guide (18.0 -> 19.0)
 
-Scope: the Community `fleet` addon. Odoo 19.0 reworks where the "plan to change" flags live, standardises how vehicle specifications are stored, and adds mileage reporting.
-
 ## What's new for users
 
-The official 19.0 release notes mention only one Fleet novelty:
-
-- **Odometer report** – a report of the average mileage per month, computed from a vehicle's odometer records, is now available.
-
-Everything else below comes from the addon's own data model and forms. The 19.0 release notes contain no other Community Fleet item; Fleet entries listed under Localizations belong to other modules and are not part of this addon.
+- **Odometers report**: a new report shows the average mileage per month, based on your odometer records. It helps spot vehicles that are over- or under-used.
+- The official 19.0 release notes say very little about Fleet itself: the only Fleet-specific entry is the odometers report above. Everything else that changes for you comes from the addon rework described below (vehicle model configuration and the "plan to change" flags).
 
 ## Technical data model changes
 
-**"Plan to change" flags moved from contacts to vehicles**
-- The `fleet` extension of `res.partner` is removed: contact-level `plan_to_change_car` / `plan_to_change_bike` no longer exist.
-- On `fleet.vehicle`, these fields are no longer related stored fields; they are plain booleans owned by each vehicle.
-- Setting a *Future Driver* now flags that driver's vehicles of the same type (grouped write) instead of one shared contact flag. Promoting the future driver to driver clears the flags on the vehicle.
+**Vehicle model configuration revamp (PR #197440)**
+- `model_year` on `fleet.vehicle.model` and `fleet.vehicle` changed from an Integer to a Selection listing years from 1970 up to the current year.
+- New field `drive_type` on `fleet.vehicle.model`: Front-Wheel Drive (FWD), All-Wheel Drive (AWD), Rear-Wheel Drive (RWD), Four-Wheel Drive (4WD).
+- New field `range_unit` (km / mi, default km, required) on both `fleet.vehicle.model` and `fleet.vehicle`.
+- New field `co2_emission_unit` (g/km or g/mi) on both models: computed from `range_unit`, stored, required.
+- `power` and `horsepower` changed from Integer to Float on both `fleet.vehicle.model` and `fleet.vehicle`.
+- Labels and help texts updated: `seats` → "Seating Capacity", `doors` → "Number of Doors", `co2` / `default_co2` → "CO₂ Emissions", `co2_standard` → "Emission Standard", power unit option "Horsepower" → "Horsepower (hp)". Tooltips were added for trailer hitch, number of doors and emission standard.
 
-**Vehicle model / specification revamp**
-- `model_year`: free text/Integer → Selection of years from 1970 to the current year, on `fleet.vehicle.model` and `fleet.vehicle`.
-- New `range_unit` (km / mi, default km) on the model, propagated to the vehicle.
-- New `co2_emission_unit` (g/km or g/mi), computed from `range_unit`, on model and vehicle.
-- New `drive_type` on `fleet.vehicle.model`: Front-Wheel (FWD), All-Wheel (AWD), Rear-Wheel (RWD), Four-Wheel (4WD).
-- `power` and `horsepower` changed from Integer to Float (decimals allowed) on model and vehicle; the power unit label "Horsepower" becomes "Horsepower (hp)".
-- Renamed labels: "Seats Number" → "Seating Capacity", "Doors Number" → "Number of Doors", "CO2 Emissions" → "CO₂ Emissions", "CO2 Standard" → "Emission Standard". New help texts on trailer hitch, doors and emission standard.
-
-**Other changes**
-- `fleet.vehicle`: new `action_open_odometer_report()`; `_clean_vals_internal_user()` signature changed.
-- `fleet.vehicle.odometer`: new `_compute_driver_id()` – odometer records keep the driver history.
-- `fleet.vehicle.model.brand`: new `action_open_brand_form()` (clicking a kanban card opens the brand form).
-- Per-field `_compute_*` methods added on `fleet.vehicle` so model values no longer overwrite fields that were manually edited (fixes a reset issue reported when migrating from 18.2).
+**"Plan to change" flags are no longer contact fields (PR #197812)**
+- The `res.partner` inheritance (`fleet/models/res_partner.py`) was deleted: `plan_to_change_car` and `plan_to_change_bike` no longer exist on contacts.
+- On `fleet.vehicle` they become plain Booleans instead of fields related to `driver_id.plan_to_change_*`.
+- The flags are now written on every vehicle of the same type whose driver matches the future driver, and cleared when the driver change is actually performed. An upgrade script accompanies this change.
 
 ## How your habits should change
 
-- Maintain *Plan to change car / bike* on each vehicle: the contact form no longer shows these flags, and a change no longer applies to all of a driver's vehicles at once.
-- Pick the model year from the list (1970 → current year) instead of typing it; check that existing values are valid years.
-- Set range and CO₂ units once on the vehicle model: kilometres imply g/km, miles imply g/mi, and the vehicle inherits them.
-- Power and horsepower accept decimal values (e.g. 110.5 kW).
-- Renamed labels may affect saved filters, favourites, exports and Studio/custom reports using the old wording.
-- Use the new odometer report for mileage-per-month analysis instead of exporting odometer records.
+- Model year is picked from a dropdown (1970 → current year) instead of being typed. Check imported data before the migration.
+- Emissions unit follows the range unit: km gives g/km, mi gives g/mi. Always check the unit before comparing CO₂ figures between vehicles or in exports.
+- Power and horsepower now accept decimals (e.g. 110.5 kW) and are no longer rounded to whole numbers.
+- Field labels changed in forms, list views, filters and exports ("Seating Capacity", "Number of Doors", "Emission Standard", "CO₂ Emissions"). Update saved filters, exports and custom reports using the old names.
+- "Plan to change car / bike" is now tracked per vehicle, not per contact. Two vehicles of the same driver can differ, and both flags are reset when the future driver becomes the actual driver. Remove any custom filters or reports on `res.partner.plan_to_change_*`, and review automations that relied on the shared contact value.
+- Enrich your vehicle models with drive type and range unit so vehicles inherit consistent data.
 
 ## What you gain by migrating
 
-- Mileage analytics out of the box: average monthly mileage per vehicle from real odometer records.
-- A cleaner "plan to change" workflow: flags follow the vehicle, not the driver's contact, and are reset consistently when the future driver takes over.
-- Better vehicle catalogue quality: standardised model years, drive type, and consistent metric or imperial units for range and CO₂ — useful for mixed fleets and reporting.
-- Manual specification edits (seats, doors, power, colour, category…) are no longer silently overwritten by model defaults after the upgrade.
-- Faster navigation from the brand kanban to the brand form, and driver history preserved on odometer records.
-- Staying current: 19.0 is the supported release, while fixes on 18.0 wind down over time.
+- Cleaner, better documented vehicle data: standardized labels, tooltips, explicit units and a year picker reduce entry mistakes.
+- New attributes (drive type, range unit, CO₂ unit) that make fleet and emissions reporting accurate instead of unit-ambiguous.
+- Decimal precision on power and horsepower.
+- The new odometer-based average mileage per month report.
+- Per-vehicle "plan to change" tracking removes the surprising side effect where one contact flag changed every vehicle of that driver.
+- You move to a still-supported version and keep receiving fixes; the 18.0 → 19.0 migration of this data is handled by standard upgrade scripts.
+
+*Note: the release notes also mention Fleet in the ESG (carbon) and Mexico Carta Porte sections. Those live in Enterprise / localization apps and are not part of this Community addon.*

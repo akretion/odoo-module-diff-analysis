@@ -2,38 +2,47 @@
 
 ## What's new for users
 
-The official 19.0 release notes cover this area with a single line, under **Inventory**: *"Inventory valuation has been simplified and new features have been added, including a new closing interface and support for transfer backdating."* Everything else below comes from the addon's own changes.
+Odoo 19 rewrites inventory valuation in `stock_account`. The official release notes summarize it as: "Inventory valuation has been simplified and new features have been added, including a new closing interface and support for transfer backdating."
 
-- **Valuation modes renamed.** "Manual" / "Automated" become **"Periodic (at closing)"** and **"Perpetual (at invoicing)"**. Product forms and filters using the old labels must be updated.
-- **A closing interface.** A dedicated closing step compares the inventory value computed from documents with the balance of the valuation account and suggests the correcting entry. It also surfaces errors such as backdated moves and rounding differences.
-- **Backdated transfers are supported**, and are regularised by the closing entry instead of rewriting history.
-- **A closing report shows goods delivered but not invoiced and bills to receive**, so you can book the corresponding accruals.
-- **No more input/output interim accounts.** The stock input and output accounts (and their reconciliation) are gone. Valuation now relies on a single stock valuation account, plus a stock variation/expense account.
-- **New "Price Difference Account"** on the product category (perpetual valuation), holding the gap between the standard price and the bill price.
-- **Value priority is explicit**: manual value > bill/invoice > purchase/sales order > standard price. Manual updates are logged in a new `product.value` object.
+In practice:
+- Valuation modes are renamed: "Manual" becomes Periodic (at closing), "Automated" becomes Perpetual (at invoicing). Behavior follows the name: perpetual valuation is posted when you invoice or bill, not when you deliver or receive.
+- Input and Output interim accounts are gone. In perpetual, the closing report shows the purchase/sales documents delivered but not yet invoiced so you can post the corresponding accruals. Full automation of accrual entries is still listed as remaining work by Odoo.
+- A new closing interface drives periodic valuation: Odoo compares the balance of the valuation account with the computed value of the products and proposes the difference.
+- Backdated transfers are supported; the errors they used to create are absorbed by the closing entry instead of replaying history.
+- Manual value adjustments are recorded in a dedicated product value log instead of being deduced from a layer ledger.
 
 ## Technical data model changes
 
-- **`stock.valuation.layer` is removed.** All related fields disappear from `stock.move`, `product.product`, `product.template`, `stock.lot`, `account.move` and `account.move.line`. Value is now stored on the **stock move**.
-- New model **`product.value`** records manual valuation updates.
-- `account.move`: `stock_move_id` becomes the One2many `stock_move_ids` (inverse `stock.move.account_move_id`).
-- `account.move.line`: new file, `stock_valuation_layer_ids` removed; `cogs_origin_id` kept; `_eligible_for_cogs` becomes `_eligible_for_stock_account`; `_stock_account_get_anglo_saxon_price_unit` becomes `_get_cogs_value`; new `_get_stock_moves`; the `_get_exchange_journal` / `_get_exchange_account` overrides are gone.
-- `account.move`: `_stock_account_prepare_anglo_saxon_out_lines_vals` becomes `_stock_account_prepare_realtime_out_lines_vals`; `_stock_account_anglo_saxon_reconcile_valuation` and `_stock_account_get_last_step_stock_moves` are removed (replaced by `_get_related_stock_moves`); `_post` no longer reconciles COGS lines but recomputes move values.
-- COGS journal items now debit the **stock valuation account** and credit the expense/variation account, instead of the old stock output/input interim accounts.
-- `account.account`: new `account_stock_variation_id` and `account_stock_expense_id`.
-- `product.template`: new `property_price_difference_account_id`; removed `property_stock_account_input_categ_id`, `property_stock_account_output_categ_id`, `valuation_in_account_id`, `valuation_out_account_id`, `group_stock_accounting_automatic`; `property_stock_journal` renamed `stock_journal`.
-- `product.product`: `avg_cost` and `total_value` are now **stored** fields; `value_svl` and `quantity_svl` are removed. `stock.lot.avg_cost` is likewise a stored Monetary field.
-- `product.template.write()` no longer empties and replenishes stock with valuation entries when the category, cost method or lot valuation changes.
-- The chart template no longer pushes category stock accounts through `ir.default` (`_post_load_data` removed).
+Removed
+- Model `stock.valuation.layer`, plus its `stock_valuation_layer_ids` relations on `account.move`, `account.move.line`, `product.product`, `stock.move` and `stock.lot`.
+- On `product.category`: `property_stock_account_input_categ_id`, `property_stock_account_output_categ_id`, `valuation_in_account_id`, `valuation_out_account_id`, `group_stock_accounting_automatic`.
+- On `product.template`/`product.product`: computed `value_svl`, `quantity_svl`, `total_value` and computed `avg_cost`.
+- `account.move.stock_move_id`, and the anglo-saxon interim reconciliation method.
+
+Added / changed
+- `account.move.stock_move_ids` (One2many) supersedes `stock_move_id`.
+- New model `product.value` logging manual valuation updates.
+- `account.account`: `account_stock_variation_id`, `account_stock_expense_id`.
+- `product.template.property_price_difference_account_id` (perpetual difference between standard and bill price).
+- `property_stock_journal` renamed to `stock_journal`; chart templates now write `stock_journal` and no longer push stock accounts as `ir.default`.
+- `avg_cost` becomes a stored field (notably on lots) instead of computed.
+- `account.move._post` now calls `line_ids._get_stock_moves()._set_value()`.
+- Renames: `_stock_account_prepare_anglo_saxon_out_lines_vals` -> `_stock_account_prepare_realtime_out_lines_vals`; `_stock_account_get_anglo_saxon_price_unit` -> `_get_cogs_value`; `_eligible_for_cogs` -> `_eligible_for_stock_account`.
+- COGS lines are generated whenever valuation is perpetual (no longer gated on anglo-saxon); the stock side hits the valuation account instead of Stock Interim Delivered. Value priority: manual value, then bill/invoice, then PO/SO, then standard price.
+- Bill/invoice lines: `_compute_account_id` assigns the valuation account for perpetual products, or the stock variation account under anglo-saxon accounting.
 
 ## How your habits should change
 
-- **Post the invoice or bill** to generate cost of goods sold and valuation entries; deliveries and receipts no longer move valuation.
-- **Stop configuring input/output accounts.** Configure the valuation account, the stock journal and, for perpetual, the price difference account.
-- **Run the closing routine at period end** instead of relying on interim account reconciliation. Review the suggested difference entry, backdated moves, and the delivered-not-invoiced / billed-not-received sections before validating accruals.
-- Changing a cost method or category no longer writes automatic stock-out/stock-in entries: the value is recomputed from documents, so verify the result through the closing report.
-- **Any customization or report built on stock valuation layers (`value_svl`, `quantity_svl`, SVL records, anglo-saxon reconciliation methods) must be rewritten.** Plan a technical audit before migrating.
+- Stop checking the Stock Valuation Layers list: it no longer exists. Trace value from stock moves and the valuation/closing report.
+- In perpetual, expect accounting entries at invoice/bill time, not at delivery. Deliveries only move quantities.
+- Configure a single stock valuation account (plus variation/expense accounts) instead of input/output accounts.
+- Run the closing report regularly: it is where you spot gaps (uninvoiced deliveries, rounding, backdated moves).
+- With standard or average cost, COGS uses the product cost; under FIFO it uses the average price of the related moves.
+- Anglo-saxon users no longer reconcile interim accounts; review your account setup before go-live.
 
 ## What you gain by migrating
 
-- **Much simpler stock accounting**: no valuation-layer table, no interim input/output accounts, no COGS reconciliation run.
+- Far less bookkeeping noise: no layer ledger to reconcile, no per-delivery interim entries.
+- One auditable closing workflow for both periodic and perpetual valuation, with explicit visibility of goods delivered not invoiced and bills to receive.
+- Backdating becomes usable again: mistakes are corrected at closing instead of forcing history replays.
+- Simpler configuration for new companies, and a valuation justified from recent documents rather than the full move history.

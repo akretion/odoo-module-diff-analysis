@@ -2,48 +2,49 @@
 
 ## What's new for users
 
-Landed costs are now built on Odoo 19's rewritten inventory valuation engine. The official release notes only mention this topic once, under Inventory: *"Inventory valuation has been simplified and new features have been added, including a new closing interface and support for transfer backdating."* There is **no dedicated release-notes entry for landed costs** — everything below comes from the code changes shipped with that valuation rewrite.
+Odoo 19.0 rebuilt inventory valuation. The official release notes only mention it briefly under **Inventory**: *"Inventory valuation has been simplified and new features have been added, including a new closing interface and support for transfer backdating."* Landed costs are not named, so the points below come from the Community code itself (`stock_account` / `stock_landed_costs`).
 
-What a landed cost user actually gets:
+Unchanged: the landed cost form, the split methods (equal, by quantity, by weight, by volume, by current cost) and the *Compute Landed Cost* button work as before.
 
-- Landed cost amounts are prorated on the quantity **still in stock**, and only that remaining part generates an accounting entry.
-- The cost is stored as a value on the stock move (a landed cost value per move) instead of being tracked in separate valuation layers.
-- Values can be read "at a date", so reports and closings can reflect landed costs at a given point in time.
-- Adding a landed cost product through a catalog/quick-add flow now takes the landed cost into account correctly (19.0 fix).
+Changed when you validate and post a landed cost:
+
+- **Valuation layers are gone.** No more `stock.valuation.layer` records, and no "Stock Valuation Layers" list to open from a landed cost.
+- **The cost now sits on the receipt's stock move**, added on top of the move value, instead of creating extra layers.
+- **No more "already out of stock" entries.** Odoo 18 posted extra lines for goods already delivered or sold (stock output account, plus a COGS entry in anglo-saxon mode). Odoo 19 only adjusts what is still in stock; the rest is handled by the new closing interface.
+- **No more automatic reconciliation** of the vendor bill against the stock input account when the landed cost is posted.
+- **Standard price, FIFO and AVCO are no longer adjusted** by a landed cost.
 
 ## Technical data model changes
 
-**Models**
-- `stock.valuation.layer` is removed; the addon's inheritance of it (and its `stock_landed_cost_id` field) is gone.
-- `stock.landed.cost.stock_valuation_layer_ids` (One2many to `stock.valuation.layer`) is removed.
-- `stock.landed.cost.reconcile_landed_cost()` and `action_view_stock_valuation_layers()` are removed.
-- `account.move._post()` override removed: posting a vendor bill no longer re-runs landed cost reconciliation. Validation now triggers `_set_value()` on the moves of the adjustment lines.
-- New `account.move._update_order_line_info()` override (landed cost from catalog fix).
+Removed:
+- `stock.valuation.layer` inheritance (`stock_valuation_layer.py` deleted) and its `stock_landed_cost_id` field.
+- `stock.landed.cost.stock_valuation_layer_ids` (One2many).
+- Methods `action_view_stock_valuation_layers()` and `reconcile_landed_cost()`.
+- The `account.move._post()` override that called `reconcile_landed_cost()`.
+- The `account.move.line._get_stock_valuation_layers()` override.
 
-**stock.move**: removed `_get_stock_valuation_layer_ids()`; added `_get_landed_cost(at_date=None)` and `_get_value_from_account_move(quantity, at_date=None)`.
-
-**account.move.line**: removed `_get_stock_valuation_layers(move)` and `_eligible_for_cogs()`; added `_eligible_for_stock_account()`.
-
-**stock.valuation.adjustment.lines**
-- `_create_accounting_entries(remaining_qty)` (was `_create_accounting_entries(move, qty_out)`).
-- `_create_account_move_line(credit_account_id, debit_account_id, remaining_qty)` (was `(move, credit_account_id, debit_account_id, qty_out, already_out_account_id)`). The entry amount is prorated by `remaining_qty / quantity`, and **no lines at all** are created when nothing remains in stock.
-
-**Accounts**
-- Landed cost lines now default to the product's `expense` account instead of `stock_input`; the vendor-bill journal entry uses `stock_valuation` instead of `stock_input`.
-- Input/output accounts no longer exist, so the "already out" counterpart lines — and the dropship special case using the expense account — are gone.
-- On valuation adjustment lines, `former_cost` is now taken from the move's value rather than summing valuation layers.
+Changed:
+- `_eligible_for_cogs()` renamed to `_eligible_for_stock_account()`.
+- Landed cost lines created on the vendor bill now use the **stock valuation** account (was **stock input**).
+- The default account of a landed cost line is now the **expense** account (was **stock input**).
+- `_create_accounting_entries(move, qty_out)` becomes `_create_accounting_entries(remaining_qty)`.
+- `_create_account_move_line(move, credit, debit, qty_out, already_out_account)` becomes `_create_account_move_line(credit, debit, remaining_qty)`: it returns no line when nothing remains in stock, and prorates the amount by `remaining_qty / quantity`.
+- `stock.move._get_stock_valuation_layer_ids()` is replaced by `_get_landed_cost(at_date=None)`; `_get_value_from_account_move()` is overridden to add the landed cost value to the move.
+- `get_valuation_lines()` reads `former_cost` from `move._get_value()[0]` instead of summing layers.
+- `button_validate()` posts the accounting entry (real-time products only) and calls `_set_value()` on the related moves.
 
 ## How your habits should change
 
-- Review product accounting configuration for landed cost products: the **expense** account is now the counterpart and the **stock valuation** account is debited. Stock Input / Stock Output accounts are no longer used.
-- Do not expect a reconciliation step between the vendor bill and the landed cost entry; it no longer exists. The value is recomputed from the moves.
-- Landed costs only capitalize what is still in stock at validation. Costs allocated to goods already shipped no longer produce dedicated "already out" entries.
-- The valuation-layers button/action on a landed cost is gone — use the standard inventory valuation views instead.
-- Historical 18.0 valuation layers are not carried over; the 19.0 value is recomputed from accounting documents (bill, order, standard price).
+- Stop auditing landed costs through valuation layers; check the receipt's stock move value instead.
+- Reconciliation with the stock input account is no longer automatic, and input/output accounts no longer exist as a concept in the new valuation engine. Review your landed cost accounting configuration before going live.
+- Update the accounts set on your landed cost products and lines: defaults moved to the expense account, and the vendor bill line now targets the stock valuation account. Expect different (and fewer) journal items on validation.
+- Adapt any report or customization reading `stock.valuation.layer` or `stock_landed_cost_id`.
+- Test on a copy of your database: validate landed costs on partially delivered receipts and compare the entries with 18.0. Use the new closing interface and back-dating support to handle goods already delivered but not yet invoiced.
 
 ## What you gain by migrating
 
-- Landed costs handled by the new, document-driven valuation engine, consistent with bills and stock moves.
-- Value-at-date support, useful for closings and backdated transactions.
-- Fewer accounts to configure (no input/output accounts) and no manual reconciliation to babysit.
-- A single source of truth for cost of goods — the stock move — with landed costs included.
+- A simpler valuation model: one value per stock move, justified by actual documents rather than a long chain of layers.
+- A dedicated closing interface that surfaces delivered-not-invoiced and to-receive items, so accruals are visible instead of hidden in layers.
+- Back-dated transfers are supported, so correcting an earlier receipt no longer means replaying history.
+- Fewer input/output accounts to configure and fewer manual reconciliation steps.
+- Landed costs fit the new model natively: the cost is reflected in the move value at a given date, which makes reporting and audits easier.

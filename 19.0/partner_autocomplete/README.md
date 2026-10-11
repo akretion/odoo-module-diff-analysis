@@ -1,54 +1,53 @@
 # partner_autocomplete migration guide (18.0 -> 19.0)
 
-This guide covers the `partner_autocomplete` addon (partner/company enrichment from the Contacts and form views) between Odoo 18.0 and Odoo 19.0.
+Scope: the Community addon `partner_autocomplete` (company/contact autocomplete and enrichment through Odoo IAP).
 
 ## What's new for users
 
-**A new data provider: Dun & Bradstreet.** Autocomplete has been moved away from Clearbit, which was judged unreliable. Functionality and pricing remain the same, but data quality improves substantially, especially outside Europe. Company logos still come from Clearbit, as D&B does not provide them yet.
+**A new data provider: Dun & Bradstreet.** Company data no longer comes from Clearbit, it now comes from Dun & Bradstreet through Odoo IAP. The official release notes state that the functionality and the pricing remain the same, while data quality is drastically improved, especially for markets outside Europe. Clearbit is still used for logos, which D&B does not provide yet.
 
-**More ways to search and enrich.** Instead of one generic call, the service now exposes separate actions: search by name, search by VAT, enrich by domain, enrich by DUNS number, and enrich by GST number (India).
+**Country-aware lookups.** Name and VAT searches now take a country into account; they default to your company's country, and passing 0 explicitly removes the country filter for broader results.
 
-**A DUNS number field.** Contact and company form views now run the autocomplete widget on the DUNS field as well as Name and VAT, so a company can be identified and updated from its D&B identifier.
+**More fields covered.** The autocomplete widget, previously attached to the Name and VAT fields on contact/company forms, is now also attached to the DUNS number field.
 
-**Country-aware suggestions.** Searches by name or VAT now send a country context, defaulting to your own company's country; this reduces wrong matches. A no-country search remains possible.
+**Richer enrichment result.** When the provider returns a preferred language, it is mapped to an installed language and set on the partner; activity (UNSPSC) codes returned by the provider become partner tags.
 
-**Language and industry filled in.** The provider's preferred language is mapped to an installed Odoo language, and industry information is transmitted as a code.
-
-**Background sync removed.** The "autosync" mechanism that pushed your Odoo company data back to the provider database no longer exists.
-
-*Note:* automatic partner category tags from UNSPSC codes are only triggered through CRM enrichment (Enterprise), not by the Community addon alone.
+Note: the release notes mainly mention the provider change. The rest of the behaviour described here comes from the code changes themselves.
 
 ## Technical data model changes
 
-**Model removed:** `res.partner.autocomplete.sync` (fields `partner_id`, `synched`; methods `add_to_queue`, `start_sync`), together with its scheduled sync job. Pending sync records have no equivalent in 19.0.
+Removed model:
+- `res.partner.autocomplete.sync` (`partner_id`, `synched`) with its `start_sync` / `add_to_queue` methods: the whole background autosync queue is gone.
 
-**Fields removed:**
+Removed fields:
 - `res.partner.partner_gid` (Integer, "Company database ID")
 - `res.partner.additional_info` (Char)
-- `res.company.partner_gid` (stored related field on `res.partner.partner_gid`, with inverse `_inverse_partner_gid`)
+- `res.company.partner_gid` (related to `partner_id.partner_gid`, stored, inverted by `_inverse_partner_gid`)
 
-**Methods removed:** `autocomplete`, `enrich_company`, `read_by_vat`, `create`, `write`, `check_gst_in`, `_is_vat_syncable`, `_is_synchable`, `_is_company_in_europe`, `_update_autocomplete_data`, `_iap_replace_logo`, `_enrich_replace_o2m_creation`, `_inverse_partner_gid`, `add_to_queue`, `start_sync`.
+Removed methods:
+- `res.company._inverse_partner_gid`, `res.company._enrich_replace_o2m_creation`
+- `res.partner._iap_replace_logo`, `_is_company_in_europe`, `_is_vat_syncable`, `check_gst_in`, `_filter_synchable`, `_update_autocomplete_data`, and the `create` / `write` overrides that fed the sync queue.
 
-**Methods added:** `autocomplete_by_name`, `autocomplete_by_vat`, `enrich_by_domain`, `enrich_by_duns`, `enrich_by_gst`, `_process_enriched_response`, `_iap_replace_language_codes`, `_iap_replace_industry_code`, `iap_partner_autocomplete_get_tag_ids` / `iap_partner_autocomplete_add_tags`.
+Changed method signatures:
+- `autocomplete(query, timeout)` → `autocomplete_by_name(query, query_country_id, timeout)`; `read_by_vat(vat, timeout)` → `autocomplete_by_vat(vat, query_country_id, timeout)`.
+- `enrich_company(company_domain, partner_gid, vat, timeout)` → `enrich_by_domain(domain, timeout)`, plus new `enrich_by_duns(duns, timeout)` and `enrich_by_gst(gst, timeout)`; all rely on a common `_process_enriched_response`.
+- `_format_data_company` now also converts language codes (`_iap_replace_language_codes`); new `iap_partner_autocomplete_add_tags(unspsc_codes)`.
+- IAP route changed from `/iap/partner_autocomplete` to `/api/dnb/1`.
 
-**Other deltas:** the IAP route changed from `/iap/partner_autocomplete` to `/api/dnb/1`; the `field_partner_autocomplete` widget is now applied to `name`, `vat` and `duns`; the enrichment error message becomes "Unable to enrich company (no credit was consumed)."
+Views: the company/contact form no longer injects a hidden `partner_gid` field, and the autocomplete widget now also targets `duns`.
 
 ## How your habits should change
 
-- Your company data is no longer pushed to the provider database in the background; enrichment is on demand only.
-- Creating or editing a partner with a VAT no longer queues a sync: nothing happens until you use the widget.
-- The chatter note "Company auto-completed by Odoo Partner Autocomplete Service" is no longer posted.
-- Enriching a company no longer creates child contacts (branches) or bank accounts automatically; only the company itself is filled in.
-- Searches by name or VAT are now performed in a country context by default, so check the country before trusting an empty result.
-- Any saved search, report or export using `partner_gid` must be adapted: the field has been dropped and its values are not migrated. Use the DUNS number instead.
-- Custom modules calling `autocomplete()`, `enrich_company()` or `read_by_vat()` must be rewritten to use the new split methods (`enrich_by_domain`, `enrich_by_duns`, `enrich_by_gst`, `autocomplete_by_name`, `autocomplete_by_vat`).
+- No more background sync. Creating or updating a company with a provider ID and a syncable VAT used to silently queue it to push data back to the provider, tracked by a "synched" flag. That queue and its model are removed: there is nothing to sync or monitor anymore.
+- No more chatter trace. Enrichment no longer posts "Company auto-completed by Odoo Partner Autocomplete Service" notes on the record.
+- Less is written automatically on companies. Enrichment no longer creates child contacts, no longer creates related records (such as bank accounts) from one2many payloads, and the backend no longer downloads and injects a logo image. Review the enriched result before saving.
+- Reports, filters, exports or automations using `partner_gid` or `additional_info` must be updated or dropped; `duns` is the identifier to use now.
+- Custom code calling `autocomplete`, `enrich_company` or `read_by_vat` must be adapted to the new methods.
+- Remove any scheduled action referring to `res.partner.autocomplete.sync`; it disappears with the model.
 
 ## What you gain by migrating
 
-- Better company data (addresses, VAT, industry, language), notably for markets outside Europe.
-- Identification of companies by DUNS and GST numbers, in addition to name, domain and VAT.
-- Country-scoped suggestions that reduce incorrect matches.
-- A simpler data model: no sync table and no sync job to maintain, fewer obsolete fields on contacts.
-- Same functionality and same IAP pricing as before.
-
-For an 18.0 database, plan a short functional test of the contact and company enrichment flows, and audit any customization that reads `partner_gid` or calls the removed methods before migrating.
+- Noticeably better company data, especially outside Europe, thanks to Dun & Bradstreet, with unchanged IAP functionality and pricing.
+- Enrichment by domain, DUNS number or GST/VAT number, and country-aware name and VAT lookups.
+- A simpler data model: no sync queue, no `partner_gid` / `additional_info` technical fields, no hidden chatter noise.
+- Enrichment results that respect the partner's language and can tag partners with their activity codes automatically.
