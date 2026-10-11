@@ -1,0 +1,166 @@
+PR: https://github.com/odoo/odoo/pull/286716
+
+From: 8b031fa8ba060e94e3364e086e980440d5954725
+From: amdi-odoo
+Date: 2026-09-10 09:45:05
+
+Breaking data model changes scores: del:2 + add:0, change matches:
+-    active = fields.Boolean('Active', default=True)
+-    partner_checked = fields.Boolean('Checked', default=True)
+
+Total Changes: 62
+
+[IMP] calendar: improve calendar side panel filters
+
+Purpose
+=======
+Improve the calendar side panel attendees filtering.
+
+Specification
+=============
+Changing the regular attendee filters display consisting of checkboxes
+into an attendee records selector with a search input and attendee tags.
+Each attendee tag matching the color of the related attendee calendar events.
+
+The filters will be defaulted to the partners listed in the context's
+"default_partner_ids" key if there is any. If there's none, they will be
+completely reset.
+
+Also adding a "My calendar" filters so that users can choose between showing/hiding
+their events.
+
+When creating a calendar event, the selected attendee filters will be used
+as default attendees for the event.
+The current user will also be added in the default attendees if the "My calendar" filter is checked.
+
+Task-5946597
+
+closes odoo/odoo#286716
+
+Related: odoo/enterprise#130670
+Related: odoo/upgrade#11276
+Signed-off-by: Thibault Delavallee (tde) <tde@openerp.com>
+Co-authored-by: Jérémy Hennecart (jeh) <jeh@odoo.com>
+
+================================= pseudo patch: =================================
+
+--- a/addons/calendar/models/calendar_filter.py
++++ b/addons/calendar/models/calendar_filter.py
+@@ -1,5 +1,7 @@
+ # Part of Odoo. See LICENSE file for full copyright and licensing details.
+ 
++from dateutil.relativedelta import relativedelta
++
+ from odoo import api, fields, models
+ 
+ 
+@@ -7,16 +9,57 @@ class CalendarFilters(models.Model):
+     _name = 'calendar.filters'
+     _description = 'Calendar Filter'
+ 
++    active = fields.Boolean('Active', default=True)  # Whether or not the partner filter is activated for user_id
+     user_id = fields.Many2one('res.users', 'Me', required=True, default=lambda self: self.env.user, index=True, ondelete='cascade')
+     partner_id = fields.Many2one('res.partner', 'Employee', required=True, index=True)
+-    active = fields.Boolean('Active', default=True)
+-    partner_checked = fields.Boolean('Checked', default=True)  # used to know if the partner is checked in the filter of the calendar view for the user_id.
+ 
+     _user_id_partner_id_unique = models.Constraint(
+         'UNIQUE(user_id, partner_id)',
+         'A user cannot have the same contact twice.',
+     )
+ 
++    @api.autovacuum
++    def _gc_calendar_filters(self):
++        """ Making sure to unlink the inactive filters which haven't been updated for more than a month. """
++        threshold = fields.Datetime.now() - relativedelta(months=1)
++        self.search([
++            ('active', '=', False),
++            ('write_date', '<', threshold),
++        ]).unlink()
++
+     @api.model
+-    def unlink_from_partner_id(self, partner_id):
+-        return self.search([('partner_id', '=', partner_id)]).unlink()
++    def init_partner_filters(self):
++        """ Default the partners filters on the ones listed in the context 'default_partner_ids' key if any.
++        If there's none, reset every partner filters.
++        """
++        self.update_partner_filters(self.env.context.get('default_partner_ids', []))
++
++    @api.model
++    def update_partner_filters(self, partner_ids):
++        """ Update current user partner filters.
++        Deactivating a partner filter by writing "active" to false instead of unlinking.
++        This keeps things fast and safe, as the filter can be reactivated/deactivated instantly and
++        the calendar view can reload right away (no need to debounce to prevent record not found crashes).
++
++        :param partner_ids: Ids of the partners for which the filters should be activated.
++                             Not considering the current user partner as the current user events filtering
++                             is handled separatly from the partner filters.
++        """
++        requested_partner_ids = set(partner_ids) - {self.env.user.partner_id.id}
++        existing_filters = self.with_context(active_test=False).search([('user_id', '=', self.env.user.id)])
++        new_partner_ids = requested_partner_ids - set(existing_filters.partner_id.ids)
++        filters_to_activate = existing_filters.filtered(
++            lambda f: f.partner_id.id in requested_partner_ids and not f.active
++        )
++        filters_to_deactivate = existing_filters.filtered(
++            lambda f: f.partner_id.id not in requested_partner_ids and f.active
++        )
++        if new_partner_ids:
++            self.create([
++                {'active': True, 'partner_id': partner_id, 'user_id': self.env.user.id}
++                for partner_id in new_partner_ids
++            ])
++        if filters_to_activate:
++            filters_to_activate.active = True
++        if filters_to_deactivate:
++            filters_to_deactivate.active = False
+
+--- a/addons/calendar/models/mail_activity.py
++++ b/addons/calendar/models/mail_activity.py
+@@ -35,6 +35,13 @@ class MailActivity(models.Model):
+     def action_create_calendar_event(self):
+         self.ensure_one()
+         action = self.env["ir.actions.actions"]._for_xml_id("calendar.action_calendar_event")
++        # The event default partners should be the current user +
++        # the activity related record "customer" (aka main partner)
++        default_partners = self.user_id.partner_id
++        if self.res_model and self.res_id:
++            record = self.env[self.res_model].browse(self.res_id).exists()
++            if record and record.has_access('read'):
++                default_partners |= record._mail_get_customer()
+         action['context'] = {
+             'default_activity_type_id': self.activity_type_id.id,
+             'default_res_id': self.env.context.get('default_res_id'),
+@@ -42,7 +49,7 @@ class MailActivity(models.Model):
+             'default_name': self.res_name,
+             'default_description': self.note if not is_html_empty(self.note) else '',
+             'default_meeting_activity_ids': [(6, 0, self.ids)],
+-            'default_partner_ids': self.user_id.partner_id.ids,
++            'default_partner_ids': default_partners.ids,
+             'default_user_id': self.user_id.id,
+             'initial_date': self.date_deadline,
+             'default_calendar_event_id': self.calendar_event_id.id,
+
+--- a/addons/calendar/models/res_users.py
++++ b/addons/calendar/models/res_users.py
+@@ -32,7 +32,6 @@ class ResUsers(models.Model):
+         self.ensure_one()
+         partner_ids = self.env['calendar.filters'].search([
+             ('user_id', '=', self.id),
+-            ('partner_checked', '=', True)
+         ]).partner_id.ids
+ 
+         if include_user:
+
+--- a/addons/calendar/models/res_users_settings.py
++++ b/addons/calendar/models/res_users_settings.py
+@@ -15,6 +15,7 @@ class ResUsersSettings(models.Model):
+         store=True, readonly=False, help="Default privacy setting for whom the calendar events will be visible."
+     )
+     calendar_show_activities = fields.Boolean(string='Show Activities in Calendar', default=True)
++    calendar_hide_my = fields.Boolean(string='Hide My Calendar from Calendar')
+ 
+     @api.model
+     def _get_fields_blacklist(self):

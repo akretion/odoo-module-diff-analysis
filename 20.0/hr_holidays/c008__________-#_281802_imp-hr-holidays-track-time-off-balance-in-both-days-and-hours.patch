@@ -1,0 +1,541 @@
+PR: https://github.com/odoo/odoo/pull/281802
+
+From: 343e0b7a4b9a67159a43ab5789b441ed690d296e
+From: 3amo-magdy
+Date: 2026-09-09 10:58:59
+
+Breaking data model changes scores: del:1 + add:0, change matches:
+-    number_of_hours_display = fields.Float(
+
+Total Changes: 265
+
+[IMP] hr_holidays: track time off balance in both days and hours
+
+Adds a generic extension point so a leave type's day/hour balance can be
+tracked as two independent counters instead of one derived from the other:
+
+* Extracted the per-work-entry-type leave consumption loop into
+  _consume_leaves_for_work_entry_type, operating on a list of `LeaveCounter`
+  (a way to track both days and hours for some specific tome types)
+
+* Added _get_consumed_leaves_extra_counters(work_entry_type), empty by default:
+  a module can register additional counters consumed in the same
+  FIFO pass as the primary one. Only the primary counter (the type's own
+  unit_of_measure) can block a request; extra counters never block, they
+  just go negative on the last allocation touched instead (see
+  l10n_be_hr_payroll).
+
+* Renamed `number_of_hours_display` to number_of_hours on hr.leave.allocation,
+  now that it not just derived from number_of_days.
+
+Task-6212208
+
+closes odoo/odoo#281802
+
+Related: odoo/enterprise#127573
+Related: odoo/upgrade#11001
+Signed-off-by: Yannick Tivisse (yti) <yti@odoo.com>
+
+================================= pseudo patch: =================================
+
+--- a/addons/hr_holidays/models/hr_employee.py
++++ b/addons/hr_holidays/models/hr_employee.py
+@@ -97,10 +97,11 @@ class HrEmployee(models.Model):
+             for work_entry_type in leaves_taken[employee]:
+                 if not work_entry_type.requires_allocation or work_entry_type.hide_on_dashboard or not work_entry_type.active:
+                     continue
++                primary_unit = 'hours' if work_entry_type.unit_of_measure == 'hour' else 'days'
+                 for allocation in leaves_taken[employee][work_entry_type]:
+                     if allocation and allocation.date_from <= current_date\
+                             and (not allocation.date_to or allocation.date_to >= current_date):
+-                        virtual_remaining_leaves = leaves_taken[employee][work_entry_type][allocation]['virtual_remaining_leaves']
++                        virtual_remaining_leaves = leaves_taken[employee][work_entry_type][allocation][f'{primary_unit}_virtual_remaining_leaves']
+                         employee_remaining_leaves += virtual_remaining_leaves\
+                             if work_entry_type.unit_of_measure == 'day'\
+                             else virtual_remaining_leaves / (employee.resource_calendar_id.hours_per_day or HOURS_PER_DAY)
+@@ -573,12 +574,12 @@ class HrEmployee(models.Model):
+         #  |--employee_id
+         #      |--work_entry_type_id
+         #          |--allocation
+-        #              |--virtual_leaves_taken
+-        #              |--leaves_taken
+-        #              |--virtual_remaining_leaves
+-        #              |--remaining_leaves
+-        #              |--max_leaves
+-        #              |--accrual_bonus
++        #              |--{days,hours}_virtual_leaves_taken
++        #              |--{days,hours}_leaves_taken
++        #              |--{days,hours}_virtual_remaining_leaves
++        #              |--{days,hours}_remaining_leaves
++        #              |--{days,hours}_max_leaves
++        #              |--{days,hours}_accrual_bonus
+         # - VALUES:
+         # Integer representing the number of (virtual) remaining leaves, (virtual) leaves taken or max leaves
+         # for each allocation.
+@@ -586,7 +587,10 @@ class HrEmployee(models.Model):
+         # also based on leaves in "confirm" or "validate1" state.
+         # Accrual bonus gives the amount of additional leaves that will have been granted at the given
+         # target_date in comparison to today.
+-        # The unit is in hour or days depending on the leave type request unit
++        # These 6 keys are always prefixed with the unit they're expressed in. The leave type's own
++        # request unit (the "primary" one) gets the full set above; the complementary unit is always
++        # also tracked in the same pass, but only exposed as its `_taken`/`_remaining` pair (e.g. a
++        # day-based type's hours_taken/hours_remaining) - see l10n_be_hr_payroll's negative-hours warning.
+         # 2) The second is a dictionary mapping the remaining days per employee and per leave type that are either
+         # not taken into account by the allocations, mainly because accruals don't take future leaves into account.
+         # This is used to warn the user if the leaves they takes bring them above their available limit.
+@@ -622,7 +626,7 @@ class HrEmployee(models.Model):
+             else:
+                 if allocation.accrual_plan_id and not ignore_future:
+                     future_leaves = allocation._get_additionnal_future_leaves_on(target_date, precomputed_allocations)
+-                max_leaves = (allocation.number_of_hours_display
++                max_leaves = (allocation.number_of_hours
+                     if allocation.work_entry_type_id.unit_of_measure == 'hour'
+                     else allocation.number_of_days) + future_leaves
+             allocation_data.update({
+@@ -653,47 +657,93 @@ class HrEmployee(models.Model):
+                         }
+                     )
+ 
+-                allocations_with_date_to = self.env['hr.leave.allocation']
+-                allocations_without_date_to = self.env['hr.leave.allocation']
+-                for leave_allocation in allocations_per_employee_type[employee][work_entry_type]:
+-                    if leave_allocation.date_to:
+-                        allocations_with_date_to |= leave_allocation
+-                    else:
+-                        allocations_without_date_to |= leave_allocation
++                if work_entry_type.unit_of_measure == 'day':
++                    primary_amount_field, primary_unit = 'number_of_days', 'days'
++                    secondary_amount_field, secondary_unit = 'number_of_hours', 'hours'
++                else:
++                    primary_amount_field, primary_unit = 'number_of_hours', 'hours'
++                    secondary_amount_field, secondary_unit = 'number_of_days', 'days'
++
++                # Always also track the complementary unit in the same pass (e.g. hours
++                # alongside a day-based type's own days), so any caller can read it without
++                # needing its own extra query - see l10n_be_hr_payroll's negative-hours warning.
++                # It never blocks: unlike the primary counter, its leftover just goes negative
++                # on the last allocation touched instead of raising an excess.
++                secondary_data = defaultdict(lambda: {
++                    'virtual_remaining_leaves': 0, 'remaining_leaves': 0, 'leaves_taken': 0, 'virtual_leaves_taken': 0,
++                })
++                for allocation in allocations_per_employee_type[employee][work_entry_type]:
++                    secondary_max = allocation[secondary_amount_field]
++                    secondary_data[allocation].update({'virtual_remaining_leaves': secondary_max, 'remaining_leaves': secondary_max})
++
++                # primary is the blocking one: unfit leftover is real excess, recorded into its
++                # own to_recheck['excess_days']. secondary never blocks: its leftover is applied
++                # to the last allocation touched instead, let it go negative.
++                primary = {
++                    'amount_field': primary_amount_field, 'unit': primary_unit,
++                    'data': allocations_leaves_consumed[employee][work_entry_type],
++                    'to_recheck': to_recheck_leaves_per_work_entry_type[employee][work_entry_type],
++                }
++                secondary = {
++                    'amount_field': secondary_amount_field, 'unit': secondary_unit,
++                    'data': secondary_data,
++                    'to_recheck': {
++                        'to_recheck_leaves': self.env['hr.leave'],
++                        'excess_days': defaultdict(lambda: {'amount': 0, 'is_virtual': True}),
++                        'exceeding_duration': 0,
++                    },
++                }
++
++                def _consume_from_allocation(counter, remaining, allocation, duration_info, partial, leave):
++                    """Take as much of `remaining` as `allocation` can still give `counter`, and
++                    return what's left of it."""
++                    if not remaining:
++                        return remaining
++                    duration = duration_info[counter['unit']] if partial else leave[counter['amount_field']]
++                    max_allowed_duration = min(duration, counter['data'][allocation]['virtual_remaining_leaves'])
++                    if not max_allowed_duration:
++                        return remaining
++                    allocated_time = min(max_allowed_duration, remaining)
++                    counter['data'][allocation]['virtual_leaves_taken'] += allocated_time
++                    counter['data'][allocation]['virtual_remaining_leaves'] -= allocated_time
++                    if leave.state == 'validate':
++                        counter['data'][allocation]['leaves_taken'] += allocated_time
++                        counter['data'][allocation]['remaining_leaves'] -= allocated_time
++                    return remaining - allocated_time
++
++                allocations_with_date_to = allocations_per_employee_type[employee][work_entry_type].filtered('date_to')
++                allocations_without_date_to = allocations_per_employee_type[employee][work_entry_type] - allocations_with_date_to
+                 # Defines the order in which allocation will be used to take the leaves in priority
+                 sorted_leave_allocations = (
+                     allocations_with_date_to.sorted(key='date_to') +
+                     allocations_without_date_to.filtered('accrual_plan_id') +
+                     allocations_without_date_to.filtered(lambda alloc: not alloc.accrual_plan_id))
+ 
+-                if work_entry_type.unit_of_measure == 'day':
+-                    leave_duration_field = 'number_of_days'
+-                    leave_unit = 'days'
+-                else:
+-                    leave_duration_field = 'number_of_hours'
+-                    leave_unit = 'hours'
+-
+-                work_entry_type_data = allocations_leaves_consumed[employee][work_entry_type]
+                 for leave in leaves_per_employee_type[employee][work_entry_type].sorted('date_from'):
+-                    leave_duration = leave[leave_duration_field]
+-                    skip_excess = False
+-
+                     if leave.date_from.date() > target_date and sorted_leave_allocations.filtered(lambda a:
+                         a.accrual_plan_id and
+                         (not a.date_to or a.date_to >= target_date) and
+                         a.date_from <= leave.date_to.date()
+                     ):
+-                        to_recheck_leaves_per_work_entry_type[employee][work_entry_type]['to_recheck_leaves'] |= leave
+-                        skip_excess = True
++                        for counter in (primary, secondary):
++                            counter['to_recheck']['to_recheck_leaves'] |= leave
+                         continue
+ 
+                     if work_entry_type.requires_allocation:
++                        # primary and secondary each track their own remaining amount; the loop
++                        # stops once both are done.
++                        remaining_primary = leave[primary['amount_field']]
++                        remaining_secondary = leave[secondary['amount_field']]
++                        last_allocation = None
+                         for allocation in sorted_leave_allocations:
++                            if not remaining_primary and not remaining_secondary:
++                                break
+                             # We don't want to include future leaves linked to accruals into the total count of available leaves.
+                             # However, we'll need to check if those leaves take more than what will be accrued in total of those days
+                             # to give a warning if the total exceeds what will be accrued.
+                             if allocation.date_from > leave.date_to.date() or (allocation.date_to and allocation.date_to < leave.date_from.date()):
+                                 continue
++                            last_allocation = allocation
+                             interval_start = max(
+                                 leave.date_from,
+                                 datetime.combine(allocation.date_from, time.min)
+@@ -703,48 +753,52 @@ class HrEmployee(models.Model):
+                                 datetime.combine(allocation.date_to, time.max)
+                                 if allocation.date_to else leave.date_to
+                             )
+-                            duration = leave[leave_duration_field]
+-                            if leave.date_from != interval_start or leave.date_to != interval_end:
+-                                duration_info = employee._get_calendar_attendances(interval_start.replace(tzinfo=UTC), interval_end.replace(tzinfo=UTC))
+-                                duration = duration_info['hours' if leave_unit == 'hours' else 'days']
+-                            max_allowed_duration = min(
+-                                duration,
+-                                work_entry_type_data[allocation]['virtual_remaining_leaves']
+-                            )
++                            partial = leave.date_from != interval_start or leave.date_to != interval_end
++                            duration_info = employee._get_calendar_attendances(
++                                interval_start.replace(tzinfo=UTC), interval_end.replace(tzinfo=UTC)
++                            ) if partial else None
+ 
+-                            if not max_allowed_duration:
+-                                continue
++                            remaining_primary = _consume_from_allocation(primary, remaining_primary, allocation, duration_info, partial, leave)
++                            remaining_secondary = _consume_from_allocation(secondary, remaining_secondary, allocation, duration_info, partial, leave)
+ 
+-                            allocated_time = min(max_allowed_duration, leave_duration)
+-                            work_entry_type_data[allocation]['virtual_leaves_taken'] += allocated_time
+-                            work_entry_type_data[allocation]['virtual_remaining_leaves'] -= allocated_time
+-                            if leave.state == 'validate':
+-                                work_entry_type_data[allocation]['leaves_taken'] += allocated_time
+-                                work_entry_type_data[allocation]['remaining_leaves'] -= allocated_time
+-
+-                            leave_duration -= allocated_time
+-                            if not leave_duration:
+-                                break
+-                        if round(leave_duration, 2) > 0 and not skip_excess:
+-                            to_recheck_leaves_per_work_entry_type[employee][work_entry_type]['excess_days'][leave.date_to.date()] = {
++                        leave_duration = round(remaining_primary, 2)
++                        if leave_duration > 0:
++                            primary['to_recheck']['excess_days'][leave.date_to.date()] = {
+                                 'amount': leave_duration,
+                                 'is_virtual': leave.state != 'validate',
+                                 'leave_id': leave.id,
+                             }
++                        if last_allocation is not None:
++                            deficit = round(remaining_secondary, 2)
++                            if deficit > 0:
++                                secondary['data'][last_allocation]['virtual_leaves_taken'] += deficit
++                                secondary['data'][last_allocation]['virtual_remaining_leaves'] -= deficit
++                                if leave.state == 'validate':
++                                    secondary['data'][last_allocation]['leaves_taken'] += deficit
++                                    secondary['data'][last_allocation]['remaining_leaves'] -= deficit
+                     else:
+-                        if leave_unit == 'hours':
+-                            allocated_time = leave.number_of_hours
+-                        else:
+-                            allocated_time = leave.number_of_days
+-                        work_entry_type_data[False]['virtual_leaves_taken'] += allocated_time
+-                        work_entry_type_data[False]['virtual_remaining_leaves'] -= allocated_time
+-                        if leave.state == 'validate':
+-                            work_entry_type_data[False]['remaining_leaves'] -= allocated_time
+-                            work_entry_type_data[False]['leaves_taken'] += allocated_time
++                        for counter in (primary, secondary):
++                            allocated_time = leave[counter['amount_field']]
++                            counter['data'][False]['virtual_leaves_taken'] += allocated_time
++                            counter['data'][False]['virtual_remaining_leaves'] -= allocated_time
++                            if leave.state == 'validate':
++                                counter['data'][False]['remaining_leaves'] -= allocated_time
++                                counter['data'][False]['leaves_taken'] += allocated_time
++
++                for data in allocations_leaves_consumed[employee][work_entry_type].values():
++                    for generic_key in ('max_leaves', 'accrual_bonus', 'leaves_taken', 'virtual_leaves_taken', 'remaining_leaves', 'virtual_remaining_leaves'):
++                        data[f'{primary_unit}_{generic_key}'] = data.pop(generic_key)
++
++                for allocation, data in secondary_data.items():
++                    allocations_leaves_consumed[employee][work_entry_type][allocation].update({
++                        f'{secondary_unit}_taken': data['leaves_taken'],
++                        f'{secondary_unit}_remaining': data['virtual_remaining_leaves'],
++                    })
+         for employee in to_recheck_leaves_per_work_entry_type:
+             for work_entry_type in to_recheck_leaves_per_work_entry_type[employee]:
+                 content = to_recheck_leaves_per_work_entry_type[employee][work_entry_type]
+                 consumed_content = allocations_leaves_consumed[employee][work_entry_type]
++                primary_unit = 'hours' if work_entry_type.unit_of_measure == 'hour' else 'days'
+                 if content['to_recheck_leaves']:
+                     date_to_simulate = max(content['to_recheck_leaves'].mapped('date_from')).date()
+                     latest_accrual_bonus = 0
+@@ -753,8 +807,8 @@ class HrEmployee(models.Model):
+                     additional_leaves_duration = 0
+                     for allocation in consumed_content:
+                         latest_accrual_bonus += allocation and allocation._get_additionnal_future_leaves_on(date_to_simulate, precomputed_allocations)
+-                        date_accrual_bonus += consumed_content[allocation]['accrual_bonus']
+-                        virtual_remaining += consumed_content[allocation]['virtual_remaining_leaves']
++                        date_accrual_bonus += consumed_content[allocation][f'{primary_unit}_accrual_bonus']
++                        virtual_remaining += consumed_content[allocation][f'{primary_unit}_virtual_remaining_leaves']
+                     for leave in content['to_recheck_leaves']:
+                         additional_leaves_duration += leave.number_of_hours if work_entry_type.unit_of_measure == 'hour' else leave.number_of_days
+                     latest_remaining = virtual_remaining - date_accrual_bonus + latest_accrual_bonus
+
+--- a/addons/hr_holidays/models/hr_leave.py
++++ b/addons/hr_holidays/models/hr_leave.py
+@@ -1137,10 +1137,11 @@ class HrLeave(models.Model):
+         for leave in self:
+             virtual_remaining_leaves = 0
+             max_leaves = 0
++            primary_unit = 'hours' if leave.work_entry_type_id.unit_of_measure == 'hour' else 'days'
+             for allocation, allocation_dict in employee_days_per_allocation[leave.employee_id][leave.work_entry_type_id].items():
+                 if allocation and (not allocation.date_to or allocation.date_to >= date_from):
+-                    max_leaves += allocation_dict['max_leaves']
+-                    virtual_remaining_leaves += allocation_dict['virtual_remaining_leaves']
++                    max_leaves += allocation_dict[f'{primary_unit}_max_leaves']
++                    virtual_remaining_leaves += allocation_dict[f'{primary_unit}_virtual_remaining_leaves']
+             leave.virtual_remaining_leaves = virtual_remaining_leaves
+             leave.max_leaves = max_leaves
+ 
+
+--- a/addons/hr_holidays/models/hr_leave_allocation.py
++++ b/addons/hr_holidays/models/hr_leave_allocation.py
+@@ -115,9 +115,9 @@ class HrLeaveAllocation(models.Model):
+     number_of_days_display = fields.Float(
+         'Duration (days)', compute='_compute_number_of_days_display', inverse='_inverse_number_of_days_display',
+         help="For an Accrual Allocation, this field contains the theorical amount of time given to the employee, due to a previous start date, on the first run of the plan. This can be manually edited.")
+-    number_of_hours_display = fields.Float(
+-        'Duration (hours)', default_export_compatible=True, compute='_compute_number_of_hours_display', store=True,
+-        inverse='_inverse_number_of_hours_display',
++    number_of_hours = fields.Float(
++        'Duration (hours)', default_export_compatible=True, compute='_compute_number_of_hours', store=True,
++        inverse='_inverse_number_of_hours',
+         help="For an Accrual Allocation, this field contains the theorical amount of time given to the employee, due to a previous start date, on the first run of the plan. This can be manually edited.")
+     duration_display = fields.Char('Allocated (Days/Hours)', compute='_compute_duration_display',
+         help="Field allowing to see the allocation duration in days or hours depending on the type_request_unit")
+@@ -235,12 +235,19 @@ class HrLeaveAllocation(models.Model):
+     def _compute_leaves(self):
+         date_from = fields.Date.context_today(self)
+         employee_days_per_allocation = self.employee_id._get_consumed_leaves(self.work_entry_type_id, date_from, ignore_future=True)[0]
++        self._set_leaves_from_consumption_data(employee_days_per_allocation)
++
++    def _set_leaves_from_consumption_data(self, employee_days_per_allocation):
++        """Assign max_leaves/leaves_taken/virtual_remaining_leaves from an already-fetched
++        _get_consumed_leaves() result, so extensions can reuse the same fetch (see
++        l10n_be_hr_payroll)."""
+         for allocation in self:
+             origin = allocation._origin
+             virtual_leave = employee_days_per_allocation[origin.employee_id][origin.work_entry_type_id][origin]
+-            allocation.max_leaves = virtual_leave['max_leaves']
+-            allocation.leaves_taken = virtual_leave['leaves_taken']
+-            allocation.virtual_remaining_leaves = virtual_leave['virtual_remaining_leaves']
++            primary_unit = 'hours' if origin.work_entry_type_id.unit_of_measure == 'hour' else 'days'
++            allocation.max_leaves = virtual_leave[f'{primary_unit}_max_leaves']
++            allocation.leaves_taken = virtual_leave[f'{primary_unit}_leaves_taken']
++            allocation.virtual_remaining_leaves = virtual_leave[f'{primary_unit}_virtual_remaining_leaves']
+ 
+     @api.depends('number_of_days')
+     def _compute_number_of_days_display(self):
+@@ -248,17 +255,17 @@ class HrLeaveAllocation(models.Model):
+             allocation.number_of_days_display = allocation.number_of_days
+ 
+     @api.depends('number_of_days', 'employee_id')
+-    def _compute_number_of_hours_display(self):
++    def _compute_number_of_hours(self):
+         for allocation in self:
+             if not allocation.employee_id:
+                 continue
+-            allocation.number_of_hours_display = (allocation.number_of_days * allocation._get_employee_hours_per_day())
++            allocation.number_of_hours = (allocation.number_of_days * allocation._get_employee_hours_per_day())
+ 
+-    @api.depends('number_of_hours_display', 'number_of_days_display')
++    @api.depends('number_of_hours', 'number_of_days_display')
+     def _compute_duration_display(self):
+         for allocation in self:
+             allocation.duration_display = '%g %s' % (
+-                (float_round(allocation.number_of_hours_display, precision_digits=2)
++                (float_round(allocation.number_of_hours, precision_digits=2)
+                 if allocation.type_request_unit == 'hour'
+                 else float_round(allocation.number_of_days_display, precision_digits=2)),
+                 _('hours') if allocation.type_request_unit == 'hour' else _('days'))
+@@ -313,9 +320,9 @@ class HrLeaveAllocation(models.Model):
+             allocation.number_of_days = allocation.number_of_days_display
+ 
+     @api.onchange('employee_id')
+-    def _inverse_number_of_hours_display(self):
++    def _inverse_number_of_hours(self):
+         for allocation in self.filtered('employee_id'):
+-            allocation.number_of_days = allocation.number_of_hours_display / allocation._get_employee_hours_per_day()
++            allocation.number_of_days = allocation.number_of_hours / allocation._get_employee_hours_per_day()
+ 
+     @api.constrains('number_of_days', 'work_entry_type_id', 'employee_id')
+     def _check_negative_allocation(self):
+@@ -337,8 +344,8 @@ class HrLeaveAllocation(models.Model):
+                 ('date_to', '>=', allocation.date_from),
+             ]
+             is_hour_allocation = allocation.type_request_unit == 'hour'
+-            aggregate_field = 'number_of_hours_display' if is_hour_allocation else 'number_of_days'
+-            current_amount = allocation.number_of_hours_display if is_hour_allocation else allocation.number_of_days
++            aggregate_field = 'number_of_hours' if is_hour_allocation else 'number_of_days'
++            current_amount = allocation.number_of_hours if is_hour_allocation else allocation.number_of_days
+             negative_total, = self.env['hr.leave.allocation']._read_group(domain, aggregates=[f'{aggregate_field}:sum'])[0]
+             total_negative = -(current_amount + (negative_total or 0))
+             max_negative = allocation.work_entry_type_id.max_allowed_negative
+@@ -648,7 +655,8 @@ class HrLeaveAllocation(models.Model):
+             employee_days_per_allocation = allocation.employee_id._get_consumed_leaves(
+                 allocation.work_entry_type_id, allocation_data['nextcall'], ignore_future=True,
+                 precomputed_allocations=allocations)[0]
+-            leaves_taken = employee_days_per_allocation[allocation.employee_id][allocation.work_entry_type_id][allocation]['leaves_taken']
++            primary_unit = 'hours' if allocation.work_entry_type_id.unit_of_measure == 'hour' else 'days'
++            leaves_taken = employee_days_per_allocation[allocation.employee_id][allocation.work_entry_type_id][allocation][f'{primary_unit}_leaves_taken']
+             return allocation._convert_to_type_request_unit(
+                 leaves_taken, allocation.work_entry_type_id.unit_of_measure or 'day', allocation_data)
+ 
+@@ -773,7 +781,7 @@ class HrLeaveAllocation(models.Model):
+         """ Possibly accrual inconsistent (see the comment under the class declaration)
+             :param allocations_data: dict containing the allocation mapped to their data. If `allocations_data` is a dict,
+             then this function will return the additionnal leaves compared to the leaves in the `allocations_data` (instead of
+-            comparing it to `self.number_of_days` or `self.number_of_hours_display`)
++            comparing it to `self.number_of_days` or `self.number_of_hours`)
+             :returns: added allocated duration expressed in the unit of the work entry type `unit_of_measure` of the allocation
+         """
+         self.ensure_one()
+@@ -856,7 +864,7 @@ class HrLeaveAllocation(models.Model):
+         for allocation in self:
+             allocation.display_name = _("Allocation of %(work_entry_type)s: %(amount).2f %(unit)s to %(target)s",
+                 work_entry_type=allocation.work_entry_type_id.sudo().name,
+-                amount=allocation.number_of_hours_display if allocation.type_request_unit == 'hour' else allocation.number_of_days,
++                amount=allocation.number_of_hours if allocation.type_request_unit == 'hour' else allocation.number_of_days,
+                 unit=_('hours') if allocation.type_request_unit == 'hour' else _('days'),
+                 target=allocation.employee_id.name,
+             )
+@@ -898,7 +906,7 @@ class HrLeaveAllocation(models.Model):
+ 
+         self.add_follower(employee_id)
+ 
+-        tracked_fields = {'number_of_days_display', 'number_of_hours_display', 'state', 'date_to'}
++        tracked_fields = {'number_of_days_display', 'number_of_hours', 'state', 'date_to'}
+         tracked_updates = tracked_fields.intersection(values)
+         if not tracked_updates:
+             return super().write(values)
+
+--- a/addons/hr_holidays/models/hr_version.py
++++ b/addons/hr_holidays/models/hr_version.py
+@@ -120,15 +120,15 @@ class HrVersion(models.Model):
+ 
+         if 'resource_calendar_id' in vals:
+             # Hour-based allocations store their duration in number_of_days, from
+-            # which the accrued hours (number_of_hours_display) are derived using
++            # which the accrued hours (number_of_hours) are derived using
+             # the employee's hours per day. When the working schedule changes
+             # number_of_days is left stale: the next accrual adds to it and
+-            # number_of_hours_display is then recomputed at the new hours per day,
++            # number_of_hours is then recomputed at the new hours per day,
+             # revaluing the hours accrued under the old schedule and losing part of
+             # the balance. Recompute number_of_days now from the still-correct
+-            # number_of_hours_display so the accrued hours are preserved. It is set
++            # number_of_hours so the accrued hours are preserved. It is set
+             # explicitly rather than through the compute graph because
+-            # number_of_days and number_of_hours_display depend on each other and
++            # number_of_days and number_of_hours depend on each other and
+             # the recomputation order is not guaranteed.
+             allocations = self.env['hr.leave.allocation'].search([
+                 ('employee_id', 'in', self.employee_id.ids),
+@@ -137,7 +137,7 @@ class HrVersion(models.Model):
+             for allocation in hour_allocations:
+                 hours_per_day = allocation.employee_id._get_hours_per_day(allocation.date_from)
+                 if hours_per_day:
+-                    allocation.number_of_days = allocation.number_of_hours_display / hours_per_day
++                    allocation.number_of_days = allocation.number_of_hours / hours_per_day
+ 
+         return result
+ 
+
+--- a/addons/hr_holidays/models/hr_work_entry_type.py
++++ b/addons/hr_holidays/models/hr_work_entry_type.py
+@@ -568,6 +568,7 @@ been taken for this time off type. Changing it now would affect existing employe
+                 allocations_now = self.env['hr.leave.allocation']
+                 allocations_date = self.env['hr.leave.allocation']
+                 allocations_with_remaining_leaves = self.env['hr.leave.allocation']
++                primary_unit = 'hours' if work_entry_type.unit_of_measure == 'hour' else 'days'
+                 for allocation, data in allocations_leaves_consumed[employee][work_entry_type].items():
+                     # We only need the allocation that are valid at the given date
+                     if allocation:
+@@ -583,20 +584,21 @@ been taken for this time off type. Changing it now would affect existing employe
+                             continue
+                         if allocation.date_to and allocation.date_to < target_date:
+                             continue
+-                    lt_info[1]['remaining_leaves'] += data['remaining_leaves']
+-                    lt_info[1]['virtual_remaining_leaves'] += data['virtual_remaining_leaves']
+-                    lt_info[1]['max_leaves'] += data['max_leaves']
+-                    lt_info[1]['accrual_bonus'] += data['accrual_bonus']
+-                    lt_info[1]['leaves_taken'] += data['leaves_taken']
+-                    lt_info[1]['virtual_leaves_taken'] += data['virtual_leaves_taken']
+-                    lt_info[1]['leaves_requested'] += data['virtual_leaves_taken'] - data['leaves_taken']
+-                    lt_info[1]['leaves_approved'] += data['leaves_taken']
+-                    if data['virtual_remaining_leaves'] > 0:
++                    lt_info[1]['remaining_leaves'] += data[f'{primary_unit}_remaining_leaves']
++                    lt_info[1]['virtual_remaining_leaves'] += data[f'{primary_unit}_virtual_remaining_leaves']
++                    lt_info[1]['max_leaves'] += data[f'{primary_unit}_max_leaves']
++                    lt_info[1]['accrual_bonus'] += data[f'{primary_unit}_accrual_bonus']
++                    lt_info[1]['leaves_taken'] += data[f'{primary_unit}_leaves_taken']
++                    lt_info[1]['virtual_leaves_taken'] += data[f'{primary_unit}_virtual_leaves_taken']
++                    lt_info[1]['leaves_requested'] += data[f'{primary_unit}_virtual_leaves_taken'] - data[f'{primary_unit}_leaves_taken']
++                    lt_info[1]['leaves_approved'] += data[f'{primary_unit}_leaves_taken']
++                    if data[f'{primary_unit}_virtual_remaining_leaves'] > 0:
+                         allocations_with_remaining_leaves |= allocation
+                 closest_expiration_date, closest_allocation_remaining = self._get_closest_expiring_leaves_date_and_count(
+                                                                             allocations_with_remaining_leaves,
+                                                                             allocations_leaves_consumed[employee][work_entry_type],
+-                                                                            target_date
++                                                                            target_date,
++                                                                            primary_unit,
+                                                                         )
+                 if closest_expiration_date:
+                     closest_allocation_expire = format_date(self.env, closest_expiration_date)
+@@ -638,7 +640,7 @@ been taken for this time off type. Changing it now would affect existing employe
+                 allocation_data[employee].append(lt_info)
+         return allocation_data
+ 
+-    def _get_closest_expiring_leaves_date_and_count(self, allocations, remaining_leaves, target_date):
++    def _get_closest_expiring_leaves_date_and_count(self, allocations, remaining_leaves, target_date, primary_unit):
+         # Get the expiration date and carryover date of all allocations and compute the closest expiration date
+         expiration_dates_per_allocation = {}
+         expiration_dates = list()
+@@ -671,12 +673,12 @@ been taken for this time off type. Changing it now would affect existing employe
+                 carried_over_days_expiration_date = expiration_dates_per_allocation[allocation]['carried_over_days_expiration_date']
+ 
+                 if expiration_date and expiration_date == closest_expiration_date:
+-                    expiring_leaves_count += remaining_leaves[allocation]['virtual_remaining_leaves']
++                    expiring_leaves_count += remaining_leaves[allocation][f'{primary_unit}_virtual_remaining_leaves']
+                 elif carryover_date and carryover_date == closest_expiration_date:
+                     current_lvl = allocation.sudo()._get_current_accrual_plan_level_idx(target_date)[0]
+                     max_carried_over_duration = allocation._convert_from_type_request_unit(
+                         current_lvl.max_carriedover_duration, allocation.work_entry_type_id.unit_of_measure)
+-                    expiring_leaves_count += max(0, remaining_leaves[allocation]['virtual_remaining_leaves'] - max_carried_over_duration)
++                    expiring_leaves_count += max(0, remaining_leaves[allocation][f'{primary_unit}_virtual_remaining_leaves'] - max_carried_over_duration)
+                 elif carried_over_days_expiration_date and carried_over_days_expiration_date == closest_expiration_date:
+                     expiring_leaves_count += carried_over_days_expiration_data[allocation]['no_expiring_days']
+ 

@@ -2,38 +2,54 @@
 
 ## What's new for users
 
-The official 20.0 release-note extract we were given contains no section specific to the `base` module (it mostly covers Enterprise features), so nothing from it is claimed here as a Community feature. Everything below is user-visible and comes from the code changes themselves.
+The official 20.0 release notes focus on business apps and localizations and say almost nothing about `base`, the technical core addon (contacts, companies, users, currencies, security). This section is therefore short by design.
 
-- **Rights are unified**: Access Rights and Record Rules are no longer two separate concepts. Both are managed through a single "Access" model, so permissions are reviewed in one place instead of two.
-- **Contacts**: the Person/Company switch disappears. A contact is considered a company when it is its own commercial entity and has a real Tax ID. The old "Company ID" (registry) field is replaced by an "Additional Identifiers" block, validated per country, which automatically fills in companion numbers.
-- **Sessions instead of device lists**: each session shows the device you are actually using (platform, browser, type deduced from the user agent) plus the other devices attached to it.
-- **Bank accounts**: the shared bank directory is gone; bank name, BIC and address are entered on the account itself, with country-aware clearing/routing validation (AU, HK, JP, SA, US).
-- **Multi-currency**: the rate table now displays the last rate update date.
+The one change the release notes do confirm for this addon is the partner "multi-ID" concept: the Saudi Arabia and Türkiye notes describe identifiers (MERSIS, national IDs) now managed through a "multi-ID feature on a partner's contact form" instead of tags or dedicated fields. That is the new unified identifiers block on contacts and companies.
+
+Everything else you will notice — a simpler contact form, richer bank accounts, sessions instead of a list of devices — comes from the addon itself and is described below.
 
 ## Technical data model changes
 
-- `ir.model.access` and `ir.rule` are **removed**, replaced by `ir.access`. Removed fields: `model_access_ids`, `rule_ids` (`ir.model`), `model_access`, `rule_groups` (`res.groups`); `res.groups` gains `access_count`. `ir.model.access.check()` is deprecated (use `Model.has_access()`).
-- `res.partner`: removed `company_registry`, `company_registry_label`, `company_registry_placeholder`, `same_company_registry_partner_id`, `company_type`, `company_name`. Added `additional_identifiers` (Json) and `available_additional_identifiers_metadata`. `is_company` becomes a stored computed field (own commercial entity + non-void VAT); `vat` gets an inverse.
-- `res.company`: `company_registry` / `company_registry_placeholder` removed; `additional_identifiers` and `available_additional_identifiers_metadata` added.
-- `res.bank` is deleted (new `clearing.label` model). `res.partner.bank` renames: `acc_number`→`account_number`, `sanitized_acc_number`→`sanitized_account_number`, `acc_holder_name`→`holder_name`, `bank_id` (m2o)→`bank_name` (Char), `bic`→`bank_bic`, `acc_type`→`account_type`, `country`→`country_id`, `state`→`state_id` (`country_id` is computed/stored).
-- `res.device.log`: `platform`, `browser`, `device_type` (selection) and `linked_ip_addresses` removed; `user_agent` added, `user_id` becomes an Integer. New `res.session` model over `res.device`; `res.device` keeps computed `platform`, `browser`, `browser_version`, `browser_language`, `device_type`. `res.users` gains `session_ids`.
-- `res.currency`: field `date` removed, `rate_date` added; `_get_rates()` now returns `(rate, date)` tuples.
-- `ir.access.token` model removed (access-token API reverted).
-- Binary-to-Json conversions: `ir.actions.act_window.views` is now Json; `ir.actions.client.params` Json and `params_store` Text.
+Security (the biggest change)
+- `ir.model.access` and `ir.rule` are replaced by one `ir.access` model that holds both permissions and record restrictions.
+- `ir.model`: `model_access_ids` and `rule_ids` removed; `access_ids` now points to `ir.access`.
+- `res.groups`: `model_access` and `rule_groups` removed; new `access_ids` and `access_count`; `comment` is relabelled "Notes".
+- `ir.model.access.check()` is deprecated in favour of `Model.has_access()`.
+
+Contacts and companies
+- `res.partner`: new `additional_identifiers` (JSON) plus `available_additional_identifiers_metadata`; `vat` gets an inverse that validates and deduces companion identifiers.
+- Removed fields: `company_type`, `company_name`, `company_registry`, `company_registry_label`, `company_registry_placeholder`, `same_company_registry_partner_id`, and `company_registry` on `res.company`.
+- `is_company` is now computed and stored (from VAT and the commercial entity) instead of being freely set.
+
+Banks
+- New `clearing.label` model; the `res.bank` model is removed, bank details now live on `res.partner.bank`.
+- `res.partner.bank` fields renamed: `acc_number` → `account_number`, `sanitized_acc_number` → `sanitized_account_number`, `acc_type` → `account_type`, `acc_holder_name` → `holder_name`; adds `country_id`, `clearing_label_id`, `clearing_number`. Deleting a bank account now archives it.
+
+Sessions and devices
+- New `res.session` model; `res.device` aggregates the devices seen inside a session and `res.device.log` becomes a technical log storing `user_agent`.
+- `res.users` gains `session_ids`.
+
+Others
+- Access tokens: `ir.access.token` and the `_grant_access_token` / `_get_sudo_record_from_access_token` / `_revoke_access_tokens` API are reverted and removed.
+- `res.currency`: `date` removed, new computed `rate_date`; `_get_rates()` now returns `{currency_id: (rate, date)}`.
+- `ir.actions.act_window.views` becomes JSON (was Binary); `ir.actions.client.params` is JSON, `params_store` is Text.
+- Profiling: new `ir.profile.query` model with an EXPLAIN ANALYSE action for system users.
 
 ## How your habits should change
 
-- Stop looking for two separate "Access Rights" / "Record Rules" screens: both live under the new Access model. Filters, exports, dashboards or data imports referencing `ir.model.access` or `ir.rule` must be re-pointed.
-- Stop filling "Company ID" on contacts: use the identifiers block. Entering a VAT now deduces companion identifiers (e.g. BE VAT → BCE/KBO, FR SIRET → SIREN). Remove any reliance on `company_type` / `company_name` in filters, imports or automated actions.
-- Bank account imports/exports and templates change column names (`acc_number`, `bank_id`, `bic`, …). Bank names become free text per account.
-- Revoke/list **sessions** rather than individual devices.
-- Scripts, reports or integrations calling `_get_rates()` must unpack the new tuple; reading `rate_date` replaces the old `date`.
-- Do not store Python data in `Binary` fields anymore — use Json/Text.
+- Security is edited in one place (`ir.access`). Custom modules, scripts or imports writing to `ir.model.access` / `ir.rule` must be rewritten.
+- No more "Person / Company" selector on contacts: the type is deduced, so make sure the Tax ID and country are filled in.
+- No more Company ID / registry field: use the identifiers block; VAT-derived numbers (e.g. FR SIREN from a SIRET) are filled automatically.
+- No more separate bank directory: capture bank name, BIC and address on the account, use the clearing label/number for domestic routing, and archive rather than delete.
+- Revoke sessions rather than individual devices on a user.
+- Reports or EDI using `company_registry` or `peppol_eas`/`peppol_endpoint` must be adapted to the identifiers JSON and to the renamed routing fields.
+- Developers: use `Model.has_access()` instead of `ir.model.access.check()`, and drop any access-token calls.
 
 ## What you gain by migrating
 
-- One coherent permission model: simpler audits, no more mismatch between ACLs and record rules.
-- Cleaner contact data: legal identifiers centralised, validated and cross-deduced, instead of scattered free-text columns.
-- Self-contained bank accounts: no bank directory to maintain, country-appropriate clearing-number checks, fewer payment errors.
-- A security screen end users actually understand (sessions with device detail).
-- Faster currency-rate lookups with a visible last-update date, plus a stricter data model where Binary fields only hold bytes.
+- Easier-to-audit security: permissions and record rules in a single model with one caching path.
+- Cleaner contacts: one identifiers block covering VAT and local identifiers, with validation, normalisation and automatic deduction.
+- Simpler bank accounts: bank info on the account, typed and validated clearing numbers per country, no orphan directory.
+- A clearer view of who is connected: one line per session, with the devices behind it.
+- Performance and visibility: faster currency-rate lookups, faster access-rights checks, the currency rate date in the multi-currency popover, and a native query-plan tool.
+- Less legacy to maintain (`company_type`, `company_registry`, `res.bank`, access tokens).

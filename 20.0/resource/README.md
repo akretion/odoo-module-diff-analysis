@@ -2,50 +2,49 @@
 
 ## What's new for users
 
-No relevant official 20.0 release note was available for this addon, so this summary is based on the Odoo 20.0 source history (PRs #229706 and #246700).
+The 20.0 release notes cover mostly the Appointments and Planning apps. Only two items touch this addon:
 
-Two large working-schedule changes land in 20.0:
+- Faster, more accurate availability: resource and date availability calculations were optimized, so bookings, shifts and time slots compute quicker.
+- Multiple resources can be assigned to one shift in Planning, built on the reworked working-schedule engine.
 
-- **Variable working schedules.** A calendar is now typed: *Fixed* (the classic weekly pattern) or *Variable* (attendances bound to actual dates, with recurrence rules — every N days or weeks, ending on a date or never, with individually excluded occurrences). This replaces the old "2 weeks calendar".
-- **Simpler fixed schedules.** The schedule-type chooser is gone: no more "Flexible vs Fully Fixed" toggle, no more two-week mode, no more calendar-level "duration based" flag, no more lunch period. Working time lines always define an amount of hours per day.
-- **Timezone moved to the company.** A working schedule no longer carries its own timezone; the timezone comes from the company (and per resource, from the employee/version). When the admin user's timezone is set at first login, it now updates the company instead of the calendar.
-- Attendances no longer have a name, a "duration in days" or a day period; an employee who does not clock out for lunch is now simply counted as working through it.
+Everything else in those sections (accessory products, WhatsApp shifts, Field Service maps and routing, worksheets, customer ratings, industry packages) belongs to Enterprise apps and is not part of this Community addon. The release notes do not describe the working-schedule rework itself — that is covered below.
 
 ## Technical data model changes
 
-`resource.calendar`
-- Removed fields: `two_weeks_calendar`, `two_weeks_explanation`, `attendance_ids_1st_week`, `attendance_ids_2nd_week`, `schedule_type`, `flexible_hours`, `duration_based`, `tz`, `tz_offset`.
-- Added fields: `calendar_type` (`fixed` / `variable`, default `fixed`) and `days_per_week`. `hours_per_day` is now derived from `hours_per_week / days_per_week`; both stored with 5 decimals.
-- Removed methods/actions: `switch_calendar_type`, `switch_based_on_duration`, `_check_overlap`, `_compute_two_weeks_attendance`, `_inverse_two_weeks_calendar`, `get_attendances`, `_get_working_hours`, `_get_two_weeks_attendance`.
-- New helpers: `_get_working_attendances`, `_get_attendances_by_date`, `_get_attendances_to_unlink`, `_calendar_clean_up`, `is_calendar_referenced`.
+**resource.calendar**
+- New `calendar_type` selection: `fixed` (weekly repeating pattern), `variable` (attendances on specific dates, with recurrencies), `undefined` (no predefined slots; the resource works freely, optionally up to an hours target). Default `fixed`.
+- New fields: `days_per_week`, `reference_calendar_id`.
+- `hours_per_week` / `hours_per_day` become the single source of truth (moved off `resource.mixin` / `resource.resource`, where they are now read-only related fields). They are user-editable on variable/undefined calendars, validated 0–168 and 0–24.
+- Removed: `two_weeks_calendar`, `two_weeks_explanation`, `attendance_ids_1st_week`, `attendance_ids_2nd_week`, `schedule_type`, `flexible_hours`, calendar-level `duration_based`, `tz`, `tz_offset`.
+- Removed methods: `switch_calendar_type`, `switch_based_on_duration`, `get_attendances`, `_get_working_hours`, `_check_overlap`.
+- New helpers: `_get_working_attendances`, `_get_attendances_by_date`, `_calendar_clean_up`, `is_calendar_referenced`, `_is_flexible`, `_is_fully_flexible`.
+- Company timezone replaces the calendar timezone: new `res.company.tz`; on the admin's first login, the user timezone now updates the company.
 
-`resource.calendar.attendance`
-- Removed fields: `name`, `duration_days`, `day_period`, `week_type`.
-- `hour_from` / `hour_to` are no longer plain required inputs: they are computed and stored.
-- New fields for the variable calendar: `date`, `recurrency`, `recurrency_type`, `recurrency_interval`, `recurrency_until`, `recurrency_end_type`, `recurrency_excluded_occurences`. `duration_based` becomes computed/stored.
+**resource.calendar.attendance**
+- New: `date`, `recurrency`, `recurrency_type`, `recurrency_interval`, `recurrency_end_type`, `recurrency_until`, `recurrency_excluded_occurences`.
+- `hour_from` / `hour_to` and `duration_based` are now computed and stored.
+- Removed: `name`, `duration_days`, `day_period`, `week_type`.
+- Lunch periods no longer exist: time spanning lunch counts as work.
 
-`res.company`
-- Added `tz` (required) — the timezone previously held on the calendar.
+**resource.resource**
+- `calendar_id` is now **required**. A flexible resource is a resource with an `undefined` calendar, not a resource without a calendar.
+- `_is_flexible()` / `_is_fully_flexible()` are methods (no longer stored booleans); on employees they accept a date, so flexibility is resolved against the version actually active on that date.
 
-`res.users`
-- On first admin login, `tz` now propagates to the company, not the calendar.
-
-API signature changes
-- `_attendance_intervals_batch(start_dt, end_dt, resources_per_tz=None, domain=None)`: the `tz` and `lunch` arguments are gone; resources are grouped in a timezone dictionary.
-- `_leave_intervals_batch` and `_work_intervals_batch` take `resources_per_tz` instead of `resources` / `tz`.
+**Batch APIs**
+- `_attendance_intervals_batch`, `_leave_intervals_batch` and `_work_intervals_batch` now take `resources_per_tz` instead of `resources` + `tz`.
 
 ## How your habits should change
 
-- Choose the **calendar type** first: Fixed for regular weekly patterns, Variable when days differ or follow a rotation.
-- Rebuild any two-week / alternating schedule as a Variable calendar with a recurrence (e.g. every 2 weeks).
-- Stop looking for a timezone on the working schedule: set it on the company, or on the employee/contract.
-- Remove lunch breaks from your mental model — attendance lines only express hours worked; a lunch gap must be an explicit unpaid period or a shorter attendance.
-- If you used "flexible hours" calendars, rely on the resource/employee level hours per week/day instead.
-- Review custom code and integrations calling `_attendance_intervals_batch`, `_work_intervals_batch`, `_leave_intervals_batch` or `get_attendances`: signatures changed and `get_attendances` is removed.
+- Two-week calendars are gone. Build multi-week rotations in a **variable** calendar, using dated attendances or recurrencies (every N days/weeks, with an end date and excluded occurrences).
+- Flexible schedules are now an **undefined** calendar: every employee and resource is assigned a working schedule.
+- Set hours per week/day on the **working schedule**, not on the employee or resource — those fields are read-only there.
+- Set the timezone on the company (or on the resource), no longer on the calendar.
+- Attendance lines no longer carry a name, a day period or a lunch slot, so clean up any custom reports or imports relying on them.
 
 ## What you gain by migrating
 
-- One coherent working-schedule model, without the old flexible / two-week special cases.
-- Rotations and irregular schedules handled natively with recurrences and excluded dates, instead of duplicated lines.
-- Cleaner timezone handling: one company-level timezone, no per-calendar drift.
-- Simpler attendance lines (hours only), making imports, integrations and payroll or attendance exports more predictable.
+- One clear concept per schedule type — fixed, variable, undefined — instead of two-week flags, schedule types and flexible-hour booleans.
+- True rotating/irregular patterns through recurrencies, which the old two-week mode could not express.
+- A single source of truth for hours per week and per day, so HR, Manufacturing work centers, Planning and Appointments all agree.
+- No more silent fallback to the company calendar: the working schedule is always defined, and flexibility is evaluated against the right employee version on the right date.
+- Faster, more accurate availability, leave and overtime computations.

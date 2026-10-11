@@ -1,39 +1,40 @@
 # account_edi_ubl_cii migration guide (19.0 -> 20.0)
 
 ## What's new for users
-The official 20.0 release notes contain no section relevant to this addon (and no Enterprise-only feature is claimed here). The user-visible changes below are derived from the code diff of the addon.
 
-- **Renamed and unified e-invoicing address fields.** "Peppol ID" (EAS) and "Peppol Endpoint" become **Routing ID** (scheme) and **Routing Endpoint**, plus a new single editable field **EDI Routing Address** written as `SCHEME:ENDPOINT` (e.g. `0208:0123456789`). Filling the address fills the two other fields.
-- **Country identifiers are now structured.** The generic `company_registry` field is gone; country-specific numbers (Belgian KBO/BCE, French SIREN/SIRET, Dutch KVK/OIN, German Leitweg-ID, Swedish, Norwegian IDs...) are kept as additional identifiers, and Odoo picks the most suitable one automatically for the legal entity, tax scheme and routing role.
-- **Validation at save time.** Routing values are validated per scheme when you save a partner, with an explicit message naming the expected format instead of a generic "Peppol endpoint is not valid".
-- **German B2G made easier.** XRechnung is selected automatically when the customer has a Leitweg-ID (no more reliance on EAS `0204`).
-- **Better import.** Importing a UBL/CII file recovers routing IDs and additional identifiers, can create the missing customer, retrieves bank details, and logs the operation.
+The official 20.0 release notes barely mention this addon: UBL/CII e-invoicing work is mostly under the hood. Only two related items appear in the Accounting notes:
+
+- Peppol global location identifiers (GLN) can be stored on partners' delivery contacts.
+- Partner identifiers are now handled through the "multi-ID" feature on the contact form instead of dedicated/tag-based fields (this is the same underlying change mentioned in country sections such as Saudi Arabia and Türkiye).
+
+Everything else below is derived from the addon itself.
 
 ## Technical data model changes
-`res.partner`
-- Removed: `peppol_eas`, `peppol_endpoint`, `available_peppol_eas`, `is_peppol_edi_format`, `_peppol_eas_endpoint_depends`, `_build_error_peppol_endpoint`, `sanitize_peppol_endpoint`.
-- Added: `routing_scheme`, `routing_endpoint` (stored, tracked), `routing_identifier` (computed + inverse, `SCHEME:ENDPOINT`), `available_routing_schemes`, `_clean_routing_endpoint` (called from `create`/`write`), `_get_all_identifiers(enrich=)`, `_get_preferred_routing_identifier_vals`, `_import_retrieve_customer_from_routing_identifier`, `_validate_identifier_by_scheme`.
 
-`res.company`: new related `routing_scheme`, `routing_endpoint`, `routing_identifier`.
+Four fields are removed from `res.partner`: `is_peppol_edi_format`, `peppol_eas`, `peppol_endpoint`, `available_peppol_eas`.
 
-`uom.uom`: new `_get_unece_code`, `_get_uom_from_unece_code`, `_compute_is_unece_code_supported`, `create`/`write` sanitizing.
-
-`account.move`: `action_invoice_download_ubl` and `get_extra_print_items` removed; `_get_specific_tax(name, domain)` signature changed; new `_group_lines_by_tax`, `_ungroup_lines`, `action_group_ungroup_lines_by_tax`, `_post_process_link_to_purchase_order`.
-
-`account.move.send`: new `_get_ubl_available_attachments`, `_display_attachments_widget`, `_needs_ubl_postprocessing`, `_get_move_constraints`.
-
-EDI models: the `EAS_MAPPING` table is removed (483 method signatures added, 6 modified, 37 removed). Export is refactored into small per-node hooks (`_ubl_add_*`, `_cii_*`) and import into a shared pipeline (`_import_*_collected_values`, `_import_retrieve_customer_search_plan`). Changed signatures include `_import_partner(..., routing_identifier=...)`, `_import_product(partner, ...)`, `_retrieve_line_vals(record, ...)`, `_retrieve_taxes(..., tax_exigibility=None)`. CII now exports `FR_SIREN` as SpecifiedLegalOrganization instead of `company_registry`.
+- `peppol_eas` becomes `routing_scheme`, `peppol_endpoint` becomes `routing_endpoint`, plus a new computed `routing_identifier` (`scheme:endpoint`). Routing is no longer Peppol-specific: any e-invoicing network can use these fields.
+- `company_registry` is dropped entirely. Legal-entity, tax and additional identifiers now live in the JSON field `additional_identifiers`, which moved from `account` to `base` (so modules that do not depend on `account` can use it too).
+- The hard-coded country/EAS table `EAS_MAPPING` is removed and replaced by shared base helpers: `get_tin_metadata_of_country()`, and partner helpers `_get_preferred_legal_entity_identifier_vals()`, `_get_preferred_tax_identifier_vals()`, `_get_preferred_routing_identifier_vals()`, `_get_additional_identifier()`. Country specifics (FR SIRET/SIREN, SG UEN, NO Brønnøysund, …) become non-stored compute/inverse fields.
+- New identifier tooling (`ISO_6523_ICD_CODELIST`, `ISO_IDENTIFIERS_METADATA`, `normalize_iso_identifier`, `normalize_vat_for_ubl`) and a new `res_company` model file.
+- Signature change: `_import_partner(..., peppol_eas, peppol_endpoint, ...)` becomes `_import_partner(..., routing_identifier=...)`.
+- Import search plan: `_import_retrieve_customer_from_eas_endpoint` becomes `_import_retrieve_customer_from_routing_identifier`. An imported `EndpointID` now fills `routing_scheme`/`routing_endpoint` and also feeds `additional_identifiers`.
+- XML generation now relies on those "preferred identifier" helpers instead of long per-country if/elif chains (BE, NL, LU, SE, DK, AU, NZ, NO…). `PartyLegalEntity/CompanyID` only carries a `schemeID` when the scheme belongs to the ISO 6523 ICD codelist.
+- Factur-X/CII `SpecifiedLegalOrganization` is now emitted only for French SIREN/SIRET.
+- Dutch compliance checks NL-R-003 / NL-R-005 now report the partner name instead of a generic missing-VAT message.
 
 ## How your habits should change
-- Set the **Routing ID / Routing Endpoint** pair, or simply type the **EDI Routing Address** (`scheme:endpoint`) — the old Peppol fields no longer exist.
-- Stop putting registry numbers in a generic field: record the country identifier (BE KBO/BCE, NL KVK/OIN, DE Leitweg-ID, FR SIREN...) so Odoo can reuse it as legal-entity, tax or routing identifier.
-- Expect blocking validation errors on save: fix partner data (valid KBO/BCE, 10-digit company number, valid e-mail for `EM`, ≤50 characters) before sending documents.
-- For German public buyers, just record the Leitweg-ID; XRechnung becomes the default format automatically.
-- Any custom code, Studio automation or import template reading/writing `peppol_eas`, `peppol_endpoint`, `is_peppol_edi_format` or `company_registry` must be updated to the new names.
+
+- Stop using `company_registry` for e-invoicing. Enter the legal-entity and tax identifiers in `additional_identifiers` on the contact.
+- The Peppol-named fields are gone: set the routing scheme (EAS code) and endpoint through `routing_identifier`.
+- Audit contacts before going live. Identifiers previously stored in `company_registry` or `peppol_*` must be migrated, and the preferred legal-entity/tax/routing identifiers must be filled in, otherwise the generated XML can lose identifiers (notably BE, NL, LU, SE, DK, NO, AU, NZ).
+- For French CII/Factur-X, only SIREN/SIRET-based legal organization data is exported.
+- When importing vendor bills, partner matching now uses the routing identifier rather than the Peppol EAS/endpoint pair.
 
 ## What you gain by migrating
-- Cleaner, better-named partner data: one routing address instead of scattered country hacks.
-- Fewer rejected e-invoices: validation happens at data entry, with actionable error messages.
-- Correct automatic format choice (including XRechnung via Leitweg-ID) and better UBL/CII import.
-- Network-agnostic routing: the same fields serve Peppol and other e-invoicing networks, so future formats and schemes plug in without rework.
-- A supported, maintainable base: 19.0 keeps the legacy fields and workarounds, 20.0 removes them.
+
+- One consistent identifier model shared by UBL, CII/Factur-X, SAF-T and Peppol/PDP flows, with far fewer country-specific special cases.
+- Coherent scheme and endpoint validation (three different, partial validations before).
+- Network-agnostic routing fields, ready for e-invoicing networks beyond Peppol.
+- `additional_identifiers` available at `base` level, so non-Account modules (payroll localizations, etc.) can use the same partner identifiers.
+- More reliable partner matching on import and clearer compliance error messages that name the partner concerned.

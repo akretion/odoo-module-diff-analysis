@@ -1,42 +1,38 @@
 # sale migration guide (19.0 -> 20.0)
 
-Migration guide for the Community addon `sale`. No 20.0 release-note extract matched this addon, so everything below is derived from the code diff (data model and method changes) between 19.0 and 20.0.
-
 ## What's new for users
 
-**Services & Materials view.** A new view on the sale order lets you record extra delivered services or consumables directly as analytic lines, without first creating an order line. Depending on the product's re-invoicing policy, Odoo creates a new order line (at cost) or updates an existing one (sales price), keeps delivered quantities in sync, and reverts the line if you delete the entry. A stat button on the invoice lists the analytic lines linked to it.
-
-**Description-first (productless) sale order lines.** Order lines can be written from a description alone; the description field also works as a searchable product + description field. A setting keeps the strict "product required" behaviour if you prefer it. Productless lines default to `Units` and to the company's default sales taxes, and are supported in section templates, loyalty rewards, sales reports and commissions.
-
-**Fixed-amount prepayments.** Besides a percentage, you can now request a fixed prepayment amount before confirmation; editing either value recalculates the other.
-
-**Other user-visible additions:** manual close/reopen of invoicing on an order, quantities on sections, a % delivered indicator, invoice overages, an expiry filter on quotations, default incoterm taken from the contact, delivery and availability handling for orders without stock, taxes recomputed when the fiscal position changes, prices recomputed when the pricelist changes, and a catalog filter for products previously bought by the customer.
+- **Services & Materials**: a new view (plus a stat button on invoices) lets you add extra delivered services or materials directly from a sale order. Odoo creates the analytic lines and the matching order lines, updates delivered quantities, and cleans up when an analytic line is deleted. The product's re-invoicing policy decides whether a new line is created at cost or an existing one at sales price is updated.
+- **Description-only order lines**: lines no longer require a product. The description field is now searchable (products included), and a new "Mandatory Product" setting restores the product-first behaviour. Productless lines receive the company's default sales taxes and any unit of measure.
+- **Fixed prepayment amounts**: set the prepayment as an amount; the percentage is recalculated automatically, and vice versa.
+- Automatic Invoicing is now a per-company setting instead of a system parameter.
+- Product images on sale orders and their PDFs, numbered order lines (form, PDF, portal) and a redesigned sale order portal page.
+- Margin is editable on the order line and recomputes the price; overages on prepaid services can be charged from the invoicing wizard.
+- Quotation sections can update the quantity and unit of all their products, hold multi-line descriptions and be saved as templates; quotation templates support the product catalog, subsections and line options.
+- Amounts such as margin, delivered % and taxes are stacked inside the order line instead of spread across columns.
 
 ## Technical data model changes
 
-- `product.template`: `expense_policy` renamed to `reinvoice_policy`; `visible_expense_policy` -> `visible_reinvoice_policy`.
-- `sale.order`: `require_payment` removed (a prepayment is now expressed by `prepayment_percent > 0`); `prepayment_amount` added; `analytic_account_id` added.
-- `res.company`: `sale_invoice_policy` and `sale_automatic_invoice` added; `prepayment_percent` now accepts 0.
-- `sale.order.line`: `invoice_policy` became a computed/searchable field; `mandatory_product` added; new line-type helpers (`_is_product_line`, `_is_discount_line`, `_is_downpayment`, `_is_reinvoicing_line`); the model now inherits the new `product.catalog.line.mixin`.
-- `account.analytic.line`: `so_line` and `order_id` are now stored computed fields; `timesheet_invoice_id` becomes `reinvoice_move_id`; synchronisation helpers (`_sync_so_lines`, `_unsync_so_lines`, ...) centralise re-invoicing.
-- `account.move`: `service_line_count` and `action_view_services_analytic_lines` added.
-- `crm.team`: `invoiced` and `invoiced_target` removed.
-- `utm.campaign`: `company_id` removed; `currency_id` is computed from the environment company; `invoiced_amount` becomes Monetary and is converted with exchange rates.
-- Signature changes: `_create_invoices(final, grouped)`, `_prepare_analytic_account_data(prefix, plan_id)`, `_check_amount_and_confirm_order` -> `_confirm_order`, plus mail notification/tracking API updates.
+- **product.template**: `expense_policy` renamed to `reinvoice_policy`, `visible_expense_policy` to `visible_reinvoice_policy`. `invoice_policy` now shares its selection with the new company-level `sale_invoice_policy`.
+- **res.company**: new `sale_invoice_policy` (required, default "Ordered quantities") and `sale_automatic_invoice`, which replaces the `sale.automatic_invoice` system parameter; the automatic-invoice cron switches on only when a company activates it.
+- **sale.order**: `require_payment` removed (a prepayment is disabled with `prepayment_percent = 0`); new `prepayment_amount` (Monetary, inverse of `prepayment_percent`), new `analytic_account_id`, and `_prepare_analytic_account_data()` now takes a `plan_id`.
+- **sale.order.line**: new `label` field (product name + description) with inverse; `name` is no longer required nor prefixed with the product name (`translated_product_name` removed), so EDI descriptions carry only the real description. New `invoice_policy` (computed and searchable) and `mandatory_product`; `product_uom_id` compute changed (empty for sections, default Units for productless lines); the "product required" SQL constraint is relaxed; `qty_delivered_method` now also depends on `product_id`; new `_is_reinvoicing_line()` and `_is_line_reinvoicable()`.
+- **account.analytic.line**: `timesheet_invoice_id` renamed to `reinvoice_move_id`; `so_line` and `order_id` become computed, stored and editable; new synchronisation keeps order lines, analytic accounts and partners aligned; lines already invoiced can no longer be edited or deleted.
+- **account.move**: new `service_line_count`, `action_view_services_analytic_lines()` and `_link_analytic_lines_to_invoice()`.
+- **Catalog**: line logic moved to the new `product.catalog.line.mixin`; `_get_product_catalog_lines_data()` and `_update_order_line_info()` disappear, and the `catalog_skip_tracking` context key becomes `catalog_update`.
+- **Reporting**: `utm.campaign.invoiced_amount` becomes Monetary with a computed currency and loses `company_id`; `crm.team.invoiced`, `invoiced_target` and `update_invoiced_target()` are removed.
 
 ## How your habits should change
 
-- Templates only accept a **prepayment percentage**; on a quotation you may switch to an amount. Set it to 0 to drop the online prepayment requirement — the "Online payment" toggle no longer exists.
-- Replace every reference to `expense_policy` (imports, exports, custom code, automated actions) with `reinvoice_policy`.
-- "Automatic Invoicing" is now a **per-company** setting instead of a system parameter: review it company by company after the upgrade.
-- The sales team kanban revenue/target fields and their progress bar are gone; if you relied on them for reporting, plan an alternative.
-- UTM campaigns no longer carry a company; their displayed currency follows the company you are working in.
+- Product re-invoicing options are unchanged (No / At cost / Sales price); only the field label changed.
+- Set the prepayment to 0 to disable it: the "Online payment" toggle is gone.
+- Leaving a line without a product is now allowed by default; enable "Mandatory Product" for the old behaviour.
+- The description now contains only the description — Odoo displays the product name next to it.
+- Configure automatic invoicing per company, not in system settings.
+- To correct an already invoiced service, cancel or adjust the invoice first.
 
 ## What you gain by migrating
 
-- Re-invoicing is now captured in one place: extra services and materials are entered on the order and delivered quantities stay consistent with what has been invoiced, so at-cost or sales-price re-invoicing cannot drift.
-- Faster quoting for simple lines, with no need to create a product for every line.
-- More flexible cash collection through fixed-amount prepayments.
-- Fewer manual steps in daily work: taxes and prices react automatically, incoterms come from the contact, and invoicing can be closed or reopened by hand.
-- More reliable figures: invoiced totals are converted with exchange rates instead of being added up blindly.
-- You stay on a maintained codebase — remaining on 19.0 means no further fixes and growing divergence from the OCA modules you depend on.
+- Less manual entry for re-invoicing: services and materials captured on the order flow into order lines, delivered quantities and invoices.
+- Faster quoting for service and project businesses thanks to description-first lines, section templates and editable margins.
+- Cleaner customer-facing documents: real descriptions in EDI and PDFs, product images, numbered lines.

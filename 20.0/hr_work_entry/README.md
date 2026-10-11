@@ -1,51 +1,45 @@
 # hr_work_entry migration guide (19.0 -> 20.0)
 
+Odoo 20.0 rebuilds how working time is produced and classified. The addon still generates the working time an employee is expected to do, but the way types, tracking methods and overtime are modelled changes substantially.
+
 ## What's new for users
 
-The official 20.0 release notes contain no extract matching this addon. The changes below are taken directly from the Odoo 20.0 source commits for `hr_work_entry`; only Community behaviour is described.
-
-- The **Work Entry Type** form has been rebuilt around clear groups: computation, display, export codes, benefit eligibility and description. Tooltips and placeholders were added, and repeated labels (e.g. "Payroll Code" under "Exports Code") were removed.
-- The work entry type list view gains new filters and hides irrelevant columns.
-- The confusing pair of checkboxes "Is Time Off" / "Working Time" is replaced by a single **Category** selector — renamed **Count as** before the 20.0 release, with two values: *Working Time* and *Absence*.
-- Work entry types are now offered per company, based on the company country.
+- **Work entry types and time off types converge.** The plain "Is Time Off" / "Working Time" flags are gone; each type now carries a single **Category**: *Working Time* or *Absence*.
+- **Time Rules (configurable overtime rules).** A new rule engine lets you express, per company/country and per employee domain: "when an employee works more (or less) than X hours per day or per week, reclassify the excess (or deficit) as type Z". Rules can be restricted to selected work entry types, to given weekdays, to public holidays and to a time window, with employee/employer tolerances and a salary rate. Rules run **in sequence**: each rule sees the output of the previous ones, so layered rules (excess > 2 h -> Overtime, excess > 4 h -> Double time) compose.
+- **Compensatory leave.** Rule output can grant (excess) or deduct (deficit) time-off allocation credits, with a per-record log so a modification or deletion of the source record reverses the credit precisely.
+- **Public holidays out of the box.** The Time Off release notes announce a "Public Holiday" time type available by default for all localizations, holidays loadable for the year with the company's country suggested.
+- **Calendar days vs working days.** Time off can now be deducted in working days or calendar days, which changes the absences fed into the schedule.
+- **Working schedules.** Working schedules can describe variable work periods, and can define a time per day without start/end times. Overtime analysis (which rule applied to which overtime) is also announced in the Attendances release notes, alongside overtime rulesets with public-holiday options.
+- Nothing in the release notes covers the Community-only internals below; they come from the code changes.
 
 ## Technical data model changes
 
-`hr.work.entry.type`
-- Removed: `is_leave`, `is_work` (and the `_compute_is_work` / `_inverse_is_work` logic), `_is_unforeseen`, `_check_work_entry_type_country`.
-- Added: `count_as` (Selection `working_time` / `absence`, required, default `working_time`). It was introduced mid-20.0 development as `category`, then renamed `count_as`.
-- Added: `copy_data`, `_check_country_id`; `code` help text reworded.
+**hr.work.entry.type**
+- Removed: `is_leave`, `is_work` (and `_compute_is_work` / `_inverse_is_work`), `_is_unforeseen`.
+- Added: `category` (Selection: `working_time`, `absence`), required, default `working_time`.
+- Renamed XML ids: `work_entry_type_attendance` -> `generic_work_entry_type_attendance`, `work_entry_type_leave` -> `generic_work_entry_type_leave`.
 
-`hr.work.entry`
-- The model definition is no longer part of `hr_work_entry` (`models/hr_work_entry.py` removed); its fields, `create`/`write`/`unlink` overrides, conflict detection, `action_validate` and `action_split` moved out of this addon.
+**hr.work.entry**
+- `is_leave` (related) replaced by `category` (related).
+- The model is no longer loaded by the addon (`models/__init__.py` no longer imports it); generation now returns value dictionaries instead of creating records.
 
-`hr.employee`
-- Removed: `has_work_entries`, `action_open_work_entries`, `work_entry_source`, `work_entry_source_calendar_invalid`.
-- Added: `external_code`.
+**hr.version**
+- Removed: `work_entry_source` (Selection "Tracking Method"), `work_entry_source_calendar_invalid`, `date_generated_from`, `date_generated_to`, `last_generation_date`.
+- Added: `has_static_work_entries()` (returns True by default, overridden when attendance based), plus, in `hr_work_entry_attendance`, a Boolean `attendance_based` and a `_get_work_entry_source()` helper.
+- `generate_work_entries(date_start, date_stop)` / `_generate_work_entries(...)`: the `force` argument is dropped, the result is a list of vals, and there is no more generation-window bookkeeping or nullification of older non-validated entries.
 
-`hr.version`
-- Removed: `date_generated_from`, `date_generated_to`, `last_generation_date`, `work_entry_source`, `work_entry_source_calendar_invalid`, plus `_remove_work_entries`, `_cancel_work_entries`, the `write`/`unlink` overrides and the `_cron_generate_missing_work_entries` cron.
-- `generate_work_entries(date_start, date_stop, force=False)` → `generate_work_entries(date_start, date_stop)` (the `force` argument is gone), on both `hr.employee` and `hr.version`. `_generate_work_entries` now returns a list of values instead of a recordset.
-- New helpers for the reworked generation logic: `_get_real_attendances`, `_get_real_leaves_static`, `_get_real_leaves_static_attendance`, `_get_real_worked_leaves`, `_get_no_wet_or_wet_match`, `_get_work_entry_merge_key`, `_get_work_entry_source_fields`.
+**hr.employee**
+- Removed: `has_work_entries`, related `work_entry_source`, `work_entry_source_calendar_invalid`, `action_open_work_entries`, the custom `create_version`.
+- Added: `external_code`. `generate_work_entries` loses `force`.
 
-Other models
-- `res.company`: `external_code` and computed `allowed_work_entry_type_ids`; `res.config.settings`: `external_code`.
-- `resource.calendar.attendance`: `work_entry_type_id` is now stored-computed and auto-filled with the `WORK100` type matching the calendar country (`_default_work_entry_type_id` removed); computed `allowed_work_entry_type_ids`.
-- `resource.calendar`: `_work_intervals_batch` accepts `resources_per_tz`; new `_compute_days_per_week`, `_compute_hours_per_day`, `_get_reference_hours_per_day`.
-- `hr.employee.departure` override removed (warning on future validated work entries, `work_entries_warning_date`, `action_register`).
+**hr.employee.departure** – the whole addon extension is removed (no departure warning on future validated work entries, no automatic reset to draft).
+
+**res.company / res.config.settings** – `work_entry_source` ("Tracking Method" / "Default Tracking") removed.
+
+**New models** – `hr.time.rule` and the abstract `hr.time.rule.source.mixin` (inherited by `hr.attendance` and `hr.leave`, firing the pipeline on validation); `hr.time.rule.allocation.log` on the leave side; an attendance validation policy per company. Work entry generation now tests `leave.count_as == 'absence'` instead of `leave.time_type == 'leave'`.
 
 ## How your habits should change
 
-- Stop using "Is Time Off" / "Working Time": classify each work entry type with **Count as**.
-- Work entry type codes are still referenced by salary rules — change them carefully.
-- The work entry source per contract is no longer a visible selection on the employee record; attendance-based tracking is handled by the Attendance app as a boolean.
-- No more "generated from/to" bookkeeping: you can no longer rely on stored last-generation dates to know what was already generated.
-- Automatic monthly generation of missing work entries is no longer driven by this addon's cron; trigger generation from the payroll/work entry tools.
-- Integrations calling `generate_work_entries(..., force=True)` must drop the `force` argument.
-
-## What you gain by migrating
-
-- One unambiguous classification field instead of two mirror checkboxes.
-- A cleaner, self-explanatory work entry type form and list, with filters.
-- Simpler generation logic with no stale generation-date ranges.
-- Country-aware default work entry types on calendars and companies.
+- Classify your work entry types by **Category** instead of ticking "Is Time Off"/"Working Time"; the old fields no longer exist, so saved views, filters, imports and custom code referencing them must be updated.
+- The employee/contract **Tracking Method** and the company **Default Tracking** setting are gone. Attendance-based tracking is now decided by the Attendance app on the contract.
+- There is no **Force** regeneration any more: regenerating no longer wipes existing non-validated entries, and no "Generated From/To"/"Last Generation Date" is displayed on the contract.

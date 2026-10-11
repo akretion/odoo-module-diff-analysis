@@ -1,36 +1,76 @@
 # pos_online_payment migration guide (19.0 -> 20.0)
 
+This addon lets a Point of Sale accept an online payment provider (as opposed to
+cash, bank or customer account) inside the POS flow. Here is what the 19.0 to
+20.0 move means for you.
+
 ## What's new for users
 
-The official 20.0 release notes contain no section for this add-on, so nothing below comes from them. Everything is derived from the code changes actually shipped between 19.0 and 20.0, and all of it is available in the Community edition.
+The 20.0 release notes about Online Payments mostly describe payment-provider
+news (new providers and payment methods, tokenization, delayed confirmations,
+wire transfers...). That belongs to the shared payment stack, not to this POS
+addon, and it does not change how a POS online payment behaves. What matters for
+you sits in the Point of Sale notes and in the POS accounting refactor:
 
-- **Online payment becomes a payment method *type*.** In 19.0 you ticked an "Online Payment" checkbox. In 20.0 you pick "Online" in the *Type* field. One setting instead of two, no more contradictory combinations.
-- **A demo online payment method is created automatically** during onboarding, so a register can be tested with an online payment flow without manual setup.
-- **Two online payment methods on the same register are now refused up front**, with a clear message, instead of failing at payment time.
-- **Some providers (APS, Flutterwave) now require a customer on the order.** The POS flags this and asks the cashier to select a customer first.
+* **End of session is simpler.** Closing a session now generates a global sale
+  (and, if needed, a global refund) instead of a batch of miscellaneous entries,
+  and payment journal entries are created automatically.
+* **Online payments are reconciled with the session.** Each online payment is
+  booked on the payment provider's receivable account, and a transfer entry now
+  links it to the POS receivable used at session closing, so no manual
+  reconciliation is needed.
+* **Clearer configuration.** An online payment method is no longer a checkbox:
+  it is a payment method *type*.
 
 ## Technical data model changes
 
-**Removed field:** `pos.payment.method.is_online_payment` (Boolean, "Online Payment"). Online methods are now identified only by `type == 'online'`; all domains, filters and constraints were rewritten. The `type` selection now declares `ondelete={"online": "cascade"}`.
-
-**Removed methods.** `pos.payment.method`: `_compute_type`, `_load_pos_data_fields`, `_onchange_is_online_payment`, `_is_online_payment`, `_get_payment_terminal_selection`. The add-on's `models/pos_session.py` is deleted entirely (`_accumulate_amounts`, `_create_bank_payment_moves`, `_get_split_receivable_op_vals`, `_reconcile_account_move_lines`); that logic is absorbed by the point_of_sale accounting refactor.
-
-**Added methods.** `pos.payment.method`: `_check_pos_config_online_payment`, `_get_provider_selection`, `_get_customer_required_providers_code` (returns `aps`, `flutterwave`), `_onchange_type`, `_create_online_payment_line_transfer(session)`, and `_create_payment_line(session, amount, account=None, message=None, partner=None, foreign_currency=None, amount_currency=None)`. `_load_pos_data_read(records, config)` replaces `_load_pos_data_fields` and exposes a `_customer_required` flag to the POS UI. `pos.config`: `_create_journal_and_payment_methods`, `_create_online_payment_demo`. `pos.order._process_order(order, existing_order)` no longer creates online payment lines on draft orders and re-syncs the partner when such a line is added.
-
-**Accounting behaviour.** Online payments are booked on the provider's receivable account, not the POS one. At session closing the add-on now posts a transfer entry (debit POS receivable / credit provider receivable) through `_create_online_payment_line_transfer`, so online payments reconcile with the session move. The previous manual split of receivables and reconciliation is gone, and `split_transactions` is no longer force-disabled on online methods.
+* `pos.payment.method.is_online_payment` (Boolean) is **removed**. Online payment
+  methods are now identified by `type == 'online'`. The `type` selection keeps
+  its `online` value and gains `ondelete={'online': 'cascade'}`.
+* Supporting members removed or renamed: `_compute_type` (it used to force the
+  type from the boolean), `_is_online_payment()`, and the
+  `_load_pos_data_fields` entry for `is_online_payment`;
+  `_onchange_is_online_payment` becomes `_onchange_type`. `_is_write_forbidden`
+  and `_force_online_payment_values` are adapted (`split_transactions` and
+  `is_cash_count` no longer exist).
+* `models/pos_session.py` is **deleted**. Its overrides (`_accumulate_amounts`,
+  `_create_bank_payment_moves`, `_get_split_receivable_op_vals`,
+  `_reconcile_account_move_lines`) are gone, replaced by a new hook on the
+  payment method: `_create_payment_line(session, amount, account=None,
+  message=None, partner=None)`. For `type == 'online'` it calls the new
+  `_create_online_payment_line_transfer(session)`, which posts a transfer entry
+  (debit POS receivable / credit payment provider receivable) and returns the
+  receivable line to reconcile.
+* All domains and filters move from `is_online_payment` to `type == 'online'`
+  (`pos.config`, `pos.order`, `pos.payment`, `pos.payment.method`).
+* Unchanged: `pos.payment.online_account_payment_id`,
+  `pos.order.online_payment_method_id` and `next_online_payment_amount`.
 
 ## How your habits should change
 
-- Configure online payment by choosing the **Online** type. Drop the habit of ticking a separate checkbox; it no longer exists.
-- Check your registers right after the migration: a POS config may have only **one** online payment method. A database that had several will now raise a validation error.
-- When a payment method uses APS or Flutterwave, always select a customer on the order before taking the payment.
-- Expect different session-closing entries: the core POS accounting refactor groups sales and refunds into separate moves, and online amounts appear through a dedicated transfer entry for the provider.
-- If you wrote custom code on `is_online_payment` or on the POS session (`_accumulate_amounts`, `_create_bank_payment_moves`, `_get_split_receivable_op_vals`, `_reconcile_account_move_lines`), it must be ported.
+* In **Point of Sale > Configuration > Payment Methods**, do not look for the
+  "Online Payment" checkbox: set **Type = Online**. The rule "one online payment
+  method per POS config" still applies, as do Allowed Providers and the provider
+  currency check.
+* Budget time for the **data migration**. Every payment method previously flagged
+  as online must end up with `type = 'online'`. A dedicated upgrade script is
+  referenced alongside the change (odoo/upgrade#10068); review it and check your
+  own records after migration.
+* If you maintain custom code, reports or exports reading `is_online_payment`, or
+  overrides of the `pos.session` methods listed above, they must be rewritten.
+* If you used payment splitting between cash and bank, note that
+  `split_transactions` was removed by the POS accounting refactor; splitting is
+  now limited to the customer account (`pay_later`) flow.
+* Do not expect to reconcile online payments by hand any more: the transfer entry
+  does it.
 
 ## What you gain by migrating
 
-- A single, unambiguous way to declare an online payment method — fewer configuration mistakes.
-- Consistency enforced by the system: one online method per register, customer requirement for providers that need it.
-- Cleaner accounting: online payments land on the right account and reconcile with the session move through an explicit transfer entry, making session closing and auditing easier.
-- Faster onboarding thanks to generated demo data, and multi-currency support in the shared payment line creation logic.
-- A supported version, built on the refactored point_of_sale accounting that now drives the whole closing and invoicing flow.
+* **Cleaner accounting.** One sales move and one refunds move per session, plus a
+  dedicated, automatically reconciled transfer entry for online payments.
+* **Better traceability.** Each online payment keeps its link to its
+  `account.payment` on the provider receivable.
+* **A simpler code base.** The heavy session-level overrides disappear in favour
+  of one well-scoped hook, reducing custom code and upgrade risk.
+* **The same safeguards.** One online payment method per POS config, online
+  payments that cannot be edited once created, and provider currency consistency.

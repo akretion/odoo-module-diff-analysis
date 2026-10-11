@@ -1,0 +1,145 @@
+PR: https://github.com/odoo/odoo/pull/284245
+
+From: 04e9a2509db0328616541a00aa82043e314c4de9
+From: djhan
+Date: 2026-09-14 08:15:37
+
+Breaking data model changes scores: del:1 + add:0, change matches:
+-    current_user_same_company_partner = fields.Boolean(compute='_compute_current_user_same_company_partner', compute_sudo=True, export_string_translation=False)
+
+Total Changes: 42
+
+[IMP] project: decouple collaborators from followers for limited edit access
+
+Before this commit, the "limited access" setting for portal users was a
+row-level restriction. Task visibility was strictly tied to the mail follower
+system, meaning users could only see tasks they followed. They could not
+see the full Kanban board, and if they unfollowed a task, they instantly
+lost access to it.
+
+After this commit, the restriction is shifted from row-level (task visibility)
+to field-level (task editability). Task visibility is now fully decoupled
+from followers, allowing portal collaborators to see the entire Kanban board
+and follow or unfollow tasks without losing access.
+
+Access modes now dictate field-level permissions:
+* `edit`: Users can modify standard fields (title, tags, state, description,
+  and color), but are explicitly restricted from modifying 'stage' and
+  'priority'.
+* `advanced_edit`: Users have full edit access to all allowed fields,
+  including 'stage' and 'priority'.
+
+Additionally, the 'planned date' field has been completely removed from
+portal editability for all access modes to prevent external modification of
+project timelines.
+
+Task: 6479918
+Part-of: odoo/odoo#284245
+Related: odoo/enterprise#129018
+Related: odoo/upgrade#11123
+Signed-off-by: Xavier Bol (xbo) <xbo@odoo.com>
+
+================================= pseudo patch: =================================
+
+--- a/addons/project/models/project_task.py
++++ b/addons/project/models/project_task.py
+@@ -12,7 +12,7 @@ from odoo import api, fields, models, tools, SUPERUSER_ID, _
+ from odoo.fields import Command, Date, Domain
+ from odoo.addons.rating.models import rating_data
+ from odoo.addons.html_editor.tools import handle_history_divergence
+-from odoo.exceptions import UserError, ValidationError
++from odoo.exceptions import UserError, ValidationError, AccessError
+ from odoo.tools import format_list, SQL, LazyTranslate, html_sanitize
+ from odoo.addons.project.controllers.project_sharing_chatter import ProjectSharingChatter
+ from odoo.addons.mail.tools.discuss import Store
+@@ -36,7 +36,6 @@ PROJECT_TASK_READABLE_FIELDS = {
+     'portal_user_names',
+     'user_ids',
+     'display_parent_task_button',
+-    'current_user_same_company_partner',
+     'allow_recurring_tasks',
+     'allow_milestones',
+     'milestone_id',
+@@ -62,21 +61,24 @@ PROJECT_TASK_READABLE_FIELDS = {
+     'has_project_template',
+     'access_token',
+     'access_url',
++    'date_deadline',
++    'partner_id',
++    'parent_id',
++    'portal_can_edit',
++    'portal_can_advanced_edit',
+ }
+ 
+ PROJECT_TASK_WRITABLE_FIELDS = {
+     'name',
+     'description',
+-    'partner_id',
+-    'date_deadline',
+     'date_last_stage_update',
+     'tag_ids',
+     'sequence',
+-    'stage_id',
++    'stage_id',  # only advanced edit
+     'child_ids',
+     'color',
+     'parent_id',
+-    'priority',
++    'priority',  # only advanced edit
+     'state',
+     'is_closed',
+ }
+@@ -288,7 +290,6 @@ class ProjectTask(models.Model):
+ 
+     # Project sharing fields
+     display_parent_task_button = fields.Boolean(compute='_compute_display_parent_task_button', compute_sudo=True, export_string_translation=False)
+-    current_user_same_company_partner = fields.Boolean(compute='_compute_current_user_same_company_partner', compute_sudo=True, export_string_translation=False)
+     display_follow_button = fields.Boolean(compute='_compute_display_follow_button', compute_sudo=True, export_string_translation=False)
+ 
+     # recurrence fields
+@@ -747,23 +748,17 @@ class ProjectTask(models.Model):
+         for task in self:
+             task.display_parent_task_button = task.parent_id in accessible_parent_tasks
+ 
+-    def _compute_current_user_same_company_partner(self):
+-        commercial_partner_id = self.env.user.partner_id.commercial_partner_id
+-        for task in self:
+-            task.current_user_same_company_partner = task.partner_id and commercial_partner_id == task.partner_id.commercial_partner_id
+-
+     def _compute_display_follow_button(self):
+         if not self.env.user.share:
+             self.display_follow_button = False
+             return
+-        project_collaborator_read_group = self.env['project.collaborator']._read_group(
+-            [('project_id', 'in', self.project_id.ids), ('partner_id', '=', self.env.user.partner_id.id)],
+-            ['project_id'],
+-            ['limited_access:bool_and'],
+-        )
+-        limited_access_per_project_id = dict(project_collaborator_read_group)
++        collaborator_projects = self.env['project.collaborator'].sudo().search([
++            ('project_id', 'in', self.project_id.ids),
++            ('partner_id', '=', self.env.user.partner_id.id)
++        ])
++        collaborator_project_ids = collaborator_projects.mapped('project_id')
+         for task in self:
+-            task.display_follow_button = not limited_access_per_project_id.get(task.project_id, True)
++            task.display_follow_button = task.project_id in collaborator_project_ids
+ 
+     def _get_group_pattern(self):
+         return {
+@@ -1266,6 +1261,15 @@ class ProjectTask(models.Model):
+         additional_vals = {}
+         if self.env.user._is_portal() and not self.env.su:
+             self._ensure_fields_write(vals, defaults=False)
++            if {'stage_id', 'priority'}.intersection(vals.keys()):
++                if self.project_id.ids:
++                    advanced_collabs_count = self.env['project.collaborator'].sudo().search_count([
++                        ('project_id', 'in', self.project_id.ids),
++                        ('partner_id', '=', self.env.user.partner_id.id),
++                        ('limited_access', '=', False),
++                    ])
++                    if advanced_collabs_count != len(self.project_id.ids):
++                        raise AccessError(self.env._("You need Advanced Edit access to change the stage or priority of a task."))
+ 
+         if 'milestone_id' in vals:
+             # WARNING: has to be done after 'project_id' vals is written on subtasks

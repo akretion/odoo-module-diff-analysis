@@ -1,0 +1,173 @@
+PR: https://github.com/odoo/odoo/pull/282867
+
+From: c36425b4dd31033816d2188cccf025046735af69
+From: Arnold Moyaux
+Date: 2026-09-10 11:43:56
+
+Breaking data model changes scores: del:3 + add:0, change matches:
+-    property_cost_method = fields.Selection(
+-    property_price_difference_account_id = fields.Many2one(
+-    property_price_difference_account_active = fields.Boolean(related='property_price_difference_account_id.active', string="Price Difference Account Active")
+
+Total Changes: 80
+
+[IMP] account: move standard and price diff in accounting
+
+Part-of: odoo/odoo#282867
+Related: odoo/enterprise#128165
+Related: odoo/upgrade#11082
+Signed-off-by: William Henrotin (whe) <whe@odoo.com>
+
+================================= pseudo patch: =================================
+
+--- a/addons/stock_account/models/account_move.py
++++ b/addons/stock_account/models/account_move.py
+@@ -69,6 +69,9 @@ class AccountMove(models.Model):
+     def _update_standard_price(self, reverse=False):
+         return
+ 
++    def _update_qty_available(self, reverse=False):
++        return
++
+     def _get_invoiced_lot_values(self):
+         return []
+ 
+
+--- a/addons/stock_account/models/account_move_line.py
++++ b/addons/stock_account/models/account_move_line.py
+@@ -84,20 +84,6 @@ class AccountMoveLine(models.Model):
+                     'balance': -amount if on_stock_account else amount,
+                 })
+ 
+-    def _get_gross_unit_price(self):
+-        if self.product_uom_id.is_zero(self.quantity):
+-            return self.price_unit
+-
+-        if self.discount != 100:
+-            if not any(t.price_include for t in self.tax_ids) and self.discount:
+-                price_unit = self.price_unit * (1 - self.discount / 100)
+-            else:
+-                price_unit = self.price_subtotal / self.quantity
+-        else:
+-            price_unit = self.price_unit
+-
+-        return -price_unit if self.move_id.move_type == 'in_refund' else price_unit
+-
+     def _get_cogs_value(self):
+         """ Get the COGS price unit in the product's default unit of measure.
+         """
+
+--- a/addons/stock_account/models/product.py
++++ b/addons/stock_account/models/product.py
+@@ -19,13 +19,7 @@ class ProductTemplate(models.Model):
+     _inherit = 'product.template'
+ 
+     cost_method = fields.Selection(
+-        string="Cost Method",
+-        selection=[
+-            ('standard', "Standard Price"),
+-            ('fifo', "First In First Out (FIFO)"),
+-            ('average', "Average Cost (AVCO)"),
+-        ],
+-        compute='_compute_cost_method',
++        selection_add=[('fifo', "First In First Out (FIFO)")],
+     )
+     lot_valuated = fields.Boolean(
+         string="Valuation by Lot/Serial",
+@@ -39,18 +33,6 @@ class ProductTemplate(models.Model):
+             if product.tracking not in ['lot', 'serial']:
+                 product.lot_valuated = False
+ 
+-    @api.depends_context('company')
+-    @api.depends('categ_id.property_cost_method')
+-    def _compute_cost_method(self):
+-        for product_template in self:
+-            company = product_template.company_id
+-            if not company or self.env.company.filtered_domain([('id', 'child_of', company.id)]):
+-                company = self.env.company
+-            product_template.cost_method = (
+-                product_template.categ_id.with_company(company).sudo().property_cost_method
+-                or company.sudo().cost_method
+-            )
+-
+     def write(self, vals):
+         product_ids_to_update = set()
+         lot_ids_to_update = set()
+@@ -97,12 +79,6 @@ class ProductTemplate(models.Model):
+             self.env['stock.lot'].browse(lot_ids_to_update).sudo()._update_standard_price()
+         return res
+ 
+-    def _get_price_diff_account(self):
+-        price_diff_account = super()._get_price_diff_account()
+-        if self.cost_method == 'standard':
+-            price_diff_account = self.categ_id.property_price_difference_account_id
+-        return price_diff_account
+-
+ 
+ class ProductProduct(models.Model):
+     _inherit = 'product.product'
+@@ -762,29 +738,13 @@ class ProductProduct(models.Model):
+ class ProductCategory(models.Model):
+     _inherit = 'product.category'
+ 
++    property_cost_method = fields.Selection(
++        selection_add=[('fifo', "First In First Out (FIFO)")],
++        ondelete={'fifo': 'set default'},
++    )
+     anglo_saxon_accounting = fields.Boolean(
+         string="Use Anglo-Saxon Accounting", compute="_compute_anglo_saxon_accounting",
+         help="If checked, the product will be valued using the Anglo-Saxon accounting method.")
+-    property_cost_method = fields.Selection(
+-        string="Costing Method",
+-        selection=[
+-            ('standard', "Standard Price"),
+-            ('fifo', "First In First Out (FIFO)"),
+-            ('average', "Average Cost (AVCO)"),
+-        ],
+-        company_dependent=True, copy=True,
+-        default=lambda self: self.env.company.cost_method,
+-        help="""Standard Price: The products are valued at their standard cost defined on the product.
+-        Average Cost (AVCO): The products are valued at weighted average cost.
+-        First In First Out (FIFO): The products are valued supposing those that enter the company first will also leave it first.
+-        """,
+-        tracking=True,
+-    )
+-    property_price_difference_account_id = fields.Many2one(
+-        'account.account', 'Price Difference Account', company_dependent=True, ondelete='restrict',
+-        check_company=True,
+-        help="""With perpetual valuation, this account will hold the price difference between the standard price and the bill price.""")
+-    property_price_difference_account_active = fields.Boolean(related='property_price_difference_account_id.active', string="Price Difference Account Active")
+ 
+     @api.depends_context('company')
+     def _compute_anglo_saxon_accounting(self):
+
+--- a/addons/stock_account/models/res_company.py
++++ b/addons/stock_account/models/res_company.py
+@@ -3,7 +3,6 @@ from datetime import datetime, time
+ 
+ from odoo import _, fields, models
+ from odoo.fields import Domain
+-from odoo.addons.base.models.res_company import company_default_for
+ 
+ 
+ class ResCompany(models.Model):
+@@ -11,17 +10,9 @@ class ResCompany(models.Model):
+ 
+     account_production_wip_account_id = fields.Many2one('account.account', string='Production WIP Account', check_company=True)
+     account_production_wip_overhead_account_id = fields.Many2one('account.account', string='Production WIP Overhead Account', check_company=True)
+-
+     cost_method = fields.Selection(
+-        string="Cost Method",
+-        selection=[
+-            ('standard', "Standard Price"),
+-            ('fifo', "First In First Out (FIFO)"),
+-            ('average', "Average Cost (AVCO)"),
+-        ],
+-        **company_default_for('cost_method', 'product.category', 'property_cost_method'),
+-        default='standard',
+-        required=True,
++        selection_add=[('fifo', "First In First Out (FIFO)")],
++        ondelete={'fifo': 'set default'},
+     )
+ 
+     def write(self, vals):

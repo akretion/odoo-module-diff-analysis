@@ -1,0 +1,890 @@
+PR: https://github.com/odoo/odoo/pull/264886
+
+From: dce36b04166974290fd35fb3e13c29f1dcc5c5f7
+From: 3amo-magdy
+Date: 2026-09-15 20:44:35
+
+Breaking data model changes scores: del:14 + add:0, change matches:
+-    _inherit = "hr.attendance"
+-    _inherit = 'hr.attendance.overtime.line'
+-    compensable_as_leave = fields.Boolean("Compensable as Time Off")
+-    leave_compensation_rate = fields.Float("Rate of leave compensation")
+-    _inherit = 'hr.attendance.overtime.rule'
+-    compensable_as_leave = fields.Boolean("Give back as time off", default=False)
+-    leave_compensation_rate = fields.Float(default=1.0)
+-    employee_overtime = fields.Float(compute='_compute_employee_overtime', groups='base.group_user')
+-    overtime_deductible = fields.Boolean(compute='_compute_overtime_deductible')
+-    overtime_deductible = fields.Boolean(compute='_compute_overtime_deductible')
+-    employee_overtime = fields.Float(compute='_compute_employee_overtime', groups='base.group_user')
+-    _inherit = 'hr.work.entry.type'
+-    overtime_deductible = fields.Boolean(
+-    _inherit = "resource.calendar.leaves"
+
+Total Changes: 679
+
+[IMP] hr_{work_entry,attendance,holidays,holidays_attendance}: sequential time rule pipeline engine
+
+Adds a configurable threshold-based engine that automatically reclassifies
+attendance and leave records when a worked-hours threshold is crossed, and
+optionally creates or deducts compensatory-leave allocation credits.
+
+MECHANISM
+
+A rule (hr.time.rule) expresses a condition:
+
+  "When employee X works more (or less) than Y hours on day/week D,
+   reclassify the excess (or deficit) as work-entry type Z and grant
+   (or deduct) N% of those hours as compensatory-leave allocation."
+
+Rules run sequentially in sequence order. Each rule sees the already-
+reclassified output of all prior rules, so they compose cleanly:
+
+  Rule 1 - excess > 2 h -> Overtime
+  Rule 2 - excess > 4 h -> Double-time   (evaluates the post-rule-1 pipeline)
+
+KEY MODULES
+
+hr_work_entry
+  hr.time.rule           rule model, field definitions, pipeline entry point
+  _evaluate_rules        builds initial intervals, runs rules in sequence,
+                         extracts excess and deficit per (employee, source) pair
+  _evaluate_period       period-level threshold: compares worked hours against
+                         the employee's schedule or a fixed expected-hours value
+  _apply_output          writes results: reclassifies sources in-place or creates
+                         child output records; collects allocation credit tuples
+  HrTimeRuleSourceMixin  abstract trigger layer inherited by hr.attendance and
+                         hr.leave; fires the pipeline on validated create/write
+                         and exposes daily/weekly cron entry points for undertime
+
+hr_attendance
+  attendance_validation  per-company policy: when an attendance counts as a
+                         validated pipeline source (immediate, officer, tolerance)
+  _apply_attendance_output  base implementation - no allocation tracking
+
+hr_holidays
+  leave_compensation_rate / allocation_type_id  output fields on the rule
+  _apply_leave_output    excess -> hr.leave.allocation credit;
+                         deficit -> allocation deduction
+  hr.time.rule.allocation.log  per-source log of credits; allows precise reversal
+                               when a source record is modified or deleted
+
+hr_holidays_attendance
+  bridge module: attendance-based excess/deficit also creates/deducts
+  hr.leave.allocation records using the same log + reversal mechanism
+
+TRIGGER TIMING:
+  On write/create (for daily excess rules)
+  Daily cron for yesterday's daily undertime
+  Weekly cron for weekly rules*
+
+* note that weekly Undertime is only processed via the weekly cron,
+meaning past corrections do not trigger the weekly undertime rules.
+
+Task-6253185
+
+Part-of: odoo/odoo#264886
+Related: odoo/enterprise#117524
+Related: odoo/upgrade#10594
+Signed-off-by: Yannick Tivisse (yti) <yti@odoo.com>
+
+================================= pseudo patch: =================================
+
+--- a/addons/hr_holidays_attendance/models/__init__.py
++++ b/addons/hr_holidays_attendance/models/__init__.py
+@@ -1,11 +1,12 @@
+ # Part of Odoo. See LICENSE file for full copyright and licensing details.
+ 
+-from . import hr_attendance_overtime_rule
+-from . import hr_attendance_overtime
++from . import hr_attendance
+ from . import hr_leave_allocation
+ from . import hr_leave_accrual_plan_level
+-from . import hr_work_entry_type
+ from . import hr_leave
++from . import hr_time_rule
+ from . import ir_ui_menu
+ from . import hr_employee
++from . import hr_version
+ from . import resource_calendar_leaves
++from . import res_company
+
+--- a/addons/hr_holidays_attendance/models/hr_attendance.py
++++ b/addons/hr_holidays_attendance/models/hr_attendance.py
+@@ -1,11 +1,27 @@
+-from odoo import models
++# Part of Odoo. See LICENSE file for full copyright and licensing details.
++
++from odoo import api, models
++
++# fields that when changed invalidate previously credited allocations
++_TIME_FIELDS = frozenset({'check_in', 'check_out', 'employee_id'})
++
++# states in which an attendance no longer counts as valid source material
++_INVALID_STATES = frozenset({'refused', 'draft'})
+ 
+ 
+ class HrAttendance(models.Model):
+-    _inherit = "hr.attendance"
++    _inherit = 'hr.attendance'
++
++    def write(self, vals):
++        to_reverse = set()
++        if not self.env.context.get('skip_time_rules') and _TIME_FIELDS & vals.keys():
++            to_reverse.update(self.ids)
++        if vals.get('state') in _INVALID_STATES:
++            to_reverse.update(self.filtered(lambda a: a.state == 'validated').ids)
++        if to_reverse:
++            self.env['hr.time.rule']._reverse_allocation_credits('hr.attendance', to_reverse)
++        return super().write(vals)
+ 
+-    def init(self):
+-        super().init()
+-        self.env.cr.execute("""
+-            CREATE INDEX IF NOT EXISTS hr_attendance_check_in_check_out_employee_id ON hr_attendance (check_in, check_out, employee_id);
+-        """)
++    @api.ondelete(at_uninstall=False)
++    def _reverse_credits_on_unlink(self):
++        self.env['hr.time.rule']._reverse_allocation_credits('hr.attendance', self.ids)
+
+--- a/addons/hr_holidays_attendance/models/hr_attendance_overtime.py
++++ b/None
+@@ -1,11 +0,0 @@
+-# Part of Odoo. See LICENSE file for full copyright and licensing details.
+-
+-from odoo import models, fields
+-
+-
+-class HrAttendanceOvertimeLine(models.Model):
+-    _name = 'hr.attendance.overtime.line'
+-    _inherit = 'hr.attendance.overtime.line'
+-
+-    compensable_as_leave = fields.Boolean("Compensable as Time Off")
+-    leave_compensation_rate = fields.Float("Rate of leave compensation")
+
+--- a/addons/hr_holidays_attendance/models/hr_attendance_overtime_rule.py
++++ b/None
+@@ -1,29 +0,0 @@
+-
+-# Part of Odoo. See LICENSE file for full copyright and licensing details.
+-
+-from odoo import models, fields
+-
+-
+-class HrAttendanceOvertimeRule(models.Model):
+-    _name = 'hr.attendance.overtime.rule'
+-    _inherit = 'hr.attendance.overtime.rule'
+-
+-    compensable_as_leave = fields.Boolean("Give back as time off", default=False)
+-    leave_compensation_rate = fields.Float(default=1.0)
+-
+-    def _extra_overtime_vals(self):
+-
+-        cal_rules = self.filtered('compensable_as_leave')
+-
+-        total_leave_compensation_rate = 0.0
+-        if cal_rules:
+-            if self.ruleset_id.rate_combination_mode == 'sum':
+-                total_leave_compensation_rate = sum((r.leave_compensation_rate - 1.0 for r in cal_rules), start=1.0)
+-            elif self.ruleset_id.rate_combination_mode == 'max':
+-                total_leave_compensation_rate = max(r.leave_compensation_rate for r in cal_rules)
+-
+-        return {
+-            **super()._extra_overtime_vals(),
+-            'compensable_as_leave': any(self.mapped('compensable_as_leave')),
+-            'leave_compensation_rate': total_leave_compensation_rate,
+-        }
+
+--- a/addons/hr_holidays_attendance/models/hr_employee.py
++++ b/addons/hr_holidays_attendance/models/hr_employee.py
+@@ -1,51 +1,63 @@
+ # Part of Odoo. See LICENSE file for full copyright and licensing details.
+-from collections import defaultdict
+-from odoo import models
++from datetime import UTC
++from zoneinfo import ZoneInfo
++
++from odoo import fields, models
++from odoo.fields import Domain
+ 
+ 
+ class HrEmployee(models.Model):
+     _inherit = "hr.employee"
+ 
+-    def _get_deductible_employee_overtime(self):
+-        # return dict {employee: number of hours}
+-        diff_by_employee = defaultdict(lambda: 0)
+-        for _, lines in self.env['hr.attendance.overtime.line'].sudo()._read_group(
+-            domain=[('compensable_as_leave', '=', True),
+-                ('employee_id', 'in', self.ids),
+-                ('status', '=', 'approved')],
+-            groupby=['employee_id'],
+-            aggregates=['id:recordset']
+-        ):
+-            for line in lines:
+-                diff_by_employee[line.employee_id] += line.manual_duration * line.leave_compensation_rate
+-        for employee, hours in self.env['hr.leave']._read_group(
+-            domain=[
+-                ('work_entry_type_id.overtime_deductible', '=', True),
+-                ('work_entry_type_id.requires_allocation', '=', False),
+-                ('employee_id', 'in', self.ids),
+-                ('state', 'not in', ['refuse', 'cancel']),
+-            ],
+-            groupby=['employee_id'],
+-            aggregates=['number_of_hours:sum'],
+-        ):
+-            diff_by_employee[employee] -= hours
+-        for employee, hours in self.env['hr.leave.allocation']._read_group(
++    def _get_calendar_attendance_domain(self):
++        return Domain.AND([
++            super()._get_calendar_attendance_domain(),
++            Domain.OR([
++                Domain("work_entry_type_id", "=", False),
++                Domain("work_entry_type_id.count_as", "!=", "absence")
++            ]),
++        ])
++
++    def _compute_hours_last_month(self):
++        super()._compute_hours_last_month()
++        now = fields.Datetime.now()
++        now_utc = now.replace(tzinfo=UTC)
++        for timezone, employees in self.grouped('tz').items():
++            tz = ZoneInfo(timezone or 'UTC')
++            now_tz = now_utc.astimezone(tz)
++            start_tz = now_tz.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
++            start_naive = start_tz.astimezone(UTC).replace(tzinfo=None)
++            end_naive = now_tz.astimezone(UTC).replace(tzinfo=None)
++
++            overtime_by_employee = dict(self.env['hr.attendance']._read_group(
++                domain=[
++                    ('time_rule_id', '!=', False),
++                    ('employee_id', 'in', employees.ids),
++                    ('check_in', '<', end_naive),
++                    ('check_out', '>', start_naive),
++                ],
++                groupby=['employee_id'],
++                aggregates=['worked_hours:sum'],
++            ))
++            for employee in employees:
++                employee.hours_last_month_overtime = round(
++                    overtime_by_employee.get(employee, 0.0), 2
++                )
++
++    def get_attendance_data_by_employee(self, date_start, date_stop):
++        attendance_data = super().get_attendance_data_by_employee(date_start, date_stop)
++
++        overtime_atts = self.env['hr.attendance']._read_group(
+             domain=[
+-                ('work_entry_type_id.overtime_deductible', '=', True),
++                ('time_rule_id', '!=', False),
+                 ('employee_id', 'in', self.ids),
+-                ('state', 'in', ['confirm', 'validate', 'validate1']),
++                ('check_in', '<', date_stop),
++                ('check_out', '>', date_start),
+             ],
+             groupby=['employee_id'],
+-            aggregates=['number_of_hours:sum'],
+-        ):
+-            diff_by_employee[employee] -= hours
+-        return diff_by_employee
+-
+-    def get_attendace_data_by_employee(self, date_start, date_stop):
+-        attendance_data = super().get_attendace_data_by_employee(date_start, date_stop)
+-        for employee_id in self.ids:
+-            attendance_data[employee_id]["unspent_compensable_overtime"] = 0
+-        unspent_overtime = self._get_deductible_employee_overtime()
+-        for employee in unspent_overtime:
+-            attendance_data[employee.id]["unspent_compensable_overtime"] += unspent_overtime[employee]
++            aggregates=['worked_hours:sum'],
++        )
++        for employee, overtime_hours in overtime_atts:
++            attendance_data[employee.id]['overtime_hours'] = overtime_hours
++
+         return attendance_data
+
+--- a/addons/hr_holidays_attendance/models/hr_leave.py
++++ b/addons/hr_holidays_attendance/models/hr_leave.py
+@@ -1,75 +1,18 @@
+ # Part of Odoo. See LICENSE file for full copyright and licensing details.
+ 
+-from collections import defaultdict
+-from datetime import timedelta
+-
+-from odoo import api, fields, models, _
+-from odoo.exceptions import ValidationError
+-from odoo.tools import float_round
++from odoo import models
+ 
+ 
+ class HrLeave(models.Model):
+     _inherit = 'hr.leave'
+ 
+-    employee_overtime = fields.Float(compute='_compute_employee_overtime', groups='base.group_user')
+-    overtime_deductible = fields.Boolean(compute='_compute_overtime_deductible')
+-
+-    @api.depends('work_entry_type_id')
+-    def _compute_overtime_deductible(self):
+-        for leave in self:
+-            leave.overtime_deductible = leave.work_entry_type_id.overtime_deductible and not leave.work_entry_type_id.requires_allocation
+-
+-    @api.model_create_multi
+-    def create(self, vals_list):
+-        res = super().create(vals_list)
+-        self._check_overtime_deductible(res)
+-        return res
+-
+-    def write(self, vals):
+-        res = super().write(vals)
+-        fields_to_check = {'number_of_days', 'request_date_from', 'request_date_to', 'state', 'employee_id', 'work_entry_type_id'}
+-        if not any(field for field in fields_to_check if field in vals):
+-            return res
+-        self._check_overtime_deductible(self)
+-        return res
+-
+-    @api.depends('number_of_hours', 'employee_id', 'work_entry_type_id')
+-    def _compute_employee_overtime(self):
+-        diff_by_employee = self.employee_id._get_deductible_employee_overtime()
+-        for leave in self:
+-            leave.employee_overtime = diff_by_employee[leave.employee_id]
+-
+-    def _check_overtime_deductible(self, leaves):
+-        # If the type of leave is overtime deductible, we have to check that the employee has enough extra hours
+-        hours = leaves.employee_id._get_deductible_employee_overtime()
+-        for leave in leaves.filtered('overtime_deductible'):
+-            remaining_overtime = hours[leave.employee_id]
+-            leave_type = leave.work_entry_type_id
+-
+-            excess_limit = leave_type.max_allowed_negative if leave_type.allows_negative else 0
+-            if leave_type.unit_of_measure == 'day':
+-                excess_limit *= leave.employee_id._get_hours_per_day(leave.date_from)
+-
+-            if remaining_overtime < -excess_limit:
+-                if leave_type.allows_negative:
+-                    raise ValidationError(_('This leave request exceeds the allowed negative leave balance cap'))
+-                if leave.employee_id.user_id == self.env.user:
+-                    raise ValidationError(_('You do not have enough extra hours to request this leave'))
+-                raise ValidationError(_('The employee does not have enough extra hours to request this leave.'))
+-
+-    def action_approve(self, check_state=True):
+-        res = super().action_approve(check_state)
+-        self._check_overtime_deductible(self)
+-        return res
+-
+-    def _update_leaves_overtime(self):  # TODO: Remove in master, since its no longer used.
+-        date_from, date_to = self.mapped('date_from'), self.mapped('date_to')
+-        if date_from and date_to:
+-            self.env['hr.attendance'].sudo().search([
+-                ('check_in', '<=', max(date_to)),
+-                ('check_out', '>=', min(date_from)),
+-                ('employee_id', 'in', self.employee_id.ids),
+-            ])._update_overtime()
+-
+-    def _force_cancel(self, *args, **kwargs):
+-        super()._force_cancel(*args, **kwargs)
++    def _compute_display_name(self):
++        super()._compute_display_name()
++        for leave in self.filtered('time_rule_id'):
++            if not (leave.date_from and leave.date_to):
++                continue
++            total_seconds = (leave.date_to - leave.date_from).total_seconds()
++            h, rem = divmod(int(total_seconds), 3600)
++            m = rem // 60
++            duration = f'{h}h{m:02d}' if m else f'{h}h'
++            leave.display_name = f'{leave.work_entry_type_id.name} {duration}'.strip()
+
+--- a/addons/hr_holidays_attendance/models/hr_leave_allocation.py
++++ b/addons/hr_holidays_attendance/models/hr_leave_allocation.py
+@@ -2,9 +2,7 @@
+ 
+ from datetime import datetime
+ 
+-from odoo import api, fields, models, _
+-from odoo.exceptions import ValidationError
+-from odoo.fields import Domain
++from odoo import models
+ from odoo.tools.date_utils import sum_intervals
+ from odoo.tools.intervals import Intervals
+ 
+@@ -12,59 +10,6 @@ from odoo.tools.intervals import Intervals
+ class HrLeaveAllocation(models.Model):
+     _inherit = 'hr.leave.allocation'
+ 
+-    @api.model
+-    def default_get(self, fields):
+-        res = super().default_get(fields)
+-        if 'work_entry_type_id' in fields and self.env.context.get('deduct_extra_hours'):
+-            domain = Domain('overtime_deductible', '=', True) & Domain('requires_allocation', '=', True)
+-            if self.env.context.get('deduct_extra_hours_employee_request', False):
+-                # Prevent loading manager allocated time type in self request contexts
+-                domain &= Domain('employee_requests', '=', True)
+-            work_entry_type = self.env['hr.work.entry.type'].search(domain, limit=1)
+-            res['work_entry_type_id'] = work_entry_type.id
+-        return res
+-
+-    overtime_deductible = fields.Boolean(compute='_compute_overtime_deductible')
+-    employee_overtime = fields.Float(compute='_compute_employee_overtime', groups='base.group_user')
+-
+-    @api.depends('work_entry_type_id')
+-    def _compute_overtime_deductible(self):
+-        for allocation in self:
+-            allocation.overtime_deductible = allocation.work_entry_type_id.overtime_deductible
+-
+-    @api.depends('employee_id')
+-    def _compute_employee_overtime(self):
+-        diff_by_employee = self.employee_id._get_deductible_employee_overtime()
+-        for allocation in self:
+-            allocation.employee_overtime = diff_by_employee.get(allocation.employee_id, 0)
+-
+-    @api.model_create_multi
+-    def create(self, vals_list):
+-        res = super().create(vals_list)
+-        res._check_employee_overtime_balance()
+-        return res
+-
+-    def write(self, vals):
+-        res = super().write(vals)
+-        if 'number_of_days' not in vals and 'work_entry_type_id' not in vals:
+-            return res
+-        if not self.env.user.has_group("hr_holidays.group_hr_holidays_user") and any(allocation.state not in ('draft', 'confirm') for allocation in self):
+-            raise ValidationError(_('Only an Officer or Administrator is allowed to edit the allocation duration in this status.'))
+-        self._check_employee_overtime_balance()
+-        return res
+-
+-    def action_refuse(self):
+-        res = super().action_refuse()
+-        return res
+-
+-    def _check_employee_overtime_balance(self):
+-        for allocation in self:
+-            if not allocation.overtime_deductible:
+-                continue
+-            deductible = allocation.employee_id._get_deductible_employee_overtime()
+-            if deductible[allocation.employee_id] < 0:
+-                raise ValidationError(_('The employee does not have enough overtime hours to request this leave.'))
+-
+     def _get_accrual_plan_level_work_entry_prorata(self, level, start_period, start_date, end_period, end_date):
+         self.ensure_one()
+         if level.frequency != 'worked_hours':
+@@ -73,11 +18,11 @@ class HrLeaveAllocation(models.Model):
+         start_dt = datetime.combine(start_date, datetime_min_time)
+         end_dt = datetime.combine(end_date, datetime_min_time)
+ 
+-        # Search for any attendance overlapping the window
+         attendances = self.env['hr.attendance'].sudo().search([
+             ('employee_id', '=', self.employee_id.id),
+             ('check_in', '<', end_dt),
+             ('check_out', '>', start_dt),
++            ('state', '=', 'validated'),
+         ])
+ 
+         attendance_intervals = []
+
+--- a/None
++++ b/addons/hr_holidays_attendance/models/hr_time_rule.py
+@@ -0,0 +1,12 @@
++# Part of Odoo. See LICENSE file for full copyright and licensing details.
++
++from odoo import models
++
++
++class HrTimeRule(models.Model):
++    _inherit = 'hr.time.rule'
++
++    def _apply_attendance_output(self, excess, deficit, active_iv=None):
++        deficit = self._filter_deficit_exceeding_allocation(deficit)
++        _new_records, _all_source_ids, excess_alloc, deficit_alloc = super()._apply_attendance_output(excess, deficit, active_iv=active_iv)
++        self._apply_allocation_credits(excess_alloc, deficit_alloc)
+
+--- a/None
++++ b/addons/hr_holidays_attendance/models/hr_version.py
+@@ -0,0 +1,188 @@
++# Part of Odoo. See LICENSE file for full copyright and licensing details.
++
++from collections import defaultdict
++from datetime import datetime, time, UTC
++from zoneinfo import ZoneInfo
++
++from odoo import api, models
++from odoo.addons.hr_work_entry.models.hr_time_rule import resolve_intervals_by_sequence
++from odoo.tools.intervals import Intervals
++
++
++class HrVersion(models.Model):
++    _inherit = 'hr.version'
++
++    def has_static_work_entries(self):
++        return not self.attendance_based
++
++    def _get_attendance_intervals(self, start_dt, end_dt):
++        result = {}
++        for v in self.filtered('attendance_based'):
++            result[v.employee_id.resource_id.id] = Intervals()
++        calendar_versions = self.filtered(lambda v: not v.attendance_based)
++        if calendar_versions:
++            result.update(super(HrVersion, calendar_versions)._get_attendance_intervals(start_dt, end_dt))
++        return result
++
++    @api.model
++    def _get_work_entry_source_fields(self):
++        return super()._get_work_entry_source_fields() + ['attendance_based', 'attendance_ids']
++
++    def _resolve_attendance_intervals(self, intervals):
++        """Split overlapping intervals and pick the winner by work_entry_type.sequence."""
++        return resolve_intervals_by_sequence(intervals)
++
++    def _get_version_work_entries_values(self, date_start, date_stop):
++        start_dt = date_start.replace(tzinfo=UTC) if not date_start.tzinfo else date_start
++        end_dt = date_stop.replace(tzinfo=UTC) if not date_stop.tzinfo else date_stop
++
++        # working-time leaves from the leave pipeline
++        working_time_leaves = self.env['hr.leave'].sudo().search([
++            ('work_entry_type_id.count_as', '=', 'working_time'),
++            ('employee_id', 'in', self.employee_id.ids),
++            ('date_from', '<=', end_dt.replace(tzinfo=None)),
++            ('date_to', '>=', start_dt.replace(tzinfo=None)),
++            ('state', '=', 'validate'),
++        ])
++
++        attendances = self.env['hr.attendance'].sudo().search([
++            ('employee_id', 'in', self.employee_id.ids),
++            ('check_in', '<=', end_dt.replace(tzinfo=None)),
++            ('check_out', '>=', start_dt.replace(tzinfo=None)),
++            ('check_out', '!=', False),
++            ('state', '=', 'validated'),
++        ])
++
++        knocked_raw = defaultdict(list)
++        time_on_raw = defaultdict(list)
++        att_coverage_raw = defaultdict(list)
++        dummy = self.env['resource.calendar']
++        attendance_vals = []
++
++        wt_iv_by_rid = defaultdict(list)
++        for leave in working_time_leaves:
++            rid = leave.employee_id.resource_id.id
++            if leave.number_of_hours:
++                ci = leave.date_from.replace(tzinfo=UTC)
++                co = leave.date_to.replace(tzinfo=UTC)
++                time_on_raw[rid].append((ci, co, dummy))
++                wt_iv_by_rid[rid].append((ci, co, leave.work_entry_type_id))
++
++        for version in self:
++            tz = ZoneInfo(version._get_tz())
++            rid = version.employee_id.resource_id.id
++            default_wet_id = version._get_default_work_entry_type_id()
++            emp_atts = attendances.filtered(lambda a: a.employee_id == version.employee_id)
++
++            raw_att = []
++            att_by_range = {}
++            for att in emp_atts:
++                check_in = att.check_in.replace(tzinfo=UTC)
++                check_out = att.check_out.replace(tzinfo=UTC)
++                # deficit outputs start after source check_out (unworked time); exclude from time_on
++                if not att.source_attendance_id or att.check_in < att.source_attendance_id.check_out:
++                    time_on_raw[rid].append((check_in, check_out, dummy))
++                if not version.attendance_based:
++                    start_day = check_in.astimezone(tz).date()
++                    end_day = check_out.astimezone(tz).date()
++                    knocked_raw[rid].append((
++                        datetime.combine(start_day, time.min, tzinfo=tz).astimezone(UTC),
++                        datetime.combine(end_day, time.max, tzinfo=tz).astimezone(UTC),
++                        dummy,
++                    ))
++                if check_out > check_in:
++                    wet = att.work_entry_type_id or self.env['hr.work.entry.type'].browse(default_wet_id)
++                    raw_att.append((check_in, check_out, wet))
++                    att_by_range[check_in, check_out] = att
++
++            # priority-resolve attendance against wt-leave intervals (lower sequence wins)
++            leave_types = {wet for _, _, wet in wt_iv_by_rid.get(rid, [])}
++            combined = raw_att + wt_iv_by_rid.get(rid, [])
++            for seg_start, seg_stop, wet in self._resolve_attendance_intervals(combined):
++                if wet in leave_types:
++                    # wt-leave won; so we skip and let base handle it
++                    continue
++                # attendance won: look up the source record (dict miss on split sub-segments,
++                # fall back to the original attendance that contains this segment)
++                att = att_by_range.get((seg_start, seg_stop)) or next(
++                    (att_by_range[ci, co] for ci, co, _ in raw_att if ci <= seg_start and co >= seg_stop),
++                    None,
++                )
++                att_coverage_raw[rid].append((seg_start, seg_stop, dummy))
++                extra = version._get_more_vals_attendance_interval((seg_start, seg_stop, att)) if att else []
++                attendance_vals.append({
++                    'date_start': seg_start.replace(tzinfo=None),
++                    'date_stop': seg_stop.replace(tzinfo=None),
++                    'work_entry_type_id': wet,
++                    'employee_id': version.employee_id,
++                    'version_id': version,
++                    'company_id': version.company_id,
++                    '_from_attendance': True,
++                    **dict(extra),
++                })
++
++        base_vals = super(HrVersion, self.with_context(
++            knocked_day_intervals={
++                rid: Intervals(items, keep_distinct=True)
++                for rid, items in knocked_raw.items()
++            },
++            time_on_intervals={
++                rid: Intervals(items, keep_distinct=True)
++                for rid, items in time_on_raw.items()
++            },
++            att_coverage_intervals={
++                rid: Intervals(items, keep_distinct=True)
++                for rid, items in att_coverage_raw.items()
++            },
++        ))._get_version_work_entries_values(date_start, date_stop)
++
++        return base_vals + attendance_vals
++
++    def _get_real_attendances(self, attendances, leaves, worked_leaves):
++        knocked = self.env.context.get('knocked_day_intervals', {}).get(
++            self.employee_id.resource_id.id, Intervals()
++        )
++        return (attendances - knocked) - leaves - worked_leaves
++
++    def _generate_work_entries_postprocess_adapt_to_calendar(self, vals):
++        if vals.pop('_from_attendance', False):
++            return False
++        # fully-flexible employees have no calendar; compute duration from actual time span
++        version = vals.get('version_id')
++        if version and version.is_fully_flexible:
++            return False
++        return super()._generate_work_entries_postprocess_adapt_to_calendar(vals)
++
++    def _get_more_vals_attendance_interval(self, interval):
++        vals = super()._get_more_vals_attendance_interval(interval)
++        att = interval[2]
++        if att and hasattr(att, '_name') and att._name == 'hr.attendance':
++            vals.append(('attendance_ids', att))
++        return vals
++
++    def _get_valid_leave_intervals(self, attendances, interval):
++        payload = interval[2]
++        if not payload:
++            return [interval]
++
++        count_as = self._get_interval_work_entry_type(interval).count_as
++
++        if count_as == 'absence':
++            # worked time wins over absence where they overlap
++            time_on = self.env.context.get('time_on_intervals', {}).get(
++                self.employee_id.resource_id.id, Intervals()
++            )
++            if not time_on:
++                return [interval]
++            return list(Intervals([interval], keep_distinct=True) - time_on)
++
++        if count_as == 'working_time':
++            # suppress base's wt-leave output for portions where attendance won the fight
++            att_coverage = self.env.context.get('att_coverage_intervals', {}).get(
++                self.employee_id.resource_id.id, Intervals()
++            )
++            if not att_coverage:
++                return [interval]
++            return list(Intervals([interval], keep_distinct=True) - att_coverage)
++
++        return [interval]
+
+--- a/addons/hr_holidays_attendance/models/hr_work_entry_type.py
++++ b/None
+@@ -1,52 +0,0 @@
+-# Part of Odoo. See LICENSE file for full copyright and licensing details.
+-
+-from odoo.tools.misc import format_duration
+-from odoo import _, api, fields, models
+-
+-
+-class HrWorkEntryType(models.Model):
+-    _inherit = 'hr.work.entry.type'
+-
+-    overtime_deductible = fields.Boolean(
+-        "Deduct Extra Hours", default=False, tracking=True,
+-        help="Once a time off of this type is approved, extra hours in attendances will be deducted.")
+-
+-    @api.depends('overtime_deductible', 'requires_allocation')
+-    @api.depends_context('request_type', 'leave', 'work_entry_type_display_name', 'employee_id')
+-    def _compute_display_name(self):
+-        # Exclude hours available in allocation contexts, it might be confusing otherwise
+-        if not self.requested_display_name() or self.env.context.get('request_type', 'leave') == 'allocation':
+-            return super()._compute_display_name()
+-
+-        employee = self.env['hr.employee'].browse(self.env.context.get('employee_id')).sudo()
+-        unspent_overtime = employee._get_deductible_employee_overtime()[employee]
+-        if not unspent_overtime:
+-            return super()._compute_display_name()
+-
+-        overtime_leaves = self.filtered(lambda l_type: l_type.overtime_deductible and not l_type.requires_allocation)
+-        for work_entry_type in overtime_leaves:
+-            work_entry_type.display_name = "%(name)s (%(count)s)" % {
+-                'name': work_entry_type.name,
+-                'count': _('%s hours available',
+-                    format_duration(unspent_overtime)),
+-            }
+-        super(HrWorkEntryType, self - overtime_leaves)._compute_display_name()
+-
+-    def get_allocation_data(self, employees, target_date=None, same_year_only=False):
+-        res = super().get_allocation_data(employees, target_date, same_year_only=same_year_only)
+-        deductible_time_off_types = self.env['hr.work.entry.type'].search([
+-            ('overtime_deductible', '=', True),
+-            ('requires_allocation', '=', False)])
+-        work_entry_type_ids = deductible_time_off_types.ids
+-        unspent_overtime = employees._get_deductible_employee_overtime()
+-        for employee in res:
+-            total_overtime = employee.sudo().total_overtime
+-            for leave_data in res[employee]:
+-                if leave_data[3] in work_entry_type_ids:
+-                    leave_data[1]['virtual_remaining_leaves'] = unspent_overtime[employee]
+-                    leave_data[1]['max_leaves'] += total_overtime
+-                    leave_data[1]['remaining_leaves'] += total_overtime
+-                    leave_data[1]['overtime_deductible'] = True
+-                else:
+-                    leave_data[1]['overtime_deductible'] = False
+-        return res
+
+--- a/None
++++ b/addons/hr_holidays_attendance/models/res_company.py
+@@ -0,0 +1,11 @@
++# Part of Odoo. See LICENSE file for full copyright and licensing details.
++
++from odoo import fields, models
++
++
++class ResCompany(models.Model):
++    _inherit = 'res.company'
++
++    attendance_work_entry_type_id = fields.Many2one(
++        domain=[('requires_allocation', '=', False), ('count_as', '=', 'working_time')],
++    )
+
+--- a/addons/hr_holidays_attendance/models/resource_calendar_leaves.py
++++ b/addons/hr_holidays_attendance/models/resource_calendar_leaves.py
+@@ -1,76 +1,71 @@
+-from datetime import UTC, datetime, time
+-from zoneinfo import ZoneInfo
++from datetime import UTC
++
+ from odoo import api, models
+ from odoo.fields import Domain
+ 
+ 
+ class ResourceCalendarLeaves(models.Model):
+-    _inherit = "resource.calendar.leaves"
+-
+-    def _get_attendance_domain(self):
+-        domain = []
+-
+-        leaves_time_type_leave = self.filtered(lambda leave: leave.count_as == 'absence')
+-
+-        resource_leaves = leaves_time_type_leave.filtered(lambda leave: leave.resource_id.employee_id)
+-
+-        for resource, leaves in resource_leaves.grouped('resource_id').items():
+-            tz = ZoneInfo(resource.tz)
+-
+-            min_date = min(leaves.mapped('date_from')).replace(tzinfo=UTC).astimezone(tz).date()
+-            utc_start = datetime.combine(min_date, time(0, 0, 0), tzinfo=tz).astimezone(UTC).replace(tzinfo=None)
+-
+-            max_date = max(leaves.mapped('date_to')).replace(tzinfo=UTC).astimezone(tz).date()
+-            utc_end = datetime.combine(max_date, time(23, 59, 59), tzinfo=tz).astimezone(UTC).replace(tzinfo=None)
+-
+-            domain.append([
+-                ('check_in', '<=', utc_end),
+-                ('check_out', '>=', utc_start),
+-                ('employee_id', 'in', resource.employee_id.ids),
+-            ])
+-
+-        for leave in (leaves_time_type_leave - resource_leaves):
+-            tz = ZoneInfo(leave.resource_id.tz or leave.company_id.tz)
+-
+-            start_date = leave.date_from.replace(tzinfo=UTC).astimezone(tz).date()
+-            utc_start = datetime.combine(start_date, time(0, 0, 0), tzinfo=tz).astimezone(UTC).replace(tzinfo=None)
+-
+-            end_date = leave.date_to.replace(tzinfo=UTC).astimezone(tz).date()
+-            utc_end = datetime.combine(end_date, time(23, 59, 59), tzinfo=tz).astimezone(UTC).replace(tzinfo=None)
+-
+-            leave_domain = [
+-                ('check_in', '<=', utc_end),
+-                ('check_out', '>=', utc_start),
+-            ]
+-            if leave.company_id:
+-                leave_domain.append(('employee_id.company_id', '=', leave.company_id.id))
++    _inherit = 'resource.calendar.leaves'
++
++    def _get_time_rule_affected(self):
++        """Return [(employee, date_from_utc, date_to_utc)] for public-holiday leaves in self."""
++        ph_leaves = self.filtered(lambda l: not l.resource_id and l.date_from and l.date_to)
++        if not ph_leaves:
++            return []
++
++        global_leaves = ph_leaves.filtered(lambda l: not l.calendar_id)
++        calendar_leaves = ph_leaves.filtered('calendar_id')
++
++        domains = []
++        if global_leaves:
++            company_ids = global_leaves.company_id.ids
++            domains.append(Domain('company_id', 'in', company_ids) if company_ids else Domain.TRUE)
++        if calendar_leaves:
++            domains.append(Domain('resource_calendar_id', 'in', calendar_leaves.calendar_id.ids))
++        if not domains:
++            return []
++
++        all_employees = self.env['hr.employee'].sudo().search(Domain.OR(domains))
++        if not all_employees:
++            return []
++
++        affected = []
++        for leave in ph_leaves:
++            df = leave.date_from.replace(tzinfo=UTC)
++            dt = leave.date_to.replace(tzinfo=UTC)
+             if leave.calendar_id:
+-                leave_domain.append(('employee_id.resource_calendar_id', '=', leave.calendar_id.id))
+-            domain.append(leave_domain)
+-
+-        return Domain.OR(domain)
+-
+-    def _update_attendances_overtime(self, domain=None):
+-        self.env['hr.attendance'].sudo().search(domain or self._get_attendance_domain())._update_overtime()
++                emps = all_employees.filtered(lambda e, c=leave.calendar_id: e.resource_calendar_id == c)
++            elif leave.company_id:
++                emps = all_employees.filtered(lambda e, cid=leave.company_id.id: e.company_id.id == cid)
++            else:
++                emps = all_employees
++            affected.extend((emp, df, dt) for emp in emps)
++        return affected
++
++    def _retrigger_time_rules(self):
++        affected = self._get_time_rule_affected()
++        if affected:
++            self.env['hr.attendance']._process_time_rules_for(affected)
+ 
+     @api.model_create_multi
+     def create(self, vals_list):
+         res = super().create(vals_list)
+-        res._update_attendances_overtime()
++        res._retrigger_time_rules()
+         return res
+ 
+     def write(self, vals):
+-        affects_attendances = bool({'date_from', 'date_to', 'resource_id', 'calendar_id', 'company_id', 'count_as'} & set(vals.keys()))
+-        if affects_attendances:
+-            before_domain = self._get_attendance_domain()
++        affects_time_rules = bool({'date_from', 'date_to', 'resource_id', 'calendar_id'} & set(vals.keys()))
++        old_affected = self._get_time_rule_affected() if affects_time_rules else []
+         res = super().write(vals)
+-        if affects_attendances:
+-            after_domain = self._get_attendance_domain()
+-            self._update_attendances_overtime(Domain.OR([before_domain, after_domain]))
++        if affects_time_rules:
++            if old_affected:
++                self.env['hr.attendance']._process_time_rules_for(old_affected)
++            self._retrigger_time_rules()
+         return res
+ 
+     def unlink(self):
+-        before_domain = self._get_attendance_domain()
++        affected = self._get_time_rule_affected()
+         res = super().unlink()
+-        self._update_attendances_overtime(before_domain)
++        if affected:
++            self.env['hr.attendance']._process_time_rules_for(affected)
+         return res

@@ -1,42 +1,35 @@
 # im_livechat migration guide (19.0 -> 20.0)
 
 ## What's new for users
+The 20.0 release notes extract provided for this addon has no im_livechat-specific content (the sections available cover features outside this module, often Enterprise-only). Everything below therefore comes from the code changes themselves.
 
-The official 20.0 release notes contain nothing specific to this addon (the matched entries only describe Enterprise features that are not part of this Community deployment). The changes below come from the module's actual code diff.
-
-- **Conversation tags are gone.** The "Live Chat Conversation Tag" model and the tag field on conversations were removed.
-- **Ratings are simplified.** The generic rating machinery is replaced by one satisfaction value per conversation: Unhappy, Neutral or Happy ("Not Rated Yet" when empty). It is set by the customer and visible on the conversation and in agent reporting.
+What a Live Chat user actually sees in 20.0:
+- The end-of-chat satisfaction is now a simple three-value rating: Unhappy (1), Neutral (3), Happy (5), or "Not Rated Yet", stored directly on the conversation.
+- Only the customer (visitor) can rate a conversation; agents and other internal users can no longer set a rating. A system administrator can still correct one.
+- Conversation tags are gone: no tag field on conversations, no tag menu, no tag column in reporting.
+- Channel satisfaction reporting still relies on the last 30 days and now also shows how many ratings sit behind the percentage.
 
 ## Technical data model changes
-
-Removed:
-- Model `im_livechat.conversation.tag`, plus `livechat_conversation_tag_ids` on `discuss.channel` and `conversation_tag_ids` on `im_livechat.channel.member.history`.
-- File `models/rating_rating.py` (the `rating.rating` extension for `discuss.channel`: `_compute_res_name`, `action_open_rated_object`).
-- `discuss.channel` no longer inherits `rating.mixin`; `im_livechat.channel` no longer inherits `rating.parent.mixin` (`_rating_satisfaction_days`, `_rating_get_parent_field_name` removed).
-- `im_livechat.channel.member.history`: `rating_id`, `rating` (float) and `rating_text` removed.
+Removed: model `im_livechat.conversation.tag` (`name`, `color`, `conversation_ids`) and the `rating.rating` override file. Fields `livechat_conversation_tag_ids` and `rating_last_text` on `discuss.channel`; `conversation_tag_ids`, `rating_id`, `rating` and `rating_text` on the member history. `discuss.channel` no longer inherits `rating.mixin`, and `im_livechat.channel` no longer inherits `rating.parent.mixin` / `_rating_satisfaction_days`.
 
 Added:
-- `discuss.channel.livechat_rating`: Selection 1 Unhappy / 3 Neutral / 5 Happy, with a SQL constraint limiting it to live chat channels.
-- `discuss.channel.livechat_rating_percentage`: Float, avg aggregator, computed in ORM and SQL (non-rated sessions excluded).
-- `im_livechat.channel.rating_percentage_satisfaction` and `rating_count`, computed over the last 30 days.
-- `im_livechat.channel.member.history.rating` (Selection, computed from the channel) and `rating_percentage` (Float with SQL aggregation).
+- `discuss.channel.livechat_rating`: Selection (`1`/`3`/`5`, stored), with a SQL check constraint allowing it only on live chat conversations and only to those values.
+- `discuss.channel.livechat_rating_percentage`: Float, average aggregator, computed and SQL-computed.
+- `im_livechat.channel.rating_percentage_satisfaction` and `rating_count`: computed over the last 30 days.
+- `im_livechat.channel.member.history.rating` (Selection, computed and stored, set for the agent/bot of the session) and `.rating_percentage` (Float, average, SQL-computed).
 
-Behavior changes:
-- Writing `livechat_rating` as a non-customer now raises "Only customers can rate a live chat conversation." (system administrators excepted).
-- The rating message uses a static image (`/rating/static/src/img/rating_N.png`); the agent notification carries `feedback` and `rating_image_url` instead of a rating id.
-- Digest and reporting KPIs read `livechat_rating` instead of `rating.rating` records.
-
-Method signatures: store serialization was refactored — `_to_store_defaults` / `_to_store` became `_store_*_fields(self, res)` helpers on `chatbot.script`, `chatbot.script.step`, `discuss.channel`, `discuss.channel.member`, `mail.message`, `res.partner`, `res.users.settings`, etc. Other signatures changed: `_close_livechat_session(message)`, `_get_visitor_leave_message(correspondents=...)`, `_update_forwarded_channel_data(..., operator_name)`, `digest._get_kpi_custom_settings`.
+Changed behaviour: `discuss.channel.write()` raises a UserError when a non-visitor changes `livechat_rating` (system group excepted). `livechat_rate()` writes the selection, posts a notification with a static image, and the bus payload carries `feedback` and `rating_image_url` instead of a `rating_id`. The digest KPI now aggregates `livechat_rating` instead of `rating_get_grades`. New helpers on `discuss.channel`: `_rating_selection_to_percentage(_sql)`, `_compute_livechat_rating_percentage`, `_compute_sql_livechat_rating_percentage`; on member history: `_compute_rating`, `_compute_rating_percentage`, `_compute_sql_rating_percentage`.
 
 ## How your habits should change
-
-- Stop using conversation tags: clean saved filters and custom reports referencing `livechat_conversation_tag_ids` / `conversation_tag_ids`. The data is dropped at upgrade and nothing replaces it.
-- Read satisfaction percentages, not star averages: the 3-step scale maps to 0 %, 50 % and 100 %, and the KPI is the average of these percentages.
-- Report on `im_livechat.channel.member.history.rating`, filled only for the agent (or bot) who handled the session; the satisfaction window stays the last 30 days.
-- Agents can no longer edit ratings through the generic rating object; only the customer rates (administrators can still override).
+- Rating: visitors keep the same experience; internal users must stop rating on behalf of customers. Free-text feedback is no longer stored as a rating field, it only appears in the conversation message.
+- Tags: stop using them. Tag records and the tags already set on conversations are dropped by the upgrade. Use expertise and notes for qualification instead.
+- Reporting: rebuild any report, filter or spreadsheet based on `rating.rating` or `im_livechat.conversation.tag`. Satisfaction now reads from `livechat_rating` (and `livechat_rating_percentage`), and per-agent figures from the member history fields.
+- Satisfaction is now a 0-100 percentage (0 = Unhappy, 100 = Happy) usable with standard aggregators.
+- Plan the data migration: both changes ship upgrade scripts (ratings, tags) — check them with your integrator before going live.
 
 ## What you gain by migrating
-
-- A purpose-built rating decoupled from `rating.rating` / `mail.thread`, making Discuss safer and reporting faster thanks to SQL aggregation.
-- Less configuration to maintain: no tag model, fewer objects to administer.
-- Cleaner agent reporting: the rating is stored per agent on the session history, with satisfaction computed consistently in digests and channel KPIs.
+- A simpler model: live chat no longer drags the generic rating machinery (and its link to the chatter / `mail.thread`), so less data, less coupling and easier customisation.
+- Ratings are stored on the conversation and on agent history, so per-agent and per-channel satisfaction become directly groupable, aggregatable dashboard data.
+- A built-in constraint plus a permission check guarantee only customers rate, keeping your satisfaction KPIs trustworthy.
+- Fewer models to maintain (no tag model), while expertise and notes still cover conversation qualification.
+- A supported upgrade path with dedicated migration scripts rather than manual data fixing.

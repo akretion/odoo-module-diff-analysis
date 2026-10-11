@@ -2,34 +2,43 @@
 
 ## What's new for users
 
-No official 20.0 release-note extract covers `hr_recruitment`, so this guide is based on the actual 19.0 → 20.0 changes shipped in the addon (four commits).
+The official 20.0 release notes for Recruitment describe features that belong to the Enterprise matching/talent tooling: matching-score filtering, viewing matching talents from a job position, and visibility conditions on the online job form. None of these ship in this Community addon, so they are not announced here. The notes only state a general direction (smoother integration between applicants, talent pool and job positions) without any Community-specific detail.
 
-- **Job tags.** Job Positions now carry reusable tags (new "Job Tags" window action under the Job Positions menu), shown in list and kanban views, so you can group, filter and report positions by tag.
-- **Richer salary information.** Salary amounts are no longer plain numbers: they are monetary amounts in the company currency. Job Positions gain a minimum/maximum salary range plus a "Scheduled Pay" interval (Hour, Day, Week, Bi-Week, Month, Year). Entering a minimum above the maximum swaps the two values automatically.
-- **Cleaner recruiter selection.** The Recruiter field only lists employees whose user account has recruitment rights (Recruitment Officer or Manager) — no more assigning applicants to users who cannot work on them.
-- **Favourites are per employee.** Favouriting a job position now follows your employee record instead of any user.
-- **Simpler stage configuration.** Per-stage kanban texts (Blocked / Waiting / Ready / In Progress) are no longer configurable; labels are unified with CRM and Project ("Ready" replaces "Ready for Next Stage"). Stage forms were reworked and expose a colour.
+For Community users, the real news of this version are the changes described below: a recruiter list you can trust, tags on job positions, and salaries expressed with a currency and a pay period.
 
 ## Technical data model changes
 
-New model: `hr.job.tag` (`name`, `color`).
+**Recruiter is now an employee** (`hr.applicant`, `hr.job`, `hr_recruitment_reports`)
+- `hr.applicant.user_id` (res.users) becomes `recruiter_id` (hr.employee, company-checked); `user_email` becomes `recruiter_email`, related to the employee's Work Email.
+- `hr.job.user_id` becomes `hr.job.recruiter_id`, with the same restricted domain.
+- `hr.job.favorite_user_ids` becomes `favorite_recruiter_ids` (new relation table `job_favorite_recruiter_rel`), defaulting to the current user's employee.
+- The recruiter list is limited to employees whose user is internal and holds Recruitment Officer or Administrator; reports and SQL queries were updated accordingly.
+- Method changes: `_compute_user` → `_compute_recruiter`; `_get_default_favorite_user_ids` → `_get_default_favorite_recruiter_ids`; new `_recruiter_domain` helper on both applicant and job; favourite computations (`_compute_is_favorite`, `_inverse_is_favorite`, `_compute_sql_is_favorite`) now work on employees. `date_open` ("Assigned") is still stamped when a recruiter is set or changed.
 
-- `hr.job`: added `tag_ids` (m2m to `hr.job.tag`), `currency_id`, `salary_min`, `salary_max`, `payment_interval`; `user_id` (res.users) replaced by `recruiter_id` (hr.employee, company-checked, restricted domain); `favorite_user_ids` replaced by `favorite_recruiter_ids` (hr.employee, `job_favorite_recruiter_rel`).
-- `hr.applicant`: `salary_proposed` and `salary_expected` changed from `Float` to `Monetary` (related `currency_id`); added `schedule_pay` (required, default monthly, copied from the job's pay interval); `user_id` → `recruiter_id`; `user_email` → `recruiter_email` (related to the employee's work email); the `legend_*` related fields are removed; `kanban_state` "done" label becomes "Ready".
-- `hr.recruitment.stage`: the `legend_blocked/waiting/done/normal` fields are gone.
-- Method signatures: 1 modified, 19 added, 7 removed. Renames include `_compute_user` → `_compute_recruiter`, `_get_default_favorite_user_ids` → `_get_default_favorite_recruiter_ids`, `_compute_kpis_actions` → `_get_kpi_custom_settings`, `_order_field_to_sql` → `_compute_sql_is_favorite`. Removed: `action_send_email`, `_track_subtype`, `_track_template`. Added: `_recruiter_domain`, `_creation_message`, `_get_sync_fields`, `_track_log_get_default_subtype`, `_track_template_parameters`, `copy`, `action_job_add_applicants`, `action_open_applicant`, `_compute_applicant_name`, `_get_light_group_xmlids`. Custom code relying on those names must be updated.
+**Job tags and salaries**
+- New model `hr.job.tag` (name, automatic colour), `hr.job.tag_ids`, tags shown in the job list and kanban, and a new "Job Tags" menu under Job Positions.
+- `hr.applicant.salary_proposed` and `salary_expected`: Float → Monetary, using the new `currency_id` (company currency); new required `schedule_pay` (Hour…Year, default Month), filled from the job when the applicant is created.
+- On `hr.job`: new `currency_id`, `salary_min`, `salary_max` (Monetary) and required `payment_interval` (default Month); an onchange swaps min/max when they are inverted.
+
+**Stages and kanban**
+- `hr.recruitment.stage` loses `legend_blocked/waiting/done/normal`; `hr.applicant` loses the four related `legend_*` fields.
+- Kanban state "Ready for Next Stage" is renamed "Ready".
+- Stage form aligned with other apps (sequence hidden in the form), colour added on stages.
 
 ## How your habits should change
 
-- Each recruiter you assign must exist as an **employee** linked to a user holding recruitment rights; users without an employee record can no longer be selected.
-- Data must be migrated: existing recruiters and favourites stored as users need conversion to employees — use the standard upgrade scripts rather than a manual import.
-- Salaries are entered as currency amounts; verify the company currency and the pay interval before reporting.
-- You can no longer customise kanban state wording per stage; those texts are fixed.
-- Filter and group by "Recruiter" (an employee) instead of user in filters, groupings and saved reports.
+- Recruiter fields now accept employees, not users: an internal user with no employee record can no longer be chosen as recruiter. Check your team's employee records first.
+- Favourites on job positions are stored per employee; a user without an employee record has no favourites.
+- If a 19.0 recruiter had no linked employee record, there is nothing to map the value to during the upgrade: review recruiters on open job positions and applicants after migrating.
+- Custom views, filters, exports, automated actions, email templates or Studio fields referencing `user_id` / `favorite_user_ids` on applicants and jobs must be renamed to `recruiter_id` / `favorite_recruiter_ids`.
+- Salary figures are now entered with the company currency and a pay period; check that the interval (Month, Year…) is correct, otherwise averages and comparisons mislead.
+- Use tags to classify job positions and the Job Tags menu to maintain them.
+- Stage-level custom labels ("Blocked", "Waiting"…) are gone; kanban columns use standard labels, and colours are set on the stage record.
 
 ## What you gain by migrating
 
-- Recruitment data that matches reality: salaries with currency, a min/max range and a pay period.
-- Fewer assignment mistakes: only qualified recruiters appear, and each applicant is tied to a real employee.
-- Faster navigation through job tags, plus a consistent stage/kanban experience shared with CRM and Project.
-- A maintained codebase: 19.0 customisations built on `user_id`, `favorite_user_ids` or `legend_*` will keep breaking until migrated, while 20.0 gives you the supported APIs and upgrade path.
+- A recruiter list restricted to people who genuinely have recruitment rights: no more applicants assigned to users who cannot act on them.
+- One consistent "who follows this job" concept for job positions and applicants, built on HR employees, keeping recruitment aligned with the Employees app.
+- Proper monetary salary fields with currency and pay period, plus salary ranges on job positions, instead of bare numbers.
+- Tags to organise and filter your job openings, and stage configuration consistent with CRM and Project.
+- Cleaner, standard kanban and stage setup, which is faster to train new recruiters on.

@@ -2,44 +2,41 @@
 
 ## What's new for users
 
-The official 20.0 release notes returned no extract matching the `crm` addon, so the points below come from the addon's own change set and cover the Community edition only.
+- **Contact-first lead form.** The company-information and contact-information sections (company name, job position, address, website) are now hidden on leads and opportunities to encourage creating or selecting a real contact. Anything still typed into them is no longer lost: it is summarised in a dedicated creation message in the chatter, and it is now tracked, so later edits also leave a trace.
+- **Simpler lead distribution.** Each sales team member gets an auto-assignment rule: *Always in rotation*, *In rotation, with a limit*, or *Out of rotation*. Pausing someone no longer requires a separate checkbox.
+- **Pipeline switcher.** You can switch between your teams' sales pipelines from a new dropdown.
 
-**The Customer field is now always visible on leads.** Previously a lead hid its Customer (partner) field unless a partner was set, the lead was already an opportunity, or you were in debug mode. From 20.0 the partner field is always shown, while the manual company and contact sections (company name, job position, website, address...) are hidden — even in debug mode. The intent is simple: attach a partner instead of typing the same information twice.
-
-**Hidden information stays visible in the chatter.** When a lead has no partner but you filled in some of those now-hidden fields, the creation message in the chatter lists what you entered. All those fields are also tracked, so later changes appear as tracking messages. The same creation summary is logged when leads are created by import.
-
-**Simpler auto-assignment rules.** On a sales team member you now pick one rule instead of juggling two fields:
-- Always in rotation (no monthly limit)
-- In rotation, with a limit (classic monthly capacity)
-- Out of rotation (no new leads assigned)
-
-"Pause assignment" / "Skip auto assignment" is gone — pausing is now simply "Out of rotation" (a capacity of 0). Team forms no longer display the maximum capacity when one of their members is in unlimited rotation, and kanban gauges use an artificial maximum.
+*Note:* the "Generate Leads" (Dun & Bradstreet) and "upsell from lead" items of the official 20.0 release notes belong to Enterprise lead mining and subscriptions; they are not part of this Community addon.
 
 ## Technical data model changes
 
-`crm.lead`
-- Removed `is_partner_visible` (computed boolean).
-- Removed `commercial_partner_id` ("Customer Company", computed, non-stored) along with its onchange.
-- `function` (tracking 55), `website` (35), `street` (60), `street2` (61), `zip` (62), `city` (63), `state_id` (64), `country_id` (65) are now tracked.
-- `_prepare_customer_values(partner_name, parent_id=False)`: the `is_company` argument is gone; a contact under a company now uses `parent_name` instead of `company_name`.
-- `_create_customer` and `_handle_partner_assignment` lose `with_parent`; `_message_post_after_hook(message)` loses `msg_vals`; `_track_subtype` is replaced by `_track_log_get_default_subtype`; `_notify_by_email_prepare_rendering_context` gains `force_header` / `force_footer`.
-- Lead creation no longer auto-links a lead to a matching company partner by phone/email.
+**crm.lead**
+- `commercial_partner_id` ("Customer Company") removed: it was a UX helper for partner creation, not business logic.
+- `create()` no longer promotes `commercial_partner_id` into `partner_id`; lead-to-opportunity conversion now relies on `partner_id` / `partner_name`.
+- `is_partner_visible` removed: the Contact field is now always displayed.
+- `function`, `website`, `street`, `street2`, `zip`, `city`, `state_id` and `country_id` are now tracked (tracking values 35 to 65).
+- New `_has_custom_creation_message()` helper and a `crm.crm_lead_creation_message` QWeb template; the creation message is also logged in batch when leads are imported.
+- `_prepare_customer_values(partner_name, is_company=False, parent_id=False)` becomes `_prepare_customer_values(partner_name, parent_id=False)`: the `is_company` argument is dropped and `company_name` is replaced by `parent_name`.
+- `_get_customer_information()` no longer sets `is_company` or `parent_id` from `commercial_partner_id`.
 
-`res.partner` (base, impacts CRM): `company_type` and `company_name` are removed; `is_company` is now computed and stored, and `company_name` is replaced by `parent_name`.
+**Related base change** (impacts contacts, not only CRM): `company_type` and `company_name` are removed and `is_company` becomes a computed stored field, based on VAT and commercial partner by default, with per-localisation overrides.
 
-`crm.team.member`: per-member `assignment_optout` is removed and replaced by a non-stored `assignment_rules` selection (Always in rotation / In rotation with a limit / Out of rotation) computed from `assignment_max`. `assignment_max` now defaults to a very large quota (30 000) meaning "no limit"; 0 means out of rotation.
-
-`crm.team`: `assignment_optout` is relabelled "Pause auto assignment"; new `show_assignment_max` field. Actions renamed: `action_open_leads` → `action_open_opportunities`, `action_open_unassigned_leads` → `action_open_unassigned_opportunities`; new `get_team_switcher_data`.
-
-`digest.digest`: `_compute_kpis_actions` replaced by `_get_kpi_custom_settings`.
+**crm.team / crm.team.member**
+- `crm.team.assignment_optout` is relabeled "Pause auto assignment"; a new computed `show_assignment_max` hides the team capacity field when a member is unlimited.
+- `crm.team.member.assignment_optout` is removed. `assignment_max` default moves from 30 to a very large quota (30 000) meaning "no limit".
+- New non-stored, editable computed field `assignment_rules` (`unlimited` / `limited` / `opt-out`) which writes `assignment_max` (30 000 / 30 by default / 0).
+- Round-robin assignment now filters members on `assignment_max != 0` instead of the removed opt-out flag.
 
 ## How your habits should change
 
-- On a lead, use the Customer field as the single source for company and contact data; the duplicate address/company fields are hidden.
-- If you relied on the "Customer Company" field on leads, use the linked partner's company instead.
-- Sales managers: re-check each member's rotation rule after migration — the "limited" option resets capacity to 30, and new members default to "Always in rotation".
-- Stop writing on removed fields (`company_type`, `company_name`, `commercial_partner_id`, `is_partner_visible`) in imports, templates or automations.
+- Prefer the **Contact** field on a lead. Company name, address and job position can still be filled in (debug mode), but they are secondary and no longer drive partner creation.
+- The **Customer Company** field is gone; the company behind a lead is deduced from its contact.
+- To pause someone's assignment, set their rule to *Out of rotation* (a capacity of 0) instead of ticking "Pause assignment". Existing 19.0 opt-out values are converted by the standard upgrade scripts.
+- Keep in mind that edits to the now-tracked address and contact fields appear as messages in the chatter, so users will see more chatter activity.
 
 ## What you gain by migrating
 
-Cleaner lead capture with one place for customer data, full chatter traceability of company and contact details, simpler and more predictable lead dispatching, and alignment with the simplified partner model where the Person/Company distinction no longer has to be set manually.
+- A cleaner, less ambiguous lead form: one customer concept, fewer silent synchronisations between lead fields and the linked partner.
+- Full traceability of contact and address information entered on a lead, including through imports.
+- Lead dispatch adapted to SME practice: new members are "always in rotation", so leads are assigned immediately, with an explicit limit when you want one, and no separate opt-out flag to maintain.
+- Alignment with the 20.0 simplification of contacts in base (`company_type` removed, `is_company` computed), which avoids double maintenance and divergence in your own customisations.

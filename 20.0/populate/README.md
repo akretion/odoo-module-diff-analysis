@@ -1,41 +1,41 @@
 # populate migration guide (19.0 -> 20.0)
 
-`populate` is a development/testing addon that generates synthetic data. In 20.0 it is a brand-new addon: the diff reports 49 added method signatures, 0 modified and 0 removed, so no pre-existing code object of this addon changed. In 19.0 the equivalent "populate" logic was not an addon at all — it was the tool merged in v18 that copied records from an initial dataset.
-
 ## What's new for users
 
-No section of the official Odoo release notes matched this addon, so everything below comes from the module's own patches and commit messages. Nothing described here is Enterprise-only.
+The 20.0 release notes extract provided for this migration covers **localizations only** (accounting, payroll and point-of-sale changes per country). **Nothing in it concerns the `populate` addon**, so there is no new business screen, report or setting to announce to functional users.
 
-- **Blueprints (XML or JSON)** declare what to generate: models, record counts, and per-field generators. Plain data instead of Python scripts.
-- **Targeted population**: a blueprint only fills the models you are benchmarking, instead of walking the whole dependency graph.
-- **Parallel generation** through the standard `-j <N>` / `-j auto` options. No parallel API to learn.
-- **Realistic figures**, not uniform noise: scalar, textual, temporal, choice, relational, reference, faker, misc and properties generators, with normal, uniform, exponential, beta, poisson and triangular distributions.
-- **Virtual fields** for intermediate computations, **write jobs** to update records already created, **blueprint inheritance** (XPath) and XML `<import>` to compose shared fragments, and **function jobs** to call your own code.
-- **Traceability**: generated records carry external references (`ref`), usable across blueprints, later writes, or cleanup.
-- **Sessions** track the run, allow `--resume` after an interruption, and offer a runtime profiling option.
-- The stated goal: reproduce a realistic test database with a single command.
+`populate` is a developer/QA tool: it creates realistic, high-volume data so performance work can be benchmarked on databases that look like production, instead of small, skewed demo data. What actually changed in 20.0 is a full rewrite: the populate framework available since 18.0 — which copied existing records and produced skewed distributions — is replaced by a new `populate` addon driven by declarative **Blueprints**. Everything below describes that rewrite.
 
 ## Technical data model changes
 
-New models (all new in 20.0):
-- `populate.blueprint` — `name`, `inherit_id`, `definition_xml`, `definition_json`, computed JSON `definition`; SQL check requiring XML *or* JSON; validation of models, fields and inheritance cycles.
-- `populate.job` — `seed`, `parent_id`/`child_ids`/`parent_path`, `blueprint_id`, `session_id`, `is_done`, `ref`, `model_name`, `record_count`, `type` (`create`/`write`, default `create`), `parallel`, `context`, `instructions`; record-count invariant, one `ref` per session for create jobs, dedicated index.
-- `populate.session` — `seed`, `scaling_factor`, `worker_count`, `blueprint_id`, `job_ids`; a session must own at least one job.
-- `populate.model.data` — `res_model`, `res_id`, `job_id`, `ref`, `session_id`, `blueprint_id`; links each generated record back to its job.
+Four new models now carry the feature (it used to be script-based, with hooks on `BaseModel` and no dedicated data model):
 
-Method signatures: 49 added, 0 modified, 0 removed. New executors `JobExecutor`, `SequentialExecutor` and `ParallelExecutor` (context-manager based); job-level `_execute`, `_execute_create`, `_execute_write`, `_execute_function`, `_create_subjobs`, `progress`, `is_executable`; session-level `_instantiate`, `is_done`, `is_parallel`, `is_running`, `is_profiling`, `progress`; blueprint `_compute_definition`, `_check_definition`, `_register_hook`.
+- **populate.blueprint** — declarative definition of what to create.
+  - `name` (required), `inherit_id` (to `populate.blueprint`, ondelete `set null`), `definition_xml` (Char), `definition_json` (Json), `definition` (computed Json, read-only; XML takes precedence over JSON, and inheritance specs are applied).
+  - SQL constraint: an XML or a JSON definition must be provided. Validation rejects inheritance cycles, unknown models and unknown non-virtual fields.
+- **populate.session** — one execution run of a blueprint.
+  - `seed` (random by default), `scaling_factor`, `worker_count` (default 1), `blueprint_id` (required), `job_ids` (One2many to `populate.job`, restricted to root jobs).
+  - A session must have jobs; `progress`, `is_done`, `is_parallel` and `is_running` are computed properties.
+- **populate.job** — one unit of work, automatically split into subjobs.
+  - `seed`, `parent_id` / `child_ids` / `parent_path`, `blueprint_id` (stored related, indexed), `session_id` (required), `is_done`, `ref`, `model_name` (required), `record_count` (default 1), `type` (`create` / `write`), `parallel` (default True), `context`, `instructions`.
+  - Constraints: strictly positive `record_count` (write jobs excepted), a single hierarchy level, same session across a hierarchy, no cycles, and unique `ref` per session for root create jobs.
+- **populate.model.data** — external reference to every generated record: `res_model`, `res_id` (`Many2oneReference`), `job_id` (cascade), related `ref` / `session_id` / `blueprint_id`, unique `(job_id, res_id)` index, no audit log.
 
-Later 20.0 changes refine the same models: typed blueprint operation blocks, `<import>` composition, `function` jobs, domains on write jobs, and runtime profiling.
+Behaviour deltas worth noting: jobs above 1000 records are split into subjobs with derived, unique seeds; each job commits on completion; write jobs target records through their `ref` instead of re-scanning the table.
 
 ## How your habits should change
 
-- **Stop writing populate scripts.** Express the data in a blueprint; adding or removing a field is usually a one-line XML edit.
-- **Install `populate`** and run a session, instead of relying on demo data or on copies of an existing dataset (which yield skewed distributions).
-- **Resume rather than restart**: an interrupted session re-executes only its pending jobs.
-- **Scale with `-j`**; note that a parallel session is refused during automated tests, and can be disabled platform-wide via `ODOO_POPULATE_MULTIPROCESS_ENABLE`.
-- **Use `ref` in blueprints** to write back to previously created records, and to clean them up afterwards.
-- **One session runs at a time** — a database-level lock prevents starting a session that is already running.
+- Custom Python generation scripts and model hooks are gone: describe *what* to create in an XML or JSON blueprint and let the framework decide *how*, including parallelism.
+- Scope a blueprint to the models you actually benchmark — unrelated models are no longer populated automatically.
+- Use `inherit_id` (XPath specs) to extend an existing blueprint instead of duplicating it; adding or removing a field is typically a one-line XML change.
+- Give jobs a `ref` and rely on `populate.model.data` to link and later retrieve generated records.
+- Expect parallel execution (`-j <N>` or `-j auto`) and resumable runs (`--resume`) rather than one long single-core script.
+- For functional users, day-to-day work is unchanged; only the way test databases are produced changes.
 
 ## What you gain by migrating
 
-Reproducible, realistically distributed test databases that a reviewer can rebuild with a single command; much faster generation thanks to transparent parallelism; deterministic, resumable runs driven by seeds; and far lower maintenance, because scenarios are declared as data instead of coded in Python.
+- **Credible benchmarks:** statistical distributions (normal, uniform, exponential, beta, poisson, triangular) and rich generators produce plausible data instead of uniformly random or copied noise.
+- **Speed:** work is parallelised transparently across workers, with frequent commits keeping memory under control.
+- **Reproducibility:** seeds make a run replayable, and `--resume` picks up an interrupted session instead of restarting it.
+- **Traceability:** every generated record is referenced in `populate.model.data`, so it can be linked across blueprints and cleaned up afterwards.
+- **Lower maintenance:** blueprints are short XML/JSON files, quick to bootstrap, extend and review — reviewers can reproduce a realistic test database with a single command.

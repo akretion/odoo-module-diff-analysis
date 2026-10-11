@@ -1,0 +1,212 @@
+PR: https://github.com/odoo/odoo/pull/275313
+
+From: a23bf2babecc19255eb6213e834e6c667caa70bd
+From: Haroune Hassine (Hahas)
+Date: 2026-09-09 10:59:21
+
+Breaking data model changes scores: del:2 + add:0, change matches:
+-    favorite = fields.Boolean('Favorite', copy=False, tracking=True)
+-    favorite_date = fields.Datetime(
+
+Total Changes: 85
+
+[IMP] mass_mailing: add mailing templates
+
+Overview
+*-----
+
+This commit introduces the mailing templates in mass mailing.
+
+Before this commit, the only way to save a mailing as a template
+is to set it as favorite so that it will appear in the theme
+selector alongside the common themes.
+Setting a mailing as favorite does not create a new mailing
+(template) it only set the favorite flag to true.
+
+This commit extends the favorite behavior and adds a complete
+template library, where the mailing can be saved as a true
+template, and hence a new mailing (with is_template=True) is
+created and listed under the `Templates` menu.
+
+Specification
+*-----
+
+* Display the mailing templates under a `Templates` menu.
+* Remove the 'favoritism' from mailing.mailing: this includes
+the favorite star icon and the favorite field.
+* Add a cog menu item in the form view to save a mailing as a
+template.
+* `email_from` and `reply_to` are not required when creating a
+template.
+
+Technical Notes
+*-----
+
+In order to have a proper display of the templates in the kanban view,
+we had to add a few things:
+* Load the kanban renderer inside an iframe: this will help isolate
+the html content of the templates from the outer Odoo one. -> Better
+for security and customized stylesheets load.
+* Wrap the renderer component in a wrapper component to make the
+reload smoother at every props update; the rationale behind this
+is to avoid reloading the whole iframe, which is a costing operation
+with all the stylesheets being refetched, at every props update.
+
+task-5358279
+subtask-6110541
+
+Part-of: odoo/odoo#275313
+Related: odoo/enterprise#123943
+Related: odoo/upgrade#10740
+Signed-off-by: Damien Abeloos (abd) <abd@odoo.com>
+
+================================= pseudo patch: =================================
+
+--- a/addons/mass_mailing/models/mailing.py
++++ b/addons/mass_mailing/models/mailing.py
+@@ -16,13 +16,14 @@ from dateutil.relativedelta import relativedelta
+ from markupsafe import Markup
+ from PIL import Image, UnidentifiedImageError
+ 
+-from odoo import api, fields, models, modules, tools, _
++from odoo import api, Command, fields, models, modules, tools, _
+ from odoo.addons.base_import.models.base_import import ImportValidationError
+ from odoo.exceptions import UserError, ValidationError
+ from odoo.fields import Datetime, Domain
+ from odoo.tools import SQL
+ from odoo.tools.float_utils import float_round
+ from odoo.tools.image import ImageProcess
++from odoo.tools.misc import clean_context
+ 
+ _logger = logging.getLogger(__name__)
+ 
+@@ -83,12 +84,7 @@ class MailingMailing(models.Model):
+     email_from = fields.Char(
+         string='Send From',
+         compute='_compute_email_from', readonly=False, store=True, precompute=True)
+-    favorite = fields.Boolean('Favorite', copy=False, tracking=True)
+-    favorite_date = fields.Datetime(
+-        'Favorite Date',
+-        compute='_compute_favorite_date', store=True,
+-        copy=False,
+-        help='When this mailing was added in the favorites')
++    is_template = fields.Boolean('Is Template', tracking=True)
+     sent_date = fields.Datetime(string='Sent Date', copy=False)
+     schedule_type = fields.Selection(
+         [('now', 'Send now'), ('scheduled', 'Send on')],
+@@ -241,10 +237,16 @@ class MailingMailing(models.Model):
+         'The A/B Testing Percentage needs to be between 0 and 100%',
+     )
+     _email_from = models.Constraint(
+-        "CHECK(email_from IS NOT NULL OR mailing_type != 'mail')",
+-        "email from is required for mailing"
++        "CHECK(is_template = true OR email_from IS NOT NULL OR mailing_type != 'mail')",
++        "email from is required for non-template 'mail' mailings"
+     )
+ 
++    @api.constrains('is_template', 'mailing_type')
++    def _check_is_template_mailing_type(self):
++        for mailing in self:
++            if mailing.is_template and mailing.mailing_type != 'mail':
++                raise ValidationError(_("Templates are only supported for Email mailings."))
++
+     def _order_field_to_sql(self, table, field_expr, direction, nulls):
+         # Override the ORDER BY logic for the `state` field from draft to sent
+         # whatever the key name and label
+@@ -298,12 +300,6 @@ class MailingMailing(models.Model):
+             else:
+                 mailing.email_from = mailing.email_from or user_email
+ 
+-    @api.depends('favorite')
+-    def _compute_favorite_date(self):
+-        favorited = self.filtered('favorite')
+-        (self - favorited).favorite_date = False
+-        favorited.filtered(lambda mailing: not mailing.favorite_date).favorite_date = fields.Datetime.now()
+-
+     def _compute_total(self):
+         for mass_mailing in self:
+             total = self.env[mass_mailing.mailing_model_real].search_count(mass_mailing._get_recipients_domain())
+@@ -804,21 +800,16 @@ class MailingMailing(models.Model):
+         return action
+ 
+     @api.model
+-    def action_fetch_favorites(self, extra_domain=None):
+-        """Return all mailings set as favorite and skip mailings with empty body.
+-
+-        Return archived mailing templates as well, so the user can archive the templates
+-        while keeping using it, without cluttering the Kanban view if they're a lot of
+-        templates.
+-        """
+-        domain = Domain('favorite', '=', True)
++    def action_fetch_templates(self, extra_domain=None):
++        """Return all active mailings set as template and skip mailings with empty body."""
++        domain = Domain('is_template', '=', True)
+         if extra_domain:
+             domain &= Domain(extra_domain)
+ 
+-        values_list = self.with_context(active_test=False).search_read(
++        values_list = self.search_read(
+             domain=domain,
+-            fields=['id', 'subject', 'body_arch', 'user_id', 'mailing_model_id'],
+-            order='favorite_date DESC',
++            fields=['id', 'subject', 'body_arch', 'user_id', 'mailing_model_id', 'active'],
++            order='create_date DESC'
+         )
+ 
+         values_list = [
+@@ -826,7 +817,7 @@ class MailingMailing(models.Model):
+             if not tools.is_html_empty(values['body_arch'])
+         ]
+ 
+-        # You see first the mailings without responsible, then your mailings and then the others
++        # You see first the templates without responsible, then your templates and then the others
+         values_list.sort(
+             key=lambda values:
+             values['user_id'][0] != self.env.user.id if values['user_id'] else -1
+@@ -834,6 +825,46 @@ class MailingMailing(models.Model):
+ 
+         return values_list
+ 
++    def action_save_as_template(self):
++        self.ensure_one()
++        if tools.is_html_empty(self.body_arch):
++            raise UserError(_("No design has been created yet!"))
++        template = self.env['mailing.mailing'].create({
++            'body_arch': self.body_arch,
++            'is_template': True,
++            'mailing_model_id': self.mailing_model_id.id,
++            'preview': self.preview,
++            'subject': self.subject,
++            'user_id': self.user_id.id,
++        })
++        new_attachments = self.env['ir.attachment']
++        for attachment in self.attachment_ids:
++            new_attachments |= attachment.copy({'res_id': self.id})
++        template.attachment_ids = [Command.set(new_attachments.ids)]
++
++        return template
++
++    def action_new_mailing_from_template(self):
++        self.ensure_one()
++        new_attachments = self.env['ir.attachment']
++        for attachment in self.attachment_ids:
++            new_attachments |= attachment.copy({'res_id': self.id})
++        return {
++            'type': 'ir.actions.act_window',
++            'view_mode': 'form',
++            'res_model': 'mailing.mailing',
++            'context': {
++                **clean_context(self.env.context),
++                'default_attachment_ids': new_attachments.ids,
++                'default_body_arch': self.body_arch,
++                'default_body_html': self.body_html,
++                'default_mailing_model_id': self.mailing_model_id.id,
++                'default_preview': self.preview,
++                'default_subject': self.subject,
++                'default_user_id': self.user_id.id
++            },
++        }
++
+     # ------------------------------------------------------
+     # A/B Test
+     # ------------------------------------------------------

@@ -1,0 +1,209 @@
+PR: https://github.com/odoo/odoo/pull/283796
+
+From: 48c0fd2b431d97b04d036756954353256432082d
+From: Lucas Lefèvre (lul)
+Date: 2026-09-08 22:39:29
++    profile_query_ids = fields.One2many('ir.profile.query', 'profile_id')
+
+Total Changes: 98
+
+[IMP] base: EXPLAIN ANALYSE queries from profile
+
+The profiling feature is really cool to analyse performance issues and detect
+bottlenecks.
+However, once you've identified a slow query, there's nothing to help you.
+
+You need to:
+* copy-paste the speedscope entry with the SQL query
+* extract the query from the line
+* have ssh access to the server
+* manually run EXPLAIN ANALYSE
+
+This commit introduces a way to run EXPLAIN ANALYSE on any profiled query.
+
+Design decisions
+*---------------
+We are keeping the current schema, with SQL stored in a serialized blob.
+This allows external tools (runbot, ...) to work the same way across versions.
+It also allows to add metrics easily in the blob in stable versions if
+necessary.
+Preserving the schema also makes it possible to backport this feature to
+stable versions in the future, as we could simply extract the feature and move it to a
+separate module.
+
+Upon request, we duplicate the SQL data in a separate model (`ir.profile.query`)
+so it can be displayed and manipulated with standard list/form views.
+Duplicating the data is acceptable since it's throwaway data that is regularly
+garbage-collected.
+
+Visualizer?
+*----------
+We considered including dalibo's open-source visualizer (pev2) to be able
+to visualize plans in one click.
+However, because that component depends on Vue.js, including it would likely
+trigger automated vulnerability scanners. Even if it's secure, we want to
+avoid the overhead of processing false-positive security reports.
+As a general rule, we also avoid adding external dependencies whenever possible.
+
+Instead, users can take the generated execution plan and visualize it as
+they see fit (e.g., using explain.dalibo.com). (Please note that SQL queries
+may contain sensitive data!)
+
+Accepted risks
+*-------------
+Some side-effects can escape the savepoint.
+
+The savepoint rollback only undoes what is transactional. Anything
+non-transactional survives: sequence advances (setval, nextval),
+session-level advisory locks (pg_advisory_lock and friends), etc.
+
+This is accepted because it grants no privilege that the caller does not
+already have: the feature is restricted to system users, who can already
+run arbitrary SQL through crons, server actions.
+A block-list would be hard to maintain.
+
+This feature is obviously limited to admin users.
+
+task-6422397
+
+closes odoo/odoo#283796
+
+Signed-off-by: Lucas Lefèvre (lul) <lul@odoo.com>
+
+================================= pseudo patch: =================================
+
+--- a/odoo/addons/base/models/__init__.py
++++ b/odoo/addons/base/models/__init__.py
+@@ -35,6 +35,7 @@ from . import report_layout
+ from . import report_paperformat
+ 
+ from . import ir_profile
++from . import ir_profile_query
+ from . import image_mixin
+ from . import avatar_mixin
+ 
+
+--- a/odoo/addons/base/models/ir_profile.py
++++ b/odoo/addons/base/models/ir_profile.py
+@@ -42,6 +42,7 @@ class IrProfile(models.Model):
+     others = fields.Text('others', prefetch=False)
+     qweb = fields.Text('Qweb', prefetch=False)
+     entry_count = fields.Integer('Entry count')
++    profile_query_ids = fields.One2many('ir.profile.query', 'profile_id')
+ 
+     speedscope = fields.Binary('Speedscope', compute='_compute_speedscope')
+     speedscope_url = fields.Text('Open', compute='_compute_speedscope_url')
+@@ -170,6 +171,24 @@ class IrProfile(models.Model):
+         limit = self.env['ir.config_parameter'].sudo().get_str('base.profiling_enabled_until')
+         return limit if str(fields.Datetime.now()) < limit else None
+ 
++    def _ensure_sql_query_records(self):
++        profiles_with_missing_queries = self.search([
++            ('id', 'in', self.ids),
++            ('sql_count', '>', 0),
++            ('profile_query_ids', '=', False)
++        ])
++        vals_list = [
++            {
++                'profile_id': profile.id,
++                'query': query['query'],
++                'full_query': query['full_query'],
++                'time': query['time'],
++            }
++            for profile in profiles_with_missing_queries
++            for query in json.loads(profile.sql)
++        ]
++        self.env['ir.profile.query'].sudo().create(vals_list)
++
+     @api.model
+     def set_profiling(self, profile=None, collectors=None, params=None):
+         """
+@@ -227,6 +246,16 @@ class IrProfile(models.Model):
+             'target': 'new',
+         }
+ 
++    def action_open_sql_queries(self):
++        self._ensure_sql_query_records()
++        return {
++            'name': self.env._('SQL queries'),
++            'type': 'ir.actions.act_window',
++            'res_model': 'ir.profile.query',
++            'view_mode': 'list,form',
++            'domain': [('profile_id', 'in', self.ids)]
++        }
++
+ class BaseEnableProfilingWizard(models.TransientModel):
+     _name = 'base.enable.profiling.wizard'
+     _description = "Enable profiling for some time"
+
+--- a/None
++++ b/odoo/addons/base/models/ir_profile_query.py
+@@ -0,0 +1,68 @@
++# Part of Odoo. See LICENSE file for full copyright and licensing details.
++
++import logging
++
++import psycopg2
++
++from odoo import api, fields, models
++from odoo.tools.speedscope import shorten
++from odoo.tools.sql import format_query
++from odoo.exceptions import AccessError, UserError
++
++_logger = logging.getLogger(__name__)
++
++
++class IrProfileQuery(models.Model):
++    _name = 'ir.profile.query'
++    _description = 'Profiling Query'
++    _log_access = False  # avoid useless foreign key on res_user
++    _order = 'id asc'
++    _rec_name = 'query_preview'
++    _allow_sudo_commands = False
++
++    profile_id = fields.Many2one('ir.profile', required=True, ondelete='cascade', index=True)
++    time = fields.Float(string="Time", help="Time spent executing the query (seconds)", min_display_digits=6)
++    query = fields.Text(readonly=True, help="Query with placeholders, before injecting the parameters")
++    full_query = fields.Text(required=True, prefetch=False, help="Query with its parameters injected, ready to execute")
++    query_preview = fields.Text(compute='_compute_query_preview')
++    formatted_query = fields.Text(compute='_compute_formatted_query')
++    plan = fields.Text("Query Plan", prefetch=False)
++
++    @api.depends('query')
++    def _compute_query_preview(self):
++        for query in self:
++            query.query_preview = shorten(query.query)
++
++    @api.depends('full_query')
++    def _compute_formatted_query(self):
++        for query in self:
++            query.formatted_query = format_query(query.full_query)
++
++    def action_explain_analyse(self):
++        for query in self:
++            query._explain_analyse_one()
++
++    def _explain_analyse_one(self):
++        self.ensure_one()
++        if not self.env.user._is_system():
++            raise AccessError(self.env._("You are not allowed to generate a query plan."))
++
++        _logger.info("User #%s is generating query plan for ir.profile.query %s", self.env.user.id, self.id)
++        # Refuse stacked statements ("SELECT 1;DROP...;COMMIT") which escape
++        # EXPLAIN. Naive on purpose (not aware of string literals or comments).
++        if ';' in self.full_query.strip().removesuffix(';'):
++            raise UserError(self.env._("This query cannot be explained."))
++        try:
++            with self.env.cr.savepoint() as savepoint:
++                # full_query is raw SQL and really executes: the savepoint
++                # rollback below is what makes this safe, don't drop it.
++                query = f'EXPLAIN (ANALYZE, COSTS, VERBOSE, BUFFERS) {self.full_query}'
++                self.env.cr.execute(query, log_exceptions=False)  # pylint: disable=sql-injection
++                plan = '\n'.join(row[0] for row in self.env.cr.fetchall())
++                savepoint.rollback()  # do not remove: discards the query's writes
++        except psycopg2.Error as e:
++            # Not everything can be explained:
++            # SAVEPOINT/RELEASE/SET/LOCK/... are in the profile, which EXPLAIN rejects
++            # with a psycopg2.errors.SyntaxError.
++            raise UserError(self.env._("This query cannot be explained.")) from e
++        self.sudo().plan = plan
