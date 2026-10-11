@@ -1,0 +1,1077 @@
+PR: https://github.com/odoo/odoo/pull/202869
+
+From: 21f18b1a6fdbf1a01c3dda83acfa66addd01a759
+From: Arthur Pierrot (arpi)
+Date: 2025-06-11 23:02:42
+
+Breaking data model changes scores: del:5 + add:0, change matches:
+-    user_id = fields.Many2one('res.users', 'Me', required=True, default=lambda self: self.env.user, ondelete='cascade')
+-    employee_id = fields.Many2one('hr.employee', 'Employee', required=True)
+-    active = fields.Boolean('Active', default=True)
+-    is_checked = fields.Boolean(default=True)
+-    _inherit = 'resource.calendar.leaves'
+
+Total Changes: 922
+
+[REF] hr_contract: Merge contracts into versioned employee model
+
+This revamp simplifies the HR system by merging contracts into a versioned structure directly linked to the employee model. All payroll-impacting fields now reside in `hr.version`, which is inherited by `hr.employee`. This approach ensures each version reflects a time-specific contract state, enabling clear historical tracking and timeline visualization.
+
+Key Changes:
+
+* New Model `hr.version`:
+  - Replaces `hr.contract` and inherits via `_inherits` on `hr.employee`
+  - Fields from both `hr.employee` and `hr.contract` centralized
+  - No standalone form view for versions (except templates)
+
+* Versioning Logic:
+  - New versions created manually or automatically (past/future)
+  - Modifying a version with "Done"/"Paid" payslips triggers:
+    - A new version
+    - Payslip flagging
+    - Activity for HR responsible
+  - Versions can only be deleted if not linked to any payslip
+  - Contract states (`open`, `close`, etc.) and `kanban_state` removed
+
+* Date Fields:
+  - Replaces `date_start`/`date_end` with:
+    - `date_version` (mandatory)
+    - `contract_date_start`, `contract_date_end`
+  - `date_start`/`date_end` now computed, non-stored
+
+* ORM and SQL Adjustments:
+  - Access to version fields via ORM remains transparent
+  - SQL queries must join with `hr.version` for accurate data
+
+* Employee Creation / Demo Data:
+  - Creating an employee creates a first version
+  - For multiple versions, use `create_version`
+  - Demo/test data must define version fields in the employee or via `create_version`
+
+* Localization & Salary Rules:
+  - Fields like marital status moved to `hr.version`
+  - Salary rules uses `version` in `localdict` from now instead of `contract`
+  - Update all domains using `date_start`, `state`, etc. to use appropriate computed methods (`is_current`, `is_past`, etc.)
+
+* UI/UX:
+  - Timeline for version history shown in the employee form view
+  - Tabs organize versioned fields for clarity
+  - Debug-only "View" button in version list to ease template editing
+
+This redesign improves HR data management, payroll accuracy, and localization readiness.
+
+closes odoo/odoo#202869
+
+Task: 4564173
+Related: odoo/enterprise#83136
+Related: odoo/upgrade#7709
+Signed-off-by: Yannick Tivisse (yti) <yti@odoo.com>
+Co-authored-by: Jurgen Gjini <jugj@odoo.com>
+Co-authored-by: David Beguin <dbe@odoo.com>
+Co-authored-by: Xavier Bol (xbo) <xbo@odoo.com>
+Co-authored-by: romc-odoo <romc@odoo.com>
+Co-authored-by: Alvaro Fuentes <afu@odoo.com>
+Co-authored-by: Yannick Tivisse <yti@odoo.com>
+
+================================= pseudo patch: =================================
+
+--- a/addons/hr_work_entry/models/__init__.py
++++ b/addons/hr_work_entry/models/__init__.py
+@@ -2,5 +2,10 @@
+ # Part of Odoo. See LICENSE file for full copyright and licensing details.
+ 
+ from . import hr_work_entry
+-from . import resource
++from . import hr_work_entry_type
++from . import hr_user_work_entry_employee
++from . import resource_calendar
++from . import resource_calendar_attendance
++from . import resource_calendar_leaves
+ from . import hr_employee
++from . import hr_version
+
+--- a/addons/hr_work_entry/models/hr_employee.py
++++ b/addons/hr_work_entry/models/hr_employee.py
+@@ -1,4 +1,3 @@
+-# -*- coding: utf-8 -*-
+ # Part of Odoo. See LICENSE file for full copyright and licensing details.
+ 
+ from odoo import models, fields, _
+@@ -37,3 +36,13 @@ class HrEmployee(models.Model):
+             'context': ctx,
+             'domain': [('employee_id', '=', self.id)],
+         }
++
++    def generate_work_entries(self, date_start, date_stop, force=False):
++        date_start = fields.Date.to_date(date_start)
++        date_stop = fields.Date.to_date(date_stop)
++
++        if self:
++            versions = self._get_versions_with_contract_overlap_with_period(date_start, date_stop)
++        else:
++            versions = self._get_all_versions_with_contract_overlap_with_period(date_start, date_stop)
++        return versions.generate_work_entries(date_start, date_stop, force=force)
+
+--- a/None
++++ b/addons/hr_work_entry/models/hr_user_work_entry_employee.py
+@@ -0,0 +1,20 @@
++# Part of Odoo. See LICENSE file for full copyright and licensing details.
++
++from odoo import fields, models
++
++
++class HrUserWorkEntryEmployee(models.Model):
++    """ Personnal calendar filter """
++
++    _name = 'hr.user.work.entry.employee'
++    _description = 'Work Entries Employees'
++
++    user_id = fields.Many2one('res.users', 'Me', required=True, default=lambda self: self.env.user, ondelete='cascade')
++    employee_id = fields.Many2one('hr.employee', 'Employee', required=True)
++    active = fields.Boolean('Active', default=True)
++    is_checked = fields.Boolean(default=True)
++
++    _user_id_employee_id_unique = models.Constraint(
++        'UNIQUE(user_id,employee_id)',
++        'You cannot have the same employee twice.',
++    )
+
+--- a/None
++++ b/addons/hr_work_entry/models/hr_version.py
+@@ -0,0 +1,498 @@
++# Part of Odoo. See LICENSE file for full copyright and licensing details.
++
++import itertools
++from collections import defaultdict
++from datetime import datetime, date, time
++import pytz
++
++from dateutil.relativedelta import relativedelta
++
++from odoo import Command, api, fields, models
++from odoo.osv import expression
++from odoo.tools import ormcache
++from odoo.tools.intervals import Intervals
++
++
++class HrVersion(models.Model):
++    _inherit = 'hr.version'
++
++    date_generated_from = fields.Datetime(string='Generated From', readonly=True, required=True,
++        default=lambda self: datetime.now().replace(hour=0, minute=0, second=0, microsecond=0), copy=False,
++        groups="hr.group_hr_user")
++    date_generated_to = fields.Datetime(string='Generated To', readonly=True, required=True,
++        default=lambda self: datetime.now().replace(hour=0, minute=0, second=0, microsecond=0), copy=False,
++        groups="hr.group_hr_user")
++    last_generation_date = fields.Date(string='Last Generation Date', readonly=True, groups="hr.group_hr_user")
++    work_entry_source = fields.Selection([('calendar', 'Working Schedule')], required=True, default='calendar', help='''
++        Defines the source for work entries generation
++
++        Working Schedule: Work entries will be generated from the working hours below.
++        Attendances: Work entries will be generated from the employee's attendances. (requires Attendance app)
++        Planning: Work entries will be generated from the employee's planning. (requires Planning app)
++    ''', groups="hr.group_hr_user")
++    work_entry_source_calendar_invalid = fields.Boolean(
++        compute='_compute_work_entry_source_calendar_invalid',
++        groups="hr.group_hr_user",
++    )
++
++    @api.depends('work_entry_source', 'resource_calendar_id')
++    def _compute_work_entry_source_calendar_invalid(self):
++        for version in self:
++            version.work_entry_source_calendar_invalid = version.work_entry_source == 'calendar' and not version.resource_calendar_id
++
++    @ormcache('self.structure_type_id')
++    def _get_default_work_entry_type_id(self):
++        attendance = self.env.ref('hr_work_entry.work_entry_type_attendance', raise_if_not_found=False)
++        return attendance.id if attendance else False
++
++    def _get_leave_work_entry_type_dates(self, leave, date_from, date_to, employee):
++        return self._get_leave_work_entry_type(leave)
++
++    def _get_leave_work_entry_type(self, leave):
++        return leave.work_entry_type_id
++
++    # Is used to add more values, for example planning_slot_id
++    def _get_more_vals_attendance_interval(self, interval):
++        return []
++
++    # Is used to add more values, for example leave_id (in hr_work_entry_holidays)
++    def _get_more_vals_leave_interval(self, interval, leaves):
++        return []
++
++    def _get_bypassing_work_entry_type_codes(self):
++        return []
++
++    def _get_interval_leave_work_entry_type(self, interval, leaves, bypassing_codes):
++        # returns the work entry time related to the leave that
++        # includes the whole interval.
++        # Overriden in hr_work_entry_holiday to select the
++        # global time off first (eg: Public Holiday > Home Working)
++        self.ensure_one()
++        for leave in leaves:
++            if interval[0] >= leave[0] and interval[1] <= leave[1] and leave[2]:
++                interval_start = interval[0].astimezone(pytz.utc).replace(tzinfo=None)
++                interval_stop = interval[1].astimezone(pytz.utc).replace(tzinfo=None)
++                return self._get_leave_work_entry_type_dates(leave[2], interval_start, interval_stop, self.employee_id)
++        return self.env.ref('hr_work_entry.work_entry_type_leave')
++
++    def _get_sub_leave_domain(self):
++        return [('calendar_id', 'in', [False] + self.resource_calendar_id.ids)]
++
++    def _get_leave_domain(self, start_dt, end_dt):
++        domain = [
++            ('resource_id', 'in', [False] + self.employee_id.resource_id.ids),
++            ('date_from', '<=', end_dt.replace(tzinfo=None)),
++            ('date_to', '>=', start_dt.replace(tzinfo=None)),
++            ('company_id', 'in', [False, self.company_id.id]),
++        ]
++        return expression.AND([domain, self._get_sub_leave_domain()])
++
++    def _get_resource_calendar_leaves(self, start_dt, end_dt):
++        return self.env['resource.calendar.leaves'].search(self._get_leave_domain(start_dt, end_dt))
++
++    def _get_attendance_intervals(self, start_dt, end_dt):
++        assert start_dt.tzinfo and end_dt.tzinfo, "function expects localized date"
++        # {resource: intervals}
++        employees_by_calendar = defaultdict(lambda: self.env['hr.employee'])
++        for version in self:
++            if version.work_entry_source != 'calendar':
++                continue
++            employees_by_calendar[version.resource_calendar_id] |= version.employee_id
++        result = dict()
++        for calendar, employees in employees_by_calendar.items():
++            result.update(calendar._attendance_intervals_batch(
++                start_dt,
++                end_dt,
++                resources=employees.resource_id,
++                tz=pytz.timezone(calendar.tz) if calendar.tz else pytz.utc
++            ))
++        return result
++
++    def _get_lunch_intervals(self, start_dt, end_dt):
++        # {resource: intervals}
++        employees_by_calendar = defaultdict(lambda: self.env['hr.employee'])
++        for version in self:
++            employees_by_calendar[version.resource_calendar_id] |= version.employee_id
++        result = {}
++        for calendar, employees in employees_by_calendar.items():
++            result.update(calendar._attendance_intervals_batch(
++                start_dt,
++                end_dt,
++                resources=employees.resource_id,
++                tz=pytz.timezone(calendar.tz),
++                lunch=True,
++            ))
++        return result
++
++    def _get_interval_work_entry_type(self, interval):
++        self.ensure_one()
++        if 'work_entry_type_id' in interval[2] and interval[2].work_entry_type_id[:1]:
++            return interval[2].work_entry_type_id[:1]
++        return self.env['hr.work.entry.type'].browse(self._get_default_work_entry_type_id())
++
++    def _get_valid_leave_intervals(self, attendances, interval):
++        self.ensure_one()
++        return [interval]
++
++    def _get_version_work_entries_values(self, date_start, date_stop):
++        start_dt = pytz.utc.localize(date_start) if not date_start.tzinfo else date_start
++        end_dt = pytz.utc.localize(date_stop) if not date_stop.tzinfo else date_stop
++        version_vals = []
++        bypassing_work_entry_type_codes = self._get_bypassing_work_entry_type_codes()
++
++        attendances_by_resource = self._get_attendance_intervals(start_dt, end_dt)
++
++        resource_calendar_leaves = self._get_resource_calendar_leaves(start_dt, end_dt)
++        # {resource: resource_calendar_leaves}
++        leaves_by_resource = defaultdict(lambda: self.env['resource.calendar.leaves'])
++        for leave in resource_calendar_leaves:
++            leaves_by_resource[leave.resource_id.id] |= leave
++
++        tz_dates = {}
++        for version in self:
++            employee = version.employee_id
++            calendar = version.resource_calendar_id
++            resource = employee.resource_id
++            # if the version is fully flexible, we refer to the employee's timezone
++            tz = pytz.timezone(resource.tz) if version._is_fully_flexible() else pytz.timezone(calendar.tz)
++            attendances = attendances_by_resource[resource.id]
++
++            # Other calendars: In case the employee has declared time off in another calendar
++            # Example: Take a time off, then a credit time.
++            resources_list = [self.env['resource.resource'], resource]
++            result = defaultdict(list)
++            for leave in itertools.chain(leaves_by_resource[False], leaves_by_resource[resource.id]):
++                for resource in resources_list:
++                    # Global time off is not for this calendar, can happen with multiple calendars in self
++                    if resource and leave.calendar_id and leave.calendar_id != calendar and not leave.resource_id:
++                        continue
++                    tz = tz if tz else pytz.timezone((resource or version).tz)
++                    if (tz, start_dt) in tz_dates:
++                        start = tz_dates[tz, start_dt]
++                    else:
++                        start = start_dt.astimezone(tz)
++                        tz_dates[tz, start_dt] = start
++                    if (tz, end_dt) in tz_dates:
++                        end = tz_dates[tz, end_dt]
++                    else:
++                        end = end_dt.astimezone(tz)
++                        tz_dates[tz, end_dt] = end
++                    dt0 = leave.date_from.astimezone(tz)
++                    dt1 = leave.date_to.astimezone(tz)
++                    leave_start_dt = max(start, dt0)
++                    leave_end_dt = min(end, dt1)
++                    leave_interval = (leave_start_dt, leave_end_dt, leave)
++                    leave_interval = version._get_valid_leave_intervals(attendances, leave_interval)
++                    if leave_interval:
++                        result[resource.id] += leave_interval
++            mapped_leaves = {r.id: Intervals(result[r.id], keep_distinct=True) for r in resources_list}
++            leaves = mapped_leaves[resource.id]
++
++            real_attendances = attendances - leaves
++            if version.has_static_work_entries() or not leaves:
++                # Empty leaves means empty real_leaves
++                real_leaves = attendances - real_attendances
++            elif not calendar:
++                # If fully flexible working schedule is defined
++                real_leaves = leaves
++            else:
++                # In the case of attendance based versions use regular attendances to generate leave intervals
++                static_attendances = calendar._attendance_intervals_batch(
++                    start_dt, end_dt, resources=resource, tz=tz)[resource.id]
++                real_leaves = static_attendances & leaves
++
++            if not version.has_static_work_entries():
++                # An attendance based version might have an invalid planning, by definition it may not happen with
++                # static work entries.
++                # Creating overlapping slots for example might lead to a single work entry.
++                # In that case we still create both work entries to indicate a problem (conflicting W E).
++                split_attendances = []
++                for attendance in real_attendances:
++                    if attendance[2] and len(attendance[2]) > 1:
++                        split_attendances += [(attendance[0], attendance[1], a) for a in attendance[2]]
++                    else:
++                        split_attendances += [attendance]
++                real_attendances = split_attendances
++
++            # A leave period can be linked to several resource.calendar.leave
++            split_leaves = []
++            for leave_interval in leaves:
++                if leave_interval[2] and len(leave_interval[2]) > 1:
++                    split_leaves += [(leave_interval[0], leave_interval[1], l) for l in leave_interval[2]]
++                else:
++                    split_leaves += [(leave_interval[0], leave_interval[1], leave_interval[2])]
++            leaves = split_leaves
++
++            # Attendances
++            for interval in real_attendances:
++                work_entry_type = version._get_interval_work_entry_type(interval)
++                # All benefits generated here are using datetimes converted from the employee's timezone
++                version_vals += [dict([
++                    ('name', "%s: %s" % (work_entry_type.name, employee.name)),
++                    ('date_start', interval[0].astimezone(pytz.utc).replace(tzinfo=None)),
++                    ('date_stop', interval[1].astimezone(pytz.utc).replace(tzinfo=None)),
++                    ('work_entry_type_id', work_entry_type.id),
++                    ('employee_id', employee.id),
++                    ('version_id', version.id),
++                    ('company_id', version.company_id.id),
++                ] + version._get_more_vals_attendance_interval(interval))]
++
++            leaves_over_attendances = Intervals(leaves, keep_distinct=True) & real_leaves
++            for interval in real_leaves:
++                # Could happen when a leave is configured on the interface on a day for which the
++                # employee is not supposed to work, i.e. no attendance_ids on the calendar.
++                # In that case, do try to generate an empty work entry, as this would raise a
++                # sql constraint error
++                if interval[0] == interval[1]:  # if start == stop
++                    continue
++                leaves_over_interval = [l for l in leaves_over_attendances if l[0] >= interval[0] and l[1] <= interval[1]]
++                for leave_interval in [(l[0], l[1], interval[2]) for l in leaves_over_interval]:
++                    leave_entry_type = version._get_interval_leave_work_entry_type(leave_interval, leaves, bypassing_work_entry_type_codes)
++                    interval_leaves = [leave for leave in leaves if leave[2].work_entry_type_id.id == leave_entry_type.id]
++                    interval_start = leave_interval[0].astimezone(pytz.utc).replace(tzinfo=None)
++                    interval_stop = leave_interval[1].astimezone(pytz.utc).replace(tzinfo=None)
++                    version_vals += [dict([
++                        ('name', "%s%s" % (leave_entry_type.name + ": " if leave_entry_type else "", employee.name)),
++                        ('date_start', interval_start),
++                        ('date_stop', interval_stop),
++                        ('work_entry_type_id', leave_entry_type.id),
++                        ('employee_id', employee.id),
++                        ('company_id', version.company_id.id),
++                        ('version_id', version.id),
++                    ] + version._get_more_vals_leave_interval(interval, interval_leaves))]
++        return version_vals
++
++    def _get_work_entries_values(self, date_start, date_stop):
++        """
++        Generate a work_entries list between date_start and date_stop for one version.
++        :return: list of dictionnary.
++        """
++        if isinstance(date_start, datetime):
++            version_vals = self._get_version_work_entries_values(date_start, date_stop)
++        else:
++            version_vals = []
++            versions_by_tz = defaultdict(lambda: self.env['hr.version'])
++            for version in self:
++                versions_by_tz[version.resource_calendar_id.tz] += version
++            for version_tz, versions in versions_by_tz.items():
++                tz = pytz.timezone(version_tz) if version_tz else pytz.utc
++                version_vals += versions._get_version_work_entries_values(
++                    tz.localize(date_start),
++                    tz.localize(date_stop))
++
++        # {version_id: ([dates_start], [dates_stop])}
++        mapped_version_dates = defaultdict(lambda: ([], []))
++        for x in version_vals:
++            mapped_version_dates[x['version_id']][0].append(x['date_start'])
++            mapped_version_dates[x['version_id']][1].append(x['date_stop'])
++
++        for version in self:
++            # If we generate work_entries which exceeds date_start or date_stop, we change boundaries on version
++            if version_vals:
++                # Handle empty work entries for certain versions, could happen on an attendance based version
++                # NOTE: this does not handle date_stop or date_start not being present in vals
++                dates_stop = mapped_version_dates[version.id][1]
++                if dates_stop:
++                    date_stop_max = max(dates_stop)
++                    if date_stop_max > version.date_generated_to:
++                        version.date_generated_to = date_stop_max
++
++                dates_start = mapped_version_dates[version.id][0]
++                if dates_start:
++                    date_start_min = min(dates_start)
++                    if date_start_min < version.date_generated_from:
++                        version.date_generated_from = date_start_min
++
++        return version_vals
++
++    def has_static_work_entries(self):
++        # Static work entries as in the same are to be generated each month
++        # Useful to differentiate attendance based versions from regular ones
++        self.ensure_one()
++        return self.work_entry_source == 'calendar'
++
++    def generate_work_entries(self, date_start, date_stop, force=False):
++        # Generate work entries between 2 dates (datetime.date)
++        # To correctly englobe the period, the start and end periods are converted
++        # using the calendar timezone.
++        assert not isinstance(date_start, datetime)
++        assert not isinstance(date_stop, datetime)
++
++        date_start = datetime.combine(fields.Datetime.to_datetime(date_start), datetime.min.time())
++        date_stop = datetime.combine(fields.Datetime.to_datetime(date_stop), datetime.max.time())
++
++        versions_by_company_tz = defaultdict(lambda: self.env['hr.version'])
++        for version in self:
++            versions_by_company_tz[
++                version.company_id,
++                (version.resource_calendar_id).tz,
++            ] += version
++        utc = pytz.timezone('UTC')
++        new_work_entries = self.env['hr.work.entry']
++        for (company, version_tz), versions in versions_by_company_tz.items():
++            tz = pytz.timezone(version_tz) if version_tz else utc
++            date_start_tz = tz.localize(date_start).astimezone(utc).replace(tzinfo=None)
++            date_stop_tz = tz.localize(date_stop).astimezone(utc).replace(tzinfo=None)
++            new_work_entries += versions.with_company(company).sudo()._generate_work_entries(
++                date_start_tz, date_stop_tz, force=force)
++        return new_work_entries
++
++    def _generate_work_entries(self, date_start, date_stop, force=False):
++        # Generate work entries between 2 dates (datetime.datetime)
++        # This method considers that the dates are correctly localized
++        # based on the target timezone
++        assert isinstance(date_start, datetime)
++        assert isinstance(date_stop, datetime)
++        self = self.with_context(tracking_disable=True)  # noqa: PLW0642
++        vals_list = []
++        self.write({'last_generation_date': fields.Date.today()})
++
++        intervals_to_generate = defaultdict(lambda: self.env['hr.version'])
++        # In case the date_generated_from == date_generated_to, move it to the date_start to
++        # avoid trying to generate several months/years of history for old versions for which
++        # we've never generated the work entries.
++        self.filtered(lambda c: c.date_generated_from == c.date_generated_to).write({
++            'date_generated_from': date_start,
++            'date_generated_to': date_start,
++        })
++        utc = pytz.timezone('UTC')
++        for version in self:
++            version_tz = (version.resource_calendar_id or version.company_id.resource_calendar_id).tz
++            tz = pytz.timezone(version_tz) if version_tz else pytz.utc
++            version_start = tz.localize(fields.Datetime.to_datetime(version.date_start)).astimezone(utc).replace(tzinfo=None)
++            version_stop = datetime.combine(fields.Datetime.to_datetime(version.date_end or datetime.max.date()),
++                                             datetime.max.time())
++            if version.date_end:
++                version_stop = tz.localize(version_stop).astimezone(utc).replace(tzinfo=None)
++            if date_start > version_stop or date_stop < version_start:
++                continue
++            date_start_work_entries = max(date_start, version_start)
++            date_stop_work_entries = min(date_stop, version_stop)
++            if force:
++                intervals_to_generate[date_start_work_entries, date_stop_work_entries] |= version
++                continue
++
++            # For each version, we found each interval we must generate
++            # In some cases we do not want to set the generated dates beforehand, since attendance based work entries
++            #  is more dynamic, we want to update the dates within the _get_work_entries_values function
++            last_generated_from = min(version.date_generated_from, version_stop)
++            if last_generated_from > date_start_work_entries:
++                version.date_generated_from = date_start_work_entries
++                intervals_to_generate[date_start_work_entries, last_generated_from] |= version
++
++            last_generated_to = max(version.date_generated_to, version_start)
++            if last_generated_to < date_stop_work_entries:
++                version.date_generated_to = date_stop_work_entries
++                intervals_to_generate[last_generated_to, date_stop_work_entries] |= version
++
++        for interval, versions in intervals_to_generate.items():
++            date_from, date_to = interval
++            vals_list.extend(versions._get_work_entries_values(date_from, date_to))
++
++        if not vals_list:
++            return self.env['hr.work.entry']
++
++        return self.env['hr.work.entry'].create(vals_list)
++
++    def _remove_work_entries(self):
++        ''' Remove all work_entries that are outside contract period (function used after writing new start or/and end date) '''
++        all_we_to_unlink = self.env['hr.work.entry']
++        for version in self:
++            date_start = fields.Datetime.to_datetime(version.date_start)
++            if version.date_generated_from < date_start:
++                we_to_remove = self.env['hr.work.entry'].search([('date_stop', '<=', date_start), ('version_id', '=', version.id)])
++                if we_to_remove:
++                    version.date_generated_from = date_start
++                    all_we_to_unlink |= we_to_remove
++            if not version.date_end:
++                continue
++            date_end = datetime.combine(version.date_end, datetime.max.time())
++            if version.date_generated_to > date_end:
++                we_to_remove = self.env['hr.work.entry'].search([('date_start', '>=', date_end), ('version_id', '=', version.id)])
++                if we_to_remove:
++                    version.date_generated_to = date_end
++                    all_we_to_unlink |= we_to_remove
++        all_we_to_unlink.unlink()
++
++    def _cancel_work_entries(self):
++        if not self:
++            return
++        domain = [('state', '!=', 'validated')]
++        for version in self:
++            date_start = fields.Datetime.to_datetime(version.date_start)
++            version_domain = [
++                ('version_id', '=', version.id),
++                ('date_start', '>=', date_start),
++            ]
++            if version.date_end:
++                date_end = datetime.combine(version.date_end, datetime.max.time())
++                version_domain += [('date_stop', '<=', date_end)]
++            domain = expression.AND([domain, version_domain])
++        work_entries = self.env['hr.work.entry'].sudo().search(domain)
++        if work_entries:
++            work_entries.sudo().unlink()
++
++    def write(self, vals):
++        result = super().write(vals)
++        if vals.get('contract_date_end') or vals.get('contract_date_start') or vals.get('date_version'):
++            self.sudo()._remove_work_entries()
++        dependent_fields = self._get_fields_that_recompute_we()
++        salary_simulation = self.env.context.get('salary_simulation')
++        if not salary_simulation and any(key in dependent_fields for key in vals):
++            for version in self:
++                date_from = max(version.date_start, version.date_generated_from.date())
++                date_to = min(version.date_end or date.max, version.date_generated_to.date())
++                if date_from != date_to and self.employee_id:
++                    version._recompute_work_entries(date_from, date_to)
++        return result
++
++    def unlink(self):
++        self._cancel_work_entries()
++        return super().unlink()
++
++    def _recompute_work_entries(self, date_from, date_to):
++        self.ensure_one()
++        if self.employee_id:
++            wizard = self.env['hr.work.entry.regeneration.wizard'].create({
++                'employee_ids': [Command.set(self.employee_id.ids)],
++                'date_from': date_from,
++                'date_to': date_to,
++            })
++            wizard.with_context(work_entry_skip_validation=True, active_test=False).regenerate_work_entries()
++
++    def _get_fields_that_recompute_we(self):
++        # Returns the fields that should recompute the work entries
++        return ['resource_calendar_id', 'work_entry_source']
++
++    @api.model
++    def _cron_generate_missing_work_entries(self):
++        # retrieve versions for the current month
++        today = fields.Date.today()
++        start = datetime.combine(today + relativedelta(day=1), time.min)
++        stop = datetime.combine(today + relativedelta(months=1, day=31), time.max)
++        all_versions = self.env['hr.employee']._get_all_versions_with_contract_overlap_with_period(start.date(), stop.date())
++        # determine versions to do (the ones whose generated dates have open periods this month)
++        versions_todo = all_versions.filtered(
++            lambda v:
++            (v.date_generated_from > start or v.date_generated_to < stop) and
++            (not v.last_generation_date or v.last_generation_date < today))
++        if not versions_todo:
++            return
++        version_todo_count = len(versions_todo)
++        # Filter versions by company, work entries generation is not supposed to be called on
++        # versions from differents companies, as we will retrieve the resource.calendar.leave
++        # and we don't want to mix everything up. The other versions will be treated when the
++        # cron is re-triggered
++        versions_todo = versions_todo.filtered(lambda v: v.company_id == versions_todo[0].company_id)
++        # generate a batch of work entries
++        BATCH_SIZE = 100
++        # Since attendance based are more volatile for their work entries generation
++        # it can happen that the date_generated_from and date_generated_to fields are not
++        # pushed to start and stop
++        # It is more interesting for batching to process statically generated work entries first
++        # since we get benefits from having multiple versions on the same calendar
++        versions_todo = versions_todo.sorted(key=lambda v: 1 if v.has_static_work_entries() else 100)
++        versions_todo = versions_todo[:BATCH_SIZE].generate_work_entries(start.date(), stop.date(), False)
++        # if necessary, retrigger the cron to generate more work entries
++        if version_todo_count > BATCH_SIZE:
++            self.env.ref('hr_work_entry.ir_cron_generate_missing_work_entries')._trigger()
+
+--- a/addons/hr_work_entry/models/hr_work_entry.py
++++ b/addons/hr_work_entry/models/hr_work_entry.py
+@@ -1,15 +1,17 @@
+-# -*- coding: utf-8 -*-
+ # Part of Odoo. See LICENSE file for full copyright and licensing details.
+ 
++import pytz
++
+ from collections import defaultdict
+ from contextlib import contextmanager
+ from dateutil.relativedelta import relativedelta
+-import itertools
++from itertools import chain
+ from psycopg2 import OperationalError
+-from odoo.exceptions import UserError
+ 
+ from odoo import api, fields, models, _
++from odoo.exceptions import ValidationError, UserError
+ from odoo.osv import expression
++from odoo.tools.intervals import Intervals
+ 
+ 
+ class HrWorkEntry(models.Model):
+@@ -20,6 +22,8 @@ class HrWorkEntry(models.Model):
+     name = fields.Char(required=True, compute='_compute_name', store=True, readonly=False)
+     active = fields.Boolean(default=True)
+     employee_id = fields.Many2one('hr.employee', required=True, domain="['|', ('company_id', '=', False), ('company_id', '=', company_id)]", index=True)
++    version_id = fields.Many2one('hr.version', string="Version", required=True)
++    work_entry_source = fields.Selection(related='version_id.work_entry_source')
+     date_start = fields.Datetime(required=True, string='From')
+     date_stop = fields.Datetime(compute='_compute_date_stop', store=True, readonly=False, string='To')
+     duration = fields.Float(compute='_compute_duration', store=True, string="Duration", readonly=False)
+@@ -68,6 +72,35 @@ class HrWorkEntry(models.Model):
+         'Validated work entries cannot overlap',
+     )
+     _date_start_date_stop_index = models.Index("(date_start, date_stop)")
++    # FROM 7s by query to 2ms (with 2.6 millions entries)
++    _contract_date_start_stop_idx = models.Index("(version_id, date_start, date_stop) WHERE state IN ('draft', 'validated')")
++
++    def _init_column(self, column_name):
++        if column_name != 'version_id':
++            super()._init_column(column_name)
++        else:
++            self.env.cr.execute("""
++                UPDATE hr_work_entry AS _hwe
++                SET version_id = result.version_id
++                FROM (
++                    SELECT
++                        hc.id AS version_id,
++                        array_agg(hwe.id) AS entry_ids
++                    FROM
++                        hr_work_entry AS hwe
++                    LEFT JOIN
++                        hr_version AS hc
++                    ON
++                        hwe.employee_id=hc.employee_id AND
++                        hwe.date_start >= hc.date_start AND
++                        hwe.date_stop < COALESCE(hc.date_end + integer '1', '9999-12-31 23:59:59')
++                    WHERE
++                        hwe.version_id IS NULL
++                    GROUP BY
++                        hwe.employee_id, hc.id
++                ) AS result
++                WHERE _hwe.id = ANY(result.entry_ids)
++            """)
+ 
+     @api.depends('work_entry_type_id', 'employee_id')
+     def _compute_name(self):
+@@ -90,8 +123,32 @@ class HrWorkEntry(models.Model):
+ 
+     @api.depends('date_start', 'duration')
+     def _compute_date_stop(self):
+-        for work_entry in self.filtered(lambda w: w.date_start and w.duration):
+-            work_entry.date_stop = work_entry.date_start + relativedelta(hours=work_entry.duration)
++        for work_entry in self:
++            if work_entry._get_duration_is_valid():
++                calendar = work_entry.version_id.resource_calendar_id
++                if not calendar:
++                    continue
++                work_entry.date_stop = calendar.plan_hours(work_entry.duration, work_entry.date_start, compute_leaves=True)
++                continue
++            if work_entry.date_start and work_entry.duration:
++                work_entry.date_stop = work_entry.date_start + relativedelta(hours=work_entry.duration)
++
++    @api.onchange('employee_id', 'date_start', 'date_stop')
++    def _onchange_version_id(self):
++        vals = {
++            'employee_id': self.employee_id.id,
++            'date_start': self.date_start,
++            'date_stop': self.date_stop,
++        }
++        try:
++            res = self._set_current_contract(vals)
++        except ValidationError:
++            return
++        if version_id := res.get('version_id'):
++            self.version_id = version_id
++
++    def _get_duration_is_valid(self):
++        return self.work_entry_type_id and self.work_entry_type_id.is_leave
+ 
+     def _get_duration_batch(self):
+         result = {}
+@@ -111,6 +168,78 @@ class HrWorkEntry(models.Model):
+                 result[work_entry.id] = duration
+         return result
+ 
++    def _get_duration_batch(self):
++        no_version_work_entries = self.env['hr.work.entry']
++        result = {}
++        # {(date_start, date_stop): {calendar: employees}}
++        mapped_periods = defaultdict(lambda: defaultdict(lambda: self.env['hr.employee']))
++        for work_entry in self:
++            if not work_entry.date_start or not work_entry.date_stop or not work_entry._is_duration_computed_from_calendar() or not work_entry.employee_id:
++                no_version_work_entries |= work_entry
++                continue
++            date_start = work_entry.date_start
++            date_stop = work_entry.date_stop
++            calendar = work_entry.version_id.resource_calendar_id
++            if not calendar:
++                result[work_entry.id] = 0.0
++                continue
++            employee = work_entry.version_id.employee_id
++            mapped_periods[date_start, date_stop][calendar] |= employee
++
++        # {(date_start, date_stop): {calendar: {'hours': foo}}}
++        mapped_contract_data = defaultdict(lambda: defaultdict(lambda: {'hours': 0.0}))
++        for (date_start, date_stop), employees_by_calendar in mapped_periods.items():
++            for calendar, employees in employees_by_calendar.items():
++                mapped_contract_data[date_start, date_stop][calendar] = employees._get_work_days_data_batch(
++                    date_start, date_stop, compute_leaves=False, calendar=calendar)
++
++        cached_periods = defaultdict(float)
++        for work_entry in no_version_work_entries:
++            date_start = work_entry.date_start
++            date_stop = work_entry.date_stop
++            if not date_start or not date_stop:
++                result[work_entry.id] = 0.0
++                continue
++            if (date_start, date_stop) in cached_periods:
++                result[work_entry.id] = cached_periods[date_start, date_stop]
++            else:
++                dt = date_stop - date_start
++                duration = dt.days * 24 + round(dt.total_seconds()) / 3600  # Number of hours
++                cached_periods[date_start, date_stop] = duration
++                result[work_entry.id] = duration
++
++        for work_entry in self - no_version_work_entries:
++            date_start = work_entry.date_start
++            date_stop = work_entry.date_stop
++            calendar = work_entry.version_id.resource_calendar_id
++            employee = work_entry.version_id.employee_id
++            result[work_entry.id] = mapped_contract_data[date_start, date_stop][calendar][employee.id]['hours'] if calendar else 0.0
++        return result
++
++    def _is_duration_computed_from_calendar(self):
++        self.ensure_one()
++        return self._get_duration_is_valid()
++
++    @api.model
++    def _set_current_contract(self, vals):
++        if not vals.get('version_id') and vals.get('date_start') and vals.get('date_stop') and vals.get('employee_id'):
++            contract_start = fields.Datetime.to_datetime(vals.get('date_start')).date()
++            contract_end = fields.Datetime.to_datetime(vals.get('date_stop')).date()
++            employee = self.env['hr.employee'].browse(vals.get('employee_id'))
++            contracts = employee._get_versions_with_contract_overlap_with_period(contract_start, contract_end)
++            if not contracts:
++                raise ValidationError(_(
++                    "%(employee)s does not have a contract from %(date_start)s to %(date_end)s.",
++                    employee=employee.name,
++                    date_start=contract_start,
++                    date_end=contract_end,
++                ))
++            elif len(contracts) > 1:
++                raise ValidationError(_("%(employee)s has multiple contracts from %(date_start)s to %(date_end)s. A work entry cannot overlap multiple contracts.",
++                                        employee=employee.name, date_start=contract_start, date_end=contract_end))
++            return dict(vals, version_id=contracts[0].id)
++        return vals
++
+     def action_validate(self):
+         """
+         Try to validate work entries.
+@@ -130,7 +259,8 @@ class HrWorkEntry(models.Model):
+         undefined_type = self.filtered(lambda b: not b.work_entry_type_id)
+         undefined_type.write({'state': 'conflict'})
+         conflict = self._mark_conflicting_work_entries(min(self.mapped('date_start')), max(self.mapped('date_stop')))
+-        return undefined_type or conflict
++        outside_calendar = self._mark_leaves_outside_schedule()
++        return undefined_type or conflict or outside_calendar
+ 
+     def _mark_conflicting_work_entries(self, start, stop):
+         """
+@@ -160,14 +290,51 @@ class HrWorkEntry(models.Model):
+                AND {}
+         """.format("b2.id IN %(ids)s" if self.ids else "b2.date_start <= %(stop)s AND b2.date_stop >= %(start)s")
+         self.env.cr.execute(query, {"stop": stop, "start": start, "ids": tuple(self.ids)})
+-        conflicts = set(itertools.chain.from_iterable(self.env.cr.fetchall()))
++        conflicts = set(chain.from_iterable(self.env.cr.fetchall()))
+         self.browse(conflicts).write({
+             'state': 'conflict',
+         })
+         return bool(conflicts)
+ 
++    def _get_leaves_entries_outside_schedule(self):
++        return self.filtered(lambda w: w.work_entry_type_id.is_leave and w.state not in ('validated', 'cancelled'))
++
++    def _mark_leaves_outside_schedule(self):
++        """
++        Check leave work entries in `self` which are completely outside
++        the contract's theoretical calendar schedule. Mark them as conflicting.
++        :return: leave work entries completely outside the contract's calendar
++        """
++        work_entries = self._get_leaves_entries_outside_schedule()
++        entries_by_calendar = defaultdict(lambda: self.env['hr.work.entry'])
++        for work_entry in work_entries:
++            calendar = work_entry.version_id.resource_calendar_id
++            entries_by_calendar[calendar] |= work_entry
++
++        outside_entries = self.env['hr.work.entry']
++        for calendar, entries in entries_by_calendar.items():
++            datetime_start = min(entries.mapped('date_start'))
++            datetime_stop = max(entries.mapped('date_stop'))
++
++            calendar_intervals = calendar._attendance_intervals_batch(pytz.utc.localize(datetime_start), pytz.utc.localize(datetime_stop))[False]
++            entries_intervals = entries._to_intervals()
++            overlapping_entries = self._from_intervals(entries_intervals & calendar_intervals)
++            outside_entries |= entries - overlapping_entries
++        outside_entries.write({'state': 'conflict'})
++        return bool(outside_entries)
++
++    def _to_intervals(self):
++        return Intervals(
++            ((w.date_start.replace(tzinfo=pytz.utc), w.date_stop.replace(tzinfo=pytz.utc), w) for w in self),
++            keep_distinct=True)
++
++    @api.model
++    def _from_intervals(self, intervals):
++        return self.browse(chain.from_iterable(recs.ids for start, end, recs in intervals))
++
+     @api.model_create_multi
+     def create(self, vals_list):
++        vals_list = [self._set_current_contract(vals) for vals in vals_list]
+         work_entries = super().create(vals_list)
+         work_entries._check_if_error()
+         return work_entries
+@@ -240,62 +407,3 @@ class HrWorkEntry(models.Model):
+                 # New work entries are handled in the create method,
+                 # no need to reload work entries.
+                 work_entries.exists()._check_if_error()
+-
+-
+-class HrWorkEntryType(models.Model):
+-    _name = 'hr.work.entry.type'
+-    _description = 'HR Work Entry Type'
+-
+-    name = fields.Char(required=True, translate=True)
+-    code = fields.Char(string="Payroll Code", required=True, help="Careful, the Code is used in many references, changing it could lead to unwanted changes.")
+-    external_code = fields.Char(help="Use this code to export your data to a third party")
+-    color = fields.Integer(default=0)
+-    sequence = fields.Integer(default=25)
+-    active = fields.Boolean(
+-        'Active', default=True,
+-        help="If the active field is set to false, it will allow you to hide the work entry type without removing it.")
+-    country_id = fields.Many2one(
+-        'res.country',
+-        string="Country",
+-        domain=lambda self: [('id', 'in', self.env.companies.country_id.ids)]
+-    )
+-    country_code = fields.Char(related='country_id.code')
+-
+-    @api.constrains('country_id')
+-    def _check_work_entry_type_country(self):
+-        if self.env.ref('hr_work_entry.work_entry_type_attendance') in self:
+-            raise UserError(_("You can't change the country of this specific work entry type."))
+-        elif not self.env.context.get('install_mode') and self.env['hr.work.entry'].sudo().search_count([('work_entry_type_id', 'in', self.ids)], limit=1):
+-            raise UserError(_("You can't change the Country of this work entry type cause it's currently used by the system. You need to delete related working entries first."))
+-
+-    @api.constrains('code', 'country_id')
+-    def _check_code_unicity(self):
+-        similar_work_entry_types = self.search([
+-            ('code', 'in', self.mapped('code')),
+-            ('country_id', 'in', self.country_id.ids + [False]),
+-            ('id', 'not in', self.ids)
+-        ])
+-        for work_entry_type in self:
+-            invalid_work_entry_types = similar_work_entry_types.filtered_domain([
+-                ('code', '=', work_entry_type.code),
+-                ('country_id', 'in', self.country_id.ids + [False]),
+-            ])
+-            if invalid_work_entry_types:
+-                raise UserError(_("The same code cannot be associated to multiple work entry types (%s)", ', '.join(list(set(invalid_work_entry_types.mapped('code'))))))
+-
+-
+-class HrUserWorkEntryEmployee(models.Model):
+-    """ Personnal calendar filter """
+-
+-    _name = 'hr.user.work.entry.employee'
+-    _description = 'Work Entries Employees'
+-
+-    user_id = fields.Many2one('res.users', 'Me', required=True, default=lambda self: self.env.user, ondelete='cascade')
+-    employee_id = fields.Many2one('hr.employee', 'Employee', required=True)
+-    active = fields.Boolean('Active', default=True)
+-    is_checked = fields.Boolean(default=True)
+-
+-    _user_id_employee_id_unique = models.Constraint(
+-        'UNIQUE(user_id,employee_id)',
+-        'You cannot have the same employee twice.',
+-    )
+
+--- a/None
++++ b/addons/hr_work_entry/models/hr_work_entry_type.py
+@@ -0,0 +1,60 @@
++# Part of Odoo. See LICENSE file for full copyright and licensing details.
++
++from odoo import api, fields, models, _
++from odoo.exceptions import UserError
++
++
++class HrWorkEntryType(models.Model):
++    _name = 'hr.work.entry.type'
++    _description = 'HR Work Entry Type'
++
++    name = fields.Char(required=True, translate=True)
++    code = fields.Char(string="Payroll Code", required=True, help="Careful, the Code is used in many references, changing it could lead to unwanted changes.")
++    external_code = fields.Char(help="Use this code to export your data to a third party")
++    color = fields.Integer(default=0)
++    sequence = fields.Integer(default=25)
++    active = fields.Boolean(
++        'Active', default=True,
++        help="If the active field is set to false, it will allow you to hide the work entry type without removing it.")
++    country_id = fields.Many2one(
++        'res.country',
++        string="Country",
++        domain=lambda self: [('id', 'in', self.env.companies.country_id.ids)]
++    )
++    country_code = fields.Char(related='country_id.code')
++    is_leave = fields.Boolean(
++        default=False, string="Time Off", help="Allow the work entry type to be linked with time off types.")
++    is_work = fields.Boolean(
++        compute='_compute_is_work', inverse='_inverse_is_work', string="Working Time", readonly=False,
++        help="If checked, the work entry is counted as work time in the working schedule")
++
++    @api.constrains('country_id')
++    def _check_work_entry_type_country(self):
++        if self.env.ref('hr_work_entry.work_entry_type_attendance') in self:
++            raise UserError(_("You can't change the country of this specific work entry type."))
++        elif not self.env.context.get('install_mode') and self.env['hr.work.entry'].sudo().search_count([('work_entry_type_id', 'in', self.ids)], limit=1):
++            raise UserError(_("You can't change the Country of this work entry type cause it's currently used by the system. You need to delete related working entries first."))
++
++    @api.constrains('code', 'country_id')
++    def _check_code_unicity(self):
++        similar_work_entry_types = self.search([
++            ('code', 'in', self.mapped('code')),
++            ('country_id', 'in', self.country_id.ids + [False]),
++            ('id', 'not in', self.ids)
++        ])
++        for work_entry_type in self:
++            invalid_work_entry_types = similar_work_entry_types.filtered_domain([
++                ('code', '=', work_entry_type.code),
++                ('country_id', 'in', self.country_id.ids + [False]),
++            ])
++            if invalid_work_entry_types:
++                raise UserError(_("The same code cannot be associated to multiple work entry types (%s)", ', '.join(list(set(invalid_work_entry_types.mapped('code'))))))
++
++    @api.depends('is_leave')
++    def _compute_is_work(self):
++        for record in self:
++            record.is_work = not record.is_leave
++
++    def _inverse_is_work(self):
++        for record in self:
++            record.is_leave = not record.is_work
+
+--- a/None
++++ b/addons/hr_work_entry/models/resource_calendar.py
+@@ -0,0 +1,15 @@
++# Part of Odoo. See LICENSE file for full copyright and licensing details.
++
++from odoo import api, models
++
++
++class ResourceCalendar(models.Model):
++    _inherit = 'resource.calendar'
++
++    # Override the method to add 'attendance_ids.work_entry_type_id.is_leave' to the dependencies
++    @api.depends('attendance_ids.work_entry_type_id.is_leave')
++    def _compute_hours_per_week(self):
++        super()._compute_hours_per_week()
++
++    def _get_global_attendances(self):
++        return super()._get_global_attendances().filtered(lambda a: not a.work_entry_type_id.is_leave)
+
+--- a/addons/hr_work_entry/models/resource.py
++++ b/addons/hr_work_entry/models/resource_calendar_attendance.py
+@@ -1,4 +1,3 @@
+-# -*- coding:utf-8 -*-
+ # Part of Odoo. See LICENSE file for full copyright and licensing details.
+ 
+ from odoo import models, fields
+@@ -19,15 +18,5 @@ class ResourceCalendarAttendance(models.Model):
+         res['work_entry_type_id'] = self.work_entry_type_id.id
+         return res
+ 
+-
+-class ResourceCalendarLeaves(models.Model):
+-    _inherit = 'resource.calendar.leaves'
+-
+-    work_entry_type_id = fields.Many2one(
+-        'hr.work.entry.type', 'Work Entry Type',
+-        groups="hr.group_hr_user")
+-
+-    def _copy_leave_vals(self):
+-        res = super()._copy_leave_vals()
+-        res['work_entry_type_id'] = self.work_entry_type_id.id
+-        return res
++    def _is_work_period(self):
++        return not self.work_entry_type_id.is_leave and super()._is_work_period()
+
+--- a/None
++++ b/addons/hr_work_entry/models/resource_calendar_leaves.py
+@@ -0,0 +1,16 @@
++# Part of Odoo. See LICENSE file for full copyright and licensing details.
++
++from odoo import models, fields
++
++
++class ResourceCalendarLeaves(models.Model):
++    _inherit = 'resource.calendar.leaves'
++
++    work_entry_type_id = fields.Many2one(
++        'hr.work.entry.type', 'Work Entry Type',
++        groups="hr.group_hr_user")
++
++    def _copy_leave_vals(self):
++        res = super()._copy_leave_vals()
++        res['work_entry_type_id'] = self.work_entry_type_id.id
++        return res
