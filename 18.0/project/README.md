@@ -2,46 +2,53 @@
 
 ## What's new for users
 
-- **Analytic plans on projects** — the headline change. Allocate project costs and revenues to several analytic plans (one account per plan) instead of a single analytic account. Stock pickings, purchase orders and manufacturing orders can be linked to a project for cost tracking, and delivered products can be re-invoiced automatically.
-- **Project sharing** — portal users can be granted edit access to *all* project tasks or only the ones they follow. External collaborators can follow/unfollow tasks, and can be @mentioned.
-- **Top bar navigation** — reach related records (timesheets, invoices…) straight from the task view through embedded control-panel actions; add custom actions, private or shared.
-- **Tracking revisions in tasks** — follow changes to a task description and revert to an earlier version.
-- **Sub-tasks from Kanban** — create sub-tasks directly from task cards.
-- **Project updates become a Dashboard**, with burn-up analysis.
-- Allocated hours on tasks now follow the planned dates.
+**Analytic plans on projects.** A project is no longer limited to a single analytic account: you can now attach one account per analytic plan (project, department, staff, customer, ...) and read profitability at a much finer level. Costs and revenues coming from stock pickings and landed costs are captured too, and delivered products can be re-invoiced to the customer automatically instead of being added by hand to the sales order.
 
-Note: the release notes also mention Gantt capabilities (workload progress bar, deadline display, batch scheduling). Those belong to the Enterprise edition and are not part of this Community addon.
+**Navigation from the control panel (top bar).** Related records (sales orders, purchase orders, manufacturing orders, BoMs, stock transfers, analytic items) can be browsed directly from the project and task views.
+
+**"Project Updates" is renamed "Dashboard"** in the project views.
+
+Other Project highlights of the 18.0 release notes (Gantt progress bar, burn-up chart, batch scheduling with deadlines, task revisions, Gantt deadline display) rely on Enterprise features and are **not** part of this community addon.
 
 ## Technical data model changes
 
 **project.project**
-- `analytic_account_id` removed, replaced by `account_id` plus the analytic distribution of `analytic.plan.fields.mixin` (one account per plan). `analytic_account_balance` now relates to `account_id.balance`.
-- Deprecated fields `doc_count` and `allow_rating` removed.
-- New computes/actions: open and closed task counts, `task_completion_percentage`, `total_update_ids`, `_add_collaborators(partners, limited_access=False)`, `_add_followers`, `message_unsubscribe`, `action_open_share_project_wizard`, `copy_data` (replacing `copy`).
+- `analytic_account_id` removed. Replaced by `account_id` (one account per plan), enabled by the new inheritance of `analytic.plan.fields.mixin`; `analytic_account_balance` now follows `account_id`.
+- New project-side support for a "sales order" used for re-invoicing stock moves.
+- `_get_values_analytic_account_batch` now takes a list of value dicts; the analytic plan used for projects is resolved automatically instead of coming from a configuration parameter.
+- Deprecated fields removed: `doc_count`, `allow_rating`.
+- Project company is now derived from `account_id`.
 
 **project.task**
-- `analytic_account_id` removed: tasks no longer carry an analytic account; timesheets take the accounts of their project, or of the sale order line distribution.
-- New fields/computes: `is_closed`, `display_in_project`, `depend_on_count`, `link_preview_name`, subtask completion percentage, follow button, `project_sharing_toggle_is_follower`, `action_archive`.
-- `_read_group_stage_ids` and the personal-stage grouping lose their `order` argument.
+- `analytic_account_id` removed, along with `_compute_analytic_account_id()` and `_get_task_analytic_account_id()`.
+- Task creation no longer copies the project's analytic account.
 
-**project.task.type** — `description` removed; personal-stage handling refactored (`copy` → `copy_data`).
-**project.tags** — `_name_search` replaced by `name_search`.
-**res.config.settings** — the `analytic_plan_id` setting is removed.
-**account.analytic.account** — `project_ids` now linked through `project.account_id`.
-**res.partner** — new company-consistency helpers on projects/tasks.
+**account.analytic.account**
+- `project_ids` now points to `project.project.account_id`.
+
+**project.task.type**
+- Deprecated `description` field removed.
+
+**res.config.settings**
+- `analytic_plan_id` (system parameter `analytic.analytic_plan_projects`) removed.
+
+**Around the addon (sale, purchase, stock, mrp)**
+- The analytic account/distribution on sales orders, purchase orders, manufacturing orders and BoMs is replaced by a **project** field; the project's accounts become the default distribution of document lines.
+- Stock operation types get an "analytic costs" option; stock pickings get a project field, generate analytic entries on validation (negative for deliveries, positive for receipts) and support re-invoicing of delivered products.
 
 ## How your habits should change
 
-- Set analytic accounting on the **project**, not on each task: use the Analytic notebook, one account per plan.
-- Tasks have no analytic account of their own; timesheet costs follow the project, or the sale order line distribution when one is defined.
-- "Project Updates" are now the **Dashboard**.
-- Creating a project in the Kanban view no longer adds you to its favorites.
-- When sharing a project, choose between full edit access and "tasks they follow"; unfollowing a project removes the user from its collaborators.
-- Task stages no longer have a description field.
+- Do not set "the" analytic account on a project any more — fill in the new Analytic section (one account per plan). The account on the *Project* plan is still the one feeding the profitability report.
+- You can no longer set an analytic account on a task; timesheets take it from the project, or from the sales order line when the task comes from a quotation (the SOL wins).
+- Link business documents to a **project** (sales order, purchase order, MO, BoM, stock picking) rather than to an analytic account; distributions are filled in for you.
+- Check that your projects are linked to the right sales order if you rely on re-invoicing stock.
+- The "Project Updates" entry is now "Dashboard".
+- Custom reports, exports or imports using `analytic_account_id` on projects/tasks, `doc_count`, `allow_rating` or stage `description` must be updated.
 
 ## What you gain by migrating
 
-- **Multi-dimensional profitability**: costs and revenues are no longer stuck on one analytic account, so you can report per team, department or service as well as per project.
-- **Stock, purchase and manufacturing flows feed project profitability** and can be re-invoiced to the customer, instead of being tracked by hand.
-- **Cleaner collaboration**: fine-grained sharing rights, task following and revision tracking keep external contributors under control.
-- **A consolidated project Dashboard** replacing scattered updates, and task planning aligned on real dates.
+- Real multi-dimensional cost and revenue tracking per project, without duplicating projects.
+- Materials actually consumed on a job (stock moves, landed costs) finally appear in project profitability, and can be re-invoiced automatically.
+- Fewer manual steps and fewer errors: distributions default from the project everywhere.
+- A cleaner data model, with obsolete fields (document counter, rating shortcut, stage descriptions) removed.
+- A supported upgrade path: these changes are covered by the standard 17.0 → 18.0 upgrade scripts.

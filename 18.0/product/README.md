@@ -1,31 +1,52 @@
 # product migration guide (17.0 -> 18.0)
 
+This guide covers the `product` addon (catalog, variants, attributes, pricelists) between Odoo 17.0 and 18.0.
+
 ## What's new for users
-- **Simpler product form.** "Storable" and "Consumable" are replaced by **Goods**, and a new **Tracked** field says if and how the product is tracked. The former "Detailed Type" disappears: a single **Product Type** (Goods / Service) remains.
-- **Better attribute maintenance.** You can now **delete an attribute value** that was used on products, once you have removed it from those products. New actions let you **add a value to all products** or **push a new extra price everywhere** at once, and unused attributes can be **archived**.
-- **Pricelists revamped.** The "Advanced Pricelists" setting is gone: pricelists are enabled or not, and all rule types are available. Rule labels are clearer, with a **Markup** concept beside discount and "Extra Fee" instead of "Price Surcharge". Pricelists can now be **printed/exported in PDF, CSV or XLSX**.
-- **Combo products** (pick several products among several options) are now handled by the product module itself and available in Sales and eCommerce.
-- **Product documents**: document links are validated when entered.
+
+**Pricelists simplified.** The old two-level setting ("Multiple prices per product" vs "Advanced price rules (discounts, formulas)") is gone. Pricelists are simply enabled or not, and every rule type (fixed price, discount, formula) is available immediately — no hidden mode to activate. The rule display has been revamped: you choose the rule scope with a simple Product / Category selector, and rules based on a product now show the product name directly. Pricelists can also be generated in PDF, CSV or XLSX format.
+
+**Markup on cost-based rules.** When a rule is based on cost, you can enter a Markup instead of a discount. "Price Surcharge" is renamed "Extra Fee" and the rounding help has been reworded.
+
+**A single product type.** Products are either Goods or Service. The extra internal "detailed type" is removed, so a product can no longer have a type that doesn't match its detailed type.
+
+**Attribute housekeeping.** Attribute values that are no longer used can be deleted (once detached from the products using them), and adding an attribute value or changing its extra cost can be applied to all existing products.
 
 ## Technical data model changes
-- product.template: the `detailed_type` field is **removed**; `type` becomes a stored selection (`consu` / `service`) instead of a computed field. `_compute_type`, `_detailed_type_mapping`, `_constrains_detailed_type` and `_sanitize_vals` are removed. Added: `copy_data` (replacing `copy`), `get_contextual_price`, `name_search` + `_search_display_name` (replacing `_name_search`), `_compute_service_tracking`, `_compute_purchase_ok`, `_get_list_price`, `_prepare_tooltip`, `_check_combo_ids_not_empty`, `_check_sale_combo_ids`. `_get_attribute_exclusions` / `_get_own_attribute_exclusions` take a new `combination_ids` argument.
-- res.config.settings: `group_sale_pricelist` and `product_pricelist_setting` are **removed**, with their onchange methods.
-- product.pricelist.item: new fields `display_applied_on`, `price_markup`, `product_uom`, `product_variant_count`; `_compute_name_and_price` is split into `_compute_name` + `_compute_price_label`; `_check_recursion` becomes `_check_pricelist_recursion`; many new onchange helpers (`_onchange_base`, `_onchange_base_pricelist_id`, `_onchange_price_markup`, `_onchange_validity_period`...).
-- product.pricelist: `action_open_pricelist_report` and `copy_data` added; default ordering is now sequence, id, name.
-- product.attribute / product.attribute.value: `action_archive`, `action_open_product_template_attribute_lines`, `action_add_to_products`, `action_update_prices`, `check_is_used_on_products`, `unlink`, `write(vals)`.
-- Combo logic is moved into this addon: `product.combo` and `product.combo.item` now live in `product`, with new compute methods (`_compute_base_price`, `_compute_combo_item_count`, `_compute_currency_id`) and constraints.
-- product.supplierinfo: new `create` / `write` handling variant-template consistency. product.document: `copy` replaced by `copy_data`, plus `_onchange_url`.
-- Core renames that impact the addon: `_name_search` → `_search_display_name`, `_search` no longer accepts `access_rights_uid`, group_expand methods no longer receive `order`.
+
+`res.config.settings`
+- Removed `group_sale_pricelist` ("Advanced Pricelists").
+- Removed `product_pricelist_setting` ("Pricelists Method", config parameter `product.product_pricelist_setting`) and its onchange. Pricelist availability now depends only on `group_product_pricelist`.
+
+`product.pricelist`
+- Default order changed from `sequence asc, id asc` to `sequence, id, name`.
+
+`product.pricelist.item`
+- Added `display_applied_on` (Product / Category, default Product) driving the new scope selector.
+- Added `price_markup` (Float, default 0) and the related fields `product_uom` and `product_variant_count`.
+- `product_id` is now restricted by a domain to the selected template.
+- Relabelled: `categ_id` "Product Category" → "Category", `product_id` "Product Variant" → "Variant", `price_surcharge` "Price Surcharge" → "Extra Fee".
+- `compute_price` selection order changed (percentage, formula, fixed); default remains fixed.
+- New helpers `_get_integer`, `_get_displayed_discount`; new onchanges `_onchange_base`, `_onchange_display_applied_on`, `_onchange_price_markup`, `_onchange_validity_period`. `_onchange_rule_content` no longer tests the removed "advanced pricelist" group.
+
+`product.template` / `product.product`
+- `detailed_type` removed.
+- `type` is no longer computed from `detailed_type`; it is a plain required stored Selection (Goods `consu`, Service `service`). Stock behaviour is driven by the Inventory fields instead.
+- Removed `_detailed_type_mapping`, `_compute_type`, `_constrains_detailed_type` and `_sanitize_vals`; `create`/`write` no longer keep `type` and `detailed_type` in sync.
+
+Any custom field, filter, report or import/export using `detailed_type`, `group_sale_pricelist` or `product_pricelist_setting` must be updated. Odoo's upgrade scripts migrate existing data.
 
 ## How your habits should change
-- Forget Storable / Consumable / Service: pick **Goods or Service**, then set the **Tracked** field to manage stock.
-- There is nothing to configure in the Pricelist settings anymore: no "Advanced Pricelists" toggle. Existing rules keep working, but the discount / markup fields shown depend on the rule's "Based on" value.
-- To delete an attribute value that is used, remove it from the products first, otherwise Odoo refuses the deletion.
-- If you have Studio fields, custom reports or integrations referring to `detailed_type`, `group_sale_pricelist` or `product_pricelist_setting`, they must be adapted during the migration.
+
+- In Settings, forget the "basic vs advanced" pricelist question: enable Pricelists and use the rule types you need.
+- When creating a rule, first pick Product or Category, then the template, variant or category. Rules are sorted by sequence, then name.
+- Price from cost with Markup (it fills the discount automatically); keep using Discount for a reduction.
+- On products, set only the Type (Goods or Service) and configure tracking in Inventory.
+- Delete an attribute value only after detaching it from every product using it.
 
 ## What you gain by migrating
-- One unambiguous product type plus explicit tracking: fewer user mistakes and cleaner product data.
-- Much faster variant and attribute maintenance: apply an attribute change to hundreds of products in one action, archive obsolete attributes, delete unused values.
-- Rationalised pricelists: a single setting, clearer labels, markup support, and printable/exportable price lists for sales teams and customers.
-- Combo products natively supported by the core product module, ready for Sales and eCommerce.
-- Staying current also means receiving bug fixes and new features instead of accumulating upgrade debt.
+
+- Simpler, more consistent pricelists: no hidden mode, clearer rule names, markup support, print/export formats.
+- A cleaner product model: one Type field, no more type/detailed-type mismatch, simpler imports and integrations.
+- Better attribute management: remove unused values and push attribute changes to all products at once.
+- A supported version with deprecated fields removed, so customisations no longer drift from the standard data model.

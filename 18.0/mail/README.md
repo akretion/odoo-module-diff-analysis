@@ -1,61 +1,31 @@
 # mail migration guide (17.0 -> 18.0)
 
-The `mail` app is the backbone of Discuss and of every chatter in Odoo (sales, invoices, projects, recruitment...). Between 17.0 and 18.0 it received a large functional overhaul plus a deep internal rework of how data is sent to the web client. Below is what changes for you as a user, and what changes under the hood.
-
 ## What's new for users
 
-**Canned responses reworked**
-- Shortcodes become **Canned Responses**: private by default, shareable with specific **Authorized Groups**.
-- You must now *manually pick* a canned response from the suggestion list instead of having it auto-substituted.
-- Created/updated/deleted canned responses are pushed live to other users.
-
-**Notification settings**
-- New **Configuration > Notifications** menu: set your default for all channels (All Messages / Mentions only / Nothing) and mute notifications for a period or forever.
-- Per-channel settings still override the global default.
-
-**Discuss & chatter**
-- **Sub-threads**: start a secondary discussion inside a channel from a message.
-- **New message separator** above the last unread message; channels open at the last message you read.
-- **@everyone** mention to ping all channel members at once.
-- **Copy message link** to share a message in another thread.
-- **Portal chatter**: portal users can react, copy links and edit/delete their own messages.
-- **Message scheduling**: write a message in the chatter and schedule it for later.
-
-**Activities**
-- New **list view with mass actions** for activities (done, snooze, cancel, "done and redirect to next").
-- **Activity plans: timing** — define the deadline of each plan step.
-
-**Emails**
-- **Dynamic placeholders** can be inserted with a dedicated button, and non *Template Editor* users may now use simple placeholders (e.g. `object.name`, `object.user_id.signature`).
-- **Heavy attachments are turned into links** so mail servers no longer reject large emails.
+- **Schedule messages and notes.** From the full chatter composer, the Send/Log button now has a "Send later" dropdown: pick a date and time and the message (or note) is posted automatically by a scheduled job. Scheduled messages appear in a new "Scheduled Messages" section of the chatter, hidden while empty. Their author can edit them and cancel them; users with write access on the record can cancel them too. A template that carries a schedule date now shows up in that section instead of being posted later on.
+- **Canned responses move to Discuss.** They can be private or shared with specific groups, and you must now select them manually: typing `:shortcut` no longer inserts the content automatically.
+- **Global notification settings.** A new Notifications menu under Configuration sets the default for all channels (All messages / Mentions only / Nothing) and lets you mute everything for a chosen period. Per-channel choices still override the default, and now include an explicit "All Messages" option.
+- **Simpler dynamic placeholders.** Users who are not members of the Mail Template Editor group can insert simple placeholders from a dedicated button in the composer, with an optional default value.
+- Other Discuss improvements listed in the release notes (persistent composer, new-message separator, copy message link, @everyone mention, sub-threads, portal chatter) also reach your users.
 
 ## Technical data model changes
 
-- **`mail.shortcode` removed → `mail.canned.response`**: same `source` / `substitution` / `description` / `last_used` fields, plus `group_ids`, `is_shared`, `is_editable`; `create`/`write`/`unlink` broadcast over the bus.
-- **New model `mail.scheduled.message`** (checks, `post_message`, `_post_messages_cron`).
-- **`discuss.channel`**: `is_chat` field removed; new constraints/methods for sub-threads (`parent_channel_id`, `from_message_id`, `_create_sub_channel`).
-- **`discuss.channel.member`**: `custom_notifications` gains the `all` value; new `_mark_as_read`, `_set_new_message_separator`, `set_custom_notifications`, mute helpers.
-- **`res.users.settings`**: new `channel_notifications`, `mute_until_dt`, `mute()`, `_cleanup_expired_mutes` (cron).
-- **`mail.mail`**: attachments-as-links, `process_email_queue(batch_size=...)`, `send(post_send_callback=...)`, size estimation.
-- **Web push**: `mail.notification.web.push` / `mail.partner.device` replaced by `mail.push` / `mail.push.device`.
-- **`mail.message` / `mail.thread`**: access checks refactored (`_check_access`, `_get_with_access`, portal tokens); `_search()` no longer accepts `access_rights_uid`; the `_*_format` methods are replaced by `_to_store`/Store data.
-- **`mail.template`**: new `send_mail_batch()`, batch `copy_data()`.
-- **`mail.alias`**: `_sanitize_alias_name(name, is_email)`; alias-domain configuration migration.
-- **`fetchmail.server.fetch_mail(raise_exception=True)`**; IMAP/POP connection helpers now need `server`, `port`, `is_ssl`.
-- **`mail.render.mixin`**: dynamic templates are now checked against a whitelist of allowed expressions instead of blocking all code; error message reworded.
+- **New model `mail.scheduled.message`** (distinct from `mail.message.schedule`, which only delays notifications): fields `subject`, `body`, `scheduled_date`, `attachment_ids`, `model`/`res_id`, `author_id`, `partner_ids`, `is_note`, `notification_parameters`. Cannot be scheduled in the past; the target record cannot be changed afterwards; access follows `_mail_post_access` on the related record. Posting happens through the `ir_cron_post_scheduled_message` cron, as the creating user.
+- **`mail.shortcode` removed, replaced by `mail.canned.response`** (`source`, `substitution`, `description`, `last_used`, plus `group_ids`, `is_shared`, `is_editable`). Create/write/unlink broadcast bus updates to the author, the current user and authorized groups.
+- **Discuss channels:** the computed `is_chat` field is removed (use `channel_type`), `_channel_channel_notifications` and `_send_transient_message` are gone, and recipient computation is rewritten around per-member and user-level notification settings.
+- **Notification settings:** `res.users.settings` gains `channel_notifications` and `mute_until_dt`, a `mute(minutes)` method and the `ir_cron_discuss_users_settings_unmute` cron. `discuss.channel.member.custom_notifications` gains the `all` value; default now comes from user settings. Discuss web-push notifications are restricted to web-push recipients.
+- **New `bus.listener.mixin`** (extended by mail): `_bus_send`, `_bus_send_store`, `_bus_channel` and `_bus_send_transient_message`. `discuss.channel` and `discuss.channel.member` inherit it, and direct `bus.bus._sendone`/`_sendmany` calls are replaced.
+- **Mail thread:** attachments coming from `mail.scheduled.message` are accepted at post time, and `scheduledMessages` can be requested by the web client.
+- **Template rendering:** `_is_dynamic` becomes `_has_unsafe_expression` (and the two `_is_dynamic_template_*` helpers are renamed), the QWeb context flag `raise_on_code` becomes `raise_on_forbidden_code`, and `ir.qweb` now allows only a directive/expression whitelist. Inline placeholders accept a default with `|||`.
 
 ## How your habits should change
 
-1. Stop relying on automatic shortcode substitution: open the canned-response menu and select one.
-2. Move your default notification and mute preferences to the global Discuss configuration; use per-channel settings only for exceptions.
-3. Check that your custom-made mail templates and aliases still render — the template security rule and alias sanitization changed.
-4. Review custom modules touching `mail.shortcode` or the removed `_*_format` methods: they must be ported to `mail.canned.response` and `_to_store`.
+- To delay a message, compose it, open "Send later" and choose the date; then track, edit or cancel it in the chatter instead of expecting it to be sent instantly.
+- Canned responses: pick them from the list (or share them through groups) rather than relying on automatic `:shortcut` substitution.
+- Set your notification preferences once in Configuration, then adjust individual channels only when needed.
+- Template editors keep full QWeb; everyone else is limited to whitelisted placeholders and defaults.
+- Review your customizations: any code using `mail.shortcode`, `is_chat`, `raise_on_code` or the old `bus.bus._sendone` helpers must be adapted.
 
 ## What you gain by migrating
 
-- Cleaner, less noisy conversations: global notification control, mute, @everyone, sub-threads, unread separator.
-- Faster daily follow-up thanks to the activities list view, mass actions and plan timing.
-- Smarter emails: scheduled sending, dynamic placeholders for everyone, and large attachments delivered as links instead of bouncing.
-- Shared, permission-aware canned responses for support and sales teams.
-- A modernized, store-based client API that keeps Discuss responsive and ready for future versions.
-
+Better control over when emails leave Odoo, cleaner notification noise for teams, shareable canned responses, safer templates for non-technical users, more consistent real-time Discuss updates, and a maintained codebase on a supported version (with upgrade scripts covering the model renames).

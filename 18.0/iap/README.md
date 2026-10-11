@@ -2,44 +2,43 @@
 
 ## What's new for users
 
-No Odoo 18 release-note extract covers the `iap` addon (the In-App Purchase framework behind SMS, Snailmail, Partner Autocomplete and other paid services). The changes below come from the 17.0 -> 18.0 source diff.
+The official Odoo 18.0 release notes contain no section dedicated to the `iap` addon (the service-account layer behind SMS, partner autocomplete, IAP enrichment, etc.). The user-visible changes below come from the code shipped in 18.0.
 
-- Account information is now fetched live: balance, registration state and service details are read from the IAP server when the account form is opened, instead of being cached in a temporary record.
-- Email alerts use recipients chosen among your own Odoo users (Email Alert Recipients), each notified in their own language, instead of one free-text address.
-- Saving is validated: the alert threshold must be positive and every recipient must have an email address on their user record.
-- The "show token" toggle disappears and the account page is simplified.
-- Services become proper records (IAP Service), so technical name, description, unit and balance format are shared configuration, and the service is locked once the account exists on the IAP side.
-- The registration flow improved for IAP services such as SMS (phone verification, sender name, warning emails handled from your own database).
+- **SMS account registration from your own database.** You no longer have to finish setting up an SMS account on the IAP website: verify your phone number, set a sender name and configure email alerts directly in Odoo.
+- **Email alerts are now per user.** Instead of one warning email address, you pick one or more Odoo users ("Email Alert Recipients"). They are warned when credits run low, in their own language.
+- **A visible account state**: Unregistered, Registered or Banned.
+- **Balance and account information are refreshed from IAP when you open the form**, and the service of an account already registered on IAP is locked (no accidental edits).
+- **Validation on save**: the alert threshold must be positive and every recipient must have an email address.
+- The "show token" toggle is gone; the account token stays hidden.
 
 ## Technical data model changes
 
-Added model
-- `iap.service`: `name`, `technical_name` (unique), `description`, `unit_name`, `integer_balance`.
+New persistent model `iap.service`: `name`, `technical_name` (readonly, unique), `description` and `unit_name` (translated), `integer_balance`.
 
-Removed model
-- `iap.account.info` (transient) is deleted.
+Removed model: `iap.account.info` (transient), with its `account_token`, `balance`, `unit_name`, `account_uuid_hashed`, `description`, `warn_me`, `warning_threshold` and `warning_email` fields.
 
-`iap.account` fields
-- Added: `service_id` (Many2one `iap.service`, required), `service_locked`, `warning_threshold` ("Email Alert Threshold"), `warning_user_ids` (Many2many `res.users`), `state` (banned / registered / unregistered).
-- Changed: `service_name` and `description` are related fields; `balance` is a stored read-only Char refreshed from IAP.
-- Removed: `account_info_id`, `account_info_ids`, `account_uuid_hashed`, `warn_me`, `warning_email`, `show_token`, and `_rec_name = 'service_name'`.
-
-Methods (0 modified, 6 added, 9 removed)
-- Added on `iap.account`: `_get_account_information_from_iap`, `get_account_id(service_name)`, `is_running_test_suite`, `validate_warning_alerts`, `web_read`, `web_save`.
-- Removed on `iap.account`: `_compute_balance`, `_compute_info`, `_inverse_info`, `_search_info`, `action_toggle_show_token`, `get_account_url`, `get_services`, `get_view`.
-- Removed on `res.config.settings`: `_redirect_to_iap_account`.
-- `web_read` triggers the IAP fetch, `web_save` disables it; writing `warning_threshold` or `warning_user_ids` calls `/iap/1/update-warning-email-alerts` with each recipient's email and language; on create the account name defaults to the service name.
+`iap.account`:
+- `service_name` (free Char) becomes `service_id` (required Many2one on `iap.service`); `service_name` and `description` become related fields. New `service_locked` boolean. The record name is now `name`, defaulting to the service name.
+- `balance`: was computed from the transient info model; now a readonly Char filled from the IAP server.
+- `warn_me` and `warning_email` are removed, replaced by `warning_user_ids` (Many2many `res.users`); `warning_threshold` becomes a stored float.
+- New `state` selection and `validate_warning_alerts` constraint; `show_token` and `action_toggle_show_token` removed.
+- Removed overrides/methods: `get_view`, `_compute_info`, `_compute_balance`, `_inverse_info`, `_search_info`, `get_services`.
+- New: `web_read` (fetches account info from IAP unless the `disable_iap_fetch` context is set), `web_save`, `_get_account_information_from_iap`, `get_account_id(service_name)`.
+- Server routes changed: `/iap/services-token` becomes `/iap/1/get-accounts-information`, and `/iap/update-warning-odoo` becomes `/iap/1/update-warning-email-alerts` (the payload now carries a list of `warning_emails` with email and language).
+- `get()` resolves the service and raises a UserError for an unknown technical name.
 
 ## How your habits should change
 
-- Rename or re-describe a service through its IAP Service record; once an account is registered, its service is locked.
-- Register alert recipients as Odoo users with an email rather than typing a raw address, and keep the threshold positive.
-- Do not treat balance and state as stored data to filter or report on: they are read from the IAP server when the form opens.
-- Any custom code using `iap.account.info`, `warn_me`, `warning_email`, `show_token` or `get_services()` must be rewritten around `service_id`, `warning_user_ids` and `_get_account_information_from_iap`.
+- Configure alerts by **choosing users**, not by typing an email address; the old "warn me" checkbox disappears — the threshold plus the recipient list replaces it.
+- Your alert configuration is now stored on the account in your own database and pushed to IAP when saved.
+- Register your SMS sender name and phone number from Odoo instead of the IAP portal.
+- Balance is informational and read-only; buy credits with the usual button.
+- If you use OCA or custom modules that read `service_name` as a plain Char, extend `iap.account.info`, or rely on `get_services()`, they must be ported before going live.
 
 ## What you gain by migrating
 
-- Fewer round trips to the IAP website: alert configuration and account follow-up happen inside your own database.
-- A real service catalogue: services are data, not hardcoded strings, so descriptions, units and balance formatting stay consistent and translatable.
-- Better alerting: several recipients, per-user language, and validation that catches mistakes early.
-- Less dead code to maintain: the temporary `iap.account.info` model and its compute/inverse/search methods are gone.
+- Faster, self-service SMS onboarding: no round-trip to the IAP website to register a sender.
+- Alerts reach the right people, in their own language, and are persisted in your database rather than in transient records.
+- A cleaner, constrained service registry (`iap.service`) instead of free-text service names: fewer configuration mistakes, and a service locked once the account is registered.
+- Clear account state, refreshed balance and server-side validation, so credit issues are spotted before they block your SMS or enrichment flows.
+- A future-proof foundation: the addon API is more explicit (`get_account_id`, single-account actions, dedicated service model) for your 18.0-and-beyond upgrades.

@@ -1,56 +1,47 @@
 # purchase_requisition migration guide (17.0 -> 18.0)
 
-This guide summarizes what changed in the `purchase_requisition` addon between Odoo 17.0 and 18.0 for functional users, and what to prepare before migrating to Community 18.0.
+This addon manages purchase agreements: blanket orders and the recurring agreements used to generate RFQs. 18.0 reshapes it noticeably — the configurable "agreement type" model disappears, one new agreement type arrives, and several fields and statuses are renamed or removed.
 
 ## What's new for users
 
-**A second agreement type: Purchase Template.** Agreements are no longer configured through a separate "Agreement Type" model. Odoo 18 offers exactly two hard-coded types, chosen directly on the agreement:
-- **Blanket Order**: negotiated quantities/prices over a period, with supplier info created (historic behaviour).
-- **Purchase Template**: create RFQs with fixed quantities easily; unit prices are pre-filled from the vendor pricelist, and no supplier info is created.
+The official 18.0 release notes are thin for this addon. Under Purchase, only one item concerns purchase agreements:
 
-**Simpler agreement states.** The status list is reduced to Draft, Confirmed, Closed, Cancelled. The former Ongoing / In progress / Bid selection states disappear — "Confirmed" now covers both agreement types. Behaviour change: confirming an RFQ linked to an "exclusive" agreement no longer cancels the other RFQs and closes the agreement automatically.
+- **New purchase agreement type**: "Added a new type of purchase agreement to create requests for quotation with fixed quantities easily."
 
-**Vendor currency is now automatic.** The agreement currency follows the vendor's purchase currency (falling back to the company currency); no more manual onchange.
+This is the **Purchase Template** agreement, which now sits next to the existing **Blanket Order**. The other items listed in the Purchase, Sales and Accounting release notes (company-currency totals, RFQ accept/decline from email or portal, lot-number generation on receipts, PO/bill matching) belong to other modules and do not change how agreements work.
 
-**Purchase alternatives are opt-in.** Comparing alternative RFQs (and merging them) is now hidden by default and enabled through the new Purchase setting "Purchase Alternatives".
-
-**Company-currency totals.** Purchase order and order line totals are available in company currency, so alternatives can be compared in a single currency.
+One visible consequence for agreement users: the purchase alternatives feature is no longer displayed by default — a new **Purchase Alternatives** setting in Purchase settings must be enabled to use it.
 
 ## Technical data model changes
 
-Removed model: `purchase.requisition.type` (agreement types are now a selection).
+**Removed model**: `purchase.requisition.type` (fields `name`, `sequence`, `exclusive`, `quantity_copy`, `line_copy`, `active`). It is replaced by a simple selection.
 
-`purchase.requisition`
-- Removed: `type_id`, `is_quantity_copy`, `state_blanket_order`, `origin` (renamed `reference`), `ordering_date`, `schedule_date`.
-- Added: `active`, `reference`, `requisition_type` (blanket_order / purchase_template, required, default blanket_order), `date_start` (Date), `date_end` (now Date, was Datetime).
-- `state` selection reduced to draft/confirmed/done/cancel; `name` comes from a dedicated sequence per type and is re-generated when type/company changes (draft only); currency is now computed, stored and editable from the vendor.
-- New constraint `_check_dates`: end date cannot be earlier than start date.
-- Methods removed: `_get_type_id`, `_set_state`, `action_in_progress`, `action_open`. Added: `action_confirm`, `create`, `write`, `_compute_currency_id`, `_check_dates`.
+**`purchase.requisition`**
+- Added `requisition_type` selection (`blanket_order`, `purchase_template`, default `blanket_order`), `reference`, `active`, `date_start` (replaces `ordering_date`).
+- `date_end` is now a Date (was Datetime); `origin`, `schedule_date`, `state_blanket_order`, `is_quantity_copy` and `type_id` are removed.
+- `state` is reduced to `draft / confirmed / done / cancel`: `ongoing`, `in_progress` and `open` are gone. `action_in_progress` becomes `action_confirm`; `action_open` and `_set_state` are removed.
+- Names are generated from `ir.sequence` at creation, with one sequence per agreement type.
+- New `_check_dates` constraint refuses an end date earlier than the start date; changing the agreement type or company on a non-draft agreement raises a UserError; `currency_id` is now stored and computed from the vendor.
+- `unlink` also removes draft lines.
 
-`purchase.requisition.line`
-- Removed `schedule_date`; `price_unit` becomes computed (vendor pricelist), stored, editable; labels of `qty_ordered` and `product_description_variants` shortened.
-- `_onchange_product_id` and `create_supplier_info` removed; `_compute_price_unit` and `_create_supplier_info` added.
+**`purchase.order`**: the `requisition_id` label becomes "Agreement"; new related `requisition_type`; `is_quantity_copy` removed. `_onchange_requisition_id` no longer depends on `line_copy` and sets quantities to zero for purchase templates; `date_order` becomes `max(now, date_start)`. The old behaviour that cancelled other RFQs on confirmation of an "exclusive" agreement is removed. `has_alternatives` now requires the new `group_purchase_alternatives` group.
 
-`purchase.order`
-- `requisition_id` label: "Blanket Order" -> "Agreement"; `is_quantity_copy` replaced by related `requisition_type`; added `_merge_alternative_po`, `_prepare_grouped_data`.
+**`purchase.requisition.line`**: `schedule_date` and `_onchange_product_id` removed; `price_unit` is stored and computed from the vendor pricelist for purchase templates (still editable); `create_supplier_info` renamed `_create_supplier_info`; labels "Custom Description" → "Description" and "Ordered Quantities" → "Ordered".
 
-`purchase.order.line`
-- Added `_compute_price_total_cc` (company currency total).
-
-New file/model: `res.config.settings.group_purchase_alternatives`.
+**New**: `res.config.settings.group_purchase_alternatives`.
 
 ## How your habits should change
 
-- Choose "Blanket Order" or "Purchase Template" on the agreement itself; the agreement-type menu is gone (menus are now named "Agreement Types").
-- Use Start Date / End Date fields; per-line scheduling has moved to purchase orders.
-- Use Confirm / Close actions; expect "Confirmed" instead of Ongoing / In progress / Bid selection.
-- Select the vendor first, then check the currency — it is derived from the vendor.
-- Enable the Purchase Alternatives setting if your team relies on comparing or merging RFQs.
-- Existing records are converted by Odoo's upgrade scripts; review in-flight agreements after migration since removed states and dates are remapped.
+The release notes say nothing further specific to this addon, so the rest follows from the changes above:
+
+- Pick the agreement type when you create the agreement: it drives numbering, available date fields and confirmation checks.
+- Use **Confirmed** instead of the former Ongoing / In progress / Bid Selection statuses.
+- Blanket orders still require a positive price and quantity per line before confirmation; purchase templates prefill prices from the vendor pricelist.
+- If you relied on comparing RFQs, enable the alternative setting first.
 
 ## What you gain by migrating
 
-- One clear, simpler model covering both blanket orders and purchase templates, with cleaner naming and fewer states.
-- Faster RFQ creation from purchase templates, with prices pre-filled from vendor pricelists.
-- Fewer manual steps: automatic currency, sequenced references, and start/end date validation.
-- Better comparison of competing RFQs thanks to company-currency totals and the optional alternatives workspace.
+- Two clear agreement types instead of a configurable type model to maintain.
+- Automatic agreement numbering and start/end date validation.
+- Vendor pricelist prices prefilled on purchase templates.
+- A lighter default interface, with alternatives available on demand.

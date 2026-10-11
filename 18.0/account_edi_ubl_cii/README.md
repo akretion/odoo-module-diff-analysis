@@ -1,44 +1,51 @@
 # account_edi_ubl_cii migration guide (17.0 -> 18.0)
 
-This addon generates and imports electronic invoices (UBL/BIS Billing 3.0, Factur-X/CII, XRechnung, NLCIUS, A-NZ, SG) in the Community edition. Odoo 18.0 brings a deep refactor of the Send & Print flow and of the XML import/export helpers.
+This Community addon generates and imports e-invoice files (UBL/BIS Billing 3.0, Factur-X/CII, XRechnung, NLCIUS, A-NZ, SG) and drives the invoice "Send & Print" flow. In 18.0 it was refactored around per-contact sending preferences.
 
 ## What's new for users
 
-- **Preferred invoicing settings on contacts.** You now define the e-invoice format (and sending method) per contact in its Accounting tab, so batch sending applies the right format automatically. The old company-wide "Generate Peppol format by default" checkbox is gone.
-- **A simpler Send & Print.** Fewer ambiguous checkboxes; the format and method are preselected from the partner. Odoo warns you before generating an incomplete file (missing Peppol Endpoint/EAS on your company or the customer, missing recipient bank account).
-- **Download the UBL file directly** from the invoice (new action), without going through Send & Print.
-- **Better import of received UBL files:** the bank account found in the XML is filled on the partner, partners can be matched through their Peppol Endpoint (EAS), files whose namespaces are declared line by line are now read correctly, and allowances/charges are imported as proper lines.
-- Improved support for country-specific flavours (e.g. Colombia, Singapore tax-exempt export, customisable Note).
+- **Preferred invoicing method per contact.** Each customer now has a preferred sending method and e-invoice format. The Send & Print wizard pre-selects it (email by default), so batch sending no longer means ticking boxes for every run.
+- **Send & Print visibility** was improved, making it clearer which documents will be generated and sent.
+- **Mandatory declarations follow the sending.** Legally required B2G/e-invoice declarations are applied by default when you send, instead of relying on a manually ticked box.
+- **New pre-flight alerts.** Before generating a UBL file, Odoo warns you when your company or a partner is missing a Peppol EAS / Peppol Endpoint, or when an invoice has no recipient bank account. The generated file would otherwise be incomplete.
+- **Better UBL import.** When you import a UBL (XML) invoice, Odoo fills the bank account found in the XML on the partner when possible.
+- **Enrich imported lines.** You can add information (products, analytic distribution, ...) to lines created from an imported e-invoice without altering imported amounts or taxes.
 
-Note: sending invoices *on* the Peppol network relies on the separate Peppol connector (Enterprise). This Community addon produces and reads the files; it does not itself transmit them.
+The release notes list many country-specific e-invoicing additions; those belong to the localisation modules, not to this one.
 
 ## Technical data model changes
 
-Fields:
-- `res.partner.ubl_cii_format` **removed**, replaced by `res.partner.invoice_edi_format` (extension of the base Accounting field). New computed `is_ubl_format`.
-- `res.company.invoice_is_ubl_cii` and `res.config.settings.invoice_is_ubl_cii` **removed**.
-- `account.move.send`: `enable_ubl_cii_xml`, `checkbox_ubl_cii_label`, `checkbox_ubl_cii_xml` **removed**; model moved to `wizard/`, now an AbstractModel. New `_get_alerts`.
-- `res.partner._get_ubl_cii_formats()` now returns a list; the country mapping moved to `_get_ubl_cii_formats_by_country()`; new `_get_suggested_invoice_edi_format()`, `_peppol_eas_endpoint_depends()`.
+Added:
+- `account.move.send` is now extended by this addon to generate the XML, embed the PDF in the XML and embed Factur-X inside the PDF.
 
-Method signatures (14 modified, 45 added, 21 removed):
-- `res.partner._get_edi_builder(invoice_edi_format)` (now a model method taking the format).
-- `account.move._need_ubl_cii_xml(ubl_cii_format)`.
-- `account.move.send._link_invoice_documents(invoices_data)` and `_get_placeholder_mail_attachments_data(move, extra_edis=None)` — batch-oriented.
-- Export: `_export_invoice(invoice, convert_fixed_taxes=True)`; `_get_tax_category_list(customer, supplier, taxes)`; `_get_tax_unece_codes(customer, supplier, tax)`; `_get_uom_unece_code(uom)`; `_validate_taxes(tax_ids)`.
-- Import: `_import_fill_invoice_form` / `_import_fill_invoice_line_form` and their helpers are replaced by a unified set (`_import_fill_invoice`, `_import_invoice_lines`, `_retrieve_line_vals`, `_import_partner`, `_retrieve_taxes`, `_find_value`, ...).
-- Added export hooks: `_get_note_vals_list(invoice)`, `_get_tax_grouping_key(base_line, tax_values)`, `_get_invoice_line_item_vals(line, taxes_vals)`, `_get_customization_ids()`.
-- New hooks on `account.move`: `action_invoice_download_ubl()`, `get_extra_print_items()`, `_get_invoice_legal_documents(filetype, allow_fallback=False)`.
+Removed fields:
+- `res.company.invoice_is_ubl_cii` (the `res.company` model was removed from the addon).
+- `res.config.settings.invoice_is_ubl_cii`.
+- On `account.move.send`: `enable_ubl_cii_xml`, `checkbox_ubl_cii_label`, `checkbox_ubl_cii_xml`.
+
+Renamed / new fields:
+- `res.partner.ubl_cii_format` **renamed** to `res.partner.invoice_edi_format`. The field now lives in `account` and this addon extends its selection (`selection_add`). Stored values keep the same meaning, but custom code, filters, import templates or reports referring to `ubl_cii_format` must be updated.
+- New computed `res.partner.is_ubl_format` (True when the contact's format is one of UBL/CII).
+- `res.partner.invoice_edi_format` is no longer computed by this addon: the country-based suggestion moved to `_get_suggested_invoice_edi_format()`.
+
+Method signature changes (relevant for customisations):
+- `res.partner._get_edi_builder()` -> `_get_edi_builder(invoice_edi_format)`, now `@api.model` (it no longer reads the partner).
+- `res.partner._get_ubl_cii_formats()` now returns a **list** (`['ubl_bis3', 'xrechnung', ...]`); the old mapping became `_get_ubl_cii_formats_by_country()`.
+- `account.move._need_ubl_cii_xml()` -> `_need_ubl_cii_xml(ubl_cii_format)`; it no longer tests the PDF presence and relies on the requested format rather than the partner default.
+- `_get_placeholder_mail_attachments_data(move, extra_edis=None)`, `_get_invoice_extra_attachments`, `_link_invoice_documents(invoices_data)` are now batch-oriented.
 
 ## How your habits should change
 
-- Stop relying on the company-level e-invoicing checkbox: set the format on each customer/vendor.
-- In Send & Print, pick one communication channel per partner; batching reuses those defaults.
-- Read the new alerts and complete Peppol EAS/Endpoint and recipient bank details before sending.
-- If you have custom modules extending this addon, update overrides to the new method names and signatures (builders now receive the format instead of reading it from the partner).
+- Forget the company-level "Generate Peppol format by default" setting: it no longer exists. Set the e-invoice format per contact instead.
+- Set each contact's preferred sending method (Post / Email / Peppol / download) once; batch sends will respect it.
+- In single mode you can still push an invoice through several channels, but only the preferred one is pre-checked. Using one channel per partner avoids duplicate invoices for your customers' accountants.
+- Fill in Peppol EAS and Peppol Endpoint on your company and on your Peppol partners, and set a recipient bank on invoices, to avoid incomplete files.
+- If you have custom code touching `ubl_cii_format` or `_get_edi_builder()`, plan an update.
 
 ## What you gain by migrating
 
-- The correct e-invoice format is applied automatically per customer, including in batch.
-- Fewer rejected or incomplete files thanks to pre-send checks and alerts.
-- More reliable import of supplier e-invoices: better partner and bank matching, broader format tolerance.
-- A cleaner foundation aligned with current Odoo and European e-invoicing practice, on a supported version instead of staying on 17.0.
+- Send e-invoices in batch reliably, with per-partner defaults instead of per-run checkboxes.
+- Fewer errors: format, EAS/Endpoint and bank details are checked before the file is produced.
+- Compliant, portable output: the PDF is embedded in the UBL XML and a Factur-X XML is embedded in the PDF, so recipients get a single file, and Factur-X files are PDF/A-3.
+- Cleaner legacy: one `invoice_edi_format` shared with the rest of Accounting, and no duplicated company setting.
+- Safer imports: UBL bills fill the partner bank; imported lines can be enriched without altering amounts.

@@ -2,42 +2,33 @@
 
 ## What's new for users
 
-The official Odoo 18 release notes cover this addon in a single line: *"New social app — Promote events through community marketing, and track speakers, attendees, and sponsors."* That is the only release-note entry that actually relates to `marketing_card`; the other Marketing Automation, Social Marketing and Email Marketing notes concern different apps and are not part of this module.
+The Odoo 18.0 release notes present Marketing Card as a **new social app**: promote events through community marketing and track speakers, attendees and sponsors. The 17.0 → 18.0 code comparison likewise shows this addon as newly added, so there is no legacy card data to convert. What did change is the campaign design itself, which was reworked during the 18.0 cycle; this guide describes the resulting behaviour. Check availability for your Odoo edition before planning the rollout.
 
-Because the release notes are very terse here, the picture below comes mainly from the code diff — which shows the addon's files being introduced during the 18.0 cycle (PR 175486) and then substantially reworked before release (PR 178007). For a 17.0 user this is therefore not a like-for-like update, but a new app to discover.
-
-What it does in its 18.0 shape: a **card campaign** is a design template plus a set of content slots, bound to a target model (Contacts, Event Tracks, Event Booths, Event Registrations) and a mandatory preview record. You select which records to invite, send a mailing that hands each recipient a personal card link, and each shared link serves a per-person image optimised for social networks, then redirects to the URL you choose.
+- Simplified campaign form: the "elements" table is gone. Header, Sub-Header, Section, Sub-Section 1/2, Button and Background are now plain fields on the campaign, each with an optional *dynamic* switch and a field path to pull the value from the record.
+- Preview is a button: the "Preview On" record is mandatory, and Preview opens a real (archived) card in a new tab instead of showing a stored URL.
+- Cleaner share links: cards are considered public, so the URL no longer needs a signed hash token.
+- Images are generated when you send the cards, under your own rights, instead of being rendered on the fly for public visitors.
+- Mailings are now linked to the campaign: a Mailings smart button lists them, and "Send Cards" pre-fills the subject, target model and a ready-to-edit message ("Help us share the news").
 
 ## Technical data model changes
 
-From the pseudo patches: 35 method signatures added, 0 modified, 0 removed.
+Removed: model `card.campaign.element` and the campaign's `card_element_ids`; fields `preview_record_url`, `record_ref`; methods `_selection_preview_record_ref`, `_get_generic_image_b64`, `_generate_card_hash_token`, `_get_card_path`.
 
-**Removed**
-- Model `card.campaign.element` and the `card_element_ids` One2many on `card.campaign`: card content is no longer a sub-list of "elements".
-- Fields `card.campaign.preview_record_url` and `card.card.record_ref`; the `base` whitelist `_marketing_card_allowed_field_paths`; the HMAC hash token (URLs are now slug-based: `/cards/<slug>/card.jpg|preview|redirect`).
+Added on `card.campaign`: `card_ids`, `mailing_ids` + `mailing_count`, `request_title` / `request_description`, and the content fields `content_background`, `content_button`, `content_header(_dyn/_path/_color)`, `content_sub_header`, `content_section`, `content_sub_section1/2` (each with `_dyn`/`_path`), `content_image1_path`, `content_image2_path`.
 
-**Added**
-- `card.campaign`: `mailing_ids` / `mailing_count`, `card_ids`, `request_title`, `request_description`, and the content fields `content_background`, `content_button`, `content_header` (with `_dyn`, `_path`, `_color`), the same trio for sub-header, section, sub-section 1 and 2, plus `content_image1_path` / `content_image2_path`.
-- `mailing.mailing`: `card_campaign_id`, computed `mailing_model_id`, `card_requires_sync_count`, `action_update_cards`, and blocking checks in `action_put_in_queue` / `action_send_mail`.
-- `card.card`: `active` (previews are inactive cards) and `requires_sync`.
-- `utm.source`: the Marketing Card UTM source can no longer be deleted.
+Changed: `res_model` is computed and read-only (derived from Preview On), `preview_record_ref` is required, `target_url` is now labelled "Post Link". On `card.card`: new `active` and `requires_sync`; `share_status` labels shortened to "Shared" / "Visited"; `record_ref` replaced by a computed `display_name`. Mailings can be attached through the new `card_campaign_id` on `mailing.mailing`.
 
-**Changed behaviour**
-- `res_model` is now computed, stored and read-only; `preview_record_ref` is required. Changing the model of a campaign that already has cards raises a validation error.
-- Card images are rendered when cards are created/updated by the user (no `sudo()`), instead of lazily by the anonymous visitor. The old "clear images after 1 day" job becomes a card deletion after 60 days (`_gc_card_url_images` -> `_gc_card`).
-- Rendering runs in batches of 100 cards through `_update_cards(domain, auto_commit)`.
+Method signatures: `_get_card_element_values(record, preview_values)` → `(record)`; `_get_or_create_cards_from_res_ids(res_ids)` → `_update_cards(domain, auto_commit=False)`; `_get_preview_url_from_res_id()` → `_get_url_from_res_id(res_id, suffix='preview')` and `card._get_path(suffix)`; new `_get_render_fields()`, `action_preview()`, `action_view_mailings()`.
 
 ## How your habits should change
 
-- Configure content directly on the campaign form rather than in a separate elements list: each slot is a plain field, with an "Is Dynamic" checkbox and a field path when values must come from the record.
-- Preview is now a button opening a temporary (inactive) card, not a URL to copy.
-- Cards exist before the mailing is sent: use "Update cards" on the mailing — scheduling or sending is blocked while cards are out of date.
-- Share links are shorter and slug-based; any visitor holding the link can display a card, so no token is used.
-- The field-path whitelist is gone: paths are evaluated with the current user's rights instead of as superuser. Review any path pointing at sensitive data.
+- Build the card content on the campaign form; there is no element list to configure.
+- Set "Preview On" first, since it drives the target model.
+- The target model can no longer be changed once the campaign has cards (validation error).
+- Dynamic values are read with your own access rights: the administrator whitelist of allowed field paths has been dropped, so any reachable field can be used.
+- Generate and send from the campaign, then follow up from the Mailings smart button and the card statistics.
 
 ## What you gain by migrating
 
-- A ready-made word-of-mouth / community-marketing app for events: speakers, attendees, sponsors and partners each get a personalised, on-brand card to share.
-- Per-campaign tracking of cards sent, shared and visited, with a reward message and link to thank people who share.
-- A simpler data model (no element sub-model, no hash tokens, no `sudo()`, no field whitelist) that is faster to configure and respects access rights.
-- Consistent per-recipient images for social sharing, generated on demand and retained for 60 days.
+- One form to design a campaign instead of a list of element lines.
+- Images are produced at send time, in batches

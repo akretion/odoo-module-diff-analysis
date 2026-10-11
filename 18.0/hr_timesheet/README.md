@@ -2,36 +2,46 @@
 
 ## What's new for users
 
-**Analytic plans on projects — the headline change.** A project no longer has a single "Analytic Account". In Odoo 18 you define **one analytic account per analytic plan** (Project, Department, Customer, …) in the project form. A timesheet can therefore post its cost to several accounts at once, so project profitability can be read on several axes instead of one. Timesheets inherit the accounts configured on their project; when a timesheet is linked to a sales order line, the distribution of that line is used instead (the SO line has priority).
+The release notes' *Timesheets* section only discusses grid-view enhancements (spotting missing hours, weekend toggle), an Enterprise-edition feature that is not part of this Community addon. The one relevant 18.0 item for hr_timesheet is listed under *Project*: **Analytic plans on projects**.
 
-**Timesheets as an analytic applicability domain.** "Timesheet" now appears in the analytic plan applicability settings, so a plan can be made mandatory for timesheet entries. If the project lacks a required plan, Odoo blocks the entry and names the missing plan instead of silently mis-posting.
+A project is no longer limited to a single analytic account: it now carries one analytic account **per analytic plan**, entered in a new analytic notebook on the project form. Timesheets no longer let users choose an accounting destination; they inherit the analytic distribution of their project, or of the linked sales order line (which takes priority). One timesheet cost can therefore feed several axes at once — project, team, department, service — for finer profitability analysis, while project profitability still follows the account of the *Projects* plan.
 
-**Timesheet grid view.** Weekends can be shown or hidden in the grid, and under-assigned hours are easier to spot.
-
-**Related records from the task kanban.** The task kanban control panel gains embedded actions to jump to related records, including timesheets.
-
-The remaining release-note items (burn-up chart, Gantt workload and deadlines, revision tracking, …) belong to the Project/Enterprise scope and are not part of this addon.
+Related 18.0 improvements (analytic entries from stock pickings, re-invoicing of delivered products, project on PO/MO) belong to other addons, not hr_timesheet.
 
 ## Technical data model changes
 
-- `project.project.analytic_account_id` is **renamed to `account_id`** (same role). `analytic_account_active` still exists and is now related to `account_id.active`.
-- `project.task.analytic_account_id` is **removed**: tasks no longer carry their own analytic account. `analytic_account_active` becomes a related field on `project_id.analytic_account_active`, and `_compute_analytic_account_active` disappears.
-- Timesheet value preparation: `_timesheet_preprocess(vals_list)` is **removed**, replaced by **`_timesheet_preprocess_get_accounts(vals)`**, which fills one field per analytic plan from the project and validates that the mandatory plans are set.
-- New `account.analytic.applicability` extension: `business_domain` gains the `timesheet` value (cascade on delete).
-- New methods on `account.analytic.line`: `_ensure_uom_hours` (installing timesheets without a UoM no longer tracebacks), `_is_updatable_timesheet` (blocks editing a timesheet tied to a validated sales order line), `_get_favorite_project_id_domain` (favourite-project suggestion ignores global time off), `_compute_message_partner_ids` / `_search_message_partner_ids` (faster portal access to timesheets), `get_views` (keeps the WIP report out of timesheet views).
-- New methods on `project.project`: `action_view_tasks`, `get_create_edit_project_ids`; on `project.task`: `_compute_allow_timesheets`, `_search_allow_timesheets`, `_get_timesheet_report_data`.
-- View and label plumbing: `_get_view` / `_get_view_cache_key` overrides on `account.analytic.line`, `project.project` and `project.task`, plus `_apply_time_label` / `_apply_timesheet_label`, unify the time field labels. `res.company._is_timesheet_hour_uom` and `_timesheet_uom_text` are removed.
-- Extra validation: the project, the task and the analytic accounts of a timesheet must belong to the same company, and timesheets on a private task are rejected (on write as well).
+Source: odoo/odoo#169868 (analytic plans on projects). No model is added or removed in hr_timesheet.
+
+Fields:
+- `project.project.analytic_account_id` is renamed to **`account_id`**.
+- `project.project.analytic_account_active` is now `related='account_id.active'`.
+- `project.task.analytic_account_active` is now `related='project_id.analytic_account_active'`; `_compute_analytic_account_active()` is removed. `analytic_account_id` was dropped from `PROJECT_TASK_READABLE_FIELDS`: tasks no longer expose an analytic account to timesheets.
+- `_create_analytic_account()` and `_init_data_analytic_account()` now use `account_id`.
+
+New applicability:
+- New file `models/analytic_applicability.py` extends `account.analytic.applicability` with the `business_domain` value `('timesheet', 'Timesheet')` (ondelete cascade): a plan can be flagged as required for timesheets.
+
+`account.analytic.line`:
+- `_timesheet_preprocess(vals_list)` is **removed**.
+- `_timesheet_preprocess_get_accounts(vals)` is **added**: it returns one account id per analytic plan column of the project, and raises if a mandatory timesheet plan has no account on that project.
+- `create()` and `write()` now resolve task/project themselves, block timesheets on private tasks in both, and force `company_id` from the project/task; `create()` also defaults `product_uom_id` to the company's project time mode.
+- `_timesheet_postprocess()` adds two checks: the analytic account must be active (the error names the required plan), and project, task and analytic accounts must belong to the same company.
+- Error wording changed: "You cannot use timesheets without an analytic account" became "To use the timesheets feature, you need an analytic account for your project... set one up in the plan '<Plan>' or turn off the timesheets feature."
 
 ## How your habits should change
 
-- On the project form, fill the **analytic notebook (one account per plan)** instead of a single Analytic Account.
-- If you use analytic applicability, set the required plans on the project **before** logging time.
-- You can no longer log time on a **private task**.
-- Editing or creating a timesheet linked to a validated sales order line is now blocked.
+- Do not pick an analytic account when logging time: it now comes from the project (or the sales order line).
+- Task-level analytic accounting is gone; move that setup to the project's analytic notebook. A task only mirrors its project's active account.
+- Fill in the analytic notebook per project: the *Projects* plan account must exist and be **active**, otherwise timesheet creation is blocked.
+- If a plan is flagged as required for the *Timesheet* domain, every timesheet-enabled project needs an account for that plan.
+- Keep project, task and analytic accounts in the same company.
+- Update custom filters, exports, saved views and automated actions that reference `analytic_account_id` on projects or tasks.
+- Retrain users on the new error messages.
 
 ## What you gain by migrating
 
-- **Multi-axis profitability**: timesheet costs feed every plan configured on the project.
-- **Fewer silent errors**: explicit messages for missing plans, mixed companies, private tasks and non-updatable lines.
-- **Faster** portal access to timesheets and clearer, unified field labels.
+- Multi-axis time costing: one timesheet feeds several analytic plans at once.
+- Less manual entry and fewer mistakes: no per-timesheet account selection.
+- Clear guard rails: explicit errors when a plan or account is missing or inactive.
+- Trustworthy figures: company-consistency and applicability checks.
+- A clean base for the wider 18.0 project analytic features (stock, MRP, purchase, re-invoicing).

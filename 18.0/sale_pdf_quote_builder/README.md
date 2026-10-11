@@ -1,50 +1,49 @@
 # sale_pdf_quote_builder migration guide (17.0 -> 18.0)
 
-This addon merges PDF headers, footers and product documents into sale quotations and fills in their PDF form fields. Odoo 18 rebuilt it around reusable documents and per-quotation choices.
-
 ## What's new for users
 
-- Custom zones: the quote builder is more flexible — choose when to use it, which documents to use, and insert text specific to each quotation in the PDF.
-- Any field of the model, including fields you created yourself, can now be used to fill a PDF form field, with no development.
-- Headers and footers become reusable records (with type, sequence, activation) that can be linked to quotation templates and selected per quotation.
-- Product documents to merge are now chosen per sale order line instead of being taken automatically from the first eligible document.
-- The "Send quotation" and "Order confirmation" email templates now mention the product documents available to the customer in the portal.
+Odoo 18 reworks the PDF Quote Builder around "custom zones". Instead of a company-level header/footer plus a configuration wizard, the feature becomes flexible and per-quotation:
+
+- Choose per quotation whether the builder is used, and which documents are included.
+- Headers and footers are now standalone, reusable documents ("Headers/Footers"): upload a PDF once and attach it to any number of quotations. Documents can also be linked to quotation templates, so a template brings its own header and footer.
+- Product documents are selected per quotation line, so you attach exactly the datasheet or terms needed for a given customer.
+- Custom zones: each form field found in your PDFs can either be filled with text typed directly on the quotation (per-customer wording) or mapped to any field of the order, order line or product — including custom fields.
+- The selection dialog only lists documents actually available for the quotation (based on template and sold products).
+
+Other sales release-notes items (Shopee, Amazon, combo products, commission plans, pricelist revamp, portal loyalty, etc.) belong to other apps or to Enterprise and are not part of this addon.
 
 ## Technical data model changes
 
 New models:
-- `quotation.document` (Header/Footer, inherits `ir.attachment`): `document_type`, `sequence`, `active`, `quotation_template_ids`, `form_field_ids`.
-- `sale.pdf.form.field`: a form field found in a PDF; `name` (unique per document type), `document_type`, `path` (dynamic mapping, optional), linked `product_document_ids` / `quotation_document_ids`.
+- `quotation.document` ("Quotation's Headers & Footers"), inheriting `ir.attachment`: `document_type` (header/footer), `sequence`, `active`, `quotation_template_ids`, `form_field_ids`.
+- `sale.pdf.form.field`: form fields parsed from the PDFs. A `path` marks a dynamic field; without a path it is a customizable (free text) field.
 
 Removed:
-- `res.company.sale_header(_name)`, `sale_footer(_name)`.
-- `sale.order.template.sale_header(_name)`, `sale_footer(_name)`, and later the `sale_header_ids` / `sale_footer_ids` helpers, replaced by `quotation_document_ids`.
-- `sale.order.is_pdf_quote_builder_active` (replaced by computed `is_pdf_quote_builder_available`).
-- The dynamic-fields wizard action and the JSON config parameter that stored the field-path mapping.
+- `res.company` inheritance and the fields `sale_header`, `sale_header_name`, `sale_footer`, `sale_footer_name`.
+- `sale.order.is_pdf_quote_builder_active` (replaced by the computed `is_pdf_quote_builder_available`).
+- `sale.order.template.sale_header_ids` / `sale_footer_ids` (`quotation_document_ids` remains).
+- The dynamic-fields wizard: `action_open_dynamic_fields_wizard` becomes `action_open_pdf_form_fields`.
+- The system parameter `sale_pdf_quote_builder.form_field_path_mapping`: field paths now live on `sale.pdf.form.field` records.
 
-Added / changed:
-- `product.document.form_field_ids`, computed from the attached PDF.
-- `sale.order`: `quotation_document_ids` (now manually editable, no longer computed/stored), `available_product_document_ids`, `customizable_pdf_form_fields` (JSON, manually editable), `is_pdf_quote_builder_available`.
-- `sale.order.line`: `product_document_ids` is no longer defaulted by a compute; `available_product_document_ids` lists eligible documents.
-- `sale.order.template.quotation_document_ids`.
-
-Method changes (`ir.actions.report`):
-- Added `_update_mapping_and_add_pages_to_writer`, `_get_value_from_path`, `_get_custom_value_from_order`.
-- Removed `_fill_sol_documents_fields`, `_get_so_form_fields_mapping`, `_get_sol_form_fields_mapping`, `_get_form_fields_values_mapping`, `_get_formatted_field`; `_add_pages_to_writer` now takes a `prefix` instead of a `sol_id`.
-- `product.document.action_open_pdf_form_fields` replaces the wizard action, and a post-upgrade job scans existing PDFs to create the matching form fields.
+Changed:
+- `sale.order`: new `quotation_document_ids` (Many2many), `customizable_pdf_form_fields` (Json, user-editable), `available_product_document_ids` (computed). Without a template, the first header and first footer are preselected.
+- `sale.order.line.product_document_ids`: no longer computed/stored; no default document is auto-selected.
+- `product.document`: new computed, stored `form_field_ids`.
+- `ir.actions.report`: `_add_pages_to_writer(writer, document, prefix=None)` replaces the previous `(writer, document, all_form_fields, sol_id)` signature; `_update_mapping_and_add_pages_to_writer`, `_get_value_from_path` and `_get_custom_value_from_order` replace `_get_form_fields_values_mapping` / `_get_formatted_field`.
+- Generated form-field prefixes are now `quotation_document_id_X__` and `sol_id_X_product_document_id_Y__`.
 
 ## How your habits should change
 
-- Upload headers/footers once as Quotation Documents and pick them per quotation or quotation template; they are no longer stored on the company or template form.
-- The "Use PDF Quote Builder" toggle and the document-selection wizard are gone. Selection happens directly on the quotation, and custom text is typed on the spot.
-- Field mapping is no longer wizard- or parameter-based: it lives on `sale.pdf.form.field` records, where an empty path means "free text filled per quotation".
-- Select explicitly the product document(s) to include on each order line; nothing is preselected for you.
-- Form field names may only contain alphanumerics, hyphens or underscores and cannot start with `sol_id_`. Only unencrypted PDFs are accepted.
+- Stop uploading headers/footers on the company: manage them in the new Headers/Footers documents and reuse them across quotations and templates. The standard upgrade scripts convert your existing company documents — check the result after migrating.
+- No more "activate the builder" toggle plus selection wizard: documents are edited directly on the quotation.
+- Configure form fields from the document's "Form Fields" action, deciding for each whether it is dynamic (model path) or free text filled per quotation.
+- Salespeople must now explicitly pick product documents per line: nothing is preselected anymore.
+- A company-level header/footer is no longer applied automatically unless the corresponding document is available and selected.
 
 ## What you gain by migrating
 
-- More control over generated quotes: combine several headers, footers and product documents, decide per quotation, and personalise each one with free text.
-- Any Odoo field, standard or custom, can feed a PDF form field: layouts evolve without a developer.
-- Reusable, centrally managed documents with type, sequence and activation, instead of duplicated company and template binaries.
-- A cleaner data model: existing PDF form fields are detected automatically during the upgrade.
-- You also get Odoo 18's quotation-side improvements, such as product documents referenced in quotation emails.
+- Reusable, centrally managed headers, footers and their fields: consistent quotes across salespeople.
+- Quotation templates carry their own document sets, saving manual work on every quote.
+- Any model field, including custom ones, can be used — no more JSON configuration parameter to maintain.
+- Per-quotation custom text and per-line product documents give truly personalized quotes.
+- A cleaner, supported data model aligned with future Odoo versions, and an easier upgrade path.
